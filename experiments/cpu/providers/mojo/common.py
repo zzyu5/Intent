@@ -42,7 +42,7 @@ def _compile(context, definition, *, constexprs=None):
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
                               tuning_config=context.tuning_config, constexprs=constexprs)
     elapsed = time.monotonic() - started
-    libraries = artifact._namespace["native_program"].compilation.libraries
+    libraries = artifact.runtime.compilation.libraries
     reasons = sorted({library.cache_reason for library in libraries if library.cache_reason})
     print(f"mojo: generated_materialization_s={elapsed:.6f}; "
           f"native_cache_hits={sum(library.cache_hit for library in libraries)}/{len(libraries)}; "
@@ -52,7 +52,7 @@ def _compile(context, definition, *, constexprs=None):
 
 def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
     artifact = _compile(context, definition)
-    generated = artifact._namespace["native_program"].prepare(arguments)
+    generated = artifact.runtime.prepare(arguments)
     report_stage("source_compilation")
     runtime = load_module(context.project_root / runtime_path, "intent_mojo_" + definition.__name__)
     source = runtime.prepare(context.target.resolve(), *arguments)
@@ -90,7 +90,7 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run, artifact._namespace["native_program"]), side(getattr(runtime, reference)), tolerance,
+        side(artifact.run, artifact.runtime), side(getattr(runtime, reference)), tolerance,
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。" + note,
     )

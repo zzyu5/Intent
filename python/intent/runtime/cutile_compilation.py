@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import linecache
 import multiprocessing
 from types import SimpleNamespace
@@ -136,32 +136,26 @@ class CuTileCompilation:
                 return arguments
 
         original_launch = ct.launch
-        saved = []
         sources = []
         bindings = {}
-        for artifact in artifacts:
-            namespace = artifact._namespace
-            kernel = namespace["_intent_kernel"]
-            for name, value in namespace.items():
-                if isinstance(value, ct.kernel):
+        with ExitStack() as contexts:
+            for artifact in artifacts:
+                provider = artifact.runtime.provider
+                kernel = provider.kernel
+                for name, value in provider.native_kernels.items():
                     bindings[value._pyfunc] = name
-            sources.append((kernel._pyfunc.__module__, kernel._pyfunc.__code__.co_filename,
-                            artifact.source))
-            saved.append((namespace, namespace["TuningState"], namespace["exhaustive_search"]))
-            namespace["TuningState"] = CompilationState
-            namespace["exhaustive_search"] = compile_search
-        ct.launch = compile_kernel
-        try:
-            # Each process owns the SDK compiler lock. Device execution remains
-            # in the benchmark process after this preparation context exits.
-            with ProcessPoolExecutor(max_workers=4,
-                                     mp_context=multiprocessing.get_context("spawn"),
-                                     initializer=_initialize_compiler,
-                                     initargs=(sources,)) as executor:
-                yield
-        finally:
-            ct.launch = original_launch
-            for namespace, state, search in saved:
-                namespace["TuningState"] = state
-                namespace["exhaustive_search"] = search
-                namespace["_TUNE_CACHE"].clear()
+                sources.append((kernel._pyfunc.__module__,
+                                kernel._pyfunc.__code__.co_filename, artifact.source))
+                contexts.enter_context(provider.compilation_only(compile_search,
+                                                                  CompilationState))
+            ct.launch = compile_kernel
+            try:
+                # Each process owns the SDK compiler lock; this phase does not
+                # execute candidates or publish a placeholder tuning winner.
+                with ProcessPoolExecutor(max_workers=4,
+                                         mp_context=multiprocessing.get_context("spawn"),
+                                         initializer=_initialize_compiler,
+                                         initargs=(sources,)) as executor:
+                    yield
+            finally:
+                ct.launch = original_launch

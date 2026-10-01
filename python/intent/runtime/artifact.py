@@ -5,10 +5,16 @@ from dataclasses import dataclass
 from dataclasses import field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 BackendIRCollector = Callable[[object], dict[str, str]]
+
+
+class ArtifactRuntime(Protocol):
+    def run(self, *arguments: Any) -> object: ...
+
+    def launch(self, *arguments: Any) -> object: ...
 
 
 class ParameterRole(IntEnum):
@@ -54,10 +60,11 @@ class CompiledArtifact:
     source: str
     mlir: str
     device: int
-    _launcher: Callable[..., object] = field(repr=False)
-    _runner: Callable[..., object] = field(repr=False)
+    runtime: ArtifactRuntime = field(repr=False, metadata={
+        "doc": "Explicit provider runtime implementing run/launch. Backend extensions use this object; "
+               "additional capabilities depend on the provider, not a generated module namespace."
+    })
     _backend_ir_collector: BackendIRCollector | None = field(repr=False)
-    _namespace: dict[str, object] = field(repr=False)
     device_type: str = field(default="cuda", kw_only=True)
     cache_directory: Path | None = field(default=None, kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
@@ -72,20 +79,54 @@ class CompiledArtifact:
         return {"intent": self.mlir, **self.backend_ir}
 
     def run(self, *arguments: Any) -> object:
-        return self._invoke(self._runner, arguments)
+        """Allocate declared Out buffers and execute with inputs in declaration order."""
+        return self._invoke(self.runtime.run, arguments)
+
+    @property
+    def interface(self):
+        """Read this runtime's typed invocation interface; unsupported runtimes raise NotImplementedError."""
+        if not hasattr(self.runtime, "interface"):
+            raise NotImplementedError("this runtime does not expose a typed invocation interface")
+        return self.runtime.interface
+
+    def prepare(self, *arguments: Any, outputs: tuple | None = None):
+        """Bind GPU arguments and allocate invocation-owned outputs/workspace without launching the kernel.
+
+        The returned call's launch performs any first-use JIT/tuning and execution.
+        Prepare again when arguments or their shape/stride metadata change.
+        """
+        from .gpu.program import GPUProgram
+
+        if not isinstance(self.runtime, GPUProgram):
+            raise NotImplementedError("prepared tensor calls require the GPU runtime interface")
+        return self._invoke(lambda *args: self.runtime.prepare(*args, outputs=outputs), arguments)
+
+    def as_torch_op(self, name: str):
+        """Return a PyTorch CustomOpDef for this allocating GPU call.
+
+        Only read-only In tensors, scalar inputs and fresh Out tensors are supported;
+        InOut and output aliases are unsupported. The fake implementation uses the
+        declared interface without provider execution or data-pointer access.
+        Backward is not inferred; authors may use the result's register_autograd.
+        """
+        from .torch import register_operator
+
+        return register_operator(self, name)
 
     def tuning_configurations(
         self, *arguments: Any,
     ) -> tuple[TuningConfiguration, ...]:
-        function = self._namespace.get("tuning_configurations")
-        if function is None:
+        if not hasattr(self.runtime, "tuning_configurations"):
             raise NotImplementedError(
                 "this provider does not export structured tuning configurations"
             )
-        return self._invoke(function, arguments)
+        return self._invoke(self.runtime.tuning_configurations, arguments)
 
     def __call__(self, *arguments: Any) -> None:
-        compiled_kernel = self._invoke(self._launcher, arguments)
+        compiled_kernel = self._invoke(self.runtime.launch, arguments)
+        self._capture_backend_ir(compiled_kernel)
+
+    def _capture_backend_ir(self, compiled_kernel: object) -> None:
         if self._backend_ir_collector is not None and (
             compiled_kernel is not self._backend_ir_kernel or not self.backend_ir
         ):

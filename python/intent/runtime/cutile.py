@@ -1,5 +1,10 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 from .artifact import CompiledArtifact
-from .source import materialize_python_source
+from .gpu.expressions import evaluate_shape, read_expressions
+from .gpu.program import LaunchResult, materialize_gpu_program
+from .tuning import TuningState
 
 
 def bind_array_view(view, group_ends: tuple[int, ...]):
@@ -57,14 +62,123 @@ def can_use_i32_array_indices(views: tuple, tile_bounds: tuple) -> bool:
     return True
 
 
+def _search(*arguments, **keywords):
+    from cuda.tile.tune import exhaustive_search
+
+    return exhaustive_search(*arguments, **keywords)
+
+
+class CuTileProgram:
+    def __init__(self, interface, namespace: dict, facts: dict) -> None:
+        self.interface = interface
+        self.facts = facts
+        self.kernel = namespace[facts["kernel"]]
+        self.narrow_kernel = None if facts["narrow_kernel"] is None else namespace[facts["narrow_kernel"]]
+        self.native_kernels = {name: namespace[name] for name in (facts["kernel"], facts["narrow_kernel"])
+                               if name is not None}
+        self.tile_bounds = (None if facts["index_tile_bounds"] is None else
+                            tuple(read_expressions(bounds) for bounds in facts["index_tile_bounds"]))
+        self.search = _search
+        self.trial_state = TuningState
+        self.observe_tuning = None
+        self.tuning_options: dict = {}
+        self._winners: dict = {}
+        self._compiling = False
+
+    def _array_values(self, values: dict) -> None:
+        for entry in self.facts["array_views"]:
+            values[entry["name"]], values[entry["eligible"]] = bind_array_view(
+                values[entry["base"]], tuple(entry["group_ends"]))
+
+    def _hints(self, config) -> dict:
+        hints = {hint: getattr(config, parameter) for hint, parameter in self.facts["compiler_hints"].items()}
+        if hints.get("num_worker_warps") == self.facts["inferred_worker_warps"]:
+            hints["num_worker_warps"] = None
+        return hints
+
+    def _arguments(self, values: dict, config) -> tuple:
+        bindings = {**values, **vars(config)}
+        return tuple(bindings[name] for name in self.facts["kernel_arguments"])
+
+    def _grid(self, values: dict, config) -> tuple:
+        return (*evaluate_shape(self.interface.grid, {**values, **vars(config)}), 1, 1)
+
+    def _key(self, invocation, values: dict) -> tuple:
+        return (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
+                      for view in invocation.views),
+                tuple(values[name] for name in self.facts["tuning_key_scalars"]),
+                tuple(values[name] for name, _, _ in self.interface.coverage),
+                tuple(values[entry["eligible"]] for entry in self.facts["array_views"]),
+                tuple(values[entry["name"]] for entry in self.interface.overlaps))
+
+    def launch(self, invocation) -> LaunchResult:
+        import torch
+        import cuda.tile as ct
+
+        values = dict(invocation.values)
+        self._array_values(values)
+        key = self._key(invocation, values)
+        cached = self._winners.get(key)
+        if cached is None:
+            configurations = tuple(SimpleNamespace(**config) for config in self.interface.candidates(values))
+            kernel = self.kernel
+            if self.tile_bounds is not None:
+                bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
+                if can_use_i32_array_indices(invocation.views, bounds):
+                    kernel = self.narrow_kernel
+            state = self.trial_state(invocation.public_views,
+                                     tuple(view.writable for view in self.interface.public_views))
+            trial_values = dict(values)
+            trial_values.update((view.kernel_name, trial) for view, trial in
+                                zip(self.interface.public_views, state.views, strict=True))
+            self._array_values(trial_values)
+            hints = (self._hints,) if self.facts["compiler_hints"] else ()
+            result = self.search(configurations, torch.cuda.current_stream(),
+                                  lambda config: self._grid(values, config), kernel,
+                                  lambda config: state.arguments(self._arguments(trial_values, config)),
+                                  *hints, quiet=True, **self.tuning_options)
+            if self.observe_tuning is not None:
+                self.observe_tuning(configurations, result)
+            config = result.best.config
+            selected = kernel.replace_hints(**self._hints(config)) if hints else kernel
+            cached = config, selected
+            if not self._compiling:
+                self._winners[key] = cached
+        config, selected = cached
+        grid = self._grid(values, config)
+        arguments = self._arguments(values, config)
+
+        def invoke():
+            return ct.launch(torch.cuda.current_stream(), grid, selected, arguments)
+
+        invoke()
+        return LaunchResult(None if self._compiling else invoke, selected)
+
+    def tuning_configurations(self, invocation):
+        return self.interface.tuning_configurations(invocation)
+
+    @contextmanager
+    def compilation_only(self, search, trial_state):
+        """Use a native compilation driver without recording its placeholders as tuning winners."""
+        previous = self.search, self.trial_state, self.observe_tuning, self._compiling
+        self.search, self.trial_state, self.observe_tuning = search, trial_state, None
+        self._compiling = True
+        try:
+            yield
+        finally:
+            self.search, self.trial_state, self.observe_tuning, self._compiling = previous
+            self._winners.clear()
+
+
 def materialize_cutile_artifact(
     source: str,
     module_text: str,
     entry_name: str,
     device: int,
+    metadata: dict,
 ) -> CompiledArtifact:
-    return materialize_python_source(
-        target_name="cutile",
+    return materialize_gpu_program(
+        provider_name="cutile", provider_type=CuTileProgram, metadata=metadata,
         source=source,
         module_text=module_text,
         entry_name=entry_name,

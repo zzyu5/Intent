@@ -125,6 +125,14 @@ class NativeProgram:
         self.function.argtypes = argument_types
         self.function.restype = ctypes.c_int
 
+    def run(self, *arguments):
+        call = self.prepare(arguments)
+        call.launch()
+        return call.result()
+
+    def launch(self, *arguments):
+        self.prepare(arguments, explicit_outputs=True).launch()
+
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         expected = len(self.parameters) if explicit_outputs else sum(
             p["kind"] != "view" or p["access"] != 1 for p in self.parameters)

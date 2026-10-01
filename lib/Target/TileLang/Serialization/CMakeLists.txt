@@ -7,5 +7,6 @@ add_mlir_library(MLIRIntentTileLangSerialization
   MLIRIR
   MLIRSCFDialect
   MLIRIntentGPUDialect
+  MLIRIntentGPUSerialization
   MLIRIntentTileLangDialect
 )

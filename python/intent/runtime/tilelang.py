@@ -1,5 +1,5 @@
 from .artifact import CompiledArtifact
-from .source import materialize_python_source
+from .gpu.program import LaunchResult, materialize_gpu_program
 from .tuning import TuningState
 
 
@@ -46,14 +46,48 @@ def tune_kernel(jit, configs: list[dict], parameters: dict,
     return tuner.run(warmup=3, rep=10, benchmark_multi_gpu=False).kernel
 
 
+class TileLangProgram:
+    def __init__(self, interface, namespace: dict, facts: dict) -> None:
+        self.interface = interface
+        self.facts = facts
+        self.kernel = namespace[facts["kernel"]]
+        self._winners = {}
+
+    def launch(self, invocation) -> LaunchResult:
+        values = invocation.values
+        key = (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
+                     for view in invocation.views),
+               tuple(values[scalar.kernel_name] for scalar in self.interface.scalars),
+               tuple(values[entry["name"]] for entry in self.interface.overlaps))
+        arguments = tuple(values[name] for name in self.facts["kernel_arguments"])
+        if key not in self._winners:
+            parameter_names = {parameter.name for parameter in self.interface.tuning_parameters
+                               if parameter.name not in {name for name, _, _ in self.interface.coverage}}
+            bindings = {name: values[name] for name in self.facts["builder_arguments"]
+                        if name not in parameter_names}
+            self._winners[key] = tune_kernel(self.kernel, list(self.interface.candidates(values)), bindings,
+                                             arguments, tuple(view.writable for view in self.interface.views))
+        compiled = self._winners[key]
+
+        def invoke():
+            return compiled(*arguments)
+
+        invoke()
+        return LaunchResult(invoke, compiled)
+
+    def tuning_configurations(self, invocation):
+        return self.interface.tuning_configurations(invocation)
+
+
 def materialize_tilelang_artifact(
     source: str,
     module_text: str,
     entry_name: str,
     device: int,
+    metadata: dict,
 ) -> CompiledArtifact:
-    return materialize_python_source(
-        target_name="tilelang",
+    return materialize_gpu_program(
+        provider_name="tilelang", provider_type=TileLangProgram, metadata=metadata,
         source=source,
         module_text=module_text,
         entry_name=entry_name,

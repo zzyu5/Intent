@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-import inspect
 import math
-from types import FunctionType
 
 import torch
 
@@ -97,23 +95,10 @@ def prepare_kernel_call(
     arguments: tuple[object, ...],
     outputs: object,
 ) -> Callable[[], object]:
-    run_arguments = inspect.signature(artifact._runner).bind(*arguments).arguments
-    launch_parameters = inspect.signature(artifact._launcher).parameters
     output_values = outputs if isinstance(outputs, tuple) else (outputs,)
-    output_names = [name for name in launch_parameters if name not in run_arguments]
-    if len(output_names) != len(output_values):
-        raise RuntimeError(
-            "generated launch ABI does not match the prepared output buffers"
-        )
-    launch_arguments = dict(run_arguments)
-    launch_arguments.update(zip(output_names, output_values))
-    ordered = tuple(launch_arguments[name] for name in launch_parameters)
-    compiled = artifact._launcher(*ordered)
-    if isinstance(compiled, FunctionType):
-        return compiled
-    if callable(compiled):
-        return lambda: compiled(*ordered)
-    return lambda: artifact._launcher(*ordered)
+    call = artifact.prepare(*arguments, outputs=output_values)
+    call.launch()
+    return call.launch
 
 
 def print_artifact(artifact: CompiledArtifact, target: str) -> None:

@@ -4,7 +4,8 @@
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Serialization/Interface.h"
+#include "Intent/Dialect/GPU/Serialization/Python.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -13,71 +14,30 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
-#include <iomanip>
 #include <map>
-#include <sstream>
+#include <set>
 
 using namespace mlir;
 
 namespace intent::tilelang {
 namespace {
 
-std::string tileLangType(Type type, bool torch = false) {
-  if (type.isIndex())
-    return torch ? "torch.int64" : "T.int64";
-  if (auto integer = dyn_cast<IntegerType>(type)) {
-    if (integer.getWidth() == 1)
-      return torch ? "torch.bool" : "T.bool";
-    StringRef prefix = integer.isUnsigned() ? "uint" : "int";
-    return ((torch ? "torch." : "T.") + prefix + Twine(integer.getWidth())).str();
-  }
-  if (isa<Float16Type>(type))
-    return torch ? "torch.float16" : "T.float16";
-  if (isa<BFloat16Type>(type))
-    return torch ? "torch.bfloat16" : "T.bfloat16";
-  if (isa<Float32Type>(type))
-    return torch ? "torch.float32" : "T.float32";
-  if (isa<Float8E4M3FNType>(type))
-    return torch ? "torch.float8_e4m3fn" : "T.float8_e4m3fn";
-  if (isa<Float8E5M2Type>(type))
-    return torch ? "torch.float8_e5m2" : "T.float8_e5m2";
-  return {};
+std::string tileLangType(Type type) {
+  static const gpu::PythonScalarSyntax syntax{
+      "T.", "bool", "", "float8_e4m3fn", "float8_e5m2"};
+  return gpu::pythonScalarType(type, syntax);
 }
 
 std::string expressionString(gpu::PhysicalExprAttr expression) {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-  if (kind == gpu::PhysicalExprKind::Constant)
-    return std::to_string(expression.getValue());
-  if (kind == gpu::PhysicalExprKind::Parameter ||
-      kind == gpu::PhysicalExprKind::Dimension ||
-      kind == gpu::PhysicalExprKind::ScalarABI)
-    return expression.getSymbol().getValue().str();
-  SmallVector<std::string> operands;
-  for (Attribute operand : expression.getOperands())
-    operands.push_back(expressionString(cast<gpu::PhysicalExprAttr>(operand)));
-  if (kind == gpu::PhysicalExprKind::Add)
-    return "(" + operands[0] + " + " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Subtract)
-    return "(" + operands[0] + " - " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Multiply)
-    return "(" + operands[0] + " * " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::CeilDiv)
-    return "T.ceildiv(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Minimum)
-    return "T.min(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Maximum)
-    return "T.max(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::FloorDiv)
-    return "(" + operands[0] + " // " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Select)
-    return "T.if_then_else(" + operands[0] + ", " + operands[1] + ", " +
-           operands[2] + ")";
-  if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-    return "T.next_power_of_2(" + operands[0] + ")";
-  return {};
+  static const gpu::PythonExpressionSyntax syntax{
+      "T.ceildiv", "T.min", "T.max", "T.if_then_else", "T.next_power_of_2", false};
+  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
+    return leaf.getSymbol().getValue().str();
+  });
 }
 
 std::string shape(ArrayAttr extents) {
@@ -93,106 +53,45 @@ std::string shape(ArrayAttr extents) {
 }
 
 std::string literal(Attribute value) {
-  if (auto integer = dyn_cast<IntegerAttr>(value)) {
-    if (integer.getType().isInteger(1))
-      return integer.getInt() ? "True" : "False";
-    return std::to_string(integer.getInt());
-  }
-  if (auto floating = dyn_cast<FloatAttr>(value)) {
-    if (floating.getValue().isNaN())
-      return "float(\"nan\")";
-    if (floating.getValue().isInfinity()) {
-      std::string type = tileLangType(floating.getType());
-      if (!type.empty())
-        return (floating.getValue().isNegative() ? "-" : "") +
-               std::string("T.infinity(") + type + ")";
-      return floating.getValue().isNegative() ? "float(\"-inf\")"
-                                               : "float(\"inf\")";
-    }
-    std::ostringstream stream;
-    stream << std::setprecision(17) << floating.getValueAsDouble();
-    std::string result = stream.str();
-    if (result.find_first_of(".eE") == std::string::npos)
-      result += ".0";
-    return result;
-  }
-  return {};
+  return gpu::pythonLiteral(value, [](Type type) {
+    std::string name = tileLangType(type);
+    return name.empty() ? "float(\"inf\")" : "T.infinity(" + name + ")";
+  });
 }
-
-struct CoverageParameter {
-  gpu::PhysicalExprAttr bound;
-  SmallVector<int64_t> candidates;
-};
 
 class Serializer {
 public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
       : kernel(kernel), output(output) {}
 
-  LogicalResult emit() {
+  LogicalResult emit(std::string &metadata) {
     bindArguments();
+    if (failed) return failure();
     collectConfiguration();
     emitPreamble();
     emitBuilder();
-    emitLaunch();
-    emitRun();
-    return failed ? failure() : success();
+    return failed ? failure() : emitMetadata(metadata);
   }
 
 private:
-  struct ViewABI {
-    unsigned argument;
-    std::string name;
-    gpu::ViewType type;
-  };
-  struct MetadataABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    unsigned sourceABI;
-    unsigned sourceAxis;
-    int64_t dimension;
-  };
-  struct ScalarABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    Type type;
-  };
-
+  using ViewABI = gpu::ViewArgument;
+  using ScalarABI = gpu::ScalarArgument;
+  using MetadataABI = gpu::MetadataArgument;
   void bindArguments() {
-    for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-      DictionaryAttr attrs = kernel.getArgAttrDict(index);
-      std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
-      std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
-      values[argument] = name;
-      if (kind == "view") {
-        views.push_back({static_cast<unsigned>(index), name,
-                         cast<gpu::ViewType>(argument.getType())});
-      } else if (kind == "scalar" || kind == "constexpr" || kind == "value") {
-        if (kind == "constexpr") {
-          if (!argument.use_empty()) {
-            kernel.emitError(
-                "live constexpr reached TileLang runtime ABI after specialization");
-            failed = true;
-          }
-          continue;
-        }
-        scalars.push_back({static_cast<unsigned>(index), name, kind,
-                           argument.getType()});
-      } else {
-        MetadataABI metadata{
-            static_cast<unsigned>(index), name, kind,
-            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceABIAttr).getInt()),
-            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceAxisAttr).getInt()),
-            attrs.getAs<IntegerAttr>(gpu::dimensionAttr)
-                ? attrs.getAs<IntegerAttr>(gpu::dimensionAttr).getInt()
-                : 0};
-        metadataArguments.push_back(metadata);
-        if (kind == "dimension")
-          dimensionBindings[metadata.dimension] = metadata;
-      }
+    auto interface = gpu::readInterface(kernel);
+    if (mlir::failed(interface)) {
+      failed = true;
+      return;
     }
+    views = std::move(interface->views);
+    scalars = std::move(interface->scalars);
+    metadataArguments = std::move(interface->metadata);
+    for (const ScalarABI &scalar : scalars)
+      values[kernel.getArgument(scalar.abi)] = scalar.name;
+    for (const MetadataABI &metadata : metadataArguments)
+      values[kernel.getArgument(metadata.abi)] = metadata.name;
+    for (const ViewABI &view : views)
+      values[kernel.getArgument(view.abi)] = view.name;
     llvm::StringSet<> occupied;
     for (const auto &entry : values)
       occupied.insert(entry.second);
@@ -205,99 +104,25 @@ private:
         name += "_";
       return name;
     };
-    overlapFunction = fresh("_intent_byte_spans_overlap");
-    overlapSpanFunction = fresh("_intent_view_byte_span");
     kernel.walk([&](gpu::ViewOverlapOp overlap) {
       values[overlap.getResult()] = fresh("_intent_overlap");
       overlapFacts.push_back(overlap);
-      for (Value view : overlap.getOperands())
-        if (!overlapSpans.count(view))
-          overlapSpans[view] = fresh("_intent_view_span");
     });
   }
 
   void collectConfiguration() {
-    llvm::StringSet<> names;
-    std::map<std::string, SmallVector<int64_t>> parameterCandidates;
     kernel.walk([&](gpu::ParameterOp parameter) {
-      auto schema = parameter.getParameter();
-      auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-      if (role == gpu::ParameterRole::ProviderWarps ||
-          role == gpu::ParameterRole::ProviderCTAs ||
-          role == gpu::ParameterRole::ProviderAccessForm ||
-          role == gpu::ParameterRole::ProviderOccupancy ||
-          role == gpu::ParameterRole::ProviderLoadPolicy) {
-        parameter.emitOpError(
-            "TileLang source cannot bind a foreign provider parameter role");
-        failed = true;
-        return;
-      }
-      StringRef name = schema.getName().getValue();
-      if (!names.insert(name).second) {
-        parameter.emitOpError("duplicates a TileLang physical parameter");
-        failed = true;
-        return;
-      }
-      auto coverage =
-          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
-      if (coverage) {
-        auto bound = parameter->getAttrOfType<gpu::PhysicalExprAttr>(
-            gpu::coverageBoundAttr);
-        if (!bound) {
-          parameter.emitOpError(
-              "full-coverage parameter has no typed bound expression");
-          failed = true;
-          return;
-        }
-        fullCoverageParameters[name.str()] = {
-            bound,
-            SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
-        values[parameter.getResult()] = name.str();
-        return;
-      }
-      parameterNames.push_back(name.str());
-      parameterCandidates[name.str()] =
-          SmallVector<int64_t>(schema.getCandidates().asArrayRef());
-      values[parameter.getResult()] = name.str();
+      std::string name = parameter.getParameter().getName().getValue().str();
+      values[parameter.getResult()] = name;
+      if (parameter->hasAttr(gpu::coverageDimensionAttr))
+        coverageNames.insert(name);
+      else
+        parameterNames.push_back(name);
     });
-    if (failed)
-      return;
-    auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::tileLangConfigsAttr);
-    if (!encoded || encoded.empty()) {
-      kernel.emitError("TileLang source requires closed provider configs");
-      failed = true;
-      return;
-    }
-    for (Attribute attribute : encoded) {
-      auto tuple = dyn_cast<DictionaryAttr>(attribute);
-      if (!tuple || tuple.size() != parameterCandidates.size()) {
-        kernel.emitError("contains a malformed TileLang provider config");
-        failed = true;
-        return;
-      }
-      std::map<std::string, int64_t> config;
-      for (NamedAttribute binding : tuple) {
-        auto domain = parameterCandidates.find(binding.getName().strref().str());
-        auto value = dyn_cast<IntegerAttr>(binding.getValue());
-        if (domain == parameterCandidates.end() || !value ||
-            !llvm::is_contained(domain->second, value.getInt())) {
-          kernel.emitError(
-              "TileLang provider config contains an invalid binding");
-          failed = true;
-          return;
-        }
-        config[binding.getName().strref().str()] = value.getInt();
-      }
-      configurations.push_back(std::move(config));
-    }
   }
 
   void emitPreamble() {
-    output << "import torch\nimport tilelang\nimport tilelang.language as T\n"
-              "from intent.runtime.tilelang import tune_kernel\n\n";
-    if (!overlapFacts.empty())
-      output << "from intent.runtime.tuning import byte_spans_overlap as "
-             << overlapFunction << ", view_byte_span as " << overlapSpanFunction << "\n\n";
+    output << "import tilelang\nimport tilelang.language as T\n\n";
     std::map<std::string, std::pair<std::string, bool>> primitives;
     auto add = [&](StringRef mnemonic, bool flush, bool binary) {
       std::string suffix = flush ? "_ftz" : "";
@@ -333,18 +158,7 @@ private:
   void emitBuilder() {
     auto lowerPredicatedLoadStore =
         kernel->getAttrOfType<BoolAttr>(lowerPredicatedLoadStoreAttr);
-    output << "_CONFIGS = [\n";
-    for (const auto &config : configurations) {
-      output << "    {";
-      for (auto [index, item] : llvm::enumerate(config)) {
-        if (index)
-          output << ", ";
-        output << "\"" << item.first << "\": " << item.second;
-      }
-      output << "},\n";
-    }
-    output << "]\n\n"
-              "@tilelang.jit(pass_configs={"
+    output << "@tilelang.jit(pass_configs={"
               "tilelang.PassConfigKey.TL_ENABLE_LOWER_LDGSTG_PREDICATED: "
            << (lowerPredicatedLoadStore.getValue() ? "True" : "False")
            << "})\ndef _intent_kernel(";
@@ -359,12 +173,9 @@ private:
       argument(metadata.name);
     for (gpu::ViewOverlapOp overlap : overlapFacts)
       argument(valueString(overlap.getResult()));
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind == "constexpr")
-        argument(scalar.name);
     for (const std::string &name : parameterNames)
       argument(name);
-    for (const auto &[name, coverage] : fullCoverageParameters)
+    for (const std::string &name : coverageNames)
       argument(name);
     output << "):\n";
     output << "    @T.prim_func\n    def main(";
@@ -377,8 +188,6 @@ private:
              << tileLangType(view.type.getElementType()) << ")";
     }
     for (const ScalarABI &scalar : scalars) {
-      if (scalar.kind == "constexpr")
-        continue;
       if (!first)
         output << ", ";
       first = false;
@@ -408,102 +217,6 @@ private:
     emitBlock(kernel.getBody().front());
     line("return main", 1);
     output << "\n";
-  }
-
-  void emitLaunch() {
-    output << "_KERNEL_CACHE = {}\n\ndef launch(" << joinLaunchArguments() << "):\n";
-    llvm::DenseSet<Value> boundSpans;
-    for (gpu::ViewOverlapOp overlap : overlapFacts) {
-      for (Value view : overlap.getOperands())
-        if (boundSpans.insert(view).second)
-          line(overlapSpans.lookup(view) + " = " + overlapSpanFunction + "(" +
-                   valueString(view) + ")", 1);
-      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
-               overlapSpans.lookup(overlap.getLhs()) + ", " +
-               overlapSpans.lookup(overlap.getRhs()) + ")", 1);
-    }
-    for (const MetadataABI &metadata : metadataArguments) {
-      const ViewABI &source = viewByABI(metadata.sourceABI);
-      line(metadata.name + " = " + source.name +
-               (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
-               std::to_string(metadata.sourceAxis) +
-               (metadata.kind == "dimension" ? "]" : ")"),
-           1);
-    }
-    for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      std::string candidates = "(";
-      for (int64_t candidate : coverage.candidates)
-        candidates += std::to_string(candidate) + ", ";
-      candidates += ")";
-      line(parameter + " = next((extent for extent in " + candidates +
-               " if extent >= " + expressionString(coverage.bound) + "), None)",
-           1);
-      line("if " + parameter + " is None:", 1);
-      line("raise ValueError(\"no legal full-coverage extent for " + parameter +
-               "\")",
-           2);
-    }
-    std::string key = "key = (";
-    for (const ViewABI &view : views)
-      key += "tuple(" + view.name + ".shape), tuple(" + view.name + ".stride()), " + view.name + ".dtype, str(" +
-             view.name + ".device), ";
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind != "constexpr")
-        key += scalar.name + ", ";
-    for (gpu::ViewOverlapOp overlap : overlapFacts)
-      key += valueString(overlap.getResult()) + ", ";
-    line(key + ")", 1);
-    line("if key not in _KERNEL_CACHE:", 1);
-    std::string compile = "_KERNEL_CACHE[key] = tune_kernel(_intent_kernel, _CONFIGS, {";
-    for (auto [index, metadata] : llvm::enumerate(metadataArguments)) {
-      if (index)
-        compile += ", ";
-      compile += "\"" + metadata.name + "\": " + metadata.name;
-    }
-    for (gpu::ViewOverlapOp overlap : overlapFacts) {
-      if (compile.back() != '{')
-        compile += ", ";
-      std::string name = valueString(overlap.getResult());
-      compile += "\"" + name + "\": " + name;
-    }
-    for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      if (!metadataArguments.empty() || compile.back() != '{')
-        compile += ", ";
-      compile += "\"" + parameter + "\": " + parameter;
-    }
-    compile += "}, (" + joinKernelRuntimeArguments() + ",), (";
-    for (const ViewABI &view : views)
-      compile += view.type.getAccess() != 0 ? "True, " : "False, ";
-    line(compile + "))", 2);
-    line("kernel = _KERNEL_CACHE[key]", 1);
-    line("kernel(" + joinKernelRuntimeArguments() + ")", 1);
-    line("return kernel", 1);
-    output << "\n";
-  }
-
-  void emitRun() {
-    SmallVector<ViewABI> inputs;
-    SmallVector<ViewABI> outputs;
-    for (const ViewABI &view : views) {
-      if (view.type.getAccess() != 1)
-        inputs.push_back(view);
-      if (view.type.getAccess() == 1)
-        outputs.push_back(view);
-    }
-    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
-    std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
-    for (const ViewABI &view : outputs)
-      line(view.name + " = torch.empty(" + outputShape(view) + ", device=" +
-               device + ", dtype=" + tileLangType(view.type.getElementType(), true) +
-               ")",
-           1);
-    line("launch(" + joinLaunchArguments() + ")", 1);
-    if (outputs.empty())
-      line("return None", 1);
-    else if (outputs.size() == 1)
-      line("return " + outputs.front().name, 1);
-    else
-      line("return (" + joinViewNames(outputs) + ")", 1);
   }
 
   void emitBlock(Block &block) {
@@ -905,61 +618,6 @@ private:
     return shape(view.type.getLayout().getExtents());
   }
 
-  std::string outputShape(const ViewABI &view) {
-    std::string result = "(";
-    auto ids = view.type.getLayout().getDimensionIds();
-    auto extents = view.type.getLayout().getExtents();
-    for (auto [axis, dimension] : llvm::enumerate(ids.asArrayRef())) {
-      if (axis)
-        result += ", ";
-      auto extent = cast<gpu::PhysicalExprAttr>(extents[axis]);
-      if (extent.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
-        result += std::to_string(extent.getValue());
-      } else {
-        auto found = dimensionBindings.find(dimension);
-        if (found == dimensionBindings.end()) {
-          failed = true;
-          return "<missing-output-shape>";
-        }
-        const MetadataABI &metadata = found->second;
-        const ViewABI &source = viewByABI(metadata.sourceABI);
-        result += source.name + ".shape[" + std::to_string(metadata.sourceAxis) + "]";
-      }
-    }
-    if (ids.size() == 1)
-      result += ",";
-    return result + ")";
-  }
-
-  std::string joinKernelRuntimeArguments() const {
-    std::string result = joinViewNames(views);
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind != "constexpr") {
-        if (!result.empty())
-          result += ", ";
-        result += scalar.name;
-      }
-    return result;
-  }
-
-  std::string joinLaunchArguments(bool includeOutputs = true) const {
-    std::map<unsigned, std::string> arguments;
-    for (const ViewABI &view : views)
-      if (includeOutputs || view.type.getAccess() != 1)
-        arguments.emplace(view.argument, view.name);
-    for (const ScalarABI &scalar : scalars)
-      if (scalar.kind != "constexpr")
-        arguments.emplace(scalar.argument, scalar.name);
-    std::string result;
-    for (const auto &[index, name] : arguments) {
-      if (!result.empty())
-        result += ", ";
-      result += name;
-    }
-    return result;
-  }
-
   std::string valueString(Value value) {
     auto found = values.find(value);
     if (found == values.end()) {
@@ -980,22 +638,25 @@ private:
     output.indent(level * 4) << text << "\n";
   }
 
-  const ViewABI &viewByABI(unsigned abi) const {
-    for (const ViewABI &view : views)
-      if (view.type.getAbiIndex() == abi)
-        return view;
-    llvm_unreachable("verified metadata references a missing view ABI");
-  }
-
-  template <typename Range>
-  std::string joinViewNames(const Range &range) const {
-    std::string result;
-    for (auto [index, view] : llvm::enumerate(range)) {
-      if (index)
-        result += ", ";
-      result += view.name;
-    }
-    return result;
+  LogicalResult emitMetadata(std::string &metadata) {
+    auto artifact = gpu::serializeInterface(kernel, "tilelang", [&](Value value) {
+      return valueString(value);
+    });
+    if (mlir::failed(artifact)) return failure();
+    llvm::json::Array arguments, builderArguments;
+    for (const ViewABI &view : views) arguments.push_back(view.name);
+    for (const ScalarABI &scalar : scalars) arguments.push_back(scalar.name);
+    for (const MetadataABI &argument : metadataArguments)
+      builderArguments.push_back(argument.name);
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      builderArguments.push_back(valueString(overlap.getResult()));
+    for (const std::string &name : parameterNames) builderArguments.push_back(name);
+    for (const std::string &name : coverageNames) builderArguments.push_back(name);
+    (*artifact)["tilelang"] = llvm::json::Object{
+        {"kernel", "_intent_kernel"}, {"kernel_arguments", std::move(arguments)},
+        {"builder_arguments", std::move(builderArguments)}};
+    llvm::raw_string_ostream(metadata) << llvm::json::Value(std::move(*artifact));
+    return failed ? failure() : success();
   }
 
   func::FuncOp kernel;
@@ -1005,13 +666,8 @@ private:
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   SmallVector<gpu::ViewOverlapOp> overlapFacts;
-  llvm::DenseMap<Value, std::string> overlapSpans;
-  std::string overlapFunction;
-  std::string overlapSpanFunction;
-  llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
   SmallVector<std::string> parameterNames;
-  SmallVector<std::map<std::string, int64_t>> configurations;
-  std::map<std::string, CoverageParameter> fullCoverageParameters;
+  std::set<std::string> coverageNames;
   unsigned indent = 0;
   unsigned counter = 0;
   bool failed = false;
@@ -1020,7 +676,8 @@ private:
 
 } // namespace
 
-LogicalResult serializeProgram(ModuleOp module, std::string &source) {
+LogicalResult serializeProgram(ModuleOp module, std::string &source,
+                               std::string &metadata) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -1028,7 +685,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source) {
     return (*kernel).emitError("TileLang program was not provider-legalized");
   llvm::raw_string_ostream stream(source);
   Serializer serializer(*kernel, stream);
-  LogicalResult result = serializer.emit();
+  LogicalResult result = serializer.emit(metadata);
   stream.flush();
   return result;
 }

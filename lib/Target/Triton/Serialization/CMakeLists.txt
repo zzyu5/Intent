@@ -8,5 +8,6 @@ add_mlir_library(MLIRIntentTritonSerialization
   MLIRIR
   MLIRSCFDialect
   MLIRIntentGPUDialect
+  MLIRIntentGPUSerialization
   MLIRIntentTritonDialect
 )

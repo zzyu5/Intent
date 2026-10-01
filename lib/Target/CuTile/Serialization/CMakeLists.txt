@@ -10,4 +10,5 @@ add_mlir_library(MLIRIntentCuTileSerialization
   MLIRIntentCuTileDialect
   MLIRIntentCuTileAnalysis
   MLIRIntentGPUDialect
+  MLIRIntentGPUSerialization
 )

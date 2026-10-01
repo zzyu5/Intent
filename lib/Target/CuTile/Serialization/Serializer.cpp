@@ -4,7 +4,8 @@
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Serialization/Interface.h"
+#include "Intent/Dialect/GPU/Serialization/Python.h"
 #include "Intent/Target/CuTile/Analysis/Tuning.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -12,89 +13,30 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cmath>
-#include <iomanip>
 #include <map>
 #include <numeric>
-#include <sstream>
 
 using namespace mlir;
 
 namespace intent::cutile {
 namespace {
 
-std::string pythonType(Type type, bool torch = false) {
-  if (type.isIndex())
-    return torch ? "torch.int64" : "ct.int64";
-  if (auto integer = dyn_cast<IntegerType>(type)) {
-    if (integer.getWidth() == 1)
-      return torch ? "torch.bool" : "ct.bool_";
-    StringRef prefix = integer.isUnsigned() ? "u" : "";
-    return ((torch ? "torch." : "ct.") + prefix + "int" +
-            Twine(integer.getWidth()))
-        .str();
-  }
-  if (isa<Float16Type>(type))
-    return torch ? "torch.float16" : "ct.float16";
-  if (isa<BFloat16Type>(type))
-    return torch ? "torch.bfloat16" : "ct.bfloat16";
-  if (isa<Float32Type>(type))
-    return torch ? "torch.float32" : "ct.float32";
-  if (isa<Float64Type>(type))
-    return torch ? "torch.float64" : "ct.float64";
-  if (isa<Float8E4M3FNType>(type))
-    return torch ? "torch.float8_e4m3fn" : "ct.float8_e4m3fn";
-  if (isa<Float8E5M2Type>(type))
-    return torch ? "torch.float8_e5m2" : "ct.float8_e5m2";
-  return {};
+std::string pythonType(Type type) {
+  static const gpu::PythonScalarSyntax syntax{
+      "ct.", "bool_", "float64", "float8_e4m3fn", "float8_e5m2"};
+  return gpu::pythonScalarType(type, syntax);
 }
 
-std::string expressionString(gpu::PhysicalExprAttr expression,
-                             bool configContext,
-                             const llvm::StringSet<> *fullCoverage = nullptr,
-                             StringRef configName = "cfg") {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-  if (kind == gpu::PhysicalExprKind::Constant)
-    return std::to_string(expression.getValue());
-  if (kind == gpu::PhysicalExprKind::Parameter) {
-    StringRef name = expression.getSymbol().getValue();
-    return configContext && (!fullCoverage || !fullCoverage->contains(name))
-               ? (Twine(configName) + "." + name).str()
-               : name.str();
-  }
-  if (kind == gpu::PhysicalExprKind::Dimension ||
-      kind == gpu::PhysicalExprKind::ScalarABI)
-    return expression.getSymbol().getValue().str();
-  SmallVector<std::string> operands;
-  for (Attribute operand : expression.getOperands())
-    operands.push_back(expressionString(cast<gpu::PhysicalExprAttr>(operand),
-                                        configContext, fullCoverage,
-                                        configName));
-  if (kind == gpu::PhysicalExprKind::Add)
-    return "(" + operands[0] + " + " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Subtract)
-    return "(" + operands[0] + " - " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Multiply)
-    return "(" + operands[0] + " * " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::CeilDiv)
-    return "ct.cdiv(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Minimum)
-    return "min(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Maximum)
-    return "max(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::FloorDiv)
-    return "(" + operands[0] + " // " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Select)
-    return "(" + operands[1] + " if " + operands[0] + " else " +
-           operands[2] + ")";
-  if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-    return "_intent_next_power_of_2(" + operands[0] + ")";
-  return {};
+std::string expressionString(gpu::PhysicalExprAttr expression) {
+  static const gpu::PythonExpressionSyntax syntax{
+      "ct.cdiv", "min", "max", "", "_intent_next_power_of_2", false};
+  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
+    return leaf.getSymbol().getValue().str();
+  });
 }
 
 std::string fragmentShape(gpu::FragmentType fragment) {
@@ -102,7 +44,7 @@ std::string fragmentShape(gpu::FragmentType fragment) {
   for (auto [index, extent] : llvm::enumerate(fragment.getShape())) {
     if (index)
       result += ", ";
-    result += expressionString(cast<gpu::PhysicalExprAttr>(extent), false);
+    result += expressionString(cast<gpu::PhysicalExprAttr>(extent));
   }
   if (fragment.getShape().size() == 1)
     result += ",";
@@ -111,40 +53,8 @@ std::string fragmentShape(gpu::FragmentType fragment) {
 
 std::string literal(Attribute value) {
   if (auto expression = dyn_cast<gpu::PhysicalExprAttr>(value))
-    return expressionString(expression, false);
-  if (auto integer = dyn_cast<IntegerAttr>(value)) {
-    if (integer.getType().isInteger(1))
-      return integer.getInt() ? "True" : "False";
-    return std::to_string(integer.getInt());
-  }
-  if (auto floating = dyn_cast<FloatAttr>(value)) {
-    double number = floating.getValueAsDouble();
-    if (std::isnan(number))
-      return "float(\"nan\")";
-    if (std::isinf(number))
-      return std::signbit(number) ? "-float(\"inf\")"
-                                  : "float(\"inf\")";
-    std::ostringstream stream;
-    stream << std::setprecision(17) << number;
-    std::string result = stream.str();
-    if (result.find_first_of(".eE") == std::string::npos)
-      result += ".0";
-    return result;
-  }
-  return {};
-}
-
-struct CoverageParameter {
-  gpu::PhysicalExprAttr bound;
-  SmallVector<int64_t> candidates;
-};
-
-bool isCuTileProviderRole(gpu::ParameterRole role) {
-  return role == gpu::ParameterRole::ProviderAccessForm ||
-         role == gpu::ParameterRole::ProviderOccupancy ||
-         role == gpu::ParameterRole::ProviderLoadPolicy ||
-         role == gpu::ParameterRole::ProviderWarps ||
-         role == gpu::ParameterRole::ProviderCTAs;
+    return expressionString(expression);
+  return gpu::pythonLiteral(value);
 }
 
 StringRef providerHint(gpu::ParameterOp parameter) {
@@ -158,141 +68,46 @@ StringRef providerHint(gpu::ParameterOp parameter) {
   return {};
 }
 
-FailureOr<SmallVector<std::map<std::string, int64_t>>>
-parameterConfigs(func::FuncOp kernel) {
-  llvm::StringMap<gpu::ParameterOp> parameters;
-  WalkResult result = kernel.walk([&](gpu::ParameterOp parameter) {
-    auto schema = parameter.getParameter();
-    auto role = static_cast<gpu::ParameterRole>(schema.getRole());
-    auto category =
-        static_cast<gpu::ParameterCategory>(schema.getCategory());
-    bool provider = category == gpu::ParameterCategory::Provider;
-    if (provider != isCuTileProviderRole(role)) {
-      parameter.emitOpError(
-          "cuTile source cannot bind a foreign provider parameter role");
-      return WalkResult::interrupt();
-    }
-    StringRef name = schema.getName().getValue();
-    if (!parameters.try_emplace(name, parameter).second) {
-      parameter.emitOpError("duplicates a cuTile physical parameter");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (result.wasInterrupted())
-    return failure();
-  auto encoded =
-      kernel->getAttrOfType<ArrayAttr>(gpu::cuTileConfigsAttr);
-  if (!encoded || encoded.empty())
-    return kernel.emitError("cuTile source requires closed provider configs");
-  SmallVector<std::map<std::string, int64_t>> configs;
-  for (Attribute attribute : encoded) {
-    auto tuple = dyn_cast<DictionaryAttr>(attribute);
-    size_t boundParameters = llvm::count_if(parameters, [](const auto &entry) {
-      return !entry.getValue()->hasAttr(gpu::coverageDimensionAttr);
-    });
-    if (!tuple || tuple.size() != boundParameters)
-      return kernel.emitError("contains a malformed cuTile provider config");
-    std::map<std::string, int64_t> config;
-    for (NamedAttribute binding : tuple) {
-      auto found = parameters.find(binding.getName().getValue());
-      auto value = dyn_cast<IntegerAttr>(binding.getValue());
-      if (found == parameters.end() || !value ||
-          found->second->hasAttr(gpu::coverageDimensionAttr) ||
-          !llvm::is_contained(
-              found->second.getParameter().getCandidates().asArrayRef(),
-              value.getInt()))
-        return kernel.emitError(
-            "cuTile provider config contains an invalid binding");
-      config[binding.getName().strref().str()] = value.getInt();
-    }
-    configs.push_back(std::move(config));
-  }
-  return configs;
-}
-
 class Serializer {
 public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
       : kernel(kernel), output(output) {}
 
-  LogicalResult emit() {
+  LogicalResult emit(std::string &metadata) {
     bindArguments();
+    if (failed) return failure();
     emitPreamble();
     emitCollectiveHelpers();
     emitKernel();
-    emitLaunch();
-    emitRun();
-    return failed ? failure() : success();
+    return failed ? failure() : emitMetadata(metadata);
   }
 
 private:
-  struct ViewABI {
-    unsigned argument;
-    std::string name;
-    gpu::ViewType type;
-    ArrayAttr indexTileBounds;
-    bool workspace;
-  };
-  struct MetadataABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    unsigned sourceABI;
-    unsigned sourceAxis;
-    int64_t dimension;
-  };
-  struct ScalarABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    Type type;
-  };
+  using ViewABI = gpu::ViewArgument;
+  using ScalarABI = gpu::ScalarArgument;
+  using MetadataABI = gpu::MetadataArgument;
   struct ArrayViewABI {
     ArrayViewOp operation;
     unsigned sourceView;
     std::string name;
     std::string eligible;
-    std::string trialName;
-    std::string trialEligible;
   };
 
   void bindArguments() {
-    auto indexBounds = kernel->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr);
-    for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-      DictionaryAttr attrs = kernel.getArgAttrDict(index);
-      std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
-      std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
-      values[argument] = name;
-      if (kind == "view" || kind == "workspace") {
-        views.push_back({static_cast<unsigned>(index), name,
-                         cast<gpu::ViewType>(argument.getType()),
-                         indexBounds ? cast<ArrayAttr>(indexBounds[index]) : ArrayAttr(),
-                         kind == "workspace"});
-      } else if (kind == "scalar" || kind == "constexpr" || kind == "value") {
-        if (kind == "constexpr") {
-          if (!argument.use_empty()) {
-            kernel.emitError(
-                "live constexpr reached cuTile runtime ABI after specialization");
-            failed = true;
-          }
-          continue;
-        }
-        scalars.push_back({static_cast<unsigned>(index), name, kind,
-                           argument.getType()});
-      } else {
-        MetadataABI metadata{
-            static_cast<unsigned>(index), name, kind,
-            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceABIAttr).getInt()),
-            static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceAxisAttr).getInt()),
-            attrs.getAs<IntegerAttr>(gpu::dimensionAttr)
-                ? attrs.getAs<IntegerAttr>(gpu::dimensionAttr).getInt()
-                : 0};
-        metadataArguments.push_back(metadata);
-        if (kind == "dimension")
-          dimensionBindings[metadata.dimension] = metadata;
-      }
+    auto interface = gpu::readInterface(kernel);
+    if (mlir::failed(interface)) {
+      failed = true;
+      return;
     }
+    views = std::move(interface->views);
+    scalars = std::move(interface->scalars);
+    metadataArguments = std::move(interface->metadata);
+    for (const ScalarABI &scalar : scalars)
+      values[kernel.getArgument(scalar.abi)] = scalar.name;
+    for (const MetadataABI &metadata : metadataArguments)
+      values[kernel.getArgument(metadata.abi)] = metadata.name;
+    for (const ViewABI &view : views)
+      values[kernel.getArgument(view.abi)] = view.name;
     kernel.walk([&](gpu::ParameterOp parameter) {
       if (StringRef hint = providerHint(parameter); !hint.empty()) {
         if (!providerHintParameters.emplace(
@@ -303,23 +118,6 @@ private:
         }
         return;
       }
-      auto dimension =
-          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
-      if (!dimension)
-        return;
-      auto bound = parameter->getAttrOfType<gpu::PhysicalExprAttr>(
-          gpu::coverageBoundAttr);
-      if (!bound) {
-        parameter.emitOpError(
-            "full-coverage parameter has no typed bound expression");
-        failed = true;
-        return;
-      }
-      auto schema = parameter.getParameter();
-      fullCoverageParameters[schema.getName().getValue().str()] = {
-          bound,
-          SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
-      fullCoverageParameterNames.insert(schema.getName().getValue());
     });
     llvm::StringSet<> occupied;
     for (const auto &entry : values)
@@ -338,25 +136,19 @@ private:
     kernel.walk([&](ArrayViewOp array) {
       unsigned argument = cast<BlockArgument>(array.getBase()).getArgNumber();
       for (auto [index, view] : llvm::enumerate(views)) {
-        if (view.argument != argument)
+        if (view.abi != argument)
           continue;
         ArrayViewABI binding{
             array, static_cast<unsigned>(index), fresh("_intent_array_view_"),
-            fresh("_intent_array_valid_"), fresh("_intent_trial_array_view_"),
-            fresh("_intent_trial_array_valid_")};
+            fresh("_intent_array_valid_")};
         values[array.getResult()] = binding.name;
         values[array.getEligible()] = binding.eligible;
         arrayViews.push_back(std::move(binding));
       }
     });
-    overlapFunction = fresh("_intent_byte_spans_overlap_");
-    overlapSpanFunction = fresh("_intent_view_byte_span_");
     kernel.walk([&](gpu::ViewOverlapOp overlap) {
       values[overlap.getResult()] = fresh("_intent_overlap_");
       overlapFacts.push_back(overlap);
-      for (Value view : overlap.getOperands())
-        if (!overlapSpans.count(view))
-          overlapSpans[view] = fresh("_intent_view_span_");
     });
   }
 
@@ -375,17 +167,9 @@ private:
     });
     if (libraryMath)
       output << "from intent.runtime import cutile_math\n";
-    if (!overlapFacts.empty())
-      output << "from intent.runtime.tuning import byte_spans_overlap as "
-             << overlapFunction << ", view_byte_span as " << overlapSpanFunction << "\n";
-    output << "from types import SimpleNamespace\n"
-              "from typing import Annotated\n"
-              "import torch\n"
+    output << "from typing import Annotated\n"
               "import cuda.tile as ct\n"
-              "from cuda.tile.tune import exhaustive_search\n"
-              "from intent.runtime.artifact import ParameterRole, TuningConfiguration, TuningParameter\n"
-              "from intent.runtime.cutile import array_index_kernels, bind_array_view, can_use_i32_array_indices\n"
-              "from intent.runtime.tuning import TuningState\n\n"
+              "from intent.runtime.cutile import array_index_kernels\n\n"
               "ConstInt = ct.Constant[int]\n\n"
               "@ct.function(host=True)\n"
               "def _intent_next_power_of_2(value):\n"
@@ -499,343 +283,6 @@ private:
     }
   }
 
-  void emitArgumentBindings() {
-    for (const MetadataABI &metadata : metadataArguments) {
-      const ViewABI &source = viewByABI(metadata.sourceABI);
-      if (source.workspace)
-        continue;
-      line(metadata.name + " = " + source.name +
-               (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
-               std::to_string(metadata.sourceAxis) +
-               (metadata.kind == "dimension" ? "]" : ")"),
-           1);
-    }
-    for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      std::string candidates = "(";
-      for (int64_t candidate : coverage.candidates)
-        candidates += std::to_string(candidate) + ", ";
-      candidates += ")";
-      line(parameter + " = next((extent for extent in " + candidates +
-               " if extent >= " + expressionString(coverage.bound, false) + "), None)",
-           1);
-      line("if " + parameter + " is None:", 1);
-      line("raise ValueError(\"no legal full-coverage extent for " + parameter +
-               "\")",
-           2);
-    }
-  }
-
-  void emitWorkspaceBindings() {
-    for (const ViewABI &view : views) {
-      if (!view.workspace)
-        continue;
-      auto deviceSource = llvm::find_if(views, [](const ViewABI &candidate) {
-        return !candidate.workspace;
-      });
-      if (deviceSource == views.end()) {
-        kernel.emitError("workspace allocation requires a public view device");
-        failed = true;
-        return;
-      }
-      line(view.name + " = torch.empty(" + outputShape(view) + ", device=" +
-               deviceSource->name + ".device, dtype=" +
-               pythonType(view.type.getElementType(), true) + ")", 1);
-    }
-    for (const MetadataABI &metadata : metadataArguments) {
-      const ViewABI &source = viewByABI(metadata.sourceABI);
-      if (source.workspace)
-        line(metadata.name + " = " + source.name + ".stride(" +
-                 std::to_string(metadata.sourceAxis) + ")", 1);
-    }
-  }
-
-  void emitArrayBindings(StringRef trialState, unsigned level) {
-    for (ArrayViewABI &view : arrayViews) {
-      bool trial = !trialState.empty();
-      std::string source = trial && !views[view.sourceView].workspace
-          ? trialState.str() + ".views[" + std::to_string(view.sourceView) + "]"
-          : views[view.sourceView].name;
-      std::string groups = "(";
-      for (int64_t end : view.operation.getGroupEnds())
-        groups += std::to_string(end) + ", ";
-      line((trial ? view.trialName : view.name) + ", " +
-               (trial ? view.trialEligible : view.eligible) +
-               " = bind_array_view(" + source + ", " + groups + "))", level);
-    }
-  }
-
-  void emitTuningConfigurations() {
-    output << "_TUNING_PARAMETERS = (\n";
-    std::string bindings = "(";
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto schema = parameter.getParameter();
-      gpu::PhysicalParameterBinding binding = gpu::queryParameterBinding(parameter);
-      if (binding.state == gpu::PhysicalFactState::Ambiguous) {
-        parameter.emitOpError("has contradictory physical parameter bindings");
-        failed = true;
-        return;
-      }
-      output << "    TuningParameter(";
-      llvm::json::OStream(output).value(schema.getName().getValue());
-      output << ", ParameterRole(" << schema.getRole() << "), "
-             << schema.getCategory() << ", (";
-      for (int64_t candidate : schema.getCandidates().asArrayRef())
-        output << candidate << ", ";
-      output << "), ";
-      if (binding.dimension)
-        output << *binding.dimension;
-      else
-        output << "None";
-      output << ", ";
-      if (binding.source)
-        output << "(" << binding.source->sourceId << ", "
-               << binding.source->sourceAxis << ", "
-               << (binding.source->derived ? "True" : "False") << ")";
-      else
-        output << "None";
-      output << ", ";
-      auto metadata = binding.dimension ? dimensionBindings.find(*binding.dimension)
-                                        : dimensionBindings.end();
-      if (metadata == dimensionBindings.end()) {
-        output << "None";
-      } else {
-        for (auto [index, view] : llvm::enumerate(views))
-          if (view.argument == metadata->second.sourceABI) {
-            unsigned runtimeIndex = index + llvm::count_if(scalars, [&](const ScalarABI &scalar) {
-              return scalar.argument < view.argument;
-            });
-            output << "(" << runtimeIndex << ", " << metadata->second.sourceAxis << ")";
-          }
-      }
-      output << "),\n";
-      std::string name = schema.getName().getValue().str();
-      bindings += fullCoverageParameterNames.contains(name)
-                      ? name + ", "
-                      : "_intent_config." + name + ", ";
-    });
-    output << ")\n\ndef tuning_configurations(" << joinLaunchArguments() << "):\n";
-    emitArgumentBindings();
-    emitConfigurationSelection("_intent_configs", "_intent_config", 1);
-    line("return tuple(TuningConfiguration(_TUNING_PARAMETERS, " + bindings +
-             ")) for _intent_config in _intent_configs)",
-         1);
-    output << "\n";
-  }
-
-  std::string resourceCondition(cf::AssertOp assertion, bool configContext,
-                                StringRef configName = "cfg") {
-    auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
-    auto count = comparison.getLhs().getDefiningOp<gpu::PhysicalExprOp>();
-    auto limit = comparison.getRhs().getDefiningOp<arith::ConstantIndexOp>();
-    return "(" + expressionString(count.getExpression(), configContext,
-                                    &fullCoverageParameterNames, configName) +
-           " <= " + std::to_string(limit.value()) + ")";
-  }
-
-  void emitConfigurationSelection(StringRef candidates, StringRef config,
-                                  unsigned level) {
-    std::string condition;
-    for (auto assertion : kernel.front().getOps<cf::AssertOp>()) {
-      if (!condition.empty())
-        condition += " and ";
-      condition += resourceCondition(assertion, true, config);
-    }
-    if (!condition.empty()) {
-      line(candidates.str() + " = tuple(" + config.str() + " for " +
-               config.str() + " in _CONFIGS if " + condition + ")", level);
-      line("if not " + candidates.str() + ":", level);
-      line("raise ValueError(\"no cuTile configuration satisfies the physical resource bounds\")",
-           level + 1);
-    } else {
-      line(candidates.str() + " = _CONFIGS", level);
-    }
-  }
-
-  void emitLaunch() {
-    FailureOr<SmallVector<std::map<std::string, int64_t>>> configs =
-        parameterConfigs(kernel);
-    if (mlir::failed(configs)) {
-      failed = true;
-      return;
-    }
-    output << "_CONFIGS = (\n";
-    for (const auto &config : *configs) {
-      output << "    SimpleNamespace(";
-      for (auto [index, item] : llvm::enumerate(config)) {
-        if (index)
-          output << ", ";
-        output << item.first << "=" << item.second;
-      }
-      output << "),\n";
-    }
-    output << ")\n_TUNE_CACHE = {}\n\n";
-    emitTuningConfigurations();
-    output << "def launch(" << joinLaunchArguments() << "):\n";
-    emitArgumentBindings();
-    emitWorkspaceBindings();
-    emitArrayBindings("", 1);
-    llvm::DenseSet<Value> boundSpans;
-    for (gpu::ViewOverlapOp overlap : overlapFacts) {
-      for (Value view : overlap.getOperands())
-        if (boundSpans.insert(view).second)
-          line(overlapSpans.lookup(view) + " = " + overlapSpanFunction + "(" +
-                   valueString(view) + ")", 1);
-      line(valueString(overlap.getResult()) + " = " + overlapFunction + "(" +
-               overlapSpans.lookup(overlap.getLhs()) + ", " +
-               overlapSpans.lookup(overlap.getRhs()) + ")", 1);
-    }
-
-    llvm::StringSet<> occupiedNames;
-    for (const ViewABI &view : views)
-      occupiedNames.insert(view.name);
-    for (const ScalarABI &scalar : scalars)
-      occupiedNames.insert(scalar.name);
-    for (const MetadataABI &metadata : metadataArguments)
-      occupiedNames.insert(metadata.name);
-    for (gpu::ViewOverlapOp overlap : overlapFacts)
-      occupiedNames.insert(valueString(overlap.getResult()));
-    for (const auto &span : overlapSpans)
-      occupiedNames.insert(span.second);
-    for (const ArrayViewABI &view : arrayViews) {
-      occupiedNames.insert(view.name);
-      occupiedNames.insert(view.eligible);
-      occupiedNames.insert(view.trialName);
-      occupiedNames.insert(view.trialEligible);
-    }
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      occupiedNames.insert(parameter.getParameter().getName().getValue());
-    });
-    auto freshName = [&](StringRef stem) {
-      std::string candidate = stem.str();
-      unsigned suffix = 0;
-      while (!occupiedNames.insert(candidate).second)
-        candidate = (Twine(stem) + "_" + Twine(++suffix)).str();
-      return candidate;
-    };
-    std::string tuneKeyName = freshName("_intent_tune_key");
-    std::string streamName = freshName("_intent_stream");
-    std::string searchResultName = freshName("_intent_search_result");
-    std::string configName = freshName("_intent_cfg");
-    std::string tunedKernelName = freshName("_intent_tuned_kernel");
-    std::string trialStateName = freshName("_intent_trial_state");
-    std::string selectedKernelName = freshName("_intent_selected_kernel");
-    std::string boundGridName = freshName("_intent_bound_grid");
-    std::string boundArgumentsName = freshName("_intent_bound_arguments");
-    std::string boundLaunchName = freshName("_intent_bound_launch");
-    std::string candidatesName = freshName("_intent_candidates");
-    std::string cachedName = freshName("_intent_cached");
-
-    std::string key = tuneKeyName + " = (";
-    for (const ViewABI &view : views)
-      key += view.name + ".shape, " + view.name + ".stride(), " +
-             view.name + ".dtype, " + view.name + ".device, ";
-    llvm::SmallBitVector scalarKeyArguments = getTuningKeyScalarArguments(kernel);
-    for (const ScalarABI &scalar : scalars)
-      if (scalarKeyArguments.test(scalar.argument))
-        key += scalar.name + ", ";
-    for (const auto &[parameter, coverage] : fullCoverageParameters)
-      key += parameter + ", ";
-    for (const ArrayViewABI &view : arrayViews)
-      key += view.eligible + ", ";
-    for (gpu::ViewOverlapOp overlap : overlapFacts)
-      key += valueString(overlap.getResult()) + ", ";
-    line(key + ")", 1);
-    line(cachedName + " = _TUNE_CACHE.get(" + tuneKeyName + ")", 1);
-    line("if " + cachedName + " is None:", 1);
-    line(streamName + " = torch.cuda.current_stream()", 2);
-    emitConfigurationSelection(candidatesName, configName, 2);
-    if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
-      std::string boundArguments = "(";
-      std::string viewArguments = "(";
-      for (const ViewABI &view : views) {
-        viewArguments += view.name + ", ";
-        boundArguments += "(";
-        for (Attribute bound : view.indexTileBounds)
-          boundArguments += expressionString(cast<gpu::PhysicalExprAttr>(bound), false) + ", ";
-        boundArguments += "), ";
-      }
-      line(selectedKernelName + " = _intent_i32_kernel if can_use_i32_array_indices(" +
-               viewArguments + "), " + boundArguments + ")) else _intent_kernel", 2);
-    } else {
-      line(selectedKernelName + " = _intent_kernel", 2);
-    }
-    std::string trialState = trialStateName + " = TuningState((";
-    for (const ViewABI &view : views)
-      if (!view.workspace)
-        trialState += view.name + ", ";
-    trialState += "), (";
-    for (const ViewABI &view : views)
-      if (!view.workspace)
-        trialState += view.type.getAccess() != 0 ? "True, " : "False, ";
-    line(trialState + "))", 2);
-    emitArrayBindings(trialStateName, 2);
-    auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-    std::string grid = "lambda " + configName + ": (";
-    for (Attribute extent : space)
-      grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
-                               &fullCoverageParameterNames, configName) +
-              ", ";
-    grid += "1, 1)";
-    std::string hints;
-    if (!providerHintParameters.empty())
-      hints = ", lambda " + configName + ": " + compilerHints(configName);
-    line(searchResultName + " = exhaustive_search(" + candidatesName + ", " + streamName +
-             ", " + grid + ", " + selectedKernelName + ", lambda " + configName +
-             ": " + trialStateName + ".arguments((" + joinKernelArguments(configName, true) + "))" + hints +
-             ", quiet=True)",
-         2);
-    std::string tunedKernel = selectedKernelName;
-    if (!providerHintParameters.empty())
-      tunedKernel += ".replace_hints(**" + compilerHints(searchResultName + ".best.config") + ")";
-    line(cachedName + " = (" + searchResultName +
-             ".best.config, " + tunedKernel + ")",
-         2);
-    line("_TUNE_CACHE[" + tuneKeyName + "] = " + cachedName, 2);
-    line(configName + ", " + tunedKernelName + " = " + cachedName, 1);
-    std::string launchGrid = "(";
-    for (Attribute extent : space)
-      launchGrid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true,
-                                     &fullCoverageParameterNames, configName) +
-                    ", ";
-    launchGrid += "1, 1)";
-    line(boundGridName + " = " + launchGrid, 1);
-    line(boundArgumentsName + " = (" + joinKernelArguments(configName) + ")", 1);
-    line("def " + boundLaunchName + "():", 1);
-    line("return ct.launch(torch.cuda.current_stream(), " + boundGridName +
-             ", " + tunedKernelName + ", " + boundArgumentsName + ")", 2);
-    line(boundLaunchName + "()", 1);
-    line("return " + boundLaunchName, 1);
-    output << "\n";
-  }
-
-  void emitRun() {
-    SmallVector<ViewABI> inputs;
-    SmallVector<ViewABI> outputs;
-    for (const ViewABI &view : views) {
-      if (view.workspace)
-        continue;
-      if (view.type.getAccess() != 1)
-        inputs.push_back(view);
-      if (view.type.getAccess() == 1)
-        outputs.push_back(view);
-    }
-    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
-    std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
-    for (const ViewABI &view : outputs) {
-      std::string shape = outputShape(view);
-      line(view.name + " = torch.empty(" + shape + ", device=" + device +
-               ", dtype=" + pythonType(view.type.getElementType(), true) + ")",
-           1);
-    }
-    line("launch(" + joinLaunchArguments() + ")", 1);
-    if (outputs.empty())
-      line("return None", 1);
-    else if (outputs.size() == 1)
-      line("return " + outputs.front().name, 1);
-    else
-      line("return (" + joinViewNames(outputs) + ")", 1);
-  }
-
   void emitBlock(Block &block, bool isLoop,
                  ArrayRef<std::string> loopResults) {
     for (Operation &operation : block) {
@@ -900,7 +347,11 @@ private:
     } else if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
       std::string message;
       llvm::raw_string_ostream(message) << llvm::json::Value(assertion.getMsg());
-      line("ct.static_assert(" + resourceCondition(assertion, false) + ", " + message + ")");
+      auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
+      auto count = comparison.getLhs().getDefiningOp<gpu::PhysicalExprOp>();
+      auto limit = comparison.getRhs().getDefiningOp<arith::ConstantIndexOp>();
+      line("ct.static_assert((" + expressionString(count.getExpression()) +
+           " <= " + std::to_string(limit.value()) + "), " + message + ")");
     } else if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
       std::string value = literal(constant.getValue());
       if (constant.getType().isInteger(64))
@@ -910,7 +361,7 @@ private:
       values[parameter.getResult()] =
           parameter.getParameter().getName().getValue().str();
     } else if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
-      assign(physical.getResult(), expressionString(physical.getExpression(), false));
+      assign(physical.getResult(), expressionString(physical.getExpression()));
     } else if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
       assign(program.getResult(), "ct.astype(ct.bid(" +
                                       std::to_string(program.getAxis()) + "), " +
@@ -920,7 +371,7 @@ private:
     } else if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
       auto extent = cast<gpu::PhysicalExprAttr>(
           dim.getView().getType().getLayout().getExtents()[dim.getAxis()]);
-      assign(dim.getResult(), expressionString(extent, false));
+      assign(dim.getResult(), expressionString(extent));
     } else if (auto range = dyn_cast<gpu::RangeOp>(operation)) {
       assign(range.getResult(), "(" + valueString(range.getStart()) + ", " +
                                     valueString(range.getStop()) + ", " +
@@ -1004,7 +455,7 @@ private:
       std::string expanded = "(";
       for (Attribute extent : input.getShape())
         expanded += expressionString(
-                        mlir::cast<gpu::PhysicalExprAttr>(extent), false) +
+                        mlir::cast<gpu::PhysicalExprAttr>(extent)) +
                     ", ";
       expanded += "1)";
       assign(join.getResult(),
@@ -1072,26 +523,24 @@ private:
       auto rhs = mma.getRhs().getType();
       std::string lhsK =
           "(" + expressionString(
-                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[1]), false) +
+                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[1])) +
           " * " + expressionString(
-                        mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[2]),
-                        false) +
+                        mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[2])) +
           ")";
       std::string rhsK =
           "(" + expressionString(
-                     mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[0]), false) +
+                     mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[0])) +
           " * " + expressionString(
-                        mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[1]),
-                        false) +
+                        mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[1])) +
           ")";
       std::string lhsShape =
           "(" + expressionString(
-                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[0]), false) +
+                     mlir::cast<gpu::PhysicalExprAttr>(lhs.getShape()[0])) +
           ", " + lhsK + ")";
       std::string rhsShape =
           "(" + rhsK + ", " +
           expressionString(
-              mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[2]), false) +
+              mlir::cast<gpu::PhysicalExprAttr>(rhs.getShape()[2])) +
           ")";
       assign(mma.getResult(),
              "ct.mma_scaled(ct.reshape(" + valueString(mma.getLhs()) + ", " +
@@ -1209,7 +658,7 @@ private:
     } else if (auto extract = dyn_cast<ExtractOp>(operation)) {
       std::string shape = "(";
       for (Attribute extent : extract.getExtractionShape())
-        shape += expressionString(mlir::cast<gpu::PhysicalExprAttr>(extent), false) + ", ";
+        shape += expressionString(mlir::cast<gpu::PhysicalExprAttr>(extent)) + ", ";
       shape += ")";
       std::string result = "ct.extract(" + valueString(extract.getSource()) +
                            ", index=" + tuple(extract.getCoordinates()) +
@@ -1468,8 +917,7 @@ private:
               static_cast<int64_t>(targetAxis)) {
         reshape += expressionString(
                        cast<gpu::PhysicalExprAttr>(
-                           source.getShape()[sourceOrder[orderedSource]]),
-                       false) +
+                           source.getShape()[sourceOrder[orderedSource]])) +
                    ", ";
         ++orderedSource;
       } else {
@@ -1491,68 +939,6 @@ private:
     if (valuesRange.size() == 1)
       result += ",";
     return result + ")";
-  }
-
-  std::string outputShape(const ViewABI &view) {
-    std::string shape = "(";
-    auto ids = view.type.getLayout().getDimensionIds();
-    auto extents = view.type.getLayout().getExtents();
-    for (auto [axis, dimension] : llvm::enumerate(ids.asArrayRef())) {
-      if (axis)
-        shape += ", ";
-      auto extent = cast<gpu::PhysicalExprAttr>(extents[axis]);
-      if (extent.getKind() ==
-          static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
-        shape += std::to_string(extent.getValue());
-      } else {
-        const MetadataABI &metadata = dimensionBindings.lookup(dimension);
-        const ViewABI &source = viewByABI(metadata.sourceABI);
-        shape += source.name + ".shape[" + std::to_string(metadata.sourceAxis) + "]";
-      }
-    }
-    if (ids.size() == 1)
-      shape += ",";
-    return shape + ")";
-  }
-
-  std::string compilerHints(StringRef configName) {
-    std::string result = "{";
-    for (const auto &[hint, parameter] : providerHintParameters) {
-      std::string value = configName.str() + "." + parameter;
-      if (hint == "num_worker_warps")
-        value = "(None if " + value + " == " +
-                std::to_string(inferredWorkerWarps) + " else " + value + ")";
-      result += "\"" + hint + "\": " + value + ", ";
-    }
-    return result + "}";
-  }
-
-  std::string joinKernelArguments(StringRef configName, bool trial = false) {
-    std::string result = joinViewNames(views);
-    for (const ArrayViewABI &view : arrayViews)
-      result += ", " + (trial ? view.trialName : view.name) + ", " +
-                (trial ? view.trialEligible : view.eligible);
-    for (const ScalarABI &scalar : scalars) {
-      if (!result.empty())
-        result += ", ";
-      result += scalar.name;
-    }
-    for (const MetadataABI &metadata : metadataArguments)
-      result += ", " + metadata.name;
-    for (gpu::ViewOverlapOp overlap : overlapFacts)
-      result += ", " + valueString(overlap.getResult());
-    SmallVector<std::string> parameters;
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      if (!providerHint(parameter).empty())
-        return;
-      parameters.push_back(parameter.getParameter().getName().getValue().str());
-    });
-    for (StringRef parameter : parameters)
-      result += ", " +
-                (fullCoverageParameters.count(parameter.str())
-                     ? parameter.str()
-                     : configName.str() + "." + parameter.str());
-    return result;
   }
 
   std::string valueString(Value value) {
@@ -1583,38 +969,60 @@ private:
     output.indent(level * 4) << text << "\n";
   }
 
-  const ViewABI &viewByABI(unsigned abi) const {
-    for (const ViewABI &view : views)
-      if (view.type.getAbiIndex() == abi)
-        return view;
-    llvm_unreachable("verified metadata references a missing view ABI");
-  }
-
-  template <typename Range>
-  std::string joinViewNames(const Range &range) const {
-    std::string result;
-    for (auto [index, view] : llvm::enumerate(range)) {
-      if (index)
-        result += ", ";
-      result += view.name;
+  LogicalResult emitMetadata(std::string &metadata) {
+    auto artifact = gpu::serializeInterface(kernel, "cutile", [&](Value value) {
+      return valueString(value);
+    });
+    if (mlir::failed(artifact)) return failure();
+    llvm::json::Object details{{"kernel", "_intent_kernel"}};
+    llvm::json::Array arguments, arrays;
+    for (const ViewABI &view : views) arguments.push_back(view.name);
+    for (const ArrayViewABI &view : arrayViews) {
+      llvm::json::Array groups;
+      ArrayViewOp operation = view.operation;
+      for (int64_t end : operation.getGroupEnds()) groups.push_back(end);
+      arrays.push_back(llvm::json::Object{
+          {"name", view.name}, {"eligible", view.eligible},
+          {"base", views[view.sourceView].name}, {"group_ends", std::move(groups)}});
+      arguments.push_back(view.name);
+      arguments.push_back(view.eligible);
     }
-    return result;
-  }
-
-  std::string joinLaunchArguments(bool includeOutputs = true) const {
-    std::map<unsigned, std::string> arguments;
-    for (const ViewABI &view : views)
-      if (!view.workspace && (includeOutputs || view.type.getAccess() != 1))
-        arguments.emplace(view.argument, view.name);
+    for (const ScalarABI &scalar : scalars) arguments.push_back(scalar.name);
+    for (const MetadataABI &argument : metadataArguments) arguments.push_back(argument.name);
+    for (gpu::ViewOverlapOp overlap : overlapFacts)
+      arguments.push_back(valueString(overlap.getResult()));
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      if (providerHint(parameter).empty())
+        arguments.push_back(parameter.getParameter().getName().getValue());
+    });
+    details["kernel_arguments"] = std::move(arguments);
+    details["array_views"] = std::move(arrays);
+    details["index_tile_bounds"] = nullptr;
+    details["narrow_kernel"] = nullptr;
+    if (auto bounds = kernel->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr)) {
+      llvm::json::Array encoded;
+      for (const ViewABI &view : views) {
+        llvm::json::Array axes;
+        for (Attribute bound : cast<ArrayAttr>(bounds[view.abi]))
+          axes.push_back(gpu::serializeExpression(cast<gpu::PhysicalExprAttr>(bound)));
+        encoded.push_back(std::move(axes));
+      }
+      details["index_tile_bounds"] = std::move(encoded);
+      details["narrow_kernel"] = "_intent_i32_kernel";
+    }
+    llvm::json::Object hints;
+    for (const auto &[hint, parameter] : providerHintParameters)
+      hints[hint] = parameter;
+    details["compiler_hints"] = std::move(hints);
+    details["inferred_worker_warps"] = inferredWorkerWarps;
+    llvm::json::Array scalarKeys;
+    llvm::SmallBitVector keyArguments = getTuningKeyScalarArguments(kernel);
     for (const ScalarABI &scalar : scalars)
-      arguments.emplace(scalar.argument, scalar.name);
-    std::string result;
-    for (const auto &[index, name] : arguments) {
-      if (!result.empty())
-        result += ", ";
-      result += name;
-    }
-    return result;
+      if (keyArguments.test(scalar.abi)) scalarKeys.push_back(scalar.name);
+    details["tuning_key_scalars"] = std::move(scalarKeys);
+    (*artifact)["cutile"] = std::move(details);
+    llvm::raw_string_ostream(metadata) << llvm::json::Value(std::move(*artifact));
+    return failed ? failure() : success();
   }
 
   func::FuncOp kernel;
@@ -1626,12 +1034,6 @@ private:
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
   SmallVector<gpu::ViewOverlapOp> overlapFacts;
-  llvm::DenseMap<Value, std::string> overlapSpans;
-  std::string overlapFunction;
-  std::string overlapSpanFunction;
-  llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
-  std::map<std::string, CoverageParameter> fullCoverageParameters;
-  llvm::StringSet<> fullCoverageParameterNames;
   std::map<std::string, std::string> providerHintParameters;
   unsigned indent = 0;
   unsigned counter = 0;
@@ -1640,7 +1042,8 @@ private:
 
 } // namespace
 
-LogicalResult serializeProgram(ModuleOp module, std::string &source) {
+LogicalResult serializeProgram(ModuleOp module, std::string &source,
+                               std::string &metadata) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -1648,7 +1051,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source) {
     return (*kernel).emitError("cuTile program was not provider-legalized");
   llvm::raw_string_ostream stream(source);
   Serializer serializer(*kernel, stream);
-  LogicalResult result = serializer.emit();
+  LogicalResult result = serializer.emit(metadata);
   stream.flush();
   return result;
 }

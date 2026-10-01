@@ -12,16 +12,9 @@ from .program import NativeProgram
 def materialize_bangc_artifact(source, module_text, metadata, target) -> CompiledArtifact:
     program = NativeProgram(source, metadata, target)
 
-    def launch(*arguments):
-        program.prepare(arguments, explicit_outputs=True).launch()
-
-    def run(*arguments):
-        call = program.prepare(arguments)
-        call.launch()
-        return call.result()
-
-    return CompiledArtifact(source, module_text, target.device, launch, run, None,
-                            {"program": program}, device_type="mlu")
+    return CompiledArtifact(source=source, mlir=module_text, device=target.device,
+                            runtime=program, _backend_ir_collector=None,
+                            device_type="mlu")
 
 
 def export_artifact(program, directory: str | Path) -> Path:

@@ -9,7 +9,8 @@
 namespace intent::triton {
 
 mlir::LogicalResult serializeProgram(mlir::ModuleOp module,
-                                     std::string &source);
+                                    std::string &source,
+                                    std::string &metadata);
 
 } // namespace intent::triton
 

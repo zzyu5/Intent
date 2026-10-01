@@ -24,14 +24,8 @@ def compile(
     kernel_mlir, resolved = _inputs(definition, target, constexprs)
     if not isinstance(resolved, ResolvedTarget):
         raise NotImplementedError("This target only generates source; use intent.generate, not intent.compile")
-    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config)
-    try:
-        artifact = resolved.materialize(program.source, program.ir, definition.__name__, program.metadata)
-        artifact.cache_directory = program.cache_directory
-        return artifact
-    except Exception as error:
-        raise CompilationStageError("generated_source_materialization", str(error),
-                                    cache_directory=program.cache_directory) from error
+    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__)
+    return program.materialize()
 
 
 def generate(
@@ -43,7 +37,7 @@ def generate(
     tuning_config: str | Path | None = None,
 ) -> GeneratedProgram:
     kernel_mlir, resolved = _inputs(definition, target, constexprs)
-    return _generate_source(kernel_mlir, resolved, compiler, tuning_config)
+    return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__)
 
 
 def _inputs(definition, target, constexprs) -> tuple[str, ResolvedSourceTarget]:
@@ -58,7 +52,7 @@ def _inputs(definition, target, constexprs) -> tuple[str, ResolvedSourceTarget]:
     return kernel_mlir, resolved
 
 
-def _generate_source(kernel_mlir, resolved, compiler, tuning_config) -> GeneratedProgram:
+def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name) -> GeneratedProgram:
     source, realized_mlir, metadata, cache_directory = run_compiler(
         compiler,
         kernel_mlir,
@@ -68,7 +62,7 @@ def _generate_source(kernel_mlir, resolved, compiler, tuning_config) -> Generate
         ),
         resolved.compiler_role,
     )
-    return GeneratedProgram(source, realized_mlir, metadata, cache_directory)
+    return GeneratedProgram(source, realized_mlir, metadata, cache_directory, entry_name, resolved)
 
 
 def compile_shared_gpu(
@@ -79,14 +73,7 @@ def compile_shared_gpu(
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
 ) -> str:
-    try:
-        kernel_mlir = lower_to_mlir(definition, constexprs=constexprs)
-    except Exception as error:
-        raise CompilationStageError("frontend_kir", str(error)) from error
-    try:
-        resolved = target.resolve()
-    except Exception as error:
-        raise CompilationStageError("target_resolution", str(error)) from error
+    kernel_mlir, resolved = _inputs(definition, target, constexprs)
     return run_shared_compiler(
         compiler,
         kernel_mlir,

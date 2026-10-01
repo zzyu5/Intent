@@ -4,6 +4,8 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Serialization/Interface.h"
+#include "Intent/Dialect/GPU/Serialization/Python.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -11,96 +13,28 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/STLFunctionalExtras.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/JSON.h"
 
-#include <cmath>
-#include <functional>
-#include <iomanip>
-#include <map>
+#include <set>
 #include <optional>
-#include <sstream>
 
 using namespace mlir;
 
 namespace intent::triton {
 namespace {
 
-std::string pythonType(Type type, bool torch = false) {
-  if (type.isIndex())
-    return torch ? "torch.int64" : "tl.int64";
-  if (auto integer = dyn_cast<IntegerType>(type)) {
-    if (integer.getWidth() == 1)
-      return torch ? "torch.bool" : "tl.int1";
-    StringRef prefix = integer.isUnsigned() ? "u" : "";
-    return ((torch ? "torch." : "tl.") + prefix + "int" +
-            Twine(integer.getWidth()))
-        .str();
-  }
-  if (isa<Float16Type>(type))
-    return torch ? "torch.float16" : "tl.float16";
-  if (isa<BFloat16Type>(type))
-    return torch ? "torch.bfloat16" : "tl.bfloat16";
-  if (isa<Float32Type>(type))
-    return torch ? "torch.float32" : "tl.float32";
-  if (isa<Float64Type>(type))
-    return torch ? "torch.float64" : "tl.float64";
-  if (isa<Float8E4M3FNType>(type))
-    return torch ? "torch.float8_e4m3fn" : "tl.float8e4nv";
-  if (isa<Float8E5M2Type>(type))
-    return torch ? "torch.float8_e5m2" : "tl.float8e5";
-  return {};
+std::string pythonType(Type type) {
+  static const gpu::PythonScalarSyntax syntax{
+      "tl.", "int1", "float64", "float8e4nv", "float8e5"};
+  return gpu::pythonScalarType(type, syntax);
 }
 
-std::string expressionString(
-    gpu::PhysicalExprAttr expression, bool launchContext,
-    llvm::function_ref<std::string(gpu::PhysicalExprAttr)> spellLeaf) {
-  auto kind = static_cast<gpu::PhysicalExprKind>(expression.getKind());
-  if (kind == gpu::PhysicalExprKind::Constant)
-    return std::to_string(expression.getValue());
-  if (kind == gpu::PhysicalExprKind::Parameter ||
-      kind == gpu::PhysicalExprKind::Dimension ||
-      kind == gpu::PhysicalExprKind::ScalarABI)
-    return spellLeaf(expression);
-  SmallVector<std::string> operands;
-  for (Attribute operand : expression.getOperands())
-    operands.push_back(
-        expressionString(cast<gpu::PhysicalExprAttr>(operand), launchContext, spellLeaf));
-  if (kind == gpu::PhysicalExprKind::Add)
-    return "(" + operands[0] + " + " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Subtract)
-    return "(" + operands[0] + " - " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Multiply)
-    return "(" + operands[0] + " * " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::CeilDiv)
-    return launchContext
-               ? "triton.cdiv(" + operands[0] + ", " + operands[1] + ")"
-               : "((" + operands[0] + " + " + operands[1] + " - 1) // " +
-                     operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Minimum)
-    return "min(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Maximum)
-    return "max(" + operands[0] + ", " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::FloorDiv)
-    return "(" + operands[0] + " // " + operands[1] + ")";
-  if (kind == gpu::PhysicalExprKind::Select)
-    return "(" + operands[1] + " if " + operands[0] + " else " +
-           operands[2] + ")";
-  if (kind == gpu::PhysicalExprKind::NextPowerOfTwo)
-    return "triton.next_power_of_2(max(" + operands[0] + ", 1))";
-  return {};
-}
-
-std::string expressionString(gpu::PhysicalExprAttr expression,
-                             bool launchContext) {
-  return expressionString(expression, launchContext, [&](gpu::PhysicalExprAttr leaf) {
-    if (launchContext && leaf.getKind() ==
-        static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter))
-      return ("META[\"" + leaf.getSymbol().getValue() + "\"]").str();
+std::string expressionString(gpu::PhysicalExprAttr expression) {
+  static const gpu::PythonExpressionSyntax syntax{
+      "", "min", "max", "", "triton.next_power_of_2", true};
+  return gpu::pythonExpression(expression, syntax, [](gpu::PhysicalExprAttr leaf) {
     return leaf.getSymbol().getValue().str();
   });
 }
@@ -109,7 +43,7 @@ std::string fragmentShape(gpu::FragmentType fragment) {
   SmallVector<std::string> extents;
   for (Attribute extent : fragment.getShape())
     extents.push_back(
-        expressionString(cast<gpu::PhysicalExprAttr>(extent), false));
+        expressionString(cast<gpu::PhysicalExprAttr>(extent)));
   std::string result = "(";
   for (auto [index, extent] : llvm::enumerate(extents)) {
     if (index)
@@ -121,75 +55,8 @@ std::string fragmentShape(gpu::FragmentType fragment) {
   return result + ")";
 }
 
-struct Config {
-  std::map<std::string, int64_t> kernelParameters;
-  int64_t warps = 0;
-  int64_t stages = 0;
-  int64_t ctas = 0;
-};
-
-struct CoverageParameter {
-  gpu::PhysicalExprAttr bound;
-  SmallVector<int64_t> candidates;
-};
-
-FailureOr<SmallVector<Config>> parameterConfigs(func::FuncOp kernel) {
-  auto encoded = kernel->getAttrOfType<ArrayAttr>(gpu::tritonConfigsAttr);
-  if (!encoded || encoded.empty())
-    return kernel.emitError(
-        "Triton legalization did not materialize a legal candidate set");
-  SmallVector<Config> configs;
-  for (Attribute candidate : encoded) {
-    auto dictionary = dyn_cast<DictionaryAttr>(candidate);
-    auto parameters = dictionary
-                          ? dictionary.getAs<DictionaryAttr>("parameters")
-                          : DictionaryAttr();
-    auto warps = dictionary ? dictionary.getAs<IntegerAttr>("num_warps")
-                            : IntegerAttr();
-    auto stages = dictionary ? dictionary.getAs<IntegerAttr>("num_stages")
-                             : IntegerAttr();
-    auto ctas = dictionary ? dictionary.getAs<IntegerAttr>("num_ctas")
-                           : IntegerAttr();
-    if (!dictionary || !parameters || !warps || !stages || !ctas)
-      return kernel.emitError("contains a malformed legalized Triton candidate");
-    Config config;
-    config.warps = warps.getInt();
-    config.stages = stages.getInt();
-    config.ctas = ctas.getInt();
-    for (NamedAttribute parameter : parameters) {
-      auto value = dyn_cast<IntegerAttr>(parameter.getValue());
-      if (!value)
-        return kernel.emitError(
-            "contains a non-integer legalized Triton parameter binding");
-      config.kernelParameters[parameter.getName().strref().str()] =
-          value.getInt();
-    }
-    configs.push_back(std::move(config));
-  }
-  return configs;
-}
-
 std::string literal(Attribute value) {
-  if (auto integer = dyn_cast<IntegerAttr>(value)) {
-    if (integer.getType().isInteger(1))
-      return integer.getInt() ? "True" : "False";
-    return std::to_string(integer.getInt());
-  }
-  if (auto floating = dyn_cast<FloatAttr>(value)) {
-    double number = floating.getValueAsDouble();
-    if (std::isnan(number))
-      return "float(\"nan\")";
-    if (std::isinf(number))
-      return std::signbit(number) ? "-float(\"inf\")"
-                                  : "float(\"inf\")";
-    std::ostringstream stream;
-    stream << std::setprecision(17) << number;
-    std::string result = stream.str();
-    if (result.find_first_of(".eE") == std::string::npos)
-      result += ".0";
-    return result;
-  }
-  return {};
+  return gpu::pythonLiteral(value);
 }
 
 class Serializer {
@@ -197,112 +64,56 @@ public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
       : kernel(kernel), output(output) {}
 
-  LogicalResult emit() {
+  LogicalResult emit(std::string &metadata) {
     bindArguments();
+    if (failed) return failure();
     emitPreamble();
-    emitDescriptorHelpers();
-    emitConfigPruner();
     emitHelpers();
     emitKernel();
-    emitLaunch();
-    emitRun();
-    return failed ? failure() : success();
+    return failed ? failure() : emitMetadata(metadata);
   }
 
 private:
-  struct ViewABI {
-    unsigned argument;
-    std::string name;
-    gpu::ViewType type;
-    bool workspace;
-  };
-  struct MetadataABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    unsigned sourceABI;
-    unsigned sourceAxis;
-    int64_t dimension;
-  };
-  struct ScalarABI {
-    unsigned argument;
-    std::string name;
-    std::string kind;
-    Type type;
-  };
+  using ViewABI = gpu::ViewArgument;
+  using ScalarABI = gpu::ScalarArgument;
+  using MetadataABI = gpu::MetadataArgument;
   struct DescriptorABI {
     TensorDescriptorOp operation;
     std::string name;
   };
 
   void bindArguments() {
+    auto interface = gpu::readInterface(kernel);
+    if (mlir::failed(interface)) {
+      failed = true;
+      return;
+    }
+    views = std::move(interface->views);
+    scalars = std::move(interface->scalars);
+    metadataArguments = std::move(interface->metadata);
+    for (const ScalarABI &scalar : scalars)
+      values[kernel.getArgument(scalar.abi)] = scalar.name;
+    for (const MetadataABI &metadata : metadataArguments)
+      values[kernel.getArgument(metadata.abi)] = metadata.name;
     llvm::StringSet<> argumentNames;
     for (unsigned index = 0; index < kernel.getNumArguments(); ++index)
       argumentNames.insert(kernel.getArgAttrDict(index)
                                .getAs<StringAttr>(gpu::abiNameAttr).getValue());
-    for (auto [index, argument] : llvm::enumerate(kernel.getArguments())) {
-      DictionaryAttr attrs = kernel.getArgAttrDict(index);
-      std::string kind = attrs.getAs<StringAttr>(gpu::abiKindAttr).getValue().str();
-      std::string name = attrs.getAs<StringAttr>(gpu::abiNameAttr).getValue().str();
-      // Triton's launch kwargs also enter autotune hook argument maps.  Keep
-      // view names out of that namespace (for example, an input named grid).
-      if (kind == "view" || kind == "workspace") {
-        name = "_intent_view_" + std::to_string(index);
-        while (!argumentNames.insert(name).second)
-          name += "_";
-      }
-      values[argument] = name;
-      if (kind == "view" || kind == "workspace") {
-        views.push_back({static_cast<unsigned>(index), name,
-                         cast<gpu::ViewType>(argument.getType()),
-                         kind == "workspace"});
-        continue;
-      }
-      if (kind == "scalar" || kind == "constexpr" || kind == "value") {
-        if (kind == "constexpr") {
-          if (!argument.use_empty()) {
-            kernel.emitError(
-                "live constexpr reached Triton runtime ABI after specialization");
-            failed = true;
-          }
-          continue;
-        }
-        scalars.push_back({static_cast<unsigned>(index), name, kind,
-                           argument.getType()});
-        continue;
-      }
-      MetadataABI metadata{
-          static_cast<unsigned>(index), name, kind,
-          static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceABIAttr).getInt()),
-          static_cast<unsigned>(attrs.getAs<IntegerAttr>(gpu::sourceAxisAttr).getInt()),
-          attrs.getAs<IntegerAttr>(gpu::dimensionAttr)
-              ? attrs.getAs<IntegerAttr>(gpu::dimensionAttr).getInt()
-              : 0};
-      metadataByName[name] = metadata;
-      metadataArguments.push_back(metadata);
-      constexprValues.insert(argument);
-      if (kind == "dimension")
-        dimensionBindings[metadata.dimension] = metadata;
+    // Launch keywords share Triton's argument map with kernel arguments.
+    for (ViewABI &view : views) {
+      view.name = "_intent_view_" + std::to_string(view.abi);
+      while (!argumentNames.insert(view.name).second)
+        view.name += "_";
+      values[kernel.getArgument(view.abi)] = view.name;
     }
+    for (const MetadataABI &metadata : metadataArguments)
+      constexprValues.insert(kernel.getArgument(metadata.abi));
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto schema = parameter.getParameter();
       std::string name = schema.getName().getValue().str();
       argumentNames.insert(name);
-      auto dimension =
-          parameter->getAttrOfType<IntegerAttr>(gpu::coverageDimensionAttr);
-      if (!dimension)
-        return;
-      auto bound = parameter->getAttrOfType<gpu::PhysicalExprAttr>(
-          gpu::coverageBoundAttr);
-      if (!bound) {
-        parameter.emitOpError(
-            "full-coverage parameter has no typed bound expression");
-        failed = true;
-        return;
-      }
-      fullCoverageParameters[name] = {
-          bound,
-          SmallVector<int64_t>(schema.getCandidates().asArrayRef())};
+      if (parameter->hasAttr(gpu::coverageDimensionAttr))
+        coverageNames.insert(name);
     });
     kernel.walk([&](TensorDescriptorChoiceOp choice) {
       descriptorChoice = choice;
@@ -322,10 +133,6 @@ private:
       values[descriptor.getResult()] = name;
       descriptors.push_back({descriptor, name});
     });
-    while (!argumentNames.insert(overlapFunction).second)
-      overlapFunction += "_";
-    while (!argumentNames.insert(overlapSpanFunction).second)
-      overlapSpanFunction += "_";
     while (!argumentNames.insert(overlapArgument).second)
       overlapArgument += "_";
     kernel.walk([&](gpu::ViewOverlapOp overlap) {
@@ -342,154 +149,9 @@ private:
   }
 
   void emitPreamble() {
-    output << "import torch\nimport triton\nimport triton.language as tl\n"
+    output << "import triton\nimport triton.language as tl\n"
               "from triton.language.extra import libdevice\n"
-              "from triton.tools.tensor_descriptor import TensorDescriptor\n"
-              "from intent.runtime.triton import TuningHooks\n"
               "from intent.runtime.triton_math import contract_fma\n\n";
-    if (!overlapFacts.empty())
-      output << "from intent.runtime.tuning import byte_spans_overlap as "
-             << overlapFunction << ", view_byte_span as "
-             << overlapSpanFunction << "\n\n";
-  }
-
-  void emitDescriptorHelpers() {
-    if (!descriptorChoice)
-      return;
-    output << "def _intent_tensor_descriptor_legal(\n"
-              "    tensor, shape, strides, source_rank,\n"
-              "    aligned_stride_axes, unit_stride_axes, require_positive_shape,\n"
-              "    require_positive_strides, alignment, maximum_shape_extent,\n"
-              "):\n"
-              "    if tensor.ndim != source_rank:\n"
-              "        return False\n"
-              "    if tensor.data_ptr() % alignment != 0:\n"
-              "        return False\n"
-              "    if require_positive_shape and any(extent <= 0 for extent in shape):\n"
-              "        return False\n"
-              "    if any(extent > maximum_shape_extent for extent in shape):\n"
-              "        return False\n"
-              "    if require_positive_strides and any(stride <= 0 for stride in strides):\n"
-              "        return False\n"
-              "    if strides[-1] != 1:\n"
-              "        return False\n"
-              "    if any(tensor.stride(axis) != 1 for axis in unit_stride_axes):\n"
-              "        return False\n"
-              "    if any((tensor.stride(axis) * tensor.element_size()) % alignment != 0 "
-              "for axis in aligned_stride_axes):\n"
-              "        return False\n"
-              "    return True\n\n"
-              "def _intent_tensor_descriptor_block_shape_legal(\n"
-              "    block_shape, element_size, minimum_contiguous_bytes,\n"
-              "    require_power_of_two, maximum_block_elements,\n"
-              "    pipeline_block_alignment, num_stages,\n"
-              "):\n"
-              "    elements = 1\n"
-              "    for extent in block_shape:\n"
-              "        if extent <= 0 or (require_power_of_two and extent & (extent - 1)):\n"
-              "            return False\n"
-              "        elements *= extent\n"
-              "    return (\n"
-              "        elements <= maximum_block_elements\n"
-              "        and block_shape[-1] * element_size >= minimum_contiguous_bytes\n"
-              "        and (num_stages <= 1 or elements * element_size % pipeline_block_alignment == 0)\n"
-              "    )\n\n"
-              "def _intent_tensor_descriptor_shapes_legal(args, num_stages):\n"
-              "    descriptors = (\n";
-    for (const DescriptorABI &descriptor : descriptors) {
-      TensorDescriptorOp operation = descriptor.operation;
-      output << "        (" << descriptorBlockShape(descriptor)
-             << ", args[\"" << valueString(operation.getBase())
-             << "\"].element_size(), "
-             << operation.getMinimumContiguousBytes() << ", "
-             << (operation.getRequirePowerOfTwoBlockShape() ? "True" : "False")
-             << ", " << operation.getMaximumBlockElements() << ", "
-             << operation.getPipelineBlockAlignment() << ", num_stages),\n";
-    }
-    output << "    )\n"
-              "    for contract in descriptors:\n"
-              "        if not _intent_tensor_descriptor_block_shape_legal(*contract):\n"
-              "            return False\n"
-              "    return True\n\n"
-              "def _intent_tensor_descriptor_allocator(size, alignment, stream):\n"
-              "    buffer = torch.empty(size, dtype=torch.int8, device=\"cuda\")\n"
-              "    if buffer.data_ptr() % alignment != 0:\n"
-              "        raise RuntimeError(\"Triton descriptor allocator returned a misaligned buffer\")\n"
-              "    return buffer\n\n";
-    for (const DescriptorABI &descriptor : descriptors) {
-      TensorDescriptorOp operation = descriptor.operation;
-      std::string base = "args[\"" + valueString(operation.getBase()) + "\"]";
-      SmallVector<std::string> shape;
-      SmallVector<std::string> strides;
-      for (Value extent : operation.getShape())
-        shape.push_back(descriptorHostValue(extent, /*argumentMap=*/true));
-      for (Value stride : operation.getStrides())
-        strides.push_back(descriptorHostValue(stride, /*argumentMap=*/true));
-      output << "def _intent_bind" << descriptor.name << "(args):\n"
-             << "    if not args[\"" << descriptorChoice.getConfigParameter()
-             << "\"]:\n"
-             << "        return " << base << "\n"
-             << "    return TensorDescriptor(" << base
-             << ", shape=" << stringList(shape)
-             << ", strides=" << stringList(strides)
-             << ", block_shape=" << descriptorBlockShape(descriptor)
-             << ", padding=\"" << operation.getPadding() << "\")\n\n";
-    }
-  }
-
-  void emitConfigPruner() {
-    auto boundExpression = [&](Value value) -> std::string {
-      if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-        return std::to_string(constant.value());
-      if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
-        if (isConstexprExpression(physical.getExpression()))
-          return descriptorArgumentExpression(physical.getExpression());
-      return {};
-    };
-    SmallVector<std::string> bounds;
-    // The same current-IR assertions also guard compilation. Evaluate their
-    // constexpr bounds before the native tuner spends its candidate budget.
-    for (auto assertion : kernel.front().getOps<cf::AssertOp>()) {
-      auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
-      if (!comparison || comparison.getPredicate() != ComparePredicate::Le)
-        continue;
-      std::string lhs = boundExpression(comparison.getLhs());
-      std::string rhs = boundExpression(comparison.getRhs());
-      if (!lhs.empty() && !rhs.empty())
-        bounds.push_back("(" + lhs + " <= " + rhs + ")");
-    }
-    hasConfigPruner = descriptorChoice || !bounds.empty();
-    if (!hasConfigPruner)
-      return;
-    output << "def _intent_prune_configs(configs, named_args, **kwargs):\n"
-              "    retained = []\n"
-              "    for config in configs:\n"
-              "        args = {**named_args, **kwargs, **config.kwargs}\n";
-    kernel.walk([&](gpu::ParameterOp parameter) {
-      auto role = static_cast<gpu::ParameterRole>(
-          parameter.getParameter().getRole());
-      StringRef field;
-      if (role == gpu::ParameterRole::ProviderWarps)
-        field = "num_warps";
-      else if (role == gpu::ParameterRole::ProviderStages)
-        field = "num_stages";
-      else if (role == gpu::ParameterRole::ProviderCTAs)
-        field = "num_ctas";
-      if (!field.empty())
-        output << "        args[\"" << parameter.getParameter().getName().getValue()
-               << "\"] = config." << field << "\n";
-    });
-    if (descriptorChoice)
-      output << "        if args[\"" << descriptorChoice.getConfigParameter()
-             << "\"] and (not args[\""
-             << descriptorChoice.getEligibilityArgument()
-             << "\"] or not _intent_tensor_descriptor_shapes_legal(args, config.num_stages)):\n"
-                "            continue\n";
-    for (const std::string &bound : bounds)
-      output << "        if not " << bound << ":\n"
-                "            continue\n";
-    output << "        retained.append(config)\n"
-              "    return retained\n\n";
   }
 
   void emitHelper(Operation *owner, Region &region, StringRef role) {
@@ -545,99 +207,6 @@ private:
   }
 
   void emitKernel() {
-    FailureOr<SmallVector<Config>> configs = parameterConfigs(kernel);
-    if (mlir::failed(configs)) {
-      failed = true;
-      return;
-    }
-    for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      output << "def _intent_cover_" << parameter << "(args):\n"
-             << "    bound = int(" << descriptorArgumentExpression(coverage.bound)
-             << ")\n"
-             << "    for extent in (";
-      for (int64_t candidate : coverage.candidates)
-        output << candidate << ", ";
-      output << "):\n"
-             << "        if extent >= bound:\n"
-             << "            return extent\n"
-             << "    raise ValueError(\"no legal full-coverage extent for "
-             << parameter << "\")\n\n";
-    }
-    output << "_intent_tuning_hooks = TuningHooks((";
-    for (const ViewABI &view : views)
-      if (!view.workspace)
-        output << "\"" << view.name << "\", ";
-    output << "), (";
-    for (const ViewABI &view : views)
-      if (!view.workspace)
-        output << (view.type.getAccess() != 0 ? "True, " : "False, ");
-    output << "), (";
-    for (const ViewABI &view : views)
-      if (!view.workspace)
-        output << (view.type.getAccess() != 1 ? "True, " : "False, ");
-    output << "))\n\n";
-    if (!fullCoverageParameters.empty()) {
-      output << "@triton.heuristics({\n";
-      for (const auto &[parameter, coverage] : fullCoverageParameters)
-        output << "    \"" << parameter << "\": _intent_cover_" << parameter
-               << ",\n";
-      output << "})\n";
-    }
-    output << "@triton.autotune(\n    configs=[\n";
-    for (const Config &config : *configs) {
-      output << "        triton.Config({";
-      bool first = true;
-      for (const auto &[name, value] : config.kernelParameters) {
-        if (!first)
-          output << ", ";
-        first = false;
-        output << "\"" << name << "\": "
-               << value;
-      }
-      output << "}, num_warps=" << config.warps
-             << ", num_stages=" << config.stages
-             << ", num_ctas=" << config.ctas << "),\n";
-    }
-    output << "    ],\n    key=[";
-    bool firstKey = true;
-    if (!metadataArguments.empty()) {
-      if (!firstKey)
-        output << ", ";
-      firstKey = false;
-      output << "\"" << metadataArgument << "\"";
-    }
-    if (!overlapFacts.empty()) {
-      if (!firstKey)
-        output << ", ";
-      firstKey = false;
-      output << "\"" << overlapArgument << "\"";
-    }
-    if (descriptorChoice) {
-      if (!firstKey)
-        output << ", ";
-      firstKey = false;
-      output << "\"" << descriptorChoice.getEligibilityArgument() << "\"";
-    }
-    for (const auto &[parameter, coverage] : fullCoverageParameters) {
-      if (!firstKey)
-        output << ", ";
-      firstKey = false;
-      output << "\"" << parameter << "\"";
-    }
-    output << "],\n";
-    output << "    pre_hook=_intent_tuning_hooks.before,\n"
-              "    post_hook=_intent_tuning_hooks.after,\n";
-    if (hasConfigPruner)
-      output << "    prune_configs_by={\"early_config_prune\": "
-                "_intent_prune_configs},\n";
-    output << ")\n";
-    if (!descriptors.empty()) {
-      output << "@triton.heuristics({\n";
-      for (const DescriptorABI &descriptor : descriptors)
-        output << "    \"" << descriptor.name << "\": _intent_bind"
-               << descriptor.name << ",\n";
-      output << "})\n";
-    }
     output << "@triton.jit\ndef _intent_kernel(";
     bool first = true;
     for (const ViewABI &view : views) {
@@ -651,10 +220,7 @@ private:
         output << ", ";
       first = false;
       output << scalar.name;
-      if (scalar.kind == "constexpr")
-        output << ": tl.constexpr";
-      else
-        output << ": " << pythonType(scalar.type);
+      output << ": " << pythonType(scalar.type);
     }
     if (!metadataArguments.empty()) {
       if (!first)
@@ -676,7 +242,6 @@ private:
       output << ", " << descriptorChoice.getConfigParameter()
              << ": tl.constexpr";
     }
-    SmallVector<std::string> parameters;
     kernel.walk([&](gpu::ParameterOp parameter) {
       auto role = static_cast<gpu::ParameterRole>(
           parameter.getParameter().getRole());
@@ -693,10 +258,10 @@ private:
           return;
       }
       std::string name = parameter.getParameter().getName().getValue().str();
-      parameters.push_back(name);
+      parameterNames.push_back(name);
       values[parameter.getResult()] = name;
     });
-    for (StringRef parameter : parameters)
+    for (StringRef parameter : parameterNames)
       output << ", " << parameter << ": tl.constexpr";
     for (const DescriptorABI &descriptor : descriptors)
       output << ", " << descriptor.name;
@@ -713,222 +278,6 @@ private:
     });
     emitBlock(kernel.getBody().front(), /*isLoop=*/false, {});
     output << "\n";
-  }
-
-  void emitViewChecks(ArrayRef<ViewABI> arguments) {
-    std::map<int64_t, std::pair<std::string, std::string>> dimensions;
-    for (const ViewABI &view : arguments) {
-      if (view.workspace)
-        continue;
-      std::string name = kernel.getArgAttrDict(view.argument)
-                             .getAs<StringAttr>(gpu::abiNameAttr)
-                             .getValue().str();
-      std::string dtype = pythonType(view.type.getElementType(), true);
-      line("if not isinstance(" + view.name + ", torch.Tensor):", 1);
-      line("raise TypeError(\"" + name + " must be a torch.Tensor\")", 2);
-      line("if " + view.name + ".dtype != " + dtype + ":", 1);
-      line("raise TypeError(f\"" + name + " must have dtype " + dtype +
-               ", got {" + view.name + ".dtype}\")", 2);
-      std::string rank = std::to_string(view.type.getRank());
-      line("if " + view.name + ".ndim != " + rank + ":", 1);
-      line("raise ValueError(f\"" + name + " must have rank " + rank +
-               ", got {" + view.name + ".ndim}\")", 2);
-      auto layout = view.type.getLayout();
-      for (auto [axis, dimension] :
-           llvm::enumerate(layout.getDimensionIds().asArrayRef())) {
-        std::string suffix = ".shape[" + std::to_string(axis) + "]";
-        std::string actual = view.name + suffix;
-        std::string label = name + suffix;
-        auto extent = cast<gpu::PhysicalExprAttr>(layout.getExtents()[axis]);
-        if (extent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
-          std::string expected = std::to_string(extent.getValue());
-          line("if " + actual + " != " + expected + ":", 1);
-          line("raise ValueError(f\"" + label + " must equal " + expected +
-                   ", got {" + actual + "}\")", 2);
-        }
-        if (dimension <= 0)
-          continue;
-        auto [binding, inserted] = dimensions.try_emplace(
-            dimension, std::make_pair(actual, label));
-        if (inserted)
-          continue;
-        const auto &[expected, source] = binding->second;
-        line("if " + actual + " != " + expected + ":", 1);
-        line("raise ValueError(f\"" + label + " must equal " + source +
-                 ", got {" + actual + "} and {" + expected + "}\")", 2);
-      }
-    }
-  }
-
-  void emitLaunch() {
-    output << "def launch(" << joinLaunchArguments() << "):\n";
-    emitViewChecks(views);
-    line("return _intent_launch(" + joinLaunchArguments() + ")", 1);
-    output << "\ndef _intent_launch(" << joinLaunchArguments() << "):\n";
-    if (descriptorAllocator)
-      line("triton.set_allocator(_intent_tensor_descriptor_allocator)", 1);
-    for (const MetadataABI &metadata : metadataArguments) {
-      const ViewABI &source = viewByABI(metadata.sourceABI);
-      if (source.workspace)
-        continue;
-      line(metadata.name + " = " + source.name +
-           (metadata.kind == "dimension" ? ".shape[" : ".stride(") +
-           std::to_string(metadata.sourceAxis) +
-           (metadata.kind == "dimension" ? "]" : ")"), 1);
-    }
-    for (const ViewABI &view : views) {
-      if (!view.workspace)
-        continue;
-      auto deviceSource = llvm::find_if(views, [](const ViewABI &candidate) {
-        return !candidate.workspace;
-      });
-      if (deviceSource == views.end()) {
-        kernel.emitError("workspace allocation requires a public view device");
-        failed = true;
-        return;
-      }
-      std::string shape = "(";
-      for (Attribute extent : view.type.getLayout().getExtents())
-        shape +=
-            expressionString(cast<gpu::PhysicalExprAttr>(extent), false) + ", ";
-      shape += ")";
-      line(view.name + " = torch.empty(" + shape + ", device=" +
-               deviceSource->name + ".device, dtype=" +
-               pythonType(view.type.getElementType(), true) + ")", 1);
-    }
-    for (const MetadataABI &metadata : metadataArguments) {
-      const ViewABI &source = viewByABI(metadata.sourceABI);
-      if (source.workspace)
-        line(metadata.name + " = " + source.name + ".stride(" +
-                 std::to_string(metadata.sourceAxis) + ")", 1);
-    }
-    llvm::DenseMap<Value, std::string> overlapSpans;
-    SmallVector<std::string> overlapChecks;
-    for (gpu::ViewOverlapOp overlap : overlapFacts) {
-      for (Value view : overlap.getOperands()) {
-        if (overlapSpans.count(view))
-          continue;
-        std::string name = newName();
-        overlapSpans[view] = name;
-        line(name + " = " + overlapSpanFunction + "(" + valueString(view) +
-                 ")", 1);
-      }
-      overlapChecks.push_back(overlapFunction + "(" +
-                              overlapSpans.lookup(overlap.getLhs()) + ", " +
-                              overlapSpans.lookup(overlap.getRhs()) + ")");
-    }
-    if (!overlapChecks.empty())
-      line(overlapArgument + " = " + stringTuple(overlapChecks), 1);
-    if (descriptorChoice) {
-      std::string eligibility;
-      for (const DescriptorABI &descriptor : descriptors) {
-        if (!eligibility.empty())
-          eligibility += " and ";
-        eligibility += descriptorContractCall(descriptor,
-                                              /*argumentMap=*/false);
-      }
-      line(descriptorChoice.getEligibilityArgument().str() + " = (" +
-               eligibility + ")",
-           1);
-    }
-    auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-    std::string gridName = newName();
-    std::string grid = gridName + " = lambda META: (";
-    for (auto [index, extent] : llvm::enumerate(space)) {
-      if (index)
-        grid += ", ";
-      grid += expressionString(cast<gpu::PhysicalExprAttr>(extent), true);
-    }
-    if (space.size() == 1)
-      grid += ",";
-    line(grid + ")", 1);
-    std::string call = "return _intent_kernel[" + gridName + "](";
-    bool first = true;
-    for (const ViewABI &view : views) {
-      if (!first)
-        call += ", ";
-      first = false;
-      call += view.name;
-    }
-    for (const ScalarABI &scalar : scalars) {
-      if (!first)
-        call += ", ";
-      first = false;
-      call += scalar.name;
-    }
-    if (!metadataArguments.empty()) {
-      SmallVector<std::string> metadata;
-      for (const MetadataABI &argument : metadataArguments)
-        metadata.push_back(argument.name);
-      call += ", " + stringTuple(metadata);
-    }
-    if (!overlapFacts.empty())
-      call += ", " + overlapArgument;
-    if (descriptorChoice)
-      call += ", " + descriptorChoice.getEligibilityArgument().str();
-    // Ordinary arithmetic permits FMA while preserving subnormals.
-    if (!first)
-      call += ", ";
-    call += "enable_fp_fusion=True, enable_reflect_ftz=False";
-    line("with _intent_tuning_hooks:", 1);
-    line(call + ")", 2);
-    output << "\n";
-  }
-
-  void emitRun() {
-    SmallVector<ViewABI> inputs;
-    SmallVector<ViewABI> outputs;
-    for (const ViewABI &view : views) {
-      if (view.workspace)
-        continue;
-      if (view.type.getAccess() != 1)
-        inputs.push_back(view);
-      if (view.type.getAccess() == 1)
-        outputs.push_back(view);
-    }
-    output << "def run(" << joinLaunchArguments(/*includeOutputs=*/false) << "):\n";
-    if (outputs.empty()) {
-      line("launch(" + joinLaunchArguments() + ")", 1);
-      line("return None", 1);
-      return;
-    }
-    emitViewChecks(inputs);
-    std::string device = inputs.empty() ? "'cuda'" : inputs.front().name + ".device";
-    for (const ViewABI &view : outputs) {
-      std::string shape = "(";
-      auto ids = view.type.getLayout().getDimensionIds();
-      auto extents = view.type.getLayout().getExtents();
-      for (auto [axis, dimension] : llvm::enumerate(ids.asArrayRef())) {
-        if (axis)
-          shape += ", ";
-        auto extent = cast<gpu::PhysicalExprAttr>(extents[axis]);
-        if (extent.getKind() ==
-            static_cast<uint32_t>(gpu::PhysicalExprKind::Constant)) {
-          shape += std::to_string(extent.getValue());
-          continue;
-        }
-        auto binding = dimensionBindings.find(dimension);
-        if (binding == dimensionBindings.end()) {
-          failed = true;
-          return;
-        }
-        const MetadataABI &metadata = binding->second;
-        const ViewABI &source = viewByABI(metadata.sourceABI);
-        shape += source.name + ".shape[" + std::to_string(metadata.sourceAxis) + "]";
-      }
-      if (ids.size() == 1)
-        shape += ",";
-      shape += ")";
-      line(view.name + " = torch.empty(" + shape + ", device=" + device +
-               ", dtype=" + pythonType(view.type.getElementType(), true) + ")",
-           1);
-    }
-    line("_intent_launch(" + joinLaunchArguments() + ")", 1);
-    if (outputs.size() == 1)
-      line("return " + outputs.front().name, 1);
-    else
-      line("return (" + joinViewNames(outputs) + ")", 1);
   }
 
   void emitBlock(Block &block, bool isLoop,
@@ -997,7 +346,7 @@ private:
     }
     if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
       assign(physical.getResult(),
-             expressionString(physical.getExpression(), false),
+             expressionString(physical.getExpression()),
              isConstexprExpression(physical.getExpression()));
       return;
     }
@@ -1014,7 +363,7 @@ private:
       auto view = dim.getView().getType();
       auto extent = cast<gpu::PhysicalExprAttr>(
           view.getLayout().getExtents()[dim.getAxis()]);
-      assign(dim.getResult(), expressionString(extent, false),
+      assign(dim.getResult(), expressionString(extent),
              isConstexprExpression(extent));
       return;
     }
@@ -1081,7 +430,7 @@ private:
           cast<gpu::PhysicalExprAttr>(fragment.getShape()[0]);
       assign(range.getResult(), "(" + valueString(range.getStart()) +
                                     " + tl.arange(0, " +
-                                    expressionString(physicalExtent, false) + ") * " +
+                                    expressionString(physicalExtent) + ") * " +
                                     valueString(range.getStep()) + ")");
       return;
     }
@@ -1290,7 +639,7 @@ private:
       };
       auto extent = [](gpu::FragmentType type, unsigned axis) {
         return expressionString(
-            cast<gpu::PhysicalExprAttr>(type.getShape()[axis]), false);
+            cast<gpu::PhysicalExprAttr>(type.getShape()[axis]));
       };
       auto lhs = contract.getLhs().getType();
       auto rhs = contract.getRhs().getType();
@@ -1764,108 +1113,6 @@ private:
     return stringList(expressions);
   }
 
-  std::string hostArgument(StringRef name) const {
-    for (auto [index, metadata] : llvm::enumerate(metadataArguments))
-      if (metadata.name == name)
-        return "args[\"" + metadataArgument + "\"][" +
-               std::to_string(index) + "]";
-    return ("args[\"" + name + "\"]").str();
-  }
-
-  std::string descriptorArgumentExpression(
-      gpu::PhysicalExprAttr expression) const {
-    return expressionString(expression, true, [&](gpu::PhysicalExprAttr leaf) {
-      if (leaf.getKind() == static_cast<uint32_t>(gpu::PhysicalExprKind::Parameter)) {
-        std::string name = leaf.getSymbol().getValue().str();
-        if (fullCoverageParameters.count(name))
-          return "_intent_cover_" + name + "(args)";
-        return "args[\"" + name + "\"]";
-      }
-      return hostArgument(leaf.getSymbol().getValue());
-    });
-  }
-
-  std::string descriptorHostValue(Value value, bool argumentMap) {
-    if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
-      auto view = cast<gpu::ViewType>(dimension.getView().getType());
-      auto expression = cast<gpu::PhysicalExprAttr>(
-          view.getLayout().getExtents()[dimension.getAxis()]);
-      return argumentMap ? descriptorArgumentExpression(expression)
-                         : expressionString(expression, false);
-    }
-    if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
-      return argumentMap
-                 ? descriptorArgumentExpression(physical.getExpression())
-                 : expressionString(physical.getExpression(), false);
-    if (auto constant = value.getDefiningOp<arith::ConstantOp>())
-      return literal(constant.getValue());
-    if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-      std::string lhs = descriptorHostValue(binary.getLhs(), argumentMap);
-      std::string rhs = descriptorHostValue(binary.getRhs(), argumentMap);
-      auto infix = [&](StringRef spelling) {
-        return "(" + lhs + " " + spelling.str() + " " + rhs + ")";
-      };
-      switch (binary.getOperatorKind()) {
-      case BinaryOperator::Add:
-        return infix("+");
-      case BinaryOperator::Subtract:
-        return infix("-");
-      case BinaryOperator::Multiply:
-        return infix("*");
-      case BinaryOperator::FloorDivide:
-        return infix("//");
-      case BinaryOperator::Maximum:
-        return "max(" + lhs + ", " + rhs + ")";
-      case BinaryOperator::Minimum:
-        return "min(" + lhs + ", " + rhs + ")";
-      default:
-        break;
-      }
-    }
-    if (isa<BlockArgument>(value))
-      return argumentMap ? hostArgument(valueString(value))
-                         : valueString(value);
-    failed = true;
-    return "<unsupported-descriptor-launch-value>";
-  }
-
-  std::string descriptorContractCall(const DescriptorABI &descriptor,
-                                     bool argumentMap) {
-    TensorDescriptorOp operation = descriptor.operation;
-    SmallVector<std::string> shape;
-    SmallVector<std::string> strides;
-    for (Value extent : operation.getShape())
-      shape.push_back(descriptorHostValue(extent, argumentMap));
-    for (Value stride : operation.getStrides())
-      strides.push_back(descriptorHostValue(stride, argumentMap));
-    std::string base = valueString(operation.getBase());
-    if (argumentMap)
-      base = "args[\"" + base + "\"]";
-    auto view = cast<gpu::ViewType>(operation.getBase().getType());
-    return "_intent_tensor_descriptor_legal(" + base + ", " +
-           stringList(shape) + ", " + stringList(strides) + ", " +
-           std::to_string(view.getRank()) + ", " +
-           axisTuple(operation.getAlignedStrideAxes()) + ", " +
-           axisTuple(operation.getUnitStrideAxes()) + ", " +
-           (operation.getRequirePositiveShape() ? "True" : "False") + ", " +
-           (operation.getRequirePositiveStrides() ? "True" : "False") +
-           ", " + std::to_string(operation.getAlignment()) + ", " +
-           std::to_string(operation.getMaximumShapeExtent()) + ")";
-  }
-
-  std::string descriptorBlockShape(const DescriptorABI &descriptor) const {
-    SmallVector<std::string> shape;
-    TensorDescriptorOp operation = descriptor.operation;
-    for (Value extent : operation.getBlockShape()) {
-      auto physical = extent.getDefiningOp<gpu::PhysicalExprOp>();
-      if (!physical)
-        return {};
-      shape.push_back(
-          descriptorArgumentExpression(physical.getExpression()));
-    }
-    return stringList(shape);
-  }
-
   std::string blockPointer(Value viewValue, ValueRange offsets,
                            ArrayRef<int64_t> blockAxes,
                            ArrayRef<int64_t> order,
@@ -1887,7 +1134,7 @@ private:
     for (auto [blockAxis, viewAxis] : llvm::enumerate(blockAxes))
       offsetLimits[viewAxis] = "(2147483648 - " +
           expressionString(cast<gpu::PhysicalExprAttr>(
-                               fragment.getShape()[blockAxis]), false) + ")";
+                               fragment.getShape()[blockAxis])) + ")";
     std::string base = valueString(viewValue);
     for (int64_t viewAxis = 0;
          viewAxis < static_cast<int64_t>(view.getRank()); ++viewAxis) {
@@ -1910,8 +1157,7 @@ private:
       shape.push_back(
           "tl.maximum((" +
           expressionString(cast<gpu::PhysicalExprAttr>(
-                               view.getLayout().getExtents()[viewAxis]),
-                           false) +
+                               view.getLayout().getExtents()[viewAxis])) +
           " - " + baseOffsets[viewAxis] + "), 0)");
       blockStrides.push_back(strideString(viewAxis));
       // A block has at most 2^20 lanes, so an offset below INT32_MIN is
@@ -2051,38 +1297,167 @@ private:
     output.indent(level * 4) << text << "\n";
   }
 
-  const ViewABI &viewByABI(unsigned abi) const {
-    for (const ViewABI &view : views)
-      if (view.type.getAbiIndex() == abi)
-        return view;
-    llvm_unreachable("verified metadata references a missing view ABI");
+  FailureOr<llvm::json::Value> descriptorHostValue(Value value) {
+    if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
+      auto view = cast<gpu::ViewType>(dimension.getView().getType());
+      return gpu::serializeExpression(cast<gpu::PhysicalExprAttr>(
+          view.getLayout().getExtents()[dimension.getAxis()]));
+    }
+    if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
+      return gpu::serializeExpression(physical.getExpression());
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+        return llvm::json::Value(llvm::json::Object{
+            {"kind", "constant"}, {"value", integer.getInt()}});
+    }
+    if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
+      StringRef kind;
+      switch (binary.getOperatorKind()) {
+      case BinaryOperator::Add: kind = "add"; break;
+      case BinaryOperator::Subtract: kind = "subtract"; break;
+      case BinaryOperator::Multiply: kind = "multiply"; break;
+      case BinaryOperator::FloorDivide: kind = "floor_div"; break;
+      case BinaryOperator::Maximum: kind = "max"; break;
+      case BinaryOperator::Minimum: kind = "min"; break;
+      default: break;
+      }
+      if (!kind.empty()) {
+        auto lhs = descriptorHostValue(binary.getLhs());
+        auto rhs = descriptorHostValue(binary.getRhs());
+        if (mlir::failed(lhs) || mlir::failed(rhs)) return failure();
+        llvm::json::Array operands;
+        operands.push_back(std::move(*lhs));
+        operands.push_back(std::move(*rhs));
+        return llvm::json::Value(llvm::json::Object{
+            {"kind", kind}, {"operands", std::move(operands)}});
+      }
+    }
+    if (isa<BlockArgument>(value))
+      return llvm::json::Value(llvm::json::Object{
+          {"kind", "scalar"}, {"symbol", valueString(value)}});
+    return kernel.emitError("Triton descriptor has no host-evaluable value binding");
   }
 
-  template <typename Range>
-  std::string joinViewNames(const Range &range) const {
-    std::string result;
-    for (auto [index, view] : llvm::enumerate(range)) {
-      if (index)
-        result += ", ";
-      result += view.name;
+  LogicalResult emitMetadata(std::string &metadata) {
+    auto artifact = gpu::serializeInterface(
+        kernel, "triton", [&](Value value) { return valueString(value); },
+        [&](DictionaryAttr local) -> LogicalResult {
+          if (!descriptorChoice) {
+            if (!local.empty())
+              return kernel.emitError(
+                  "Triton configuration has undeclared provider bindings");
+            return success();
+          }
+          auto choice = local.getAs<IntegerAttr>(descriptorChoice.getConfigParameter());
+          if (local.size() != 1 || !choice ||
+              (choice.getInt() != 0 && choice.getInt() != 1))
+            return kernel.emitError(
+                "Triton configuration must bind its descriptor choice to 0 or 1");
+          return success();
+        });
+    if (mlir::failed(artifact)) return failure();
+    llvm::json::Object details{{"kernel", "_intent_kernel"}};
+    llvm::json::Array configs;
+    for (Attribute attribute : kernel->getAttrOfType<ArrayAttr>(gpu::tritonConfigsAttr)) {
+      auto config = cast<DictionaryAttr>(attribute);
+      llvm::json::Object parameters;
+      for (NamedAttribute parameter : config.getAs<DictionaryAttr>("parameters"))
+        parameters[parameter.getName().getValue()] =
+            cast<IntegerAttr>(parameter.getValue()).getInt();
+      configs.push_back(llvm::json::Object{
+          {"parameters", std::move(parameters)},
+          {"num_warps", config.getAs<IntegerAttr>("num_warps").getInt()},
+          {"num_stages", config.getAs<IntegerAttr>("num_stages").getInt()},
+          {"num_ctas", config.getAs<IntegerAttr>("num_ctas").getInt()}});
     }
-    return result;
-  }
-
-  std::string joinLaunchArguments(bool includeOutputs = true) const {
-    std::map<unsigned, std::string> arguments;
-    for (const ViewABI &view : views)
-      if (!view.workspace && (includeOutputs || view.type.getAccess() != 1))
-        arguments.emplace(view.argument, view.name);
-    for (const ScalarABI &scalar : scalars)
-      arguments.emplace(scalar.argument, scalar.name);
-    std::string result;
-    for (const auto &[index, name] : arguments) {
-      if (!result.empty())
-        result += ", ";
-      result += name;
+    details["configs"] = std::move(configs);
+    llvm::json::Array arguments, key;
+    for (const ViewABI &view : views) arguments.push_back(view.name);
+    for (const ScalarABI &scalar : scalars) arguments.push_back(scalar.name);
+    details["metadata_argument"] = nullptr;
+    if (!metadataArguments.empty()) {
+      details["metadata_argument"] = metadataArgument;
+      arguments.push_back(metadataArgument);
+      key.push_back(metadataArgument);
     }
-    return result;
+    details["overlap_argument"] = nullptr;
+    if (!overlapFacts.empty()) {
+      details["overlap_argument"] = overlapArgument;
+      arguments.push_back(overlapArgument);
+      key.push_back(overlapArgument);
+    }
+    details["descriptor_choice"] = nullptr;
+    if (descriptorChoice) {
+      details["descriptor_choice"] = llvm::json::Object{
+          {"config", descriptorChoice.getConfigParameter()},
+          {"eligibility", descriptorChoice.getEligibilityArgument()}};
+      arguments.push_back(descriptorChoice.getEligibilityArgument());
+      key.push_back(descriptorChoice.getEligibilityArgument());
+    }
+    for (const std::string &name : coverageNames) key.push_back(name);
+    llvm::json::Object configOptions;
+    kernel.walk([&](gpu::ParameterOp parameter) {
+      StringRef field;
+      switch (static_cast<gpu::ParameterRole>(parameter.getParameter().getRole())) {
+      case gpu::ParameterRole::ProviderWarps: field = "num_warps"; break;
+      case gpu::ParameterRole::ProviderStages: field = "num_stages"; break;
+      case gpu::ParameterRole::ProviderCTAs: field = "num_ctas"; break;
+      default: break;
+      }
+      if (!field.empty())
+        configOptions[parameter.getParameter().getName().getValue()] = field;
+    });
+    details["config_options"] = std::move(configOptions);
+    llvm::json::Array encodedDescriptors;
+    for (const DescriptorABI &descriptor : descriptors) {
+      TensorDescriptorOp operation = descriptor.operation;
+      llvm::json::Object encoded{
+          {"name", descriptor.name}, {"base", valueString(operation.getBase())},
+          {"rank", cast<gpu::ViewType>(operation.getBase().getType()).getRank()},
+          {"require_positive_shape", operation.getRequirePositiveShape()},
+          {"require_positive_strides", operation.getRequirePositiveStrides()},
+          {"alignment", operation.getAlignment()},
+          {"maximum_shape_extent", operation.getMaximumShapeExtent()},
+          {"minimum_contiguous_bytes", operation.getMinimumContiguousBytes()},
+          {"require_power_of_two_block_shape", operation.getRequirePowerOfTwoBlockShape()},
+          {"maximum_block_elements", operation.getMaximumBlockElements()},
+          {"pipeline_block_alignment", operation.getPipelineBlockAlignment()},
+          {"padding", operation.getPadding()}};
+      auto encodeValues = [&](StringRef field, ValueRange values) -> LogicalResult {
+        llvm::json::Array expressions;
+        for (Value value : values) {
+          auto expression = descriptorHostValue(value);
+          if (mlir::failed(expression)) return failure();
+          expressions.push_back(std::move(*expression));
+        }
+        encoded[field] = std::move(expressions);
+        return success();
+      };
+      if (mlir::failed(encodeValues("shape", operation.getShape())) ||
+          mlir::failed(encodeValues("strides", operation.getStrides())) ||
+          mlir::failed(encodeValues("block_shape", operation.getBlockShape())))
+        return failure();
+      llvm::json::Array aligned, unit;
+      for (int64_t axis : operation.getAlignedStrideAxes()) aligned.push_back(axis);
+      for (int64_t axis : operation.getUnitStrideAxes()) unit.push_back(axis);
+      encoded["aligned_stride_axes"] = std::move(aligned);
+      encoded["unit_stride_axes"] = std::move(unit);
+      encodedDescriptors.push_back(std::move(encoded));
+    }
+    details["descriptors"] = std::move(encodedDescriptors);
+    details["allocator"] = nullptr;
+    if (descriptorAllocator)
+      details["allocator"] = llvm::json::Object{
+          {"size_argument", descriptorAllocator.getSizeArgument()},
+          {"alignment_argument", descriptorAllocator.getAlignmentArgument()},
+          {"stream_argument", descriptorAllocator.getStreamArgument()},
+          {"lifetime", descriptorAllocator.getLifetime()},
+          {"implementation", descriptorAllocator.getImplementation()}};
+    details["kernel_arguments"] = std::move(arguments);
+    details["autotune_key"] = std::move(key);
+    (*artifact)["triton"] = std::move(details);
+    llvm::raw_string_ostream(metadata) << llvm::json::Value(std::move(*artifact));
+    return failed ? failure() : success();
   }
 
   func::FuncOp kernel;
@@ -2095,11 +1470,8 @@ private:
   std::string metadataArgument = "_intent_metadata";
   SmallVector<gpu::ViewOverlapOp> overlapFacts;
   std::string overlapArgument = "_intent_overlaps";
-  std::string overlapFunction = "_intent_byte_spans_overlap";
-  std::string overlapSpanFunction = "_intent_view_byte_span";
-  llvm::StringMap<MetadataABI> metadataByName;
-  llvm::DenseMap<int64_t, MetadataABI> dimensionBindings;
-  std::map<std::string, CoverageParameter> fullCoverageParameters;
+  std::set<std::string> coverageNames;
+  SmallVector<std::string> parameterNames;
   llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
   TensorDescriptorChoiceOp descriptorChoice;
   TensorDescriptorAllocatorOp descriptorAllocator;
@@ -2108,13 +1480,13 @@ private:
   unsigned counter = 0;
   unsigned helperCounter = 0;
   bool emittingHelper = false;
-  bool hasConfigPruner = false;
   bool failed = false;
 };
 
 } // namespace
 
-LogicalResult serializeProgram(ModuleOp module, std::string &source) {
+LogicalResult serializeProgram(ModuleOp module, std::string &source,
+                               std::string &metadata) {
   SmallVector<func::FuncOp> kernels;
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (function->hasAttr(gpu::kernelAttr))
@@ -2127,7 +1499,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source) {
     return kernel.emitError("Triton program was not provider-legalized");
   llvm::raw_string_ostream stream(source);
   Serializer serializer(kernel, stream);
-  LogicalResult result = serializer.emit();
+  LogicalResult result = serializer.emit(metadata);
   stream.flush();
   return result;
 }

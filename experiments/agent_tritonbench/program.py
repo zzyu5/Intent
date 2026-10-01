@@ -8,8 +8,8 @@ from pathlib import Path
 import intent
 from intent.runtime.artifact import CompiledArtifact
 from intent.runtime.source import materialize_python_source
-from intent.runtime.cutile import materialize_cutile_artifact
-from intent.runtime.triton import materialize_triton_artifact, TuningHooks
+from intent.runtime.cutile_compilation import CuTileCompilation
+from intent.runtime.triton import TuningHooks
 from intent.targets import CuTileTarget, TritonTarget
 import triton
 from triton.compiler.errors import CompileTimeAssertionFailure
@@ -21,7 +21,6 @@ from torch.utils._python_dispatch import _disable_current_modes
 from experiments._common.support import benchmark
 from experiments._common.loading import load_module
 from experiments._common.measurement import CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
-from experiments._common.cutile_compilation import CuTileCompilation
 
 
 class ProgramContext:
@@ -45,39 +44,21 @@ class ProgramContext:
             raise ValueError("each compile() needs a distinct literal identifier")
         program = intent.generate(definition, target=self.target, compiler=self.compiler,
                                   constexprs=constexprs, tuning_config=self.tuning_config)
-        materialize = {"triton": materialize_triton_artifact, "cutile": materialize_cutile_artifact}[self.target_name]
-        try:
-            artifact = materialize(program.source, program.ir, definition.__name__, 0)
-        except Exception as error:
-            raise intent.CompilationStageError("generated_source_materialization", str(error),
-                                               cache_directory=program.cache_directory) from error
-        artifact.cache_directory = program.cache_directory
+        artifact = program.materialize()
         if self.target_name == "cutile":
-            search = artifact._namespace["exhaustive_search"]
+            provider = artifact.runtime.provider
+            provider.tuning_options["single_run_timeout_sec"] = CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
 
-            def record_search(configs, *args, **kwargs):
-                kwargs.setdefault("single_run_timeout_sec",
-                                  CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS)
-                result = search(configs, *args, **kwargs)
+            def record_search(configs, result):
                 self.tuning.append({"kernel": name, "declared": len(configs),
                                     "measured": len(result.successes),
                                     "failures": [(str(cfg), kind.__name__, message)
                                                  for cfg, kind, message in result.failures],
                                     "winner": str(result.best.config)})
-                return result
-
-            artifact._namespace["exhaustive_search"] = record_search
-
-            def trusted_runtime(function):
-                def invoke(*args, **kwargs):
-                    # Compiler-owned trial buffers may copy state. Candidate
-                    # host code remains under CandidateTorchPolicy.
-                    with _disable_current_modes():
-                        return function(*args, **kwargs)
-                return invoke
-
-            artifact._launcher = trusted_runtime(artifact._launcher)
-            artifact._runner = trusted_runtime(artifact._runner)
+            provider.observe_tuning = record_search
+            # Compiler-owned trial buffers may copy state. Candidate host code
+            # remains under CandidateTorchPolicy outside the runtime boundary.
+            artifact.runtime.invocation_context = _disable_current_modes
         self.generated[name] = artifact
         return artifact
 

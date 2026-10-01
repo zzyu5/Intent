@@ -10,7 +10,7 @@ from experiments._common.model import PreparedComparison, PreparedLaunch, Tolera
 
 
 def selected_outputs(artifact, outputs):
-    program = artifact._namespace["native_program"]
+    program = artifact.runtime
     for key, winner in program.winners.items():
         print(f"mojo: selected {program.candidates[winner]}; candidate_ms={program.timings[key]}", flush=True)
     return outputs

@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
     return path.str().str();
   };
   std::string source;
-  std::string metadata = "{}";
+  std::string metadata;
   auto emitShared = [&]() {
     if (irOutputFilename.empty()) {
       llvm::errs() << "--ir-output is required with --stop-after-shared\n";
@@ -323,17 +323,17 @@ int main(int argc, char **argv) {
   case TargetKind::Triton:
     provider = intent::triton::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
-      serialized = intent::triton::serializeProgram(*module, source);
+      serialized = intent::triton::serializeProgram(*module, source, metadata);
     break;
   case TargetKind::CuTile:
     provider = intent::cutile::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
-      serialized = intent::cutile::serializeProgram(*module, source);
+      serialized = intent::cutile::serializeProgram(*module, source, metadata);
     break;
   case TargetKind::TileLang:
     provider = intent::tilelang::legalizeGPUProgram(*module, *profiles);
     if (mlir::succeeded(provider))
-      serialized = intent::tilelang::serializeProgram(*module, source);
+      serialized = intent::tilelang::serializeProgram(*module, source, metadata);
     break;
   case TargetKind::Mojo:
   case TargetKind::Weft:
