@@ -10,18 +10,23 @@ from kernels.normalization.softmax import stable_softmax_f16
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=("triton", "cutile"), default="triton")
+    parser.add_argument("--target", choices=("triton", "cutile", "mojo"), default="triton")
     parser.add_argument("--program", type=Path,
                         help="Load a saved generated program and bind it to the selected runtime")
-    parser.add_argument("--torch-compile", action="store_true",
-                        help="Call through the opaque PyTorch operator adapter")
+    invocation = parser.add_mutually_exclusive_group()
+    invocation.add_argument("--prepared", action="store_true",
+                            help="Bind an explicit output once, then launch the prepared call")
+    invocation.add_argument("--torch-compile", action="store_true",
+                            help="Call through the opaque PyTorch operator adapter")
     args = parser.parse_args()
-    target = intent.TritonTarget() if args.target == "triton" else intent.CuTileTarget()
+    target = {"triton": intent.TritonTarget, "cutile": intent.CuTileTarget,
+              "mojo": intent.MojoTarget}[args.target]()
     if args.program is None:
         softmax = intent.compile(stable_softmax_f16, target=target)
     else:
         softmax = intent.GeneratedProgram.load(args.program).materialize(target=target)
-    x = torch.randn((8192, 8192), device="cuda", dtype=torch.float16)
+    device = torch.device("cuda", softmax.device) if softmax.device_type == "cuda" else torch.device("cpu")
+    x = torch.randn((8192, 8192), device=device, dtype=torch.float16)
     if args.torch_compile:
         operation = softmax.as_torch_op("intent_examples::softmax")
         # Prepare the same real invocation before graph capture so first-use
@@ -32,6 +37,11 @@ def main() -> None:
             return operation(value)
 
         y = torch.compile(apply, fullgraph=True)(x)
+    elif args.prepared:
+        output = torch.empty_like(x)
+        call = softmax.prepare(x, outputs=(output,))
+        call.launch()
+        y = call.result()
     else:
         y = softmax.run(x)
     print(f"softmax: {tuple(y.shape)}, {y.dtype}, {y.device}")

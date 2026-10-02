@@ -8,10 +8,19 @@
 |---|---|
 | `python examples/softmax.py --target triton` | 编译一次、传入 PyTorch tensor、分配声明的输出、定位编译产物 |
 | `python examples/softmax.py --target cutile` | 在独立 cuTile 环境中复用同一算法定义 |
+| `python examples/softmax.py --target triton --prepared` | 显式提供输出，准备一次调用，再分别执行 `launch()` 与 `result()` |
 | `python examples/softmax.py --target triton --torch-compile` | 先普通调用同一算子完成 JIT/调优，再通过 opaque custom op 进入 `torch.compile(fullgraph=True)` |
-| `python examples/softmax_forward_backward.py --target triton` | 作者显式编译 forward/backward，传递中间结果并决定调用顺序 |
+| `python examples/softmax_forward_backward.py --target triton` | 作者注册已有 backward，保存 forward 输出，用 `Tensor.backward(upstream)` 取得输入梯度 |
+| `python examples/softmax_forward_backward.py --target triton --torch-compile` | 同一 forward/backward 注册进入 PyTorch 图编译；两份 kernel 在捕获前完成首次 JIT/调优 |
+| `python examples/softmax_forward_backward.py --target mojo --torch-compile` | 同一作者 forward/backward 在 Mojo CPU runtime 上接入 PyTorch 图编译与 autograd |
 
-Forward/backward 示例使用既有 backward 定义的固定 shape，不注册 autograd，也不由 compiler 隐式创建第二次调用。PyTorch adapter 当前支持 GPU 的只读 `In`/scalar 输入和新分配的 `Out`；fake 实现来自同一 ABI，不调用 provider、不读取 tensor 数据。`InOut`/返回 alias 暂不支持；backward 需作者通过返回的 `CustomOpDef.register_autograd` 注册。示例输出不是 benchmark 或数值验证结论。每个脚本把 host 执行放在 `main` 下，因此也能作为模块加载。
+`artifact.run(...)` 省略声明的 `Out`，返回新分配的输出；显式调用 `artifact(...)` 保留全部 runtime 参数的声明顺序。`artifact.prepare(..., outputs=(...))` 接受相同输入和指定的 `Out`，准备过程不执行 kernel。返回的调用对象拥有这次参数绑定：`launch()` 执行，`result()` 取得输出容器而不执行或同步。零输出返回 `None`，单输出返回该值，多输出按声明顺序返回 tuple；`InOut` 始终由调用方传入。
+
+Forward/backward 示例复用既有的 `4096 × 4097`、f32 backward 定义。作者分别编译两个 kernels，把它们注册为 PyTorch custom ops，再通过 `register_autograd` 提供梯度公式：`setup_context` 保存 probabilities，backward 回调调用已注册的 backward op。普通 Python wrapper 决定这两个 kernels 的关系，compiler 不推导梯度或隐藏增加调用。这里只演示一阶梯度；更高阶梯度需要作者另行提供相应公式。
+
+PyTorch adapter 支持 GPU 和 Mojo CPU runtime 的只读 `In`/scalar 输入及新分配的 `Out`。Runtime 通过 `infer_outputs` 提供 fake 输出，复用普通调用的公共 shape、dtype 和 stride 合同，不调用 provider、不读取 tensor 数据。`InOut`/返回 alias 暂不支持；Weft 和 BANG C 的原生 buffer 接口不冒充 Torch tensor 接口。
+
+两个脚本都接受 `--target triton`、`--target cutile` 和 `--target mojo`，输入 tensor 跟随 artifact 的实际 CPU/CUDA 设备。Mojo 使用公开 `MojoTarget()` 的默认配置；SDK 可通过 `INTENT_MOJO` 指定。换 target 不改变示例算法、shape 或 dtype。示例输出不是 benchmark 或数值验证结论。每个脚本把 host 执行放在 `main` 下，因此也能作为模块加载。
 
 只编译而不运行可用：
 

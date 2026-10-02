@@ -210,7 +210,8 @@ Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14
 | 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/ProgramInterface.h)：同步维护 function type 与参数属性 |
 | CPU/DSA 的外部原生参数槽 | [Serialization/NativeABI](include/Intent/Serialization/NativeABI.h)：从最终 physical entry 展开参数，供源码签名和 metadata 共用 |
 | Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析及 shape/stride 关系；不观察或缓存实际 tensor |
-| 原生调用绑定 | [runtime/native.py](python/intent/runtime/native.py)：消费编译器导出的 native slots，生成绑定函数；observer 与设备调用留在各 runtime |
+| 公共实参绑定 | [runtime/invocation.py](python/intent/runtime/invocation.py)：按同一声明生成 allocating/explicit binders，统一 shape/stride、Out 分配与作者 alias 检查 |
+| 原生调用绑定 | [runtime/native.py](python/intent/runtime/native.py)：消费公共绑定结果与 compiler 导出的 native slots，不重推参数顺序、返回值或入口资格 |
 
 GPU 的每个物理参数携带 `ArgumentBindingAttr`。其稳定 `ArgumentRefAttr` 与当前
 `BlockArgument` 位置、作者参数名、生成源码名相互独立。Public binding 指向公共参数
@@ -621,12 +622,13 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 
 | 修改目标 | 入口 | 应保持的边界 |
 |---|---|---|
-| GPU 公共参数绑定、输出与 workspace | [gpu/interface.py](python/intent/runtime/gpu/interface.py) | `GPUInterface` 解析一次声明，每次 `bind` 读取真实实参并检查 dtype/shape/stride/alias；不缓存可变 tensor facts |
+| 公共参数、输出与 alias | [invocation.py](python/intent/runtime/invocation.py)、[torch_views.py](python/intent/runtime/torch_views.py) | GPU、native 和 fake 消费同一 public binder；Torch observer 供 GPU/Mojo 复用，不缓存可变 tensor facts |
+| GPU 参数与 workspace | [gpu/interface.py](python/intent/runtime/gpu/interface.py) | 将公共实参绑定到当前 GPU 参数身份，按已导出的 host dependencies 形成 metadata、coverage 和 workspace |
 | 已导出的整数表达式 | [gpu/expressions.py](python/intent/runtime/gpu/expressions.py) | 只求值 compiler 已声明的表达式，不按算法名或观察到的 shape 发明策略 |
 | 候选、deferred coverage 与资源条件 | [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) | 唯一解析已导出的候选表；provider 明确选择用于执行或展示的现有行，不再重建第二份配置 |
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
 | Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py)、[runtime/tilelang.py](python/intent/runtime/tilelang.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
-| PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 注册 opaque 调用；fake 只消费相同接口。当前限 GPU 只读 In/scalar 和 fresh Out，拒绝 InOut，backward 由作者注册 |
+| PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `TorchOutputInference` 能力注册 CPU/CUDA opaque 调用；GPU 与 Mojo CPU 支持只读 In/scalar 和 fresh Out，backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
 
 新增 GPU provider 时，先让 legalization 交付可独立验证的当前程序，再导出共同 interface 与必要 provider facts，实现上述 provider 调用接口，并由 `ResolvedTarget.materialize` 接入。不要复制 serializer 中的 Python host 模板，也不要让 framework adapter 自己猜输出或解析生成源码。CPU、DSA 可以保留自己的 ABI/buffer 类型；共同 `ArtifactRuntime` 协议不要求它们采用 GPU 的 grid、workspace 或 tensor binder。
@@ -635,9 +637,38 @@ GPU 的纯编译事实位于 [targets/specification.py](python/intent/targets/sp
 
 实验适配若需要准备候选、观察调优或绑定调用，使用 `artifact.runtime` 的明确对象与 provider 扩展点。Compiler 生成的 source 不再承担 host `launch/run` 协议；只有显式作者提供的 Python source 由 [runtime/source.py](python/intent/runtime/source.py) 的独立 source loader 承接其已有 host callable。不要通过生成模块的私有字典改写编译器产物的执行语义。
 
-Mojo、Weft、BANG C 的共同 native ABI 绑定在 [runtime/native.py](python/intent/runtime/native.py)。`NativeABI.read` 消费公共 `PublicInterface` 和编译器导出的 `native.slots`，为隐式分配与显式传入输出生成绑定函数；原生参数顺序、scalar carrier 和 pointer pointee 不在 Python 中重新推导。每次调用重新观察实参；allocator 返回新输出和本次 `ViewFacts`。CPU 的别名拒绝规则位于 [cpu.py](python/intent/runtime/cpu.py)，BANG C 的设备、队列、tile 资格与分配规则留在自己的 `program.py`；Mojo 的 Torch 规则、Weft 的 Buffer/alignment 规则和各自 tuning key 也留在 provider。Weft 的 `_ExecutionContract` 每次执行继续检查当前线程的 affinity、stack、RVV 状态和 VLEN。不要把一次实参观察或线程状态存入不可变 ABI schema，也不要在绑定函数中重建算法或 task 调度。
+Mojo、Weft、BANG C 的 [NativeABI](python/intent/runtime/native.py) 先消费公共绑定结果，
+再按 `native.slots` 形成 pointer、extent、stride 和 scalar carrier。公共 binder 与
+native packing 都按一次声明生成，prepared launch 不重新遍历公共 schema。
+`ViewFacts` 只属于本次观察：shape/stride、访问字节范围与 allocation 身份是不同事实。
+同名 alias group 要求同 allocation，允许不同 offset/shape 和不重叠子视图；
+`noalias` 检查 allocation 范围，不能与后端的写入重叠限制混为一条规则。
 
-公共 `artifact.prepare(*inputs, outputs=...)` 通过 `PreparedRuntime.prepare_call` 接入这些能力，返回 `intent.PreparedCall`，仅共同保证 `launch()` 和 `result()`。GPU launch 使用当前 stream，CPU launch 等待本次任务，BANG C launch 同步自己的 CNRT queue；`result()` 只返回输出容器，不隐含同步。CPU 既有返回值包含 InOut，GPU/BANG C 仅返回 Out，这个差异没有被 ABI 复用改写。Provider 特有的 enqueue、benchmark 或调优观察仍属于其具体调用对象。
+原生入口要求由 [queryNativeEntryRequirements](include/Intent/Serialization/NativeABI.h)
+读取当前 family 的 typed IR，导出 `native.requirements` 中逐 view 的 layout/alignment
+及 disjoint 参数对。[NativeRequirements](python/intent/runtime/native_requirements.py)
+是 Python 的唯一解释器，`NativeABI.read` 同时检查 slots 和 requirements，保存、加载
+与 materialize 都消费这份事实。修改后端支持范围时先改 IR 的合法性与导出，不能只删
+runtime 检查，也不能从 provider 名字推断所有输入必须 contiguous。
+Mojo 的空指针 ABI 限制、BANG C 设备/队列/整行 tile 资格和 Weft 的调用线程
+affinity、stack、RVV/VLEN 检查继续留在各自 runtime。
+
+`artifact.run(*inputs)` 与 prepared `result()` 只返回 `Out`：零个为 `None`，一个为
+单值，多个为声明顺序的 tuple；`InOut` 通过原对象观察。`artifact.launch(...)`、
+`artifact(...)` 与 prepared `launch()` 执行后返回 `None`。内部 `LaunchResult` 的
+native kernel 仍用于后端 IR 收集，不成为公共调用结果。
+`artifact.prepare(*inputs, outputs=(...))` 可显式绑定 Out 并复用调用。GPU 使用当前
+stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()` 不隐含同步。
+参数或其 shape/stride 改变时重新 prepare。enqueue、benchmark 等扩展仍归具体 provider。
+
+PyTorch fake 通过 runtime 的 `infer_outputs` 调用同一个公共 binder，使用 symbolic
+关系断言，既不读取 data pointer，也不创建 GPU workspace 或执行 native code。
+[softmax_forward_backward.py](examples/softmax_forward_backward.py) 展示两个已编译
+artifacts 注册为 forward/backward operators，作者通过 `register_autograd` 保存并
+传递张量；同一份 host 组织可选择 Triton、cuTile 或 Mojo CPU。
+这对应本地 Triton `python/tutorials/05-layer-norm.py:233–294` 的职责：host wrapper
+保存上下文并调用作者 backward，compiler 不自动发明梯度算法。Intent 的 adapter
+负责 dispatcher/fake 接口，不承担这份算法与多 kernel 编排。
 
 原生编译与产物寿命由 provider runtime 负责。Mojo 的 [compilation.py](python/intent/runtime/mojo/compilation.py) 组织候选和加载，[toolchain.py](python/intent/runtime/mojo/toolchain.py) 查询已支持工具链的依赖身份，公共 [compiler/cache.py](python/intent/compiler/cache.py) 提供输入比较、锁与发布机制。新增 SDK import 时同步 serializer 的 `native_dependencies`；无法证明依赖闭合时继续原编译并说明缓存不可复用原因。失败不发布成功产物，已加载的库不原位覆写；这些机制不改变算法、候选或算子计时范围。
 
@@ -683,9 +714,22 @@ INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
 
 这个调用示例用于理解公开入口；修改具体能力时，选择实际受影响的既有生产程序及其所属实验组入口，保留原输入、容差和完整 callable 计时合同。
 
-普通用户可先运行 `intent doctor --target triton --json` 检查所选环境，再用 `intent compile path/to/program.py:kernel --target triton --json` 取得真实阶段与编译产物。`--materialize` 调用同一个 `GeneratedProgram.materialize()`，不会重新 lowering。工具不主动 launch 所选 kernel，但加载模块仍执行其顶层 Python；依赖检查、编译成功与运行正确必须分开说明。
+普通用户可先运行 `intent describe --json` 查询实际公开 API，`intent doctor --json`
+检查基础 compiler/KIR；选择后端后再用 `--target triton` 等检查相应包、SDK 与设备。
+`intent compile path/to/program.py:kernel --target triton --json` 返回真实阶段与编译产物，
+`--materialize` 调用同一个 `GeneratedProgram.materialize()`，不会重新 lowering。
+工具不主动 launch 所选 kernel，但加载模块仍执行其顶层 Python。
+`intent read-artifact <返回的文件路径> --offset 0 --limit 16000 --json` 可分页读取
+真实 IR、源码或日志，不执行文件内容。compiler MCP 提供相同 describe/environment/
+read_artifact 入口，使仅使用 MCP 的客户端也能从编译诊断继续读取服务器上的产物。
 
-定位失败时看 `CompilationStageError.stage`、`cache_directory`、`artifact.source` 和 `artifact.mlir`。区分 frontend、physical program、provider source、下层编译及实际 launch，不把所有失败归成“后端不支持”。CLI/MCP 的 [compilation.py](python/intent/tools/compilation.py) 只转换现有诊断与路径，不维护另一份错误知识库或 compiler policy。
+定位失败时看 `CompilationStageError.stage`、`cache_directory`、`candidate` 与
+`artifacts`。Native 编译失败保留实际 attempt 目录及异常 cause，不被 materialize
+覆盖成只有 Intent 编译目录的错误。CLI/MCP 的 [compilation.py](python/intent/tools/compilation.py)
+转换同一阶段链与文件路径，不维护另一份错误知识库或 compiler policy。
+Intent lowering、provider native compilation、首次 tuning/load 与热 launch 是不同成本；
+`generate` 不运行 kernel，materialize 是否立即 native compile 由 provider 决定，
+首次 launch 仍可能触发 JIT/tuning。普通 PyTorch graph capture 前先完成需要的首次调用。
 
 作者位置沿 [SourceUnit.location](python/intent/frontend/source/unit.py)、[KIR 序列化](python/intent/frontend/mlir/serialization.py) 和 [compiler IR 输出](tools/intent-compile/intent-compile.cpp) 保存在标准 MLIR location 中。缓存的 `input.mlir`、`kernel.mlir` 与 operation 诊断使用这条位置链；新增 rewrite 创建或克隆 operation 时保留相应 source location，不用旁表替代。编译日志位于同一 `cache_directory` 的 `compiler.log`。
 
