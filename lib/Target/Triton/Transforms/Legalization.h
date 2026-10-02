@@ -40,6 +40,8 @@ llvm::SmallVector<mlir::scf::ForOp> findLoadPipelineLoops(mlir::func::FuncOp ker
 void selectOrderedLoadUnrolling(mlir::func::FuncOp kernel);
 
 // Values owns provider compute forms and value-graph representation.
+gpu::ConfigurationRequirementAttr
+contractionExpansionRequirement(gpu::ContractOp contract);
 void selectContractForms(mlir::func::FuncOp kernel);
 void canonicalizeBroadcastProjections(mlir::func::FuncOp kernel);
 void sinkSelectProducers(mlir::func::FuncOp kernel);

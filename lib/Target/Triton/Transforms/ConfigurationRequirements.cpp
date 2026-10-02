@@ -1,5 +1,6 @@
 #include "ConfigurationRequirements.h"
 #include "Configurations.h"
+#include "Legalization.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -62,6 +63,7 @@ collectConfigurationRequirements(func::FuncOp kernel) {
   TensorDescriptorChoiceOp descriptorChoice;
   SmallVector<TensorDescriptorOp> descriptors;
   SmallVector<gpu::MakeRangeOp> ranges;
+  SmallVector<gpu::ContractOp> contracts;
   kernel.walk([&](Operation *operation) {
     if (auto reduce = dyn_cast<gpu::ReduceOp>(operation))
       reductionSources.push_back(reduce.getSources());
@@ -73,6 +75,8 @@ collectConfigurationRequirements(func::FuncOp kernel) {
       descriptors.push_back(descriptor);
     else if (auto range = dyn_cast<gpu::MakeRangeOp>(operation))
       ranges.push_back(range);
+    else if (auto contract = dyn_cast<gpu::ContractOp>(operation))
+      contracts.push_back(contract);
   });
   auto requirements = gpu::collectReductionRequirements(
       kernel, reductionSources, gpu::ReductionRequirementScope::AllCandidates);
@@ -103,6 +107,17 @@ collectConfigurationRequirements(func::FuncOp kernel) {
   using Kind = gpu::ConfigurationRequirementKind;
   using Metric = gpu::ConfigurationRequirementMetric;
   using Predicate = gpu::ConfigurationRequirementPredicate;
+  for (gpu::ContractOp contract : contracts) {
+    auto form = contract->getAttrOfType<StringAttr>(detail::contractFormAttr);
+    if (contract->hasAttr(detail::contractFormAttr) &&
+        (!form || (form.getValue() != "multiply_sum" && form.getValue() != "fma")))
+      return contract.emitOpError("has an unknown Triton contraction form"), failure();
+    auto requirement = detail::contractionExpansionRequirement(contract);
+    if (!requirement)
+      return contract.emitOpError("Triton contraction expansion requires a reduction axis"), failure();
+    if (!llvm::is_contained(requirements, requirement))
+      requirements.push_back(requirement);
+  }
   for (gpu::FragmentType fragment : resources.valueTypes()) {
     auto elements = gpu::fragmentElementCount(fragment);
     if (!isTritonFragmentExtent(elements))

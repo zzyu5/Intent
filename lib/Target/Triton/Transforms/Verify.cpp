@@ -6,7 +6,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringSet.h"
@@ -79,18 +78,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
-    if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
-      auto compare = assertion.getArg().getDefiningOp<gpu::CompareOp>();
-      if (!compare || !llvm::all_of(compare->getOperands(), [&](Value operand) {
-            if (auto expression = operand.getDefiningOp<gpu::PhysicalExprOp>())
-              return isTritonFragmentExtent(expression.getExpression());
-            return operand.getDefiningOp<arith::ConstantOp>() != nullptr;
-          })) {
-        assertion.emitOpError("Triton assertions require a constexpr condition");
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    }
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getApproximate() &&
         unary.getOperatorKind() == UnaryOperator::Tanh) {

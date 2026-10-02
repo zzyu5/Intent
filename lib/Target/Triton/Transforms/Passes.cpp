@@ -4,7 +4,6 @@
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"

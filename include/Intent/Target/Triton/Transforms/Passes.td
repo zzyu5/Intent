@@ -5,7 +5,7 @@ class IntentTritonTransformPass<string passArgument, string summaryText>
   let summary = summaryText;
   let dependentDialects = ["::intent::gpu::IntentGPUDialect",
       "::intent::triton::IntentTritonDialect", "::mlir::arith::ArithDialect",
-      "::mlir::cf::ControlFlowDialect", "::mlir::func::FuncDialect",
+      "::mlir::func::FuncDialect",
       "::mlir::scf::SCFDialect"];
 }
 
