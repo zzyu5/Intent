@@ -61,7 +61,7 @@ void CPUBackend::buildShared(OpPassManager &manager, const Request &request, Str
 }
 
 LogicalResult CPUBackend::verifySharedInput(ModuleOp module, const Request &request, StringRef provider) const {
-  if (failed(cpu::verifyCPUProgram(module, false))) return failure();
+  if (failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers))) return failure();
   auto expected = cpu::CapabilitiesAttr::getChecked([&] { return module.emitError(); },
       module.getContext(), request.cpu.vectorBits, request.cpu.workers,
       request.cpu.privateBytes, request.cpu.matrixI8I32);

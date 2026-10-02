@@ -33,7 +33,7 @@ SmallVector<Value> scratch(OpBuilder &b, Location loc, ValueRange prototypes) {
 
 LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
                           const RegionPartition *partition, Value begin, OpFoldResult width,
-                          Value predicate = {}, bool predicateValue = false, Operation *trueReduction = nullptr) {
+                          ValueRange predicates = {}, bool predicateValue = false, Operation *trueReduction = nullptr) {
   Block &body = helper.front();
   if (arguments.size() != body.getNumArguments()) return helper.getParentOp()->emitError("region helper binding is incomplete");
   IRMapping mapping;
@@ -124,7 +124,7 @@ LogicalResult instantiate(OpBuilder &b, Region &helper, ValueRange arguments,
       }
     }
     Operation *cloned = b.clone(operation, mapping);
-    if (predicate)
+    for (Value predicate : predicates)
       if (Value condition = mapping.lookupOrNull(predicate);
           condition && cloned->isAncestor(condition.getDefiningOp())) {
         OpBuilder builder(condition.getDefiningOp());
@@ -264,7 +264,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     });
     if (failed(arguments)) return failure();
     return instantiate(b, helper, *arguments, partition ? &*partition : nullptr, beginPanel, panelWidth,
-        knownPredicate ? predicate->predicate : Value(), knownPredicate.value_or(false),
+        knownPredicate ? ValueRange(predicate->predicates) : ValueRange(), knownPredicate.value_or(false),
         summaryIsNonempty ? predicate->validityReduction : nullptr);
   };
   auto visitOne = [&](Value begin, int64_t width, std::optional<bool> knownPredicate,

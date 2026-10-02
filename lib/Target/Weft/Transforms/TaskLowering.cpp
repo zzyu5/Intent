@@ -7,6 +7,7 @@
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Analysis/ControlFlow.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
@@ -18,7 +19,9 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
 
 using namespace mlir;
@@ -102,7 +105,7 @@ public:
                       SmallVectorImpl<unsigned> &argumentPositions) {
     storage = std::make_unique<cpu::StorageAnalysis>(sourceFunction);
     currentTask = tasks;
-    values.clear(); locals.clear(); readOnlySupplies.clear(); viewAxes.clear();
+    values.clear(); locals.clear(); localReferences.clear(); controlOwners.clear(); shapeValues.clear(); readOnlySupplies.clear(); viewAxes.clear();
     Location loc = tasks.getLoc();
     SmallVector<Attribute> names, accesses, symbols;
     SmallVector<int64_t> aliases;
@@ -184,8 +187,8 @@ public:
     for (Type type : types) body->addArgument(type, loc);
     b.setInsertionPointToStart(body);
     for (Attribute symbol : symbols)
-      b.create<wk::SymbolOp>(loc, b.getIndexType(), cast<StringAttr>(symbol),
-          b.getStringAttr("shape"), array({}));
+      shapeValues.push_back(b.create<wk::SymbolOp>(loc, b.getIndexType(), cast<StringAttr>(symbol),
+          b.getStringAttr("shape"), array({})));
     b.create<wk::RootDomainOp>(loc,
         wk::DomainType::get(b.getContext(), "root", 0, -1, 0, "root", "exact"));
     for (auto [position, target] : llvm::zip(argumentPositions, body->getArguments())) {
@@ -277,13 +280,74 @@ private:
       return std::nullopt;
     };
     auto a = constant(lhs), c = constant(rhs);
-    return a && c && *a == *c;
+    if (a && c) return *a == *c;
+    auto identity = [&](OpFoldResult bound) -> std::optional<int64_t> {
+      if (auto value = dyn_cast<Value>(bound)) {
+        auto found = llvm::find(shapeValues, value);
+        if (found != shapeValues.end()) return -1 - (found - shapeValues.begin());
+      }
+      return nativeExtent(bound);
+    };
+    auto left = identity(lhs), right = identity(rhs);
+    return left && right && *left == *right;
   }
   Value localRoot(Value memory) {
+    if (controlOwners.contains(memory)) return memory;
+    if (auto found = localReferences.find(memory); found != localReferences.end())
+      return found->second;
+    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return localRoot(cast.getSource());
+    if (auto view = memory.getDefiningOp<memref::SubViewOp>()) return localRoot(view.getSource());
+    if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp())) {
+      auto projection = queryAxisView(memory);
+      if (succeeded(projection)) return localRoot(projection->source);
+    }
     return storage->uniqueOrigin(memory);
+  }
+
+  bool sameStorageShape(Value first, Value second) {
+    auto left = dyn_cast<MemRefType>(first.getType());
+    auto right = dyn_cast<MemRefType>(second.getType());
+    if (!left || !right || left.getRank() != right.getRank() ||
+        left.getElementType() != right.getElementType()) return false;
+    for (int64_t axis = 0; axis < left.getRank(); ++axis) {
+      if (!left.isDynamicDim(axis) && !right.isDynamicDim(axis) &&
+          left.getDimSize(axis) == right.getDimSize(axis)) continue;
+      if (!cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(first, axis),
+                                ValueBoundsConstraintSet::Variable(second, axis))) return false;
+    }
+    return true;
+  }
+
+  Value fullLocalOwner(Value memory) {
+    Value root = storage->uniqueOrigin(memory);
+    if (!root || !isLocal(root)) return {};
+    if (!sameStorageShape(memory, root)) return {};
+    llvm::SmallDenseSet<Value> visited;
+    std::function<bool(Value)> complete = [&](Value value) {
+      if (value == root || !visited.insert(value).second) return true;
+      if (auto cast = value.getDefiningOp<memref::CastOp>())
+        return complete(cast.getSource());
+      if (auto view = value.getDefiningOp<memref::SubViewOp>()) {
+        if (view.getDroppedDims().any()) return false;
+        for (auto [axis, size] : llvm::enumerate(view.getMixedSizes()))
+          if (!sameBound(view.getMixedOffsets()[axis], b.getIndexAttr(0)) ||
+              !sameBound(view.getMixedStrides()[axis], b.getIndexAttr(1)) ||
+              !cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(size),
+                  ValueBoundsConstraintSet::Variable(view.getSource(), axis)))
+            return false;
+        return complete(view.getSource());
+      }
+      auto incoming = intent::queryControlFlowIncoming(value);
+      return incoming.complete && !incoming.edges.empty() &&
+          llvm::all_of(incoming.edges, [&](const intent::ControlFlowEdge &edge) {
+            return edge.operand && complete(edge.operand->get());
+          });
+    };
+    return complete(memory) ? root : Value{};
   }
   bool isLocal(Value memory) {
     Value root = localRoot(memory);
+    if (controlOwners.contains(root)) return true;
     Operation *owner = root ? root.getDefiningOp() : nullptr;
     return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) &&
            currentTask->isProperAncestor(owner);
@@ -543,6 +607,15 @@ private:
   FailureOr<Value> dimension(Value memory, unsigned axis) {
     auto type = cast<MemRefType>(memory.getType());
     if (!type.isDynamicDim(axis)) return index(memory.getLoc(), type.getDimSize(axis));
+    if (auto found = localReferences.find(memory); found != localReferences.end())
+      return dimension(found->second, axis);
+    if (controlOwners.contains(memory)) {
+      auto found = locals.find(memory);
+      if (found == locals.end()) return emitError(memory.getLoc(), "private control value has no dominating supply"), failure();
+      OpFoldResult size = found->second.sizes[axis];
+      return isa<Attribute>(size) ? index(memory.getLoc(), cast<IntegerAttr>(cast<Attribute>(size)).getInt())
+                                  : cast<Value>(size);
+    }
     if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimension(cast.getSource(), axis);
     if (isAxisView(memory.getDefiningOp())) {
       auto projection = queryAxisView(memory);
@@ -596,11 +669,26 @@ private:
       emitError(memory.getLoc(), "Weft local value is read before a dominating complete supply");
       return failure();
     }
-    if (memory == root) {
+    if (!isa<wk::ValueType>(found->second.value.getType()) &&
+        cast<MemRefType>(root.getType()).getRank() != 0) {
+      // A complete uniform definition needs only its scalar until a consumer
+      // selects a domain. In particular, a panel read never creates the full
+      // allocation's register value just to extract that panel again.
+      auto type = resultType(memory);
+      if (failed(type)) return failure();
+      auto supplied = alignValue(found->second.value, *type, memory.getLoc());
+      if (failed(supplied)) return failure();
+      auto &mapping = viewAxes[memory];
+      mapping.clear();
+      for (int64_t axis = 0; axis < cast<MemRefType>(memory.getType()).getRank(); ++axis)
+        mapping.push_back(axis);
+      return supplied;
+    }
+    if (memory == root || localReferences.lookup(memory) == root) {
       auto type = cast<MemRefType>(root.getType());
       unsigned dynamic = 0;
       for (auto [axis, extent] : llvm::enumerate(type.getShape())) {
-        OpFoldResult full = ShapedType::isDynamic(extent)
+        OpFoldResult full = controlOwners.contains(root) ? found->second.sizes[axis] : ShapedType::isDynamic(extent)
             ? OpFoldResult(root.getDefiningOp()->getOperand(dynamic++))
             : OpFoldResult(b.getIndexAttr(extent));
         if (!sameBound(found->second.sizes[axis], full))
@@ -620,7 +708,7 @@ private:
     auto projection = localProjection(memory, found->second);
     if (failed(projection)) return failure();
     Value selected = b.create<wk::ExtractOp>(memory.getLoc(), projection->type, found->second.value,
-                                            projection->indices, b.getArrayAttr(projection->selectors));
+                                            projectionIndices(*projection, memory.getLoc()), b.getArrayAttr(projection->selectors));
     return selected;
   }
 
@@ -675,9 +763,28 @@ private:
 
   struct LocalProjection {
     Type type;
-    SmallVector<Value> indices;
+    SmallVector<Value> offsets;
     SmallVector<Attribute> selectors;
   };
+
+  SmallVector<Value> projectionIndices(const LocalProjection &projection, Location loc) {
+    SmallVector<Value> result;
+    auto dimensions = shape(projection.type), ids = axes(projection.type);
+    unsigned retained = 0;
+    for (auto [selector, offset] : llvm::zip_equal(projection.selectors, projection.offsets)) {
+      StringRef kind = cast<StringAttr>(selector).getValue();
+      if (kind == "index") { result.push_back(offset); continue; }
+      if (kind == "gather") {
+        Type unsignedIndex = IntegerType::get(b.getContext(), 64, IntegerType::Unsigned);
+        auto type = cast<wk::ValueType>(valueType(unsignedIndex, {dimensions[retained]}, {ids[retained]}));
+        Value lane = b.create<wk::IotaOp>(loc, type, 0, dimensions[retained]);
+        Value base = b.create<wk::CastOp>(loc, unsignedIndex, offset);
+        result.push_back(b.create<wk::BinaryOp>(loc, type, lane, base, "add"));
+      }
+      ++retained;
+    }
+    return result;
+  }
 
   FailureOr<LocalProjection> localProjection(Value memory, const LocalValue &state) {
     Value root = localRoot(memory);
@@ -690,7 +797,8 @@ private:
     for (unsigned axis = 0; axis < rootType.getRank(); ++axis) kept.push_back(axis);
     SmallVector<Value> chain;
     for (Value current = memory; current != root;) {
-      if (auto cast = current.getDefiningOp<memref::CastOp>()) current = cast.getSource();
+      if (auto found = localReferences.find(current); found != localReferences.end()) current = found->second;
+      else if (auto cast = current.getDefiningOp<memref::CastOp>()) current = cast.getSource();
       else if (auto view = current.getDefiningOp<memref::SubViewOp>()) { chain.push_back(current); current = view.getSource(); }
       else if (current.getDefiningOp() && isAxisView(current.getDefiningOp())) {
         auto projection = queryAxisView(current);
@@ -739,8 +847,9 @@ private:
       auto found = llvm::find(rootAxes, axis);
       if (found == rootAxes.end()) return emitError(memory.getLoc(), "private state axis lost its destination relation"), failure();
       unsigned original = found - rootAxes.begin();
+      result.offsets.push_back(origins[original]);
       if (!llvm::is_contained(kept, original)) {
-        result.selectors.push_back(b.getStringAttr("index")); result.indices.push_back(origins[original]);
+        result.selectors.push_back(b.getStringAttr("index"));
         continue;
       }
       selectedRoots.push_back(original);
@@ -754,12 +863,7 @@ private:
       else { llvm::APInt constant; if (matchPattern(cast<Value>(sizes[original]), m_ConstantInt(&constant))) size = constant.getSExtValue(); }
       if (!size || *size <= 0)
         return emitError(memory.getLoc(), "private window extent must be statically bounded by the selected implementation"), failure();
-      Type unsignedIndex = IntegerType::get(b.getContext(), 64, IntegerType::Unsigned);
-      auto laneType = cast<wk::ValueType>(valueType(unsignedIndex, {*size}, {axis}));
-      Value lane = b.create<wk::IotaOp>(memory.getLoc(), laneType, 0, *size);
-      Value base = b.create<wk::CastOp>(memory.getLoc(), unsignedIndex, origins[original]);
-      Value coordinate = b.create<wk::BinaryOp>(memory.getLoc(), laneType, lane, base, "add");
-      result.selectors.push_back(b.getStringAttr("gather")); result.indices.push_back(coordinate);
+      result.selectors.push_back(b.getStringAttr("gather"));
       dimensions.push_back(*size); ids.push_back(axis);
     }
     result.type = valueType(element(state.value.getType()), dimensions, ids);
@@ -810,7 +914,61 @@ private:
     return failure();
   }
 
+  LogicalResult materializeLocal(Value root) {
+    auto found = locals.find(root);
+    if (found == locals.end() || isa<wk::ValueType>(found->second.value.getType()) ||
+        cast<MemRefType>(root.getType()).getRank() == 0) return success();
+    auto type = resultType(root);
+    if (failed(type)) return failure();
+    auto supplied = alignValue(found->second.value, *type, root.getLoc());
+    if (failed(supplied)) return failure();
+    found->second.value = *supplied;
+    return success();
+  }
+
+  Value fillLocal(Value owner, Value scalar, Location loc,
+                  const LocalProjection *projection = nullptr) {
+    if (!isa<wk::ValueType>(owner.getType())) return scalar;
+    auto dimensions = shape(projection ? projection->type : owner.getType());
+    SmallVector<Value> coordinates;
+    SmallVector<Attribute> selectors(shape(owner.getType()).size(), b.getStringAttr("index"));
+    std::function<Value(unsigned, Value)> fill = [&](unsigned axis, Value current) -> Value {
+      if (axis == dimensions.size()) {
+        SmallVector<Value> selected;
+        if (projection) {
+          unsigned coordinate = 0;
+          for (auto [selector, offset] : llvm::zip_equal(projection->selectors, projection->offsets)) {
+            StringRef kind = cast<StringAttr>(selector).getValue();
+            if (kind == "index") selected.push_back(offset);
+            else selected.push_back(b.create<wk::BinaryOp>(loc, b.getIndexType(), offset,
+                                                           coordinates[coordinate++], "add"));
+          }
+        } else selected = coordinates;
+        for (Value &coordinate : selected)
+          if (!coordinate.getType().isIndex())
+            coordinate = b.create<wk::CastOp>(loc, b.getIndexType(), coordinate);
+        return b.create<wk::UpdateOp>(loc, current.getType(), current, scalar,
+                                     selected, b.getArrayAttr(selectors));
+      }
+      Value end = dimensions[axis] < 0 ? shapeValues[-dimensions[axis] - 1]
+                                       : index(loc, dimensions[axis]);
+      auto loop = b.create<scf::ForOp>(loc, index(loc, 0), end, index(loc, 1), ValueRange{current});
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(loop.getBody());
+        coordinates.push_back(loop.getInductionVar());
+        Value updated = fill(axis + 1, loop.getRegionIterArgs().front());
+        coordinates.pop_back();
+        b.create<scf::YieldOp>(loc, ValueRange{updated});
+      }
+      return loop.getResult(0);
+    };
+    return fill(0, owner);
+  }
+
   LogicalResult write(Value memory, Value value, SmallVector<OpFoldResult> sizes = {}) {
+    if (auto found = localReferences.find(memory); found != localReferences.end())
+      return write(found->second, value, std::move(sizes));
     if (!isLocal(memory)) {
       auto region = view(memory);
       if (failed(region)) return failure();
@@ -866,8 +1024,15 @@ private:
       auto projection = memory.getDefiningOp<memref::SubViewOp>();
       auto found = locals.find(root);
       if (found != locals.end()) {
+        if (failed(materializeLocal(root))) return failure();
         auto projected = localProjection(memory, found->second);
         if (failed(projected)) return failure();
+        if (!isa<wk::ValueType>(value.getType())) {
+          auto scalar = alignValue(value, element(projected->type), memory.getLoc());
+          if (failed(scalar)) return failure();
+          found->second.value = fillLocal(found->second.value, *scalar, memory.getLoc(), &*projected);
+          return success();
+        }
         auto logicalType = resultType(memory);
         if (failed(logicalType)) return failure();
         auto logical = alignValue(value, *logicalType, memory.getLoc());
@@ -875,7 +1040,7 @@ private:
         auto aligned = projectViewValue(memory, *logical, projected->type, true);
         if (failed(aligned)) return failure();
         found->second.value = b.create<wk::UpdateOp>(memory.getLoc(), found->second.value.getType(),
-            found->second.value, *aligned, projected->indices, b.getArrayAttr(projected->selectors));
+            found->second.value, *aligned, projectionIndices(*projected, memory.getLoc()), b.getArrayAttr(projected->selectors));
         return success();
       }
       if (isAxisView(memory.getDefiningOp())) {
@@ -897,6 +1062,11 @@ private:
       sizes = projection.getMixedSizes();
     }
     if (sizes.empty()) {
+      if (controlOwners.contains(root)) {
+        auto found = locals.find(root);
+        if (found == locals.end()) return emitError(memory.getLoc(), "private control write has no incoming value");
+        sizes = found->second.sizes;
+      } else {
       auto type = cast<MemRefType>(root.getType());
       Operation *allocation = root.getDefiningOp();
       unsigned dynamic = 0;
@@ -904,21 +1074,34 @@ private:
         if (ShapedType::isDynamic(extent)) sizes.push_back(allocation->getOperand(dynamic++));
         else sizes.push_back(b.getIndexAttr(extent));
       }
+      }
     }
     auto type = resultType(memory);
     if (failed(type)) return failure();
+    auto current = locals.find(root);
+    if (memory == root && !isa<wk::ValueType>(value.getType())) {
+      Type scalar = element(*type);
+      auto aligned = alignValue(value, scalar, memory.getLoc());
+      if (failed(aligned)) return failure();
+      if (current != locals.end() && isa<wk::ValueType>(current->second.value.getType()))
+        current->second.value = fillLocal(current->second.value, *aligned, memory.getLoc());
+      else locals[root] = {*aligned, sizes};
+      return success();
+    }
     auto aligned = alignValue(value, *type, memory.getLoc());
     if (failed(aligned)) return failure();
-    auto current = locals.find(root);
     if (current != locals.end() && isa<wk::ValueType>(*type)) {
-      if (current->second.value.getType() != *type || current->second.sizes.size() != sizes.size() ||
+      if ((isa<wk::ValueType>(current->second.value.getType()) &&
+           current->second.value.getType() != *type) || current->second.sizes.size() != sizes.size() ||
           !llvm::all_of(llvm::zip(current->second.sizes, sizes), [&](auto bounds) {
             return sameBound(std::get<0>(bounds), std::get<1>(bounds));
           }))
         return emitError(memory.getLoc(), "complete private write must preserve its initialized owner and extents");
-      current->second.value = b.create<wk::UpdateOp>(memory.getLoc(), *type,
-          current->second.value, *aligned, ValueRange{},
-          b.getArrayAttr(SmallVector<Attribute>(shape(*type).size(), b.getStringAttr("all"))));
+      if (isa<wk::ValueType>(current->second.value.getType()))
+        current->second.value = b.create<wk::UpdateOp>(memory.getLoc(), *type,
+            current->second.value, *aligned, ValueRange{},
+            b.getArrayAttr(SmallVector<Attribute>(shape(*type).size(), b.getStringAttr("all"))));
+      else current->second.value = *aligned;
       return success();
     }
     locals[root] = {*aligned, sizes};
@@ -1240,6 +1423,15 @@ private:
       Value memory = entry.effect.getValue();
       if (!memory)
         return scope->emitError("Weft control write has no storage target"), failure();
+      Value owner = localRoot(memory);
+      if (owner && isLocal(owner)) {
+        Operation *definition = owner.getDefiningOp();
+        if (auto argument = dyn_cast<BlockArgument>(owner))
+          definition = argument.getOwner()->getParentOp();
+        if (definition != scope && !scope->isProperAncestor(definition) &&
+            !llvm::is_contained(result, owner)) result.push_back(owner);
+        continue;
+      }
       auto origins = storage->origins(memory);
       if (!origins.complete)
         return scope->emitError("Weft control write has unresolved storage origins"), failure();
@@ -1251,6 +1443,8 @@ private:
   }
 
   LogicalResult checkCarry(Value root, const LocalValue &before, Operation *scope) {
+    if (isa<wk::ValueType>(before.value.getType()) && failed(materializeLocal(root)))
+      return failure();
     auto found = locals.find(root);
     if (found == locals.end() || found->second.value.getType() != before.value.getType() ||
         found->second.sizes.size() != before.sizes.size() ||
@@ -1258,6 +1452,320 @@ private:
           return sameBound(std::get<0>(bounds), std::get<1>(bounds));
         }))
       return scope->emitError("Weft control carry must preserve its complete initialized region and type");
+    return success();
+  }
+
+  LogicalResult bindLocalReference(Value memory, Operation *scope) {
+    Value root = fullLocalOwner(memory);
+    if (!root)
+      return scope->emitError("Weft task control requires a complete private storage owner; dynamic external descriptors belong to host control");
+    if (memory != root) localReferences[memory] = root;
+    return success();
+  }
+
+  bool immutableBorrow(Value memory) {
+    auto view = storage->externalView(memory);
+    if (!view || view.getAccess() != 0) return false;
+    auto effects = storage->effects(currentTask);
+    if (!effects.complete || effects.ordered) return false;
+    for (const cpu::StorageEffect &entry : effects.entries) {
+      Value affected = entry.effect.getValue();
+      if (isa<MemoryEffects::Write>(entry.effect.getEffect()) &&
+          (!affected || !storage->disjoint(affected, memory))) return false;
+      // Native ownership has already proved that a mixed-origin conditional
+      // release never frees its borrowed alternative. A direct release of the
+      // borrowed storage does not have that ownership distinction.
+      if (isa<MemoryEffects::Free>(entry.effect.getEffect()) &&
+          (!affected || storage->uniqueOrigin(affected) == memory)) return false;
+    }
+    return true;
+  }
+
+  bool completePrivateValue(Value memory) {
+    auto origins = storage->origins(memory);
+    if (!origins.complete || origins.values.empty()) return false;
+    for (Value origin : origins.values) {
+      if (immutableBorrow(origin)) continue;
+      Operation *allocation = origin.getDefiningOp();
+      if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(allocation) ||
+          !currentTask->isProperAncestor(allocation)) return false;
+    }
+    llvm::SmallDenseSet<Value> visited;
+    std::function<bool(Value)> complete = [&](Value value) {
+      if (!visited.insert(value).second) return true;
+      auto sources = storage->origins(value);
+      // The actual descriptor is admitted at its original projection; a
+      // borrowed tile need not cover the public allocation's complete shape.
+      if (sources.complete && !sources.values.empty() &&
+          llvm::all_of(sources.values, [&](Value origin) { return immutableBorrow(origin); }))
+        return true;
+      if (!sameStorageShape(memory, value)) return false;
+      if (llvm::is_contained(origins.values, value)) return true;
+      if (auto cast = value.getDefiningOp<memref::CastOp>())
+        return complete(cast.getSource());
+      if (auto view = value.getDefiningOp<memref::SubViewOp>()) {
+        if (view.getDroppedDims().any()) return false;
+        for (auto [axis, size] : llvm::enumerate(view.getMixedSizes()))
+          if (!sameBound(view.getMixedOffsets()[axis], b.getIndexAttr(0)) ||
+              !sameBound(view.getMixedStrides()[axis], b.getIndexAttr(1)) ||
+              !cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(size),
+                  ValueBoundsConstraintSet::Variable(view.getSource(), axis))) return false;
+        return complete(view.getSource());
+      }
+      auto incoming = intent::queryControlFlowIncoming(value);
+      return incoming.complete && !incoming.edges.empty() &&
+          llvm::all_of(incoming.edges, [&](const intent::ControlFlowEdge &edge) {
+            return edge.operand && complete(edge.operand->get());
+          });
+    };
+    return complete(memory);
+  }
+
+  LogicalResult isolateControlValue(Value memory, Operation *scope,
+                                   ValueRange boundaries) {
+    if (!completePrivateValue(memory))
+      return scope->emitError("Weft task control requires complete private values; external runtime descriptors require host control");
+    auto origins = storage->origins(memory);
+    llvm::SmallDenseSet<Value> incomingAliases, outgoingAliases;
+    for (Value boundary : boundaries) {
+      if (!isa<MemRefType>(boundary.getType())) continue;
+      auto aliases = storage->aliases(boundary);
+      if (!aliases.complete)
+        return scope->emitError("private control value has an unresolved storage escape");
+      auto &allowed = isa<BlockArgument>(boundary) ? incomingAliases : outgoingAliases;
+      allowed.insert(aliases.values.begin(), aliases.values.end());
+    }
+    auto taskEffects = storage->effects(currentTask);
+    auto writesAliases = [&](const auto &aliases) {
+      return llvm::any_of(taskEffects.entries, [&](const cpu::StorageEffect &entry) {
+        return isa<MemoryEffects::Write>(entry.effect.getEffect()) &&
+            (!entry.effect.getValue() || aliases.contains(entry.effect.getValue()));
+      });
+    };
+    bool boundaryWrites = writesAliases(incomingAliases) || writesAliases(outgoingAliases);
+    for (Value origin : origins.values) {
+      auto aliases = storage->aliases(origin);
+      if (!aliases.complete)
+        return scope->emitError("private control storage has an unresolved alias or escape");
+      Operation *definition = origin.getDefiningOp();
+      bool createdInside = definition && scope->isProperAncestor(definition);
+      bool mutatesIncoming = llvm::any_of(storage->effects(scope).entries,
+          [&](const cpu::StorageEffect &entry) {
+            if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) return false;
+            Value target = entry.effect.getValue();
+            if (!target) return true;
+            if (incomingAliases.contains(target)) return true;
+            return !createdInside && llvm::is_contained(storage->origins(target).values, origin);
+          });
+      for (Value alias : aliases.values)
+        for (Operation *user : alias.getUsers()) {
+          if (!currentTask->isProperAncestor(user)) continue;
+          if (user == scope || isa<RegionBranchOpInterface,
+                  RegionBranchTerminatorOpInterface>(user) ||
+              cpu::isStorageAliasOperation(user)) continue;
+          auto effects = storage->effects(user);
+          if (!effects.complete || effects.ordered)
+            return scope->emitError("private control storage has an ordered or unknown observer");
+          bool observes = llvm::any_of(effects.entries, [&](const cpu::StorageEffect &entry) {
+            return (!entry.effect.getValue() || entry.effect.getValue() == alias) &&
+                isa<MemoryEffects::Read, MemoryEffects::Write>(entry.effect.getEffect());
+          });
+          if (!observes) continue;
+          if (scope->isProperAncestor(user)) {
+            if (!isa<scf::IfOp>(scope) && !createdInside &&
+                !incomingAliases.contains(alias) && mutatesIncoming)
+              return scope->emitError("private control value has a separately observable incoming alias");
+          } else {
+            Operation *position = scope->getBlock()->findAncestorOpInBlock(*user);
+            if (position && position->isBeforeInBlock(scope)) continue;
+            bool writes = llvm::any_of(effects.entries, [&](const cpu::StorageEffect &entry) {
+              return (!entry.effect.getValue() || entry.effect.getValue() == alias) &&
+                  isa<MemoryEffects::Write>(entry.effect.getEffect());
+            });
+            if (!outgoingAliases.contains(alias) && (writes || boundaryWrites))
+              return scope->emitError("private control value retains a separately observable outgoing alias");
+          }
+        }
+    }
+    // Distinct live descriptors cannot become independent value states when
+    // writes through one may be observed through another descriptor.
+    for (Value other : boundaries) {
+      if (other == memory || !isa<MemRefType>(other.getType())) continue;
+      auto argument = dyn_cast<BlockArgument>(memory);
+      auto otherArgument = dyn_cast<BlockArgument>(other);
+      bool simultaneous = argument && otherArgument
+          ? argument.getOwner() == otherArgument.getOwner()
+          : !argument && !otherArgument;
+      if (!simultaneous || storage->disjoint(memory, other)) continue;
+      llvm::SmallDenseSet<Value> sharedAliases;
+      for (Value value : {memory, other}) {
+        auto aliases = storage->aliases(value);
+        sharedAliases.insert(aliases.values.begin(), aliases.values.end());
+      }
+      if (writesAliases(sharedAliases))
+        return scope->emitError("private control values share an observable mutable storage identity");
+    }
+    return success();
+  }
+
+  LogicalResult prepareControlValues(Operation *scope, ValueRange boundaries) {
+    for (Value value : boundaries) {
+      if (!isa<MemRefType>(value.getType())) continue;
+      Value owner = fullLocalOwner(value);
+      if (owner && !scope->isProperAncestor(owner.getDefiningOp())) {
+        if (failed(bindLocalReference(value, scope))) return failure();
+      } else {
+        if (failed(isolateControlValue(value, scope, boundaries))) return failure();
+        controlOwners.insert(value);
+      }
+    }
+    return success();
+  }
+
+  FailureOr<SmallVector<Type>> controlTypes(ValueRange boundaries) {
+    SmallVector<Type> result;
+    for (Value value : boundaries) {
+      if (!isa<MemRefType>(value.getType())) result.push_back(scalarType(value.getType()));
+      else if (controlOwners.contains(value)) {
+        auto type = resultType(value);
+        if (failed(type)) return failure();
+        result.push_back(*type);
+      }
+    }
+    return result;
+  }
+
+  Value controlOwner(Type type, Location loc, Value initial = {}) {
+    Type scalar = element(type);
+    Value zero;
+    if (auto floating = dyn_cast<FloatType>(scalar))
+      zero = b.create<arith::ConstantOp>(loc, b.getFloatAttr(floating, 0.0));
+    else zero = b.create<wk::ConstantOp>(loc, scalar, b.getIntegerAttr(scalar, 0));
+    Value owner = b.create<wk::NewOp>(loc, type, zero, true);
+    if (initial)
+      owner = b.create<wk::UpdateOp>(loc, type, owner, initial, ValueRange{},
+          b.getArrayAttr(SmallVector<Attribute>(shape(type).size(), b.getStringAttr("all"))));
+    return owner;
+  }
+
+  Value nativeOwner(Value value) {
+    while (auto update = value.getDefiningOp<wk::UpdateOp>()) value = update.getInput();
+    return value.getDefiningOp<wk::NewOp>() || value.getDefiningOp<wk::MaterializeOp>()
+        ? value : Value{};
+  }
+
+  bool canReuseControlOwner(Value input, Value boundary, Operation *scope) {
+    Value root = fullLocalOwner(input);
+    if (!root || !locals.count(root)) return false;
+    auto aliases = storage->aliases(root), forwarded = storage->aliases(boundary);
+    if (!aliases.complete || !forwarded.complete) return false;
+    llvm::SmallDenseSet<Value> transferred(forwarded.values.begin(), forwarded.values.end());
+    for (Value alias : aliases.values) {
+      if (transferred.contains(alias)) continue;
+      for (Operation *user : alias.getUsers()) {
+        if (user == scope || cpu::isStorageAliasOperation(user) ||
+            isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface>(user)) continue;
+        auto effects = storage->effects(user);
+        if (!effects.complete || effects.ordered) return false;
+        bool observes = llvm::any_of(effects.entries, [&](const cpu::StorageEffect &entry) {
+          return (!entry.effect.getValue() || entry.effect.getValue() == alias) &&
+              isa<MemoryEffects::Read, MemoryEffects::Write>(entry.effect.getEffect());
+        });
+        if (!observes) continue;
+        Operation *position = scope->getBlock()->findAncestorOpInBlock(*user);
+        if (!position || position == scope || !position->isBeforeInBlock(scope)) return false;
+      }
+    }
+    return true;
+  }
+
+  void ownControlInputs(SmallVectorImpl<Value> &initial, ValueRange inputs,
+                        ValueRange boundaries, Operation *scope) {
+    llvm::SmallDenseSet<Value> reused;
+    unsigned position = 0;
+    for (auto [input, boundary] : llvm::zip_equal(inputs, boundaries)) {
+      if (isa<MemRefType>(boundary.getType()) && !controlOwners.contains(boundary)) continue;
+      Value &value = initial[position++];
+      if (!isa<MemRefType>(boundary.getType()) || !isa<wk::ValueType>(value.getType())) continue;
+      Value owner = nativeOwner(value);
+      if (!owner || reused.contains(owner) || !canReuseControlOwner(input, boundary, scope))
+        value = controlOwner(value.getType(), scope->getLoc(), value);
+      else reused.insert(owner);
+    }
+  }
+
+  FailureOr<Value> alignControlValue(Value value, Type target, Location loc) {
+    if (value.getType() == target) return value;
+    if (isa<wk::ValueType>(value.getType()) && isa<wk::ValueType>(target) &&
+        element(value.getType()) == element(target) && shape(value.getType()) == shape(target))
+      return Value(b.create<wk::ReshapeOp>(loc, target, value, array(axes(value.getType()))));
+    return alignValue(value, target, loc);
+  }
+
+  FailureOr<SmallVector<Value>> controlValues(ValueRange inputs, ValueRange boundaries,
+                                             ValueRange owners = {}) {
+    SmallVector<Value> result;
+    for (auto [input, boundary] : llvm::zip_equal(inputs, boundaries)) {
+      if (!isa<MemRefType>(input.getType())) result.push_back(values.lookup(input));
+      else if (controlOwners.contains(boundary)) {
+        if (Value owner = fullLocalOwner(input); owner && !locals.count(owner))
+          if (failed(bindLocalReference(input, boundary.getParentBlock()->getParentOp())))
+            return failure();
+        auto supplied = read(input);
+        auto type = resultType(boundary);
+        if (failed(supplied) || failed(type)) return failure();
+        if (!owners.empty() && owners[result.size()]) *type = owners[result.size()].getType();
+        auto aligned = alignControlValue(*supplied, *type, input.getLoc());
+        if (failed(aligned)) return failure();
+        result.push_back(*aligned);
+      }
+    }
+    if (!owners.empty()) {
+      auto exactOwner = [&](Value value, Value owner) {
+        while (auto update = value.getDefiningOp<wk::UpdateOp>()) value = update.getInput();
+        return value == owner;
+      };
+      auto referencesOwner = [&](Value value) {
+        while (true) {
+          if (llvm::is_contained(owners, value)) return true;
+          if (auto update = value.getDefiningOp<wk::UpdateOp>()) value = update.getInput();
+          else if (auto extract = value.getDefiningOp<wk::ExtractOp>()) value = extract.getInput();
+          else if (auto reshape = value.getDefiningOp<wk::ReshapeOp>()) value = reshape.getInput();
+          else return false;
+        }
+      };
+      // Region exits are parallel assignments. Preserve every incoming owner
+      // used by another output before any update changes its physical contents.
+      for (auto [value, owner] : llvm::zip_equal(result, owners))
+        if (owner && isa<wk::ValueType>(value.getType()) &&
+            !exactOwner(value, owner) && referencesOwner(value))
+          value = controlOwner(value.getType(), value.getLoc(), value);
+      for (auto [value, owner] : llvm::zip_equal(result, owners))
+        if (owner && isa<wk::ValueType>(value.getType()) && !exactOwner(value, owner))
+          value = b.create<wk::UpdateOp>(value.getLoc(), value.getType(), owner, value, ValueRange{},
+              b.getArrayAttr(SmallVector<Attribute>(shape(value.getType()).size(), b.getStringAttr("all"))));
+    }
+    return result;
+  }
+
+  LogicalResult mapControlValues(ValueRange source, ValueRange target) {
+    unsigned position = 0;
+    for (Value value : source) {
+      if (!isa<MemRefType>(value.getType())) values.map(value, target[position++]);
+      else if (controlOwners.contains(value)) {
+        Value supplied = target[position++];
+        auto type = resultType(value);
+        if (failed(type)) return failure();
+        auto aligned = alignControlValue(supplied, *type, value.getLoc());
+        if (failed(aligned)) return failure();
+        supplied = *aligned;
+        SmallVector<OpFoldResult> sizes;
+        for (int64_t extent : shape(supplied.getType()))
+          sizes.push_back(extent < 0 ? OpFoldResult(shapeValues[-extent - 1])
+                                     : OpFoldResult(b.getIndexAttr(extent)));
+        locals[value] = {supplied, std::move(sizes)};
+      }
+    }
     return success();
   }
 
@@ -1306,11 +1814,9 @@ private:
         *value = b.create<wk::ReshapeOp>(loc, *target, *value, array(axes((*value).getType())));
       if (isLocal(copy.getTarget())) {
         Value root = localRoot(copy.getTarget());
-        auto current = locals.find(root);
-        if (root == copy.getTarget() && current != locals.end() && isa<wk::ValueType>(*target)) {
-          current->second.value = b.create<wk::UpdateOp>(loc, *target, current->second.value,
-              *value, ValueRange{}, b.getArrayAttr(SmallVector<Attribute>(shape(*target).size(), b.getStringAttr("all"))));
-          return success();
+        if (root == copy.getTarget() && locals.count(root)) {
+          if (failed(materializeLocal(root))) return failure();
+          return write(copy.getTarget(), *value);
         }
         *value = b.create<wk::MaterializeOp>(loc, (*value).getType(), *value);
       }
@@ -1324,8 +1830,7 @@ private:
         if (failed(type)) return failure();
         if (initial.getType().isIndex() && element(*type).isSignedInteger(64))
           initial = b.create<wk::CastOp>(loc, element(*type), initial);
-        Value result = b.create<wk::NewOp>(loc, *type, initial, true);
-        return write(destination, result);
+        return write(destination, initial);
       }
       auto region = view(destination);
       if (failed(region)) return failure();
@@ -1394,12 +1899,20 @@ private:
     if (auto genericOp = dyn_cast<linalg::GenericOp>(operation)) return generic(genericOp);
     if (auto reduce = dyn_cast<cpu::ReduceOp>(operation)) return reduction(reduce);
     if (auto conditional = dyn_cast<scf::IfOp>(operation)) {
+      if (failed(prepareControlValues(conditional, conditional.getResults()))) return failure();
       auto written = writtenEnclosingLocals(conditional);
       if (failed(written)) return failure();
       auto &roots = *written;
+      for (Value root : roots)
+        if (failed(materializeLocal(root))) return failure();
       auto savedLocals = locals;
-      SmallVector<Type> types;
-      for (Type type : conditional.getResultTypes()) types.push_back(scalarType(type));
+      auto nativeTypes = controlTypes(conditional.getResults());
+      if (failed(nativeTypes)) return failure();
+      auto types = *nativeTypes;
+      unsigned explicitResults = types.size();
+      SmallVector<Value> owners;
+      for (Type type : types)
+        owners.push_back(isa<wk::ValueType>(type) ? controlOwner(type, loc) : Value{});
       for (Value root : roots) {
         auto found = savedLocals.find(root);
         if (found == savedLocals.end()) {
@@ -1418,44 +1931,59 @@ private:
         b.setInsertionPointToStart(destination);
         Block *source = then ? conditional.thenBlock() : conditional.getElseRegion().empty() ? nullptr : conditional.elseBlock();
         if (source && failed(block(*source))) return failure();
-        SmallVector<Value> results;
-        if (source)
-          for (Value value : source->getTerminator()->getOperands()) results.push_back(values.lookup(value));
+        auto supplied = source
+            ? controlValues(source->getTerminator()->getOperands(), conditional.getResults(), owners)
+            : FailureOr<SmallVector<Value>>(SmallVector<Value>{});
+        if (failed(supplied)) return failure();
+        auto results = *supplied;
         for (Value root : roots) {
           if (!locals.count(root)) return conditional.emitError("conditional local result is not initialized on every branch");
+          if (failed(materializeLocal(root))) return failure();
           if (savedLocals.count(root) && failed(checkCarry(root, savedLocals.lookup(root), conditional))) return failure();
           results.push_back(locals.lookup(root).value);
         }
         if (!types.empty()) b.create<scf::YieldOp>(loc, results);
       }
       locals = savedLocals;
-      for (auto [source, destination] : llvm::zip(conditional.getResults(), target.getResults().take_front(conditional.getNumResults()))) values.map(source, destination);
-      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(conditional.getNumResults())))
+      if (failed(mapControlValues(conditional.getResults(), target.getResults().take_front(explicitResults)))) return failure();
+      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(explicitResults)))
         if (locals.count(root)) locals[root].value = value;
         else if (failed(write(root, value))) return failure();
       return success();
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-      SmallVector<Value> initial;
-      for (Value value : loop.getInitArgs()) initial.push_back(values.lookup(value));
-      auto savedLocals = locals;
+      SmallVector<Value> boundaries(loop.getRegionIterArgs());
+      llvm::append_range(boundaries, loop.getResults());
+      if (failed(prepareControlValues(loop, boundaries))) return failure();
+      auto supplied = controlValues(loop.getInitArgs(), loop.getRegionIterArgs());
+      if (failed(supplied)) return failure();
+      auto initial = *supplied;
+      ownControlInputs(initial, loop.getInitArgs(), loop.getRegionIterArgs(), loop);
+      unsigned explicitResults = initial.size();
       SmallVector<Value> roots;
       auto written = writtenEnclosingLocals(loop);
       if (failed(written)) return failure();
-      for (Value root : *written)
-        if (locals.count(root)) { roots.push_back(root); initial.push_back(locals.lookup(root).value); }
+      for (Value root : *written) {
+        if (!locals.count(root)) continue;
+        if (failed(materializeLocal(root))) return failure();
+        roots.push_back(root);
+        initial.push_back(locals.lookup(root).value);
+      }
+      auto savedLocals = locals;
       auto target = b.create<scf::ForOp>(loc, values.lookup(loop.getLowerBound()),
           values.lookup(loop.getUpperBound()), values.lookup(loop.getStep()), initial);
       {
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToStart(target.getBody());
         values.map(loop.getInductionVar(), target.getInductionVar());
-        for (auto [source, destination] : llvm::zip(loop.getRegionIterArgs(), target.getRegionIterArgs().take_front(loop.getNumRegionIterArgs()))) values.map(source, destination);
-        for (auto [root, value] : llvm::zip(roots, target.getRegionIterArgs().drop_front(loop.getNumRegionIterArgs())))
+        if (failed(mapControlValues(loop.getRegionIterArgs(), target.getRegionIterArgs().take_front(explicitResults)))) return failure();
+        for (auto [root, value] : llvm::zip(roots, target.getRegionIterArgs().drop_front(explicitResults)))
           locals[root].value = value;
         if (failed(block(*loop.getBody()))) return failure();
-        SmallVector<Value> results;
-        for (Value value : loop.getBody()->getTerminator()->getOperands()) results.push_back(values.lookup(value));
+        auto supplied = controlValues(loop.getBody()->getTerminator()->getOperands(), loop.getRegionIterArgs(),
+            target.getRegionIterArgs().take_front(explicitResults));
+        if (failed(supplied)) return failure();
+        auto results = *supplied;
         for (Value root : roots) {
           if (failed(checkCarry(root, savedLocals.lookup(root), loop))) return failure();
           results.push_back(locals.lookup(root).value);
@@ -1463,8 +1991,87 @@ private:
         if (!initial.empty()) b.create<scf::YieldOp>(loc, results);
       }
       locals = std::move(savedLocals);
-      for (auto [source, destination] : llvm::zip(loop.getResults(), target.getResults().take_front(loop.getNumResults()))) values.map(source, destination);
-      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(loop.getNumResults())))
+      if (failed(mapControlValues(loop.getResults(), target.getResults().take_front(explicitResults)))) return failure();
+      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(explicitResults)))
+        locals[root].value = value;
+      return success();
+    }
+    if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+      SmallVector<Value> boundaries(loop.getBeforeArguments());
+      llvm::append_range(boundaries, loop.getAfterArguments());
+      llvm::append_range(boundaries, loop.getResults());
+      if (failed(prepareControlValues(loop, boundaries))) return failure();
+      auto supplied = controlValues(loop.getInits(), loop.getBeforeArguments());
+      auto nativeTypes = controlTypes(loop.getResults());
+      if (failed(supplied) || failed(nativeTypes)) return failure();
+      auto initial = *supplied;
+      ownControlInputs(initial, loop.getInits(), loop.getBeforeArguments(), loop);
+      unsigned explicitInputs = initial.size();
+      auto types = *nativeTypes;
+      unsigned explicitResults = types.size();
+      if (initial.size() != types.size() ||
+          !llvm::all_of(llvm::zip(initial, types), [](auto pair) {
+            Type left = std::get<0>(pair).getType(), right = std::get<1>(pair);
+            return left == right || (isa<wk::ValueType>(left) && isa<wk::ValueType>(right) &&
+                element(left) == element(right) && shape(left) == shape(right));
+          }))
+        return loop.emitError("Weft while requires one stable physical state schema across both regions");
+      for (auto [value, type] : llvm::zip(initial, types)) type = value.getType();
+      auto written = writtenEnclosingLocals(loop);
+      if (failed(written)) return failure();
+      SmallVector<Value> roots;
+      for (Value root : *written)
+        if (locals.count(root)) {
+          if (failed(materializeLocal(root))) return failure();
+          roots.push_back(root);
+          initial.push_back(locals.lookup(root).value);
+          types.push_back(locals.lookup(root).value.getType());
+        }
+      auto savedLocals = locals;
+      auto target = b.create<scf::WhileOp>(loc, types, initial);
+      Block &before = target.getBefore().emplaceBlock();
+      Block &after = target.getAfter().emplaceBlock();
+      for (Value value : initial) before.addArgument(value.getType(), loc);
+      for (Type type : types) after.addArgument(type, loc);
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(&before);
+        if (failed(mapControlValues(loop.getBeforeArguments(), before.getArguments().take_front(explicitInputs)))) return failure();
+        for (auto [root, value] : llvm::zip(roots, before.getArguments().drop_front(explicitInputs)))
+          locals[root].value = value;
+        if (failed(block(loop.getBefore().front()))) return failure();
+        auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+        auto supplied = controlValues(condition.getArgs(), loop.getAfterArguments(),
+            before.getArguments().take_front(explicitInputs));
+        if (failed(supplied)) return failure();
+        auto results = *supplied;
+        for (Value root : roots) {
+          if (failed(checkCarry(root, savedLocals.lookup(root), loop))) return failure();
+          results.push_back(locals.lookup(root).value);
+        }
+        b.create<scf::ConditionOp>(loc, values.lookup(condition.getCondition()), results);
+      }
+      locals = savedLocals;
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(&after);
+        if (failed(mapControlValues(loop.getAfterArguments(), after.getArguments().take_front(explicitResults)))) return failure();
+        for (auto [root, value] : llvm::zip(roots, after.getArguments().drop_front(explicitResults)))
+          locals[root].value = value;
+        if (failed(block(loop.getAfter().front()))) return failure();
+        auto supplied = controlValues(loop.getAfter().front().getTerminator()->getOperands(), loop.getBeforeArguments(),
+            after.getArguments().take_front(explicitResults));
+        if (failed(supplied)) return failure();
+        auto results = *supplied;
+        for (Value root : roots) {
+          if (failed(checkCarry(root, savedLocals.lookup(root), loop))) return failure();
+          results.push_back(locals.lookup(root).value);
+        }
+        b.create<scf::YieldOp>(loc, results);
+      }
+      locals = std::move(savedLocals);
+      if (failed(mapControlValues(loop.getResults(), target.getResults().take_front(explicitResults)))) return failure();
+      for (auto [root, value] : llvm::zip(roots, target.getResults().drop_front(explicitResults)))
         locals[root].value = value;
       return success();
     }
@@ -1500,6 +2107,9 @@ private:
   IRMapping values;
   llvm::DenseMap<Value, SmallVector<int64_t>> viewAxes;
   llvm::DenseMap<Value, LocalValue> locals;
+  llvm::DenseMap<Value, Value> localReferences;
+  llvm::DenseSet<Value> controlOwners;
+  SmallVector<Value> shapeValues;
   llvm::DenseMap<Value, Value> operandReads;
   llvm::DenseMap<Value, Value> readOnlySupplies;
   const llvm::DenseMap<Value, intent::QuantFormat> &formats;

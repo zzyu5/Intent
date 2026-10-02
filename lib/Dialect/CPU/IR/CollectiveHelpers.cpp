@@ -1,17 +1,21 @@
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
+#include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
+#include <memory>
 
 using namespace mlir;
 
 namespace intent::cpu {
 
 MemRefType collectiveStateType(Type type) {
-  if (auto memory = dyn_cast<MemRefType>(type))
+  if (auto memory = dyn_cast<ShapedType>(type))
     return MemRefType::get(memory.getShape(), memory.getElementType());
   return MemRefType::get({}, type);
 }
@@ -127,6 +131,7 @@ LogicalResult verifyCollectiveHelper(Operation *owner, Region &region,
 LogicalResult verifyCollectiveHelperEffects(Operation *owner, Region &region,
                                             unsigned destinations) {
   Block &body = region.front();
+  std::unique_ptr<BufferViewFlowAnalysis> bufferFlow;
   WalkResult status = region.walk<WalkOrder::PreOrder>([&](Operation *nested) -> WalkResult {
     if (nested->getName().getDialectNamespace() == "intent") {
       nested->emitOpError("CPU collective helper cannot retain canonical operations");
@@ -137,10 +142,47 @@ LogicalResult verifyCollectiveHelperEffects(Operation *owner, Region &region,
         nested->emitOpError("collective helper has an implicit capture: ") << input;
         return WalkResult::interrupt();
       }
+    if (auto release = dyn_cast<bufferization::DeallocOp>(nested)) {
+      // Native ownership conversion can merge a local allocation and a borrowed
+      // input through control flow. Its condition selects the owning path; the
+      // retained operands and resulting ownership flags keep their native ABI.
+      for (auto [memory, condition] :
+           llvm::zip(release.getMemrefs(), release.getConditions())) {
+        if (matchPattern(condition, m_Zero())) continue;
+        if (!bufferFlow) bufferFlow = std::make_unique<BufferViewFlowAnalysis>(owner);
+        bool owned = false, borrowed = false, unknown = false;
+        for (Value origin : bufferFlow->resolveReverse(memory)) {
+          if (auto formal = dyn_cast<BlockArgument>(origin);
+              formal && formal.getOwner() == &body) {
+            borrowed = true;
+            continue;
+          }
+          if (!region.isAncestor(origin.getParentRegion())) {
+            borrowed = true;
+            continue;
+          }
+          if (!bufferFlow->mayBeTerminalBuffer(origin)) continue;
+          if (origin.getDefiningOp<memref::AllocOp>()) owned = true;
+          else if (origin.getDefiningOp<memref::AllocaOp>()) borrowed = true;
+          else unknown = true;
+        }
+        if (!owned || unknown || (borrowed && matchPattern(condition, m_One()))) {
+          release.emitOpError("collective release requires local owned storage; "
+                              "borrowed alternatives require native conditional ownership");
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    }
     bool collective = isa<SliceReduceOp, ScanOp, RegionOpInterface>(nested);
     SmallVector<MemoryEffects::EffectInstance> effects;
     if (auto interface = dyn_cast<MemoryEffectOpInterface>(nested)) {
       interface.getEffects(effects);
+    } else if (isa<bufferization::AllocTensorOp>(nested)) {
+      // The native bufferization anchor owns a fresh tensor (and optionally
+      // copies another immutable tensor). It exposes BufferizableOpInterface,
+      // not memref effects, until that allocation is materialized.
+      return WalkResult::advance();
     } else if (nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
       return WalkResult::advance();
     } else if (!isMemoryEffectFree(nested)) {
@@ -191,12 +233,47 @@ void SliceReduceOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &e
   }
 }
 
+LogicalResult verifyCollectiveOutputs(Operation *operation, ValueRange outputs) {
+  bool valueForm = operation->getNumResults() != 0;
+  if (valueForm && operation->getNumResults() != outputs.size())
+    return operation->emitOpError("each value result requires one destination shape");
+  for (auto [index, output] : llvm::enumerate(outputs)) {
+    if (!valueForm) {
+      if (!isa<MemRefType>(output.getType()))
+        return operation->emitOpError("buffer form requires memref destinations");
+      continue;
+    }
+    auto shape = dyn_cast<RankedTensorType>(output.getType());
+    Type result = operation->getResult(index).getType();
+    if (!shape || (result != shape &&
+        (shape.getRank() || result != shape.getElementType())))
+      return operation->emitOpError("value result must match its tensor destination shape");
+  }
+  for (Value input : operation->getOperands()) {
+    if (isa<RankedTensorType>(input.getType()) && !valueForm)
+      return operation->emitOpError("buffer form cannot retain tensor operands");
+  }
+  return success();
+}
+
+LogicalResult verifyValueCollectiveHelper(Operation *owner, Region &region,
+                                         TypeRange arguments,
+                                         TypeRange results) {
+  if (!llvm::hasSingleElement(region) || region.front().empty() ||
+      !llvm::equal(region.front().getArgumentTypes(), arguments) ||
+      !llvm::equal(region.front().getTerminator()->getOperandTypes(), results))
+    return owner->emitOpError("value helper arguments and yielded components must match its schema");
+  return verifyCollectiveHelperEffects(owner, region, 0);
+}
+
 LogicalResult SliceReduceOp::verify() {
   unsigned count = getSources().size();
   if (!count || getIdentities().size() != count || getOutputs().size() != count ||
       getAxes().empty() || !llvm::hasSingleElement(getCombine()))
     return emitOpError("slice reduction requires sources, identities, outputs, axes and one combine block");
-  auto first = cast<MemRefType>(getSources().front().getType());
+  if (failed(verifyCollectiveOutputs(getOperation(), getOutputs()))) return failure();
+  bool valueForm = getNumResults() != 0;
+  auto first = cast<ShapedType>(getSources().front().getType());
   SmallVector<int64_t> seen;
   for (int64_t axis : getAxes()) {
     if (axis < 0 || axis >= first.getRank() || llvm::is_contained(seen, axis))
@@ -205,17 +282,20 @@ LogicalResult SliceReduceOp::verify() {
   }
   SmallVector<Type> states, members;
   for (auto [source, identity, output] : llvm::zip(getSources(), getIdentities(), getOutputs())) {
-    auto input = cast<MemRefType>(source.getType());
-    auto destination = cast<MemRefType>(output.getType());
+    auto input = cast<ShapedType>(source.getType());
+    auto destination = cast<ShapedType>(output.getType());
+    if (isa<RankedTensorType>(source.getType()) != valueForm)
+      return emitOpError("sources and destinations must use the same value/buffer form");
     for (int64_t axis : getAxes())
       if (axis >= input.getRank() || input.getDimSize(axis) != first.getDimSize(axis))
         return emitOpError("reduction sources must share every member extent");
-    auto member = collectiveMemberType(input, getAxes());
+    auto member = collectiveMemberType(
+        MemRefType::get(input.getShape(), input.getElementType()), getAxes());
     auto state = collectiveStateType(identity.getType());
     if (destination.getShape() != member.getShape() ||
         destination.getElementType() != input.getElementType() ||
         state.getElementType() != input.getElementType() ||
-        (isa<MemRefType>(identity.getType()) && state.getShape() != member.getShape()))
+        (isa<ShapedType>(identity.getType()) && state.getShape() != member.getShape()))
       return emitOpError("reduction outputs and identities must preserve their complete source slices");
     states.push_back(collectiveStateType(destination));
     members.push_back(member);
@@ -224,6 +304,13 @@ LogicalResult SliceReduceOp::verify() {
   auto yield = body.empty() ? SliceReduceYieldOp() : dyn_cast<SliceReduceYieldOp>(body.getTerminator());
   if (!yield) return emitOpError("slice reduction requires slice_reduce_yield");
   SmallVector<Type> arguments;
+  if (valueForm) {
+    llvm::append_range(arguments, getIdentities().getTypes());
+    llvm::append_range(arguments, getIdentities().getTypes());
+    llvm::append_range(arguments, getCaptures().getTypes());
+    return verifyValueCollectiveHelper(getOperation(), getCombine(), arguments,
+                                      getIdentities().getTypes());
+  }
   if (isDestinationPassing()) {
     arguments = states;
     llvm::append_range(arguments, members);

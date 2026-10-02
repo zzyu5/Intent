@@ -7,6 +7,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include <functional>
 
 using namespace mlir;
 
@@ -269,7 +270,7 @@ bool fuseProduct(linalg::GenericOp reduction) {
   Value lhs = projectMemory(builder, location, operands[0].source.value, relation->lhsKept);
   Value rhs = projectMemory(builder, location, operands[1].source.value, relation->rhsKept);
   Value output = projectMemory(builder, location, reduction.getOutputs()[0], outputAxes);
-  builder.create<linalg::FillOp>(location, initialization.getInputs(), ValueRange{output});
+  builder.create<linalg::FillOp>(location, ValueRange{initialization->value}, ValueRange{output});
   SmallVector<utils::IteratorType> iterators(relation->axes.results.size(), utils::IteratorType::parallel);
   iterators.append(relation->axes.reduction.size(), utils::IteratorType::reduction);
   auto contraction = builder.create<linalg::GenericOp>(location, ValueRange{lhs, rhs}, ValueRange{output},
@@ -280,7 +281,7 @@ bool fuseProduct(linalg::GenericOp reduction) {
       });
   contraction->setAttr("intent_cpu.reduction_order", order);
   reduction.erase();
-  initialization.erase();
+  if (initialization->erasable) initialization->operation->erase();
   llvm::SmallPtrSet<Operation *, 8> uniqueViews;
   for (Operation *view : views)
     if (uniqueViews.insert(view).second && view->use_empty()) view->erase();
@@ -340,30 +341,42 @@ Value foldContractionInput(Value input, linalg::GenericOp consumer,
   return builder.create<memref::ReinterpretCastOp>(loc, viewType, metadata.getBaseBuffer(), offset, sizes, strides);
 }
 
-linalg::FillOp findContractionInitialization(linalg::GenericOp operation) {
-  Value output = operation.getOutputs()[0];
-  linalg::FillOp fill;
-  for (Operation *user : output.getUsers()) {
-    auto candidate = dyn_cast<linalg::FillOp>(user);
-    if (candidate && candidate->getBlock() == operation->getBlock() &&
-        candidate->isBeforeInBlock(operation) && (!fill || fill->isBeforeInBlock(candidate))) fill = candidate;
-  }
-  if (!fill || fill.getOutputs().size() != 1) return {};
-  Value value = fill.getInputs()[0];
-  if (!(isa<FloatType>(value.getType()) ? matchPattern(value, m_PosZeroFloat()) : matchPattern(value, m_Zero())))
-    return {};
+std::optional<ContractionInitialization>
+findContractionInitialization(linalg::GenericOp operation) {
   StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
-  for (Operation *between = fill->getNextNode(); between != operation; between = between->getNextNode()) {
-    auto effects = storage.effects(between);
-    if (!effects.complete || effects.ordered) return {};
-    for (const StorageEffect &entry : effects.entries) {
-      const auto &effect = entry.effect;
-      if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-      if (!effect.getValue() || !isa<BaseMemRefType>(effect.getValue().getType()) ||
-          !storage.disjoint(output, effect.getValue())) return {};
+  std::function<std::optional<ContractionInitialization>(Value, Operation *)> find =
+      [&](Value memory, Operation *before) -> std::optional<ContractionInitialization> {
+    bool observed = false;
+    for (Operation *previous = before->getPrevNode(); previous; previous = previous->getPrevNode()) {
+      auto effects = storage.effects(previous);
+      if (!effects.complete || effects.ordered) return std::nullopt;
+      bool written = false;
+      for (const StorageEffect &entry : effects.entries) {
+        const auto &effect = entry.effect;
+        if (isa<MemoryEffects::Allocate>(effect.getEffect()) ||
+            storage.disjoint(memory, effect.getValue())) continue;
+        if (isa<MemoryEffects::Read>(effect.getEffect())) observed = true;
+        else if (isa<MemoryEffects::Write>(effect.getEffect())) written = true;
+        else return std::nullopt;
+      }
+      if (!written) continue;
+      Value value;
+      if (auto fill = dyn_cast<linalg::FillOp>(previous);
+          fill && fill.getOutputs().size() == 1 && fill.getOutputs()[0] == memory) {
+        value = fill.getInputs()[0];
+      } else if (auto copy = dyn_cast<memref::CopyOp>(previous);
+                 copy && copy.getTarget() == memory) {
+        auto source = find(copy.getSource(), copy);
+        if (source) value = source->value;
+      }
+      if (!value || !(isa<FloatType>(value.getType()) ? matchPattern(value, m_PosZeroFloat())
+                                                     : matchPattern(value, m_Zero())))
+        return std::nullopt;
+      return ContractionInitialization{previous, value, !observed};
     }
-  }
-  return fill;
+    return std::nullopt;
+  };
+  return find(operation.getOutputs()[0], operation);
 }
 
 LogicalResult normalizeContractionSources(func::FuncOp function) {

@@ -12,6 +12,8 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentCPU_Op<string name, list<Trait> traits = []>
     : Op<IntentCPU_Dialect, name, traits>;
 
+def IntentCPU_ShapedValue : AnyTypeOf<[AnyRankedTensor, AnyMemRef]>;
+
 def IntentCPU_TasksOp : IntentCPU_Op<"tasks", [SingleBlock,
     IsolatedFromAbove, AutomaticAllocationScope, RecursiveMemoryEffects,
     DeclareOpInterfaceMethods<BufferViewFlowOpInterface>]> {
@@ -76,10 +78,11 @@ def IntentCPU_SliceReduceOp : IntentCPU_Op<"slice_reduce", [SingleBlock,
     DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Product reduction over complete source slices with explicit combine";
-  let arguments = (ins Variadic<AnyMemRef>:$sources,
+  let arguments = (ins Variadic<IntentCPU_ShapedValue>:$sources,
       Variadic<AnyType>:$identities, Variadic<AnyType>:$captures,
-      Variadic<AnyMemRef>:$outputs, DenseI64ArrayAttr:$axes,
+      Variadic<IntentCPU_ShapedValue>:$outputs, DenseI64ArrayAttr:$axes,
       IntentCPU_ReductionOrderAttr:$order);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
   let extraClassDeclaration = [{
@@ -100,10 +103,11 @@ def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, Att
     DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Ordered prefixes with typed scalar or destination-passing slice combines";
-  let arguments = (ins Variadic<AnyMemRef>:$sources,
+  let arguments = (ins Variadic<IntentCPU_ShapedValue>:$sources,
       Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
-      Variadic<AnyMemRef>:$outputs,
+      Variadic<IntentCPU_ShapedValue>:$outputs,
       I64Attr:$axis, BoolAttr:$inclusive, BoolAttr:$reverse);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
   let extraClassDeclaration = [{
@@ -120,11 +124,13 @@ def IntentCPU_ScanYieldOp : IntentCPU_Op<"scan_yield", [Pure, Terminator,
   let arguments = (ins Variadic<AnyType>:$values);
 }
 
-def IntentCPU_HistogramOp : IntentCPU_Op<"histogram"> {
+def IntentCPU_HistogramOp : IntentCPU_Op<"histogram", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Typed active values contributing to logical integer bins";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$values,
-      Arg<AnyMemRef, "", [MemRead]>:$valid,
-      Arg<AnyMemRef, "", [MemWrite]>:$output, BoolAttr:$unsigned_values);
+  let arguments = (ins IntentCPU_ShapedValue:$values,
+      IntentCPU_ShapedValue:$valid,
+      IntentCPU_ShapedValue:$output, BoolAttr:$unsigned_values);
+  let results = (outs Optional<AnyRankedTensor>:$result);
   let hasVerifier = 1;
 }
 
@@ -158,19 +164,23 @@ def IntentCPU_AtomicCompareExchangeOp : IntentCPU_AtomicOp<"atomic_compare_excha
   let results = (outs AnyType:$old_value, I1:$success);
 }
 
-def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize"> {
+def IntentCPU_QuantizeOp : IntentCPU_Op<"quantize", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Quantize complete records into invocation-owned storage";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,
-      Arg<AnyMemRef, "", [MemWrite]>:$output, Intent_QuantFormatAttr:$format);
+  let arguments = (ins IntentCPU_ShapedValue:$input,
+      IntentCPU_ShapedValue:$output, Intent_QuantFormatAttr:$format);
+  let results = (outs Optional<AnyRankedTensor>:$result);
   let hasVerifier = 1;
 }
 
-def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
+def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Independent closed record dots with explicit output ownership";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-      Arg<AnyMemRef, "", [MemRead]>:$rhs,
-      Arg<AnyMemRef, "", [MemWrite]>:$output,
+  let arguments = (ins IntentCPU_ShapedValue:$lhs,
+      IntentCPU_ShapedValue:$rhs,
+      IntentCPU_ShapedValue:$output,
       Intent_QuantFormatAttr:$lhs_format, Intent_QuantFormatAttr:$rhs_format);
+  let results = (outs Optional<AnyRankedTensor>:$result);
   let hasVerifier = 1;
 }
 
@@ -186,19 +196,27 @@ class IntentCPU_RegionOp<string name> : IntentCPU_Op<name,
 
 def IntentCPU_RegionFoldOp : IntentCPU_RegionOp<"region_fold"> {
   let summary = "Ordered source slices and destination-passing summary helpers";
-  let arguments = (ins Variadic<AnyMemRef>:$sources, Variadic<AnyType>:$identities,
-      Variadic<AnyType>:$captures, Variadic<AnyMemRef>:$summary_outputs,
+  let arguments = (ins Variadic<IntentCPU_ShapedValue>:$sources, Variadic<AnyType>:$identities,
+      Variadic<AnyType>:$captures, Variadic<IntentCPU_ShapedValue>:$summary_outputs,
       I64Attr:$axis, ArrayAttr:$summary_fields, OptionalAttr<I64Attr>:$segment_size);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine);
 }
 
-def IntentCPU_RegionScanOp : IntentCPU_RegionOp<"region_scan"> {
+def IntentCPU_RegionScanOp : IntentCPU_Op<"region_scan", [
+    IsolatedFromAbove, AttrSizedOperandSegments, AttrSizedResultSegments,
+    IntentCPU_RegionOpInterface,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Region transitions, incoming state, slice outputs and final state";
-  let arguments = (ins Variadic<AnyMemRef>:$sources, Variadic<AnyType>:$identities,
+  let arguments = (ins Variadic<IntentCPU_ShapedValue>:$sources, Variadic<AnyType>:$identities,
       Variadic<AnyType>:$initial_states, Variadic<AnyType>:$captures,
-      Variadic<AnyMemRef>:$emitted_outputs, Variadic<AnyMemRef>:$final_state_outputs,
+      Variadic<IntentCPU_ShapedValue>:$emitted_outputs, Variadic<IntentCPU_ShapedValue>:$final_state_outputs,
       I64Attr:$axis, ArrayAttr:$summary_fields, ArrayAttr:$state_fields,
       DenseI64ArrayAttr:$output_axes, OptionalAttr<I64Attr>:$segment_size);
+  let results = (outs Variadic<AnyType>:$emitted_results,
+      Variadic<AnyType>:$final_states);
+  let hasVerifier = 1;
   let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine,
       SizedRegion<1>:$apply, SizedRegion<1>:$emit);
   let extraClassDeclaration = [{
@@ -208,6 +226,10 @@ def IntentCPU_RegionScanOp : IntentCPU_RegionOp<"region_scan"> {
   }];
 }
 
-def IntentCPU_RegionYieldOp : IntentCPU_Op<"region_yield", [Pure, Terminator]>;
+def IntentCPU_RegionYieldOp : IntentCPU_Op<"region_yield", [Pure, Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+}
+
+include "Intent/Dialect/CPU/IR/CPUValueOps.td"
 
 #endif

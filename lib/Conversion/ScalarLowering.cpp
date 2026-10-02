@@ -26,6 +26,10 @@ Type integerStorageType(Type type) {
     return MemRefType::get(memory.getShape(),
                           integerStorageType(memory.getElementType()),
                           memory.getLayout(), memory.getMemorySpace());
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return RankedTensorType::get(tensor.getShape(),
+                                integerStorageType(tensor.getElementType()),
+                                tensor.getEncoding());
   if (auto function = dyn_cast<FunctionType>(type)) {
     SmallVector<Type> inputs, outputs;
     for (Type input : function.getInputs())

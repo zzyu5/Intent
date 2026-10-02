@@ -2,6 +2,7 @@
 #include "Intent/Target/Mojo/Serialization/Scalar.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Serialization/NativeABI.h"
+#include "Intent/Serialization/MemoryDescriptor.h"
 #include "Intent/Serialization/Source.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -9,6 +10,9 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -18,13 +22,7 @@ using namespace mlir;
 namespace intent::mojo {
 namespace {
 
-struct Memory {
-  std::string pointer;
-  SmallVector<std::string> sizes;
-  SmallVector<std::string> strides;
-  std::string base;
-  std::string offset;
-};
+using Memory = MemoryDescriptor;
 
 std::string join(ArrayRef<std::string> values, llvm::StringRef separator = ", ") {
   return llvm::join(values, separator);
@@ -54,14 +52,14 @@ public:
 
   LogicalResult function(func::FuncOp function, const NativeABI &abi) {
     ScopedValues local(*this);
-    memories.clear(); allocations.clear(); scope.clear();
+    memories.clear();
     SmallVector<std::string> signature;
     for (auto [number, argument] : llvm::enumerate(function.getArguments())) {
       std::string name = "a" + std::to_string(number);
       values[argument] = name;
       if (auto type = dyn_cast<MemRefType>(argument.getType())) {
-        Memory memory{name, SmallVector<std::string>(type.getRank()),
-                      SmallVector<std::string>(type.getRank()), name, "0"};
+        Memory memory{name, "0", SmallVector<std::string>(type.getRank()),
+                      SmallVector<std::string>(type.getRank())};
         SmallVector<int64_t> staticStrides;
         int64_t staticOffset;
         if (mlir::failed(type.getStridesAndOffset(staticStrides, staticOffset)))
@@ -78,7 +76,6 @@ public:
     for (const NativeSlot &slot : abi.slots) {
       Value argument = function.getArgument(slot.parameter);
       std::string name = slot.name();
-      scope.push_back(name);
       if (slot.role == NativeSlotRole::Pointer) {
         signature.push_back(name + ": Pointer[" + memoryElement(slot.element) + ", MutUntrackedOrigin]");
       } else if (slot.role == NativeSlotRole::Scalar) {
@@ -104,11 +101,6 @@ public:
 private:
   std::string name(Value value) { return valueString(value); }
 
-  void bind(Value value, const std::string &name) {
-    SourceEmitter::bind(value, name);
-    scope.push_back(name);
-  }
-
   std::string fresh(Value value) {
     std::string result = newName();
     bind(value, result);
@@ -117,7 +109,6 @@ private:
 
   void assign(Value value, const std::string &expression, bool constant = false) {
     std::string identifier = fresh(value);
-    if (constant) scope.pop_back();
     line(std::string(constant ? "comptime " : "var ") + identifier + " = " + expression);
   }
 
@@ -135,7 +126,54 @@ private:
   }
 
   std::string pointer(Value memory, ValueRange indices) {
-    return memories.at(memory).pointer + ".unsafe_offset(" + offset(memory, indices) + ")";
+    const Memory &descriptor = memories.at(memory);
+    return descriptor.base + ".unsafe_offset((" + descriptor.offset + ") + (" + offset(memory, indices) + "))";
+  }
+
+  SmallVector<std::string> components(Value value) {
+    if (isa<MemRefType>(value.getType())) return memories.at(value).components();
+    return {name(value)};
+  }
+
+  SmallVector<std::string> componentTypes(Type type) {
+    if (auto memory = dyn_cast<MemRefType>(type)) {
+      SmallVector<std::string> types{"Pointer[" + memoryElement(memory.getElementType()) + ", MutUntrackedOrigin]"};
+      types.append(1 + 2 * memory.getRank(), "Int");
+      return types;
+    }
+    return {valueType(type)};
+  }
+
+  void declare(Value value, Value initial = {}) {
+    SmallVector<std::string> fields;
+    auto types = componentTypes(value.getType());
+    auto sources = initial ? components(initial) : SmallVector<std::string>{};
+    for (auto [index, type] : llvm::enumerate(types)) {
+      fields.push_back(newName());
+      line("var " + fields.back() + ": " + type +
+           (initial ? " = " + sources[index] : ""));
+    }
+    if (auto memory = dyn_cast<MemRefType>(value.getType()))
+      memories[value] = Memory::fromComponents(memory, fields);
+    else values[value] = fields.front();
+  }
+
+  void alias(Value result, Value source) {
+    if (isa<MemRefType>(result.getType())) memories[result] = memories.at(source);
+    else values[result] = name(source);
+  }
+
+  // Snapshot all sources before assigning any destination, including descriptor
+  // fields. A loop may exchange two values or change a view of the same base.
+  void transfer(ValueRange from, ValueRange to) {
+    SmallVector<std::pair<std::string, std::string>> assignments;
+    for (auto [source, target] : llvm::zip(from, to))
+      for (auto [expression, destination] : llvm::zip(components(source), components(target))) {
+        auto temporary = newName("next_");
+        line("var " + temporary + " = " + expression);
+        assignments.emplace_back(destination, temporary);
+      }
+    for (auto &[destination, temporary] : assignments) line(destination + " = " + temporary);
   }
 
   LogicalResult block(Block &body) {
@@ -145,43 +183,59 @@ private:
   }
 
   LogicalResult forLoop(scf::ForOp loop) {
-    SmallVector<std::string> carries;
-    for (auto [argument, initial] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) {
-      assign(argument, name(initial));
-      carries.push_back(name(argument));
-    }
-    auto saved = scope.size();
+    for (auto [argument, initial] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs()))
+      declare(argument, initial);
     std::string iv = fresh(loop.getInductionVar());
     line("for " + iv + " in range(" + name(loop.getLowerBound()) + ", " + name(loop.getUpperBound()) + ", " + name(loop.getStep()) + "):");
     ++indent;
     if (mlir::failed(block(*loop.getBody()))) return failure();
-    SmallVector<std::string> nextValues;
-    for (Value value : loop.getBody()->getTerminator()->getOperands()) {
-      std::string temporary = newName("next_");
-      line("var " + temporary + " = " + name(value));
-      nextValues.push_back(temporary);
-    }
-    for (auto [carry, value] : llvm::zip(carries, nextValues)) line(carry + " = " + value);
-    if (loop.getBody()->getOperations().size() == 1 && carries.empty()) line("pass");
+    transfer(loop.getBody()->getTerminator()->getOperands(), loop.getRegionIterArgs());
+    if (loop.getBody()->getOperations().size() == 1 && loop.getInitArgs().empty()) line("pass");
     --indent;
-    scope.resize(saved);
-    for (auto [result, carry] : llvm::zip(loop.getResults(), carries)) values[result] = carry;
+    for (auto [result, carry] : llvm::zip(loop.getResults(), loop.getRegionIterArgs())) alias(result, carry);
     return success();
   }
 
   LogicalResult dispatch(cpu::TaskDispatchOp dispatch) {
     Block &body = dispatch.getBody().front();
+    llvm::SetVector<Value> used;
+    getUsedValuesDefinedAbove(dispatch.getBody(), dispatch.getBody(), used);
+    SmallVector<std::pair<Value, SmallVector<std::string>>> bindings;
     SmallVector<std::string> captures;
-    for (const std::string &value : scope) captures.push_back("imm " + value);
-    auto saved = scope.size();
+    for (Value value : used) {
+      auto expressions = components(value);
+      SmallVector<std::string> fields;
+      for (auto [type, expression] :
+           llvm::zip_equal(componentTypes(value.getType()), expressions)) {
+        fields.push_back(newName("capture_"));
+        line("var " + fields.back() + ": " + type + " = " + expression);
+        captures.push_back("imm " + fields.back());
+      }
+      bindings.emplace_back(value, std::move(fields));
+    }
     std::string task = newName("task_");
-    std::string iv = fresh(body.getArgument(0));
-    line("def " + task + "(" + iv + ": Int) {" + join(captures) + "}:");
-    ++indent;
-    if (mlir::failed(block(body))) return failure();
-    if (body.getOperations().size() == 1) line("pass");
-    --indent;
-    scope.resize(saved);
+    LogicalResult emitted = success();
+    {
+      ScopedValues local(*this);
+      auto enclosingMemories = std::move(memories);
+      memories.clear();
+      auto restoreMemories = llvm::make_scope_exit([&] {
+        memories = std::move(enclosingMemories);
+      });
+      for (auto &[value, fields] : bindings) {
+        for (const std::string &field : fields) reserveName(field);
+        if (auto memory = dyn_cast<MemRefType>(value.getType()))
+          memories[value] = Memory::fromComponents(memory, fields);
+        else bind(value, fields.front());
+      }
+      std::string iv = fresh(body.getArgument(0));
+      line("def " + task + "(" + iv + ": Int) {" + join(captures) + "}:");
+      ++indent;
+      emitted = block(body);
+      if (succeeded(emitted) && body.getOperations().size() == 1) line("pass");
+      --indent;
+    }
+    if (mlir::failed(emitted)) return failure();
     line("parallelize(" + task + ", " + name(dispatch.getCount()) + ", " + name(dispatch.getWorkerCount()) + ")");
     return success();
   }
@@ -189,19 +243,9 @@ private:
   LogicalResult whileLoop(scf::WhileOp loop) {
     Block &before = loop.getBefore().front(), &after = loop.getAfter().front();
     for (auto [argument, initial] : llvm::zip(before.getArguments(), loop.getInits()))
-      assign(argument, name(initial));
+      declare(argument, initial);
     for (BlockArgument argument : after.getArguments())
-      line("var " + fresh(argument) + ": " + valueType(argument.getType()));
-    auto saved = scope.size();
-    auto transfer = [&](ValueRange from, ValueRange to) {
-      SmallVector<std::string> nextValues;
-      for (Value value : from) {
-        std::string temporary = newName("next_");
-        line("var " + temporary + " = " + name(value));
-        nextValues.push_back(temporary);
-      }
-      for (auto [value, temporary] : llvm::zip(to, nextValues)) line(name(value) + " = " + temporary);
-    };
+      declare(argument);
     line("while True:");
     ++indent;
     if (mlir::failed(block(before))) return failure();
@@ -212,36 +256,27 @@ private:
     if (mlir::failed(block(after))) return failure();
     transfer(after.getTerminator()->getOperands(), before.getArguments());
     --indent;
-    scope.resize(saved);
-    for (auto [result, argument] : llvm::zip(loop.getResults(), after.getArguments())) values[result] = name(argument);
+    for (auto [result, argument] : llvm::zip(loop.getResults(), after.getArguments())) alias(result, argument);
     return success();
   }
 
   LogicalResult conditional(scf::IfOp operation) {
-    SmallVector<std::string> results;
-    for (Value result : operation.getResults()) {
-      results.push_back(fresh(result));
-      line("var " + results.back() + ": " + valueType(result.getType()));
-    }
-    auto saved = scope.size();
+    for (Value result : operation.getResults()) declare(result);
     auto branch = [&](Block *body) {
       if (mlir::failed(block(*body))) return failure();
-      for (auto [result, value] : llvm::zip(results, body->getTerminator()->getOperands()))
-        line(result + " = " + name(value));
-      if (body->getOperations().size() == 1 && results.empty()) line("pass");
+      transfer(body->getTerminator()->getOperands(), operation.getResults());
+      if (body->getOperations().size() == 1 && operation.getResults().empty()) line("pass");
       return success();
     };
     line("if " + name(operation.getCondition()) + ":");
     ++indent;
     if (mlir::failed(branch(operation.thenBlock()))) return failure();
     --indent;
-    scope.resize(saved);
     if (!operation.getElseRegion().empty()) {
       line("else:");
       ++indent;
       if (mlir::failed(branch(operation.elseBlock()))) return failure();
       --indent;
-      scope.resize(saved);
     }
     return success();
   }
@@ -254,8 +289,7 @@ private:
       return operation->emitError("Mojo stack allocation requires static extents");
     std::string element = memoryElement(type.getElementType());
     std::string value = fresh(memory);
-    std::string storage = "storage_" + value;
-    Memory descriptor{value, {}, {}, value, "0"};
+    Memory descriptor{value, "0", {}, {}};
     unsigned dynamicAxis = 0;
     for (int64_t axis = 0; axis < type.getRank(); ++axis)
       descriptor.sizes.push_back(type.isDynamicDim(axis) ? name(dynamicSizes[dynamicAxis++])
@@ -273,12 +307,13 @@ private:
           std::to_string(type.getNumElements()) + ", " + element + ", alignment=" +
           std::to_string(alignment) + "]()");
     } else {
-      auto alignment = cast<memref::AllocOp>(operation).getAlignment();
-      std::string layout = "Layout[" + element + "]";
-      if (alignment) layout += ".aligned[" + std::to_string(*alignment) + "]";
-      line("var " + storage + " = alloc(" + layout + "(count=" + stride + "))");
-      line("var " + value + " = " + storage + ".unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()");
-      allocations[memory] = storage;
+      int64_t elementBytes = type.getElementType().isIndex() ? 8 : (type.getElementTypeBitWidth() + 7) / 8;
+      int64_t alignment = std::max<int64_t>(16, cast<memref::AllocOp>(operation).getAlignment().value_or(elementBytes));
+      std::string bytes = "max(Int(1), (" + stride + ") * " + std::to_string(elementBytes) + ")";
+      std::string size = "((" + bytes + " + " + std::to_string(alignment - 1) + ") // " +
+          std::to_string(alignment) + ") * " + std::to_string(alignment);
+      line("var " + value + " = external_call[\"aligned_alloc\", Pointer[" + element +
+           ", MutUntrackedOrigin]](UInt(" + std::to_string(alignment) + "), UInt(" + size + "))");
     }
     memories[memory] = std::move(descriptor);
     return success();
@@ -314,7 +349,7 @@ private:
       const Memory memory = memories.at(op.getSource());
       if (!op.getBaseBuffer().use_empty()) {
         assign(op.getBaseBuffer(), memory.base);
-        memories[op.getBaseBuffer()] = {name(op.getBaseBuffer()), {}, {}, memory.base, "0"};
+        memories[op.getBaseBuffer()] = {name(op.getBaseBuffer()), "0", {}, {}};
       }
       if (!op.getOffset().use_empty()) assign(op.getOffset(), memory.offset);
       for (auto [value, size] : llvm::zip(op.getSizes(), memory.sizes))
@@ -334,8 +369,6 @@ private:
           result.strides.push_back("(" + fold(strides[axis]) + ") * (" + source.strides[axis] + ")");
         }
       }
-      assign(op.getResult(), source.pointer + ".unsafe_offset(" + join(terms, " + ") + ")");
-      result.pointer = name(op.getResult());
       result.base = source.base;
       result.offset = "(" + source.offset + ") + (" + join(terms, " + ") + ")";
       memories[op.getResult()] = std::move(result);
@@ -345,12 +378,11 @@ private:
       result.offset = fold(op.getMixedOffsets()[0]);
       for (OpFoldResult size : op.getMixedSizes()) result.sizes.push_back(fold(size));
       for (OpFoldResult stride : op.getMixedStrides()) result.strides.push_back(fold(stride));
-      assign(op.getResult(), result.base + ".unsafe_offset(" + result.offset + ")");
-      result.pointer = name(op.getResult());
       memories[op.getResult()] = std::move(result);
     } else if (auto op = dyn_cast<memref::CastOp>(operation)) {
       memories[op.getResult()] = memories.at(op.getSource());
-      values[op.getResult()] = name(op.getSource());
+    } else if (auto op = dyn_cast<memref::ExtractAlignedPointerAsIndexOp>(operation)) {
+      assign(op.getResult(), "Int(" + memories.at(op.getSource()).base + ")");
     } else if (auto op = dyn_cast<memref::LoadOp>(operation)) {
       std::string expression = pointer(op.getMemref(), op.getIndices()) + ".unsafe_load()";
       if (op.getType().isIndex()) expression = "Int(" + expression + ")";
@@ -414,7 +446,7 @@ private:
     } else if (auto op = dyn_cast<memref::AllocOp>(operation)) {
       return allocation(operation, op.getResult(), op.getDynamicSizes(), false);
     } else if (auto op = dyn_cast<memref::DeallocOp>(operation)) {
-      line("dealloc(" + allocations.at(op.getMemref()) + "^)");
+      line("external_call[\"free\", NoneType](" + memories.at(op.getMemref()).base + ")");
     } else if (auto op = dyn_cast<scf::ForOp>(operation)) {
       return forLoop(op);
     } else if (auto op = dyn_cast<scf::WhileOp>(operation)) {
@@ -428,8 +460,6 @@ private:
   }
 
   llvm::DenseMap<Value, Memory> memories;
-  llvm::DenseMap<Value, std::string> allocations;
-  SmallVector<std::string> scope;
 };
 
 }
@@ -437,11 +467,11 @@ private:
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
   auto options = readCompileOptions(module);
   if (mlir::failed(options)) return failure();
-  if (mlir::failed(cpu::verifyCPUProgram(module, true))) return failure();
+  if (mlir::failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Realized))) return failure();
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
             "from std.atomic import Atomic, Ordering\n"
-            "from std.memory import Layout, alloc, dealloc, unsafe_stack_allocation, bitcast\n"
+            "from std.memory import unsafe_stack_allocation, bitcast\n"
             "from std.sys import prefetch, llvm_intrinsic\n"
             "from std.sys.intrinsics import PrefetchOptions\n"
             "from std.math import fma, sqrt, exp, exp2, log, tanh, sin, cos, floor, erf, abs, min, max\n"

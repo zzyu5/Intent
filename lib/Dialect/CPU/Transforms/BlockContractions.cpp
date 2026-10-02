@@ -2,6 +2,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "ImplementationInputs.h"
+#include "Contractions.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -31,35 +32,15 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       "intent_cpu.configuration");
   Value lhs = operation.getInputs()[0], rhs = operation.getInputs()[1];
   Value output = operation.getOutputs()[0];
-  linalg::FillOp initialization;
-  for (Operation *user : output.getUsers()) {
-    if (auto fill = dyn_cast<linalg::FillOp>(user)) {
-      if (fill->getBlock() == operation->getBlock() && fill->isBeforeInBlock(operation) &&
-          (!initialization || initialization->isBeforeInBlock(fill)))
-        initialization = fill;
-    }
-  }
+  auto initialization = findContractionInitialization(operation);
   if (!initialization)
     return operation.emitError("CPU contraction accumulator initialization is missing");
   StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
   Value root = storage.uniqueOrigin(output);
-  bool keepInitialization = (*implementation)->contraction.completePrivateInitialization &&
-      root && isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp());
-  for (Operation *between = initialization->getNextNode(); between != operation;
-       between = between->getNextNode()) {
-    auto effects = storage.effects(between);
-    if (!effects.complete || effects.ordered)
-      return operation.emitError("CPU contraction initialization has an unknown or ordered intervening effect");
-    for (const StorageEffect &entry : effects.entries) {
-      const auto &effect = entry.effect;
-      if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-      if (!effect.getValue() || !storage.disjoint(effect.getValue(), output))
-        return operation.emitError("CPU contraction initialization has an intervening memory access");
-    }
-  }
-  Value initial = initialization.getInputs()[0];
-  if (!(isa<FloatType>(initial.getType()) ? matchPattern(initial, m_PosZeroFloat()) : matchPattern(initial, m_Zero())))
-    return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");
+  bool keepInitialization = !initialization->erasable ||
+      ((*implementation)->contraction.completePrivateInitialization && root &&
+       isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp()));
+  Value initial = initialization->value;
   auto requirements = (*implementation)->inputRequirements(operation, shared, binding);
   auto supplies = inputs.prepare(operation, requirements, **implementation);
   if (failed(supplies)) return failure();
@@ -181,7 +162,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     emitTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
   if (failed(status)) return failure();
-  if (!keepInitialization) initialization.erase();
+  if (!keepInitialization) initialization->operation->erase();
   operation.erase();
   return success();
 }

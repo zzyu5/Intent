@@ -15,6 +15,13 @@ namespace intent::cpu {
 
 void registerStorageInterfaces(mlir::DialectRegistry &registry);
 
+// Check that explicit release operands connect to owned storage, no heap origin
+// is disconnected from all releases, and unconditional lexical frees precede
+// no later accesses. Native dealloc verifies its condition/retention schema;
+// its transformation establishes the complex control-flow ownership algorithm.
+// This structural audit is not a second path-sensitive deallocation proof.
+mlir::LogicalResult verifyStorageOwnership(mlir::func::FuncOp function);
+
 struct StorageOriginFacts {
   llvm::SmallVector<mlir::Value> values;
   // All origin frontiers have a declared identity: allocation, public argument

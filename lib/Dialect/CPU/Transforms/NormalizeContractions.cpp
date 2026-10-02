@@ -386,7 +386,7 @@ LogicalResult normalizeContractions(func::FuncOp function) {
     if (!fill) return operation.emitError("CPU contraction normalization requires a closed zero initialization");
     if (failed(Normalizer(operation, *axes).run())) return failure();
     operation.erase();
-    fill.erase();
+    if (fill->erasable) fill->operation->erase();
   }
   eraseDeadPrivateBuffers(function);
   return success();

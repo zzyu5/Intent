@@ -95,7 +95,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
   return result;
 }
 
-LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
+LogicalResult PhysicalProgramAnalysis::verify(CPUProgramStage stage) {
   StorageAnalysis storage(function);
   auto interface = getPublicInterface(function);
   auto requirements = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
@@ -143,12 +143,9 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
   for (auto facts : allocations()) {
     if (facts.stack && capabilities && (!facts.bytes || *facts.bytes > capabilities.getPrivateBytes()))
       return facts.value.getDefiningOp()->emitError("CPU stack allocation exceeds its declared budget");
-    if (!facts.stack) {
-      if (!storage.lifetime(cast<memref::AllocOp>(facts.value.getDefiningOp())))
-        return facts.value.getDefiningOp()->emitError(
-            "CPU heap allocation requires one lexical lifetime end covering every known alias use");
-    }
   }
+  if (stage != CPUProgramStage::Values && failed(verifyStorageOwnership(function)))
+    return failure();
   bool invalid = false;
   for (const StorageEffect &entry : storage.effects(function).entries) {
     if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
@@ -162,7 +159,19 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, SliceReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (stage != CPUProgramStage::Values) {
+      auto tensor = [](Type type) { return isa<TensorType>(type); };
+      bool hasTensor = llvm::any_of(operation->getOperandTypes(), tensor) ||
+                       llvm::any_of(operation->getResultTypes(), tensor);
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          hasTensor |= llvm::any_of(block.getArgumentTypes(), tensor);
+      if (hasTensor) {
+        operation->emitError("CPU buffer program still contains an unmaterialized tensor value");
+        invalid = true;
+      }
+    }
+    if (stage == CPUProgramStage::Realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, SliceReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }
@@ -188,14 +197,16 @@ bool supportsVectorScan(ScanOp operation) {
       });
 }
 
-LogicalResult verifyCPUProgram(ModuleOp module, bool realized) {
+LogicalResult verifyCPUProgram(ModuleOp module, CPUProgramStage stage) {
   if (failed(mlir::verify(module))) return failure();
   bool invalid = false;
   module.walk([&](Operation *operation) {
     llvm::StringRef dialect = operation->getName().getDialectNamespace();
     if (dialect != "builtin" && dialect != "func" && dialect != "arith" &&
         dialect != "math" && dialect != "memref" && dialect != "scf" &&
-        dialect != "vector" && dialect != "linalg" && dialect != "intent_cpu") {
+        dialect != "vector" && dialect != "linalg" && dialect != "intent_cpu" &&
+        !(stage != CPUProgramStage::Realized && dialect == "bufferization") &&
+        !(stage == CPUProgramStage::Values && dialect == "tensor")) {
       operation->emitError("operation is outside the current CPU execution family");
       invalid = true;
     }
@@ -203,7 +214,7 @@ LogicalResult verifyCPUProgram(ModuleOp module, bool realized) {
   func::FuncOp first;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal() && function->hasAttr("cpu.external_runtime")) continue;
-    if (failed(PhysicalProgramAnalysis(function).verify(realized))) invalid = true;
+    if (failed(PhysicalProgramAnalysis(function).verify(stage))) invalid = true;
     if (!first) first = function;
     else if (getPublicInterface(function) != getPublicInterface(first) ||
              function.getFunctionType() != first.getFunctionType() ||

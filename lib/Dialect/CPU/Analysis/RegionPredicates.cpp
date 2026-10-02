@@ -15,34 +15,12 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
-bool fullSubview(memref::SubViewOp view) {
-  auto type = view.getSourceType();
-  if (type.getRank() != view.getType().getRank()) return false;
-  for (unsigned axis = 0; axis < type.getRank(); ++axis) {
-    if (getConstantIntValue(view.getMixedOffsets()[axis]) != 0 ||
-        getConstantIntValue(view.getMixedStrides()[axis]) != 1) return false;
-    if (!haveEqualExtents(ValueBoundsConstraintSet::Variable(view.getMixedSizes()[axis]),
-                         ValueBoundsConstraintSet::Variable(view.getSource(), axis)))
-      return false;
-  }
-  return true;
-}
-Value stripIdentityViews(Value value) {
-  while (true) {
-    if (auto cast = value.getDefiningOp<memref::CastOp>()) { value = cast.getSource(); continue; }
-    if (auto view = value.getDefiningOp<memref::SubViewOp>(); view && fullSubview(view)) {
-      value = view.getSource();
-      continue;
-    }
-    return value;
-  }
-}
 std::optional<SmallVector<Value>> fullAliases(Value value) {
-  value = stripIdentityViews(value);
+  value = canonicalUniformMemory(value);
   StorageAnalysis storage(value.getParentRegion()->getParentOfType<func::FuncOp>());
   auto aliases = storage.aliases(value);
   if (!aliases.complete || llvm::any_of(aliases.values, [&](Value alias) {
-        return stripIdentityViews(alias) != value;
+        return canonicalUniformMemory(alias) != value;
       })) return std::nullopt;
   return aliases.values;
 }
@@ -175,7 +153,7 @@ Operation *lastWriter(Value value, Operation *before = nullptr) {
   auto aliases = fullAliases(value);
   if (!aliases) return nullptr;
   StorageAnalysis storage(value.getParentRegion()->getParentOfType<func::FuncOp>());
-  Value observed = stripIdentityViews(value);
+  Value observed = canonicalUniformMemory(value);
   Operation *last = nullptr;
   for (Value alias : *aliases) for (Operation *user : alias.getUsers()) {
     if (user == before) continue;
@@ -185,7 +163,7 @@ Operation *lastWriter(Value value, Operation *before = nullptr) {
       if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
       Value target = entry.effect.getValue();
       if (target && storage.disjoint(value, target)) continue;
-      if (!target || stripIdentityViews(target) != observed) return nullptr;
+      if (!target || canonicalUniformMemory(target) != observed) return nullptr;
       Operation *writer = entry.operation;
       if (before && writer->getBlock() != before->getBlock()) return nullptr;
       if (before && !writer->isBeforeInBlock(before)) continue;
@@ -195,23 +173,102 @@ Operation *lastWriter(Value value, Operation *before = nullptr) {
   }
   return last;
 }
-linalg::GenericOp producer(Value value) {
+struct ComputationResult {
+  linalg::GenericOp operation;
+  unsigned output;
+};
+std::optional<ComputationResult> producer(Value value) {
   llvm::SmallDenseSet<Value> seen;
   while (seen.insert(value).second) {
-    value = stripIdentityViews(value);
+    value = canonicalUniformMemory(value);
     Operation *writer = lastWriter(value);
     if (auto copy = dyn_cast_or_null<memref::CopyOp>(writer)) value = copy.getSource();
-    else return dyn_cast_or_null<linalg::GenericOp>(writer);
+    else {
+      auto generic = dyn_cast_or_null<linalg::GenericOp>(writer);
+      if (!generic) return std::nullopt;
+      for (auto [index, output] : llvm::enumerate(generic.getOutputs()))
+        if (canonicalUniformMemory(output) == value)
+          return ComputationResult{generic, static_cast<unsigned>(index)};
+      return std::nullopt;
+    }
   }
-  return {};
+  return std::nullopt;
 }
 bool initializedFalse(Value value, Operation *before) {
   auto fill = dyn_cast_or_null<linalg::FillOp>(lastWriter(value, before));
   return fill && uniformBoolean(UniformValueAnalysis(describeScalarValue).evaluate(fill.getInputs()[0])) == false;
 }
 
-std::optional<unsigned> validityField(RegionOpInterface program, linalg::GenericOp membership,
-                                      unsigned memberAxis) {
+struct CoordinatePredicate {
+  Value value;
+  unsigned source, capture, sourceAxis;
+  UniformPredicate comparison;
+};
+
+std::optional<CoordinatePredicate> coordinatePredicate(
+    RegionOpInterface program, linalg::GenericOp generic, arith::CmpIOp compare) {
+  Block &helper = program.getSummarize().front();
+  auto operand = [&](Value value) -> std::optional<std::pair<BlockArgument, unsigned>> {
+    auto argument = dyn_cast<BlockArgument>(stripIndexWidthCasts(value));
+    if (!argument || argument.getOwner() != &generic.getRegion().front() ||
+        argument.getArgNumber() >= generic.getNumDpsInputs()) return std::nullopt;
+    Value input = canonicalUniformMemory(generic.getInputs()[argument.getArgNumber()]);
+    AffineMap coordinates = generic.getIndexingMapsArray()[argument.getArgNumber()];
+    Operation *consumer = generic;
+    llvm::SmallDenseSet<Value> seen;
+    while (!isa<BlockArgument>(input)) {
+      if (!seen.insert(input).second) return std::nullopt;
+      auto forward = producer(input);
+      if (!forward || forward->operation.getNumReductionLoops() ||
+          forward->operation->getBlock() != consumer->getBlock() ||
+          !forward->operation->isBeforeInBlock(consumer)) return std::nullopt;
+      auto maps = forward->operation.getIndexingMapsArray();
+      AffineMap outputMap = maps[forward->operation.getNumDpsInputs() + forward->output];
+      if (!outputMap.isPermutation()) return std::nullopt;
+      Block &body = forward->operation.getRegion().front();
+      auto yielded = dyn_cast<BlockArgument>(
+          stripIndexWidthCasts(body.getTerminator()->getOperand(forward->output)));
+      if (!yielded || yielded.getOwner() != &body ||
+          yielded.getArgNumber() >= forward->operation.getNumDpsInputs() ||
+          llvm::any_of(body.without_terminator(), [](Operation &op) {
+            return op.getNumRegions() || !isMemoryEffectFree(&op);
+          })) return std::nullopt;
+      coordinates = maps[yielded.getArgNumber()].compose(inversePermutation(outputMap)).compose(coordinates);
+      input = canonicalUniformMemory(forward->operation.getInputs()[yielded.getArgNumber()]);
+      consumer = forward->operation;
+    }
+    auto formal = dyn_cast<BlockArgument>(input);
+    auto type = dyn_cast<MemRefType>(input.getType());
+    if (!formal || formal.getOwner() != &helper || !type || type.getRank() != 1 ||
+        (!type.getElementType().isIndex() && !type.getElementType().isInteger(64))) return std::nullopt;
+    auto axis = dyn_cast<AffineDimExpr>(coordinates.getResult(0));
+    if (!axis) return std::nullopt;
+    return std::make_pair(formal, axis.getPosition());
+  };
+  auto left = operand(compare.getLhs()), right = operand(compare.getRhs());
+  if (!left || !right || left->second == right->second) return std::nullopt;
+  auto sources = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Sources);
+  auto captures = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Captures);
+  bool reverse = !llvm::is_contained(sources, left->first);
+  auto source = reverse ? *right : *left, capture = reverse ? *left : *right;
+  if (!llvm::is_contained(sources, source.first) ||
+      !llvm::is_contained(captures, capture.first)) return std::nullopt;
+  UniformPredicate predicate;
+  switch (compare.getPredicate()) {
+  case arith::CmpIPredicate::slt: predicate = reverse ? UniformPredicate::Greater : UniformPredicate::Less; break;
+  case arith::CmpIPredicate::sle: predicate = reverse ? UniformPredicate::GreaterEqual : UniformPredicate::LessEqual; break;
+  case arith::CmpIPredicate::sgt: predicate = reverse ? UniformPredicate::Less : UniformPredicate::Greater; break;
+  case arith::CmpIPredicate::sge: predicate = reverse ? UniformPredicate::LessEqual : UniformPredicate::GreaterEqual; break;
+  default: return std::nullopt;
+  }
+  return CoordinatePredicate{compare,
+      static_cast<unsigned>(llvm::find(sources, source.first) - sources.begin()),
+      static_cast<unsigned>(llvm::find(captures, capture.first) - captures.begin()),
+      source.second, predicate};
+}
+
+std::optional<std::pair<unsigned, Operation *>> validityField(
+    RegionOpInterface program, ArrayRef<CoordinatePredicate> predicates) {
   UniformValueAnalysis values(describeScalarValue);
   auto summaryOutputs = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Destinations);
   auto combinedOutputs = program.getRegionArguments(program.getCombine(), RegionArgumentKind::Destinations);
@@ -220,101 +277,61 @@ std::optional<unsigned> validityField(RegionOpInterface program, linalg::Generic
   for (auto [field, slot] : llvm::enumerate(summaryOutputs)) {
     auto type = cast<MemRefType>(slot.getType());
     if (!type.getElementType().isInteger(1)) continue;
-    auto reduction = producer(slot);
-    if (!reduction || reduction.getNumDpsInputs() != 1 || reduction.getNumDpsInits() != 1 ||
-        reduction.getNumReductionLoops() != 1 || stripIdentityViews(reduction.getInputs()[0]) != stripIdentityViews(membership.getOutputs()[0]) ||
+    auto produced = producer(slot);
+    if (!produced) continue;
+    auto reduction = produced->operation;
+    if (reduction.getNumDpsInits() != 1 || reduction.getNumReductionLoops() != 1 ||
         !initializedFalse(reduction.getOutputs()[0], reduction)) continue;
-    auto sourceMap = reduction.getIndexingMapsArray()[0];
-    auto coordinate = dyn_cast<AffineDimExpr>(sourceMap.getResult(memberAxis));
-    if (!coordinate || reduction.getIteratorTypesArray()[coordinate.getPosition()] != utils::IteratorType::reduction) continue;
     Block &body = reduction.getRegion().front();
-    if (!isBooleanUnion(values, body.getTerminator()->getOperand(0), body.getArgument(0), body.getArgument(1))) continue;
-    Value identity = stripIdentityViews(program.getIdentities()[field]);
+    Value membership;
+    for (const CoordinatePredicate &predicate : predicates) {
+      auto owner = predicate.value.getDefiningOp()->getParentOfType<linalg::GenericOp>();
+      if (owner == reduction) {
+        if (reduction.getIteratorTypesArray()[predicate.sourceAxis] == utils::IteratorType::reduction)
+          membership = predicate.value;
+      } else if (!owner.getNumReductionLoops()) {
+        auto maps = owner.getIndexingMapsArray();
+        for (auto [number, yielded] : llvm::enumerate(owner.getRegion().front().getTerminator()->getOperands())) {
+          if (yielded != predicate.value) continue;
+          AffineMap outputMap = maps[owner.getNumDpsInputs() + number];
+          for (auto [axis, expression] : llvm::enumerate(outputMap.getResults())) {
+            auto dimension = dyn_cast<AffineDimExpr>(expression);
+            if (!dimension || dimension.getPosition() != predicate.sourceAxis) continue;
+            for (auto [input, memory] : llvm::enumerate(reduction.getInputs())) {
+              if (canonicalUniformMemory(memory) != canonicalUniformMemory(owner.getOutputs()[number])) continue;
+              auto coordinate = dyn_cast<AffineDimExpr>(reduction.getIndexingMapsArray()[input].getResult(axis));
+              if (coordinate && reduction.getIteratorTypesArray()[coordinate.getPosition()] == utils::IteratorType::reduction)
+                membership = body.getArgument(input);
+            }
+          }
+        }
+      }
+      if (membership && isBooleanUnion(values, body.getTerminator()->getOperand(0),
+              membership, body.getArguments().back())) break;
+      membership = {};
+    }
+    if (!membership) continue;
+    Value identity = canonicalUniformMemory(program.getIdentities()[field]);
     if (!initializedFalse(identity, program.getOperation())) continue;
-    auto combined = producer(combinedOutputs[field]);
-    if (!combined || combined.getNumReductionLoops() || combined.getNumDpsInits() != 1 ||
-        !combined.getIndexingMapsArray().back().isIdentity()) continue;
+    auto combinedResult = producer(combinedOutputs[field]);
+    if (!combinedResult) continue;
+    auto combined = combinedResult->operation;
+    if (combined.getNumReductionLoops() ||
+        !combined.getIndexingMapsArray()[combined.getNumDpsInputs() + combinedResult->output].isIdentity()) continue;
     Value lhs, rhs;
     for (auto [index, input] : llvm::enumerate(combined.getInputs())) {
       if (!combined.getIndexingMapsArray()[index].isIdentity()) continue;
-      if (stripIdentityViews(input) == left[field]) lhs = combined.getRegion().front().getArgument(index);
-      if (stripIdentityViews(input) == right[field]) rhs = combined.getRegion().front().getArgument(index);
+      if (canonicalUniformMemory(input) == left[field]) lhs = combined.getRegion().front().getArgument(index);
+      if (canonicalUniformMemory(input) == right[field]) rhs = combined.getRegion().front().getArgument(index);
     }
-    Value result = combined.getRegion().front().getTerminator()->getOperand(0);
-    if (lhs && rhs && isBooleanUnion(values, result, lhs, rhs) && hasTrueStateInvariant(values, result, lhs)) return field;
+    Value result = combined.getRegion().front().getTerminator()->getOperand(combinedResult->output);
+    if (lhs && rhs && isBooleanUnion(values, result, lhs, rhs) && hasTrueStateInvariant(values, result, lhs))
+      return std::make_pair(static_cast<unsigned>(field), reduction.getOperation());
   }
   return std::nullopt;
 }
 
-class ConstantMemory {
-public:
-  explicit ConstantMemory(StorageAnalysis &storage) : storage(storage), values(describeScalarValue) {}
-
-  Attribute read(Value value, const UniformBindings &scalars = UniformBindings()) {
-    if (!isa<MemRefType>(value.getType())) return values.evaluate(value, scalars);
-    Type element = cast<MemRefType>(value.getType()).getElementType();
-    value = stripIdentityViews(value);
-    auto found = facts.find(value);
-    Value origin = storage.uniqueOrigin(value);
-    Attribute constant = found != facts.end() ? found->second
-        : origin ? facts.lookup(origin) : Attribute();
-    auto typed = dyn_cast_or_null<TypedAttr>(constant);
-    return typed && typed.getType() == element ? constant : Attribute();
-  }
-  void write(Value value, Attribute constant) {
-    SmallVector<Value> invalidated;
-    for (auto &fact : facts)
-      if (!storage.disjoint(fact.first, value)) invalidated.push_back(fact.first);
-    for (Value alias : invalidated) facts.erase(alias);
-    if (constant) facts[stripIdentityViews(value)] = constant;
-  }
-  void visit(Operation *operation, const UniformBindings &scalars = UniformBindings()) {
-    if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
-      write(fill.getOutputs()[0], read(fill.getInputs()[0], scalars));
-    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
-      write(copy.getTarget(), read(copy.getSource(), scalars));
-    } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
-      if (generic.getOutputs().size() != 1) { facts.clear(); return; }
-      auto effects = storage.effects(operation);
-      if (!effects.complete || effects.ordered) { facts.clear(); return; }
-      UniformBindings operands;
-      Value output = generic.getOutputs()[0];
-      auto maps = generic.getIndexingMapsArray();
-      bool unsafeAlias = false;
-      for (auto [number, input] : llvm::enumerate(generic.getInputs())) {
-        operands[input] = read(input, scalars);
-        if (isa<MemRefType>(input.getType()) && !storage.disjoint(input, output))
-          unsafeAlias |= input != output || generic.getNumReductionLoops() ||
-              maps[number] != maps.back() || !maps.back().isPermutation();
-      }
-      operands[output] = read(output, scalars);
-      Attribute constant = unsafeAlias ? Attribute()
-          : foldUniformComputation(generic, operands, scalars);
-      invalidate(effects);
-      write(output, constant);
-    } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-      write(store.getMemref(), store.getIndices().empty() ? read(store.getValue(), scalars) : Attribute());
-    } else {
-      invalidate(storage.effects(operation));
-    }
-  }
-
-private:
-  void invalidate(const StorageEffects &effects) {
-    if (!effects.complete || effects.ordered) { facts.clear(); return; }
-    for (const StorageEffect &entry : effects.entries) {
-      if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(entry.effect.getEffect())) continue;
-      if (entry.effect.getValue()) write(entry.effect.getValue(), {});
-      else facts.clear();
-    }
-  }
-
-  StorageAnalysis &storage;
-  UniformValueAnalysis values;
-  UniformBindings facts;
-};
-
-bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
+bool summaryIsIdentityWhenFalse(RegionOpInterface program, ValueRange predicates) {
   StorageAnalysis storage(program.getOperation()->getParentOfType<func::FuncOp>());
   for (Region &region : program.getOperation()->getRegions()) {
     auto destinations = program.getRegionArguments(region, RegionArgumentKind::Destinations);
@@ -338,7 +355,10 @@ bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
       }
     }
   }
-  ConstantMemory outer(storage), summary(storage);
+  UniformBindings scalars;
+  for (Value predicate : predicates)
+    scalars[predicate] = IntegerAttr::get(IntegerType::get(predicate.getContext(), 1), 0);
+  UniformMemoryAnalysis outer(storage), summary(storage, std::move(scalars));
   for (Operation &operation : *program.getOperation()->getBlock()) {
     if (&operation == program.getOperation()) break;
     outer.visit(&operation);
@@ -349,9 +369,7 @@ bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
   for (const auto &relation : *schema)
     if (relation.kind != RegionArgumentKind::Destinations)
       summary.write(relation.argument, outer.read(relation.prototype));
-  UniformBindings scalars;
-  scalars[predicate] = IntegerAttr::get(IntegerType::get(predicate.getContext(), 1), 0);
-  for (Operation &operation : helper.without_terminator()) summary.visit(&operation, scalars);
+  for (Operation &operation : helper.without_terminator()) summary.visit(&operation);
   for (auto [result, identity] : llvm::zip(
            program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Destinations),
            program.getIdentities()))
@@ -450,70 +468,27 @@ std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at
 std::optional<RegionPredicatePlan> analyzeRegionPredicate(RegionOpInterface program) {
   if (program.isScan() || !getEffectsRecursively(program.getOperation())) return std::nullopt;
   Block &helper = program.getSummarize().front();
+  SmallVector<CoordinatePredicate> predicates;
   for (auto generic : helper.getOps<linalg::GenericOp>()) {
-    if (generic.getNumReductionLoops() || generic.getOutputs().size() != 1) continue;
-    auto compare = generic.getRegion().front().getTerminator()->getOperand(0).getDefiningOp<arith::CmpIOp>();
-    if (!compare) continue;
-    auto operand = [&](Value value) -> std::optional<std::pair<BlockArgument, unsigned>> {
-      auto argument = dyn_cast<BlockArgument>(value);
-      if (!argument || argument.getOwner() != &generic.getRegion().front() || argument.getArgNumber() >= generic.getNumDpsInputs()) return std::nullopt;
-      Value input = stripIdentityViews(generic.getInputs()[argument.getArgNumber()]);
-      AffineMap coordinates = generic.getIndexingMapsArray()[argument.getArgNumber()];
-      Operation *consumer = generic;
-      llvm::SmallDenseSet<Value> seen;
-      while (!isa<BlockArgument>(input)) {
-        if (!seen.insert(input).second) return std::nullopt;
-        auto forward = dyn_cast_or_null<linalg::GenericOp>(lastWriter(input));
-        if (!forward || forward.getOutputs().size() != 1 || forward.getNumReductionLoops() ||
-            forward->getBlock() != consumer->getBlock() || !forward->isBeforeInBlock(consumer) ||
-            !forward.getIndexingMapsArray().back().isPermutation()) return std::nullopt;
-        Block &body = forward.getRegion().front();
-        auto yielded = dyn_cast<BlockArgument>(body.getTerminator()->getOperand(0));
-        if (!yielded || yielded.getOwner() != &body || yielded.getArgNumber() >= forward.getNumDpsInputs() ||
-            llvm::any_of(body.without_terminator(), [](Operation &op) { return op.getNumRegions() || !isMemoryEffectFree(&op); })) return std::nullopt;
-        auto maps = forward.getIndexingMapsArray();
-        coordinates = maps[yielded.getArgNumber()].compose(inversePermutation(maps.back())).compose(coordinates);
-        input = stripIdentityViews(forward.getInputs()[yielded.getArgNumber()]);
-        consumer = forward;
-      }
-      auto formal = dyn_cast<BlockArgument>(input);
-      auto type = dyn_cast<MemRefType>(input.getType());
-      if (!formal || formal.getOwner() != &helper || !type || type.getRank() != 1 ||
-          (!type.getElementType().isIndex() && !type.getElementType().isInteger(64))) return std::nullopt;
-      auto axis = dyn_cast<AffineDimExpr>(coordinates.getResult(0));
-      if (!axis) return std::nullopt;
-      return std::make_pair(formal, axis.getPosition());
-    };
-    auto left = operand(compare.getLhs()), right = operand(compare.getRhs());
-    if (!left || !right || left->second == right->second) continue;
-    auto sourceArguments = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Sources);
-    auto captureArguments = program.getRegionArguments(program.getSummarize(), RegionArgumentKind::Captures);
-    bool reverse = !llvm::is_contained(sourceArguments, left->first);
-    auto source = reverse ? *right : *left, capture = reverse ? *left : *right;
-    if (!llvm::is_contained(sourceArguments, source.first) ||
-        !llvm::is_contained(captureArguments, capture.first)) continue;
-    UniformPredicate predicate;
-    switch (compare.getPredicate()) {
-    case arith::CmpIPredicate::slt: predicate = reverse ? UniformPredicate::Greater : UniformPredicate::Less; break;
-    case arith::CmpIPredicate::sle: predicate = reverse ? UniformPredicate::GreaterEqual : UniformPredicate::LessEqual; break;
-    case arith::CmpIPredicate::sgt: predicate = reverse ? UniformPredicate::Less : UniformPredicate::Greater; break;
-    case arith::CmpIPredicate::sge: predicate = reverse ? UniformPredicate::LessEqual : UniformPredicate::GreaterEqual; break;
-    default: continue;
-    }
-    unsigned memberAxis = generic.getIndexingMapsArray().back().getNumResults();
-    for (auto [axis, expression] : llvm::enumerate(generic.getIndexingMapsArray().back().getResults()))
-      if (auto dimension = dyn_cast<AffineDimExpr>(expression); dimension && dimension.getPosition() == source.second) memberAxis = axis;
-    if (memberAxis == generic.getIndexingMapsArray().back().getNumResults()) continue;
-    auto validity = validityField(program, generic, memberAxis);
-    auto reduction = validity ? producer(program.getRegionArguments(
-        program.getSummarize(), RegionArgumentKind::Destinations)[*validity])
-                              : linalg::GenericOp();
-    return RegionPredicatePlan{compare,
-        static_cast<unsigned>(llvm::find(sourceArguments, source.first) - sourceArguments.begin()),
-        static_cast<unsigned>(llvm::find(captureArguments, capture.first) - captureArguments.begin()),
-        predicate, validity, reduction, summaryIsIdentityWhenFalse(program, compare)};
+    for (auto compare : generic.getRegion().front().getOps<arith::CmpIOp>())
+      if (auto predicate = coordinatePredicate(program, generic, compare))
+        predicates.push_back(*predicate);
   }
-  return std::nullopt;
+  if (predicates.empty()) return std::nullopt;
+  const CoordinatePredicate &selected = predicates.front();
+  SmallVector<CoordinatePredicate> equivalent;
+  SmallVector<Value> conditions;
+  for (const CoordinatePredicate &predicate : predicates)
+    if (predicate.source == selected.source && predicate.capture == selected.capture &&
+        predicate.comparison == selected.comparison) {
+      equivalent.push_back(predicate);
+      conditions.push_back(predicate.value);
+    }
+  auto validity = validityField(program, equivalent);
+  bool identity = summaryIsIdentityWhenFalse(program, conditions);
+  return RegionPredicatePlan{std::move(conditions), selected.source, selected.capture,
+      selected.comparison, validity ? std::optional<unsigned>(validity->first) : std::nullopt,
+      validity ? validity->second : nullptr, identity};
 }
 
 }

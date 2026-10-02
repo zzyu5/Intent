@@ -2,7 +2,9 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "mlir/Dialect/Bufferization/IR/BufferViewFlowOpInterface.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
@@ -29,6 +31,19 @@ struct PrefetchEffects
     // Preserve the hint through ordinary MLIR dead-op elimination even though
     // it produces no SSA result. Cache state is separate from buffer contents.
     effects.emplace_back(MemoryEffects::Write::get(), CacheHintResource::get());
+  }
+};
+
+struct DeallocationEffects
+    : MemoryEffectOpInterface::ExternalModel<DeallocationEffects,
+                                            bufferization::DeallocOp> {
+  void getEffects(Operation *operation,
+                  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) const {
+    auto release = cast<bufferization::DeallocOp>(operation);
+    for (auto [memory, condition] :
+         llvm::zip(release.getMemrefsMutable(), release.getConditions()))
+      if (!matchPattern(condition, m_Zero()))
+        effects.emplace_back(MemoryEffects::Free::get(), &memory);
   }
 };
 
@@ -75,6 +90,9 @@ func::FuncOp enclosingFunction(Operation *scope) {
 void registerStorageInterfaces(DialectRegistry &registry) {
   registry.addExtension(+[](MLIRContext *context, memref::MemRefDialect *) {
     memref::PrefetchOp::attachInterface<PrefetchEffects>(*context);
+  });
+  registry.addExtension(+[](MLIRContext *context, bufferization::BufferizationDialect *) {
+    bufferization::DeallocOp::attachInterface<DeallocationEffects>(*context);
   });
 }
 

@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Contractions.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Bufferization.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -8,6 +9,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
@@ -18,6 +21,7 @@ namespace intent::cpu {
 
 #define GEN_PASS_DEF_CPUCONFIGURETARGET
 #define GEN_PASS_DEF_CPUNORMALIZESOURCE
+#define GEN_PASS_DEF_CPUBUFFERIZEVALUES
 #define GEN_PASS_DEF_CPUMATERIALIZECONFIGURATIONS
 #define GEN_PASS_DEF_CPUREALIZEREGIONS
 #define GEN_PASS_DEF_CPUFORMINPUTSUPPLY
@@ -36,10 +40,11 @@ OpPassManager normalizationPipeline() {
   return manager;
 }
 
-LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result) {
+LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result,
+                          CPUProgramStage stage = CPUProgramStage::Buffers) {
   if (failed(result))
     return module.emitError() << "CPU transformation failed: " << name;
-  if (failed(verifyCPUProgram(module, false)))
+  if (failed(verifyCPUProgram(module, stage)))
     return module.emitError() << "CPU postcondition failed: " << name;
   return success();
 }
@@ -62,7 +67,18 @@ public:
         privateBytes.getValue(), matrixI8I32.getValue());
     if (!capabilities) return signalPassFailure();
     module->setAttr("intent_cpu.capabilities", capabilities);
-    if (failed(finishGroup(module, getArgument(), success()))) signalPassFailure();
+    if (failed(finishGroup(module, getArgument(), success(), CPUProgramStage::Values))) signalPassFailure();
+  }
+};
+
+class BufferizeValuesPass : public impl::CPUBufferizeValuesBase<BufferizeValuesPass> {
+public:
+  using CPUBufferizeValuesBase::CPUBufferizeValuesBase;
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyCPUProgram(module, CPUProgramStage::Values)) ||
+        failed(finishGroup(module, getArgument(), bufferizeValues(module))))
+      signalPassFailure();
   }
 };
 
@@ -194,6 +210,7 @@ void buildCPUPipeline(OpPassManager &manager, const CPUCompilationOptions &optio
   target.privateBytes = options.privateBytes;
   target.matrixI8I32 = options.matrixI8I32;
   manager.addPass(createCPUConfigureTarget(target));
+  manager.addPass(createCPUBufferizeValues());
   manager.addPass(createCPUNormalizeSource());
   CPUMaterializeConfigurationsOptions configurations;
   configurations.provider = options.provider;

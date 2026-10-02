@@ -3,6 +3,7 @@
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Region.h"
+#include "mlir/IR/ValueRange.h"
 
 namespace intent::cpu {
 
@@ -23,6 +24,14 @@ mlir::LogicalResult verifyCollectiveHelper(
     mlir::Operation *owner, mlir::Region &region, unsigned destinations);
 mlir::LogicalResult verifyCollectiveHelperEffects(
     mlir::Operation *owner, mlir::Region &region, unsigned destinations);
+
+// Tensor destinations carry shape; results own immutable values. Buffer form
+// has no results and writes its memref destinations.
+mlir::LogicalResult verifyCollectiveOutputs(mlir::Operation *operation,
+                                          mlir::ValueRange outputs);
+mlir::LogicalResult verifyValueCollectiveHelper(
+    mlir::Operation *owner, mlir::Region &region,
+    mlir::TypeRange arguments, mlir::TypeRange results);
 
 } // namespace intent::cpu
 #endif

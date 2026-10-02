@@ -1,8 +1,10 @@
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
+#include "Intent/Analysis/ControlFlow.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
 
 using namespace mlir;
 
@@ -60,6 +62,26 @@ AxisRelations::AxisRelations(func::FuncOp function) {
       if (lhs.size() == 3) unite(lhs[0], positions.at(dot.getOutput())[0]);
     }
   });
+  for (Value memory : memories) {
+    auto incoming = intent::queryControlFlowIncoming(memory);
+    if (!incoming.complete || incoming.edges.empty()) continue;
+    auto type = cast<MemRefType>(memory.getType());
+    auto previous = parents;
+    for (const intent::ControlFlowEdge &edge : incoming.edges) {
+      if (!edge.operand) continue;
+      Value source = edge.operand->get();
+      auto sourceType = dyn_cast<MemRefType>(source.getType());
+      if (sourceType && sourceType.getShape() == type.getShape())
+        equate(memory, source);
+    }
+    bool compatible = llvm::all_of(memories, [&](Value value) {
+      llvm::SmallSet<unsigned, 4> distinct;
+      for (unsigned position : positions.at(value))
+        if (!distinct.insert(root(position)).second) return false;
+      return true;
+    });
+    if (!compatible) parents = std::move(previous);
+  }
   auto identify = [&](unsigned position) {
     unsigned representative = root(position);
     if (!identities.count(representative)) identities[representative] = identities.size() + 1;

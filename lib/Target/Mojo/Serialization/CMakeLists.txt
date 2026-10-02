@@ -18,5 +18,6 @@ add_mlir_library(MLIRIntentMojoSerialization
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRVectorDialect
+  MLIRTransformUtils
   MLIRIR
 )

@@ -12,5 +12,6 @@ add_mlir_library(MLIRIntentKIRToCPU
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
+  MLIRTensorDialect
   MLIRIR
 )

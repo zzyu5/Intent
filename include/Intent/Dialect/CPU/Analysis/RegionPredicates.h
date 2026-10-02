@@ -15,7 +15,7 @@ struct CoordinateSequence {
   mlir::Value origin;
 };
 struct RegionPredicatePlan {
-  mlir::Value predicate;
+  llvm::SmallVector<mlir::Value> predicates;
   unsigned source, capture;
   UniformPredicate comparison;
   std::optional<unsigned> validityField;

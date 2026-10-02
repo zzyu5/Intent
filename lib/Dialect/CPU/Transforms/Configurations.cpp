@@ -97,7 +97,7 @@ LogicalResult materializeCPUConfigurations(
       return failure();
   }
   original.erase();
-  return verifyCPUProgram(module, false);
+  return verifyCPUProgram(module, CPUProgramStage::Buffers);
 }
 
 } // namespace intent::cpu

@@ -25,6 +25,8 @@ add_mlir_library(MLIRIntentCPUTransforms
   TuningProfiles.cpp
   Configurations.cpp
   FinalizedCandidates.cpp
+  Bufferization.cpp
+  CollectiveBufferization.cpp
   Passes.cpp
 
   DEPENDS IntentCPUTransformsIncGen
@@ -35,13 +37,19 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRIntentCPUDialect
   MLIRAnalysis
   MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRBufferizationTransforms
+  MLIRBufferizationToMemRef
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
+  MLIRMemRefTransforms
   MLIRSCFDialect
   MLIRSCFUtils
+  MLIRTensorDialect
+  MLIRTensorTransforms
   MLIRVectorDialect
   MLIRValueBoundsOpInterface
   MLIRIR

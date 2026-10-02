@@ -5,6 +5,7 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Bufferization.h"
 #include "TaskLowering.h"
 #include "Quantization.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
@@ -21,7 +22,8 @@ namespace intent::weft_provider {
 LogicalResult legalizeProgram(ModuleOp program) {
   auto registry = cpu::lookupImplementationProvider(program, "weft");
   if (failed(registry)) return failure();
-  if (failed(cpu::verifyCPUProgram(program, false))) return failure();
+  if (failed(cpu::verifyCPUProgram(program, cpu::CPUProgramStage::Buffers))) return failure();
+  if (failed(cpu::lowerOwnership(program))) return failure();
   program.getContext()->loadDialect<IntentWeftDialect, wk::WEFTKernelDialect>();
   auto cpuProgram = ModuleOp::create(program.getLoc(), hostModuleName);
   auto output = ModuleOp::create(program.getLoc(), deviceModuleName);

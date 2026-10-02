@@ -154,9 +154,38 @@ LogicalResult ScanOp::verify() {
   if (!count || getInitials().size() != count || getOutputs().size() != count ||
       !llvm::hasSingleElement(getCombine()))
     return emitOpError("scan requires matching sources, identities and destinations");
-  auto first = cast<MemRefType>(getSources()[0].getType());
+  if (failed(verifyCollectiveOutputs(getOperation(), getOutputs()))) return failure();
+  auto first = cast<ShapedType>(getSources()[0].getType());
   if (getAxis() >= static_cast<uint64_t>(first.getRank()))
     return emitOpError("scan axis is outside its source rank");
+  if (getNumResults()) {
+    for (auto [source, initial, output] :
+         llvm::zip(getSources(), getInitials(), getOutputs())) {
+      auto input = dyn_cast<RankedTensorType>(source.getType());
+      auto result = cast<RankedTensorType>(output.getType());
+      if (!input || getAxis() >= static_cast<uint64_t>(input.getRank()) ||
+          input.getDimSize(getAxis()) != first.getDimSize(getAxis()) ||
+          input != result)
+        return emitOpError("value scan must preserve source shapes and a common member extent");
+      SmallVector<int64_t> shape(input.getShape());
+      shape.erase(shape.begin() + getAxis());
+      if (auto state = dyn_cast<RankedTensorType>(initial.getType())) {
+        if (state.getShape() != ArrayRef<int64_t>(shape) ||
+            state.getElementType() != input.getElementType())
+          return emitOpError("scan identity must describe its complete source slice");
+      } else if (initial.getType() != input.getElementType()) {
+        return emitOpError("scalar scan identity must match its source element type");
+      }
+    }
+    SmallVector<Type> arguments(getInitials().getTypes());
+    llvm::append_range(arguments, getInitials().getTypes());
+    llvm::append_range(arguments, getCaptures().getTypes());
+    if (getCombine().front().empty() ||
+        !isa<ScanYieldOp>(getCombine().front().getTerminator()))
+      return emitOpError("scan helper requires scan_yield");
+    return verifyValueCollectiveHelper(getOperation(), getCombine(), arguments,
+                                      getInitials().getTypes());
+  }
   if (isDestinationPassing()) {
     SmallVector<Type> states, members;
     for (auto [source, initial, output] : llvm::zip(getSources(), getInitials(), getOutputs())) {
@@ -212,15 +241,45 @@ LogicalResult ScanOp::verify() {
 }
 
 LogicalResult HistogramOp::verify() {
-  auto values = cast<MemRefType>(getValues().getType());
-  auto valid = cast<MemRefType>(getValid().getType());
-  auto output = cast<MemRefType>(getOutput().getType());
+  if (failed(verifyCollectiveOutputs(getOperation(), ValueRange{getOutput()})))
+    return failure();
+  auto values = cast<ShapedType>(getValues().getType());
+  auto valid = cast<ShapedType>(getValid().getType());
+  auto output = cast<ShapedType>(getOutput().getType());
+  if (isa<RankedTensorType>(values) != bool(getResult()) ||
+      isa<RankedTensorType>(valid) != bool(getResult()))
+    return emitOpError("histogram operands must use one value/buffer form");
   if (!isa<IntegerType, IndexType>(values.getElementType()) || values.getElementType().isInteger(1) ||
       values.getShape() != valid.getShape() || !valid.getElementType().isInteger(1) ||
       output.getRank() != 1 || !isa<IntegerType>(output.getElementType()) || output.getElementType().isInteger(1) ||
       (!output.isDynamicDim(0) && output.getDimSize(0) <= 0))
     return emitOpError("histogram requires integer values, a matching bool predicate and a nonempty integer-bin vector");
   return success();
+}
+
+namespace {
+void destinationEffects(Operation *operation,
+                        SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (OpOperand &operand : operation->getOpOperands()) {
+    if (!isa<MemRefType>(operand.get().getType())) continue;
+    if (operand.getOperandNumber() + 1 == operation->getNumOperands())
+      effects.emplace_back(MemoryEffects::Write::get(), &operand);
+    else
+      effects.emplace_back(MemoryEffects::Read::get(), &operand);
+  }
+}
+} // namespace
+
+void HistogramOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  destinationEffects(getOperation(), effects);
+}
+
+void QuantizeOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  destinationEffects(getOperation(), effects);
+}
+
+void QuantizedDotOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  destinationEffects(getOperation(), effects);
 }
 
 namespace {
@@ -265,7 +324,7 @@ LogicalResult AtomicCompareExchangeOp::verify() {
 
 namespace {
 bool recordType(Type type, int64_t bytes) {
-  auto memory = dyn_cast<MemRefType>(type);
+  auto memory = dyn_cast<ShapedType>(type);
   return memory && memory.getRank() == 2 &&
       (memory.isDynamicDim(1) || memory.getDimSize(1) == bytes) &&
       memory.getElementType().isSignlessInteger(8);
@@ -273,8 +332,12 @@ bool recordType(Type type, int64_t bytes) {
 }
 
 LogicalResult QuantizeOp::verify() {
-  auto input = cast<MemRefType>(getInput().getType());
-  auto output = cast<MemRefType>(getOutput().getType());
+  if (failed(verifyCollectiveOutputs(getOperation(), ValueRange{getOutput()})))
+    return failure();
+  auto input = cast<ShapedType>(getInput().getType());
+  auto output = cast<ShapedType>(getOutput().getType());
+  if (isa<RankedTensorType>(input) != bool(getResult()))
+    return emitOpError("quantize operands must use one value/buffer form");
   if (getFormat() != intent::QuantFormat::Q8K || input.getRank() != 2 ||
       (!input.isDynamicDim(1) && input.getDimSize(1) != 256) ||
       !input.getElementType().isF32() || !recordType(output, 292) ||
@@ -285,9 +348,14 @@ LogicalResult QuantizeOp::verify() {
 }
 
 LogicalResult QuantizedDotOp::verify() {
-  auto lhs = cast<MemRefType>(getLhs().getType());
-  auto rhs = cast<MemRefType>(getRhs().getType());
-  auto output = cast<MemRefType>(getOutput().getType());
+  if (failed(verifyCollectiveOutputs(getOperation(), ValueRange{getOutput()})))
+    return failure();
+  auto lhs = cast<ShapedType>(getLhs().getType());
+  auto rhs = cast<ShapedType>(getRhs().getType());
+  auto output = cast<ShapedType>(getOutput().getType());
+  if (isa<RankedTensorType>(lhs) != bool(getResult()) ||
+      isa<RankedTensorType>(rhs) != bool(getResult()))
+    return emitOpError("quantized dot operands must use one value/buffer form");
   if (getLhsFormat() != intent::QuantFormat::Q4K || getRhsFormat() != intent::QuantFormat::Q8K ||
       !recordType(rhs, 292) || (lhs.getRank() != 2 && lhs.getRank() != 3) ||
       !lhs.getElementType().isSignlessInteger(8) ||

@@ -1,6 +1,7 @@
 add_mlir_dialect_library(MLIRIntentCPUDialect
   CPUDialect.cpp
   CPUOps.cpp
+  ValueOps.cpp
   CollectiveHelpers.cpp
   ShapeRelations.cpp
   CPUOpInterfaces.cpp
@@ -9,6 +10,7 @@ add_mlir_dialect_library(MLIRIntentCPUDialect
   MLIRIntentDialect
   MLIRArithDialect
   MLIRBufferizationDialect
+  MLIRBufferizationTransforms
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMemRefDialect

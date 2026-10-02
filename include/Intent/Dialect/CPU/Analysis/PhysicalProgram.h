@@ -9,6 +9,8 @@
 
 namespace intent::cpu {
 
+enum class CPUProgramStage { Values, Buffers, Realized };
+
 struct AllocationFacts {
   mlir::Value value;
   mlir::Operation *owner;
@@ -22,7 +24,7 @@ class PhysicalProgramAnalysis {
 public:
   explicit PhysicalProgramAnalysis(mlir::func::FuncOp function) : function(function) {}
   llvm::SmallVector<AllocationFacts> allocations();
-  mlir::LogicalResult verify(bool realized);
+  mlir::LogicalResult verify(CPUProgramStage stage);
 
 private:
   mlir::func::FuncOp function;
@@ -32,7 +34,7 @@ bool isMatrixContraction(mlir::linalg::GenericOp operation);
 std::optional<llvm::SmallVector<std::pair<unsigned, unsigned>>>
 unitReshapeAxes(mlir::Operation *operation);
 bool supportsVectorScan(ScanOp operation);
-mlir::LogicalResult verifyCPUProgram(mlir::ModuleOp module, bool realized);
+mlir::LogicalResult verifyCPUProgram(mlir::ModuleOp module, CPUProgramStage stage);
 
 }
 #endif

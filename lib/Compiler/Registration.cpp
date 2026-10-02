@@ -8,6 +8,7 @@
 #include "Intent/Dialect/CPU/IR/ImplementationProvider.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Bufferization.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -44,6 +45,7 @@ void registerDialects(DialectRegistry &registry) {
   registerAllDialects(registry);
   cpu::registerExtentRelations(registry);
   cpu::registerStorageInterfaces(registry);
+  cpu::registerValueBufferizationInterfaces(registry);
   registry.insert<IntentDialect, gpu::IntentGPUDialect, cpu::IntentCPUDialect,
       dsa::IntentDSADialect>();
   registry.addExtension(+[](MLIRContext *, cpu::IntentCPUDialect *dialect) {

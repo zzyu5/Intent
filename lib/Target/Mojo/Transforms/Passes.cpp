@@ -33,7 +33,8 @@ LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result,
                           bool realized = false) {
   if (failed(result))
     return module.emitError() << "Mojo transformation failed: " << name;
-  if (failed(cpu::verifyCPUProgram(module, realized)))
+  if (failed(cpu::verifyCPUProgram(module, realized ? cpu::CPUProgramStage::Realized
+                                                  : cpu::CPUProgramStage::Buffers)))
     return module.emitError() << "Mojo postcondition failed: " << name;
   return success();
 }
@@ -44,7 +45,7 @@ public:
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
-    if (failed(cpu::verifyCPUProgram(module, false))) return signalPassFailure();
+    if (failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), prepareNativeProgram(module))))
       signalPassFailure();
   }

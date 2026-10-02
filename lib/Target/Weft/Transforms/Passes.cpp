@@ -32,12 +32,12 @@ public:
   using WeftPrepareTaskViewsBase::WeftPrepareTaskViewsBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(cpu::verifyCPUProgram(module, false)) ||
+    if (failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers)) ||
         failed(cpu::verifyImplementationBindings(module, "weft")))
       return signalPassFailure();
     for (auto function : module.getOps<func::FuncOp>())
       if (failed(reifyTaskViewCaptures(function))) return signalPassFailure();
-    if (failed(cpu::verifyCPUProgram(module, false))) signalPassFailure();
+    if (failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers))) signalPassFailure();
   }
 };
 

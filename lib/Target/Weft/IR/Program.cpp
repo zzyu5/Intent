@@ -98,7 +98,7 @@ FailureOr<ProgramModules> getProgramModules(ModuleOp program) {
 LogicalResult verifyProgram(ModuleOp program) {
   if (failed(mlir::verify(program))) return failure();
   auto modules = getProgramModules(program);
-  if (failed(modules) || failed(cpu::verifyCPUProgram(modules->host, true))) return failure();
+  if (failed(modules) || failed(cpu::verifyCPUProgram(modules->host, cpu::CPUProgramStage::Realized))) return failure();
   if (failed(verifyHostScalarOperations(modules->host))) return failure();
   if (!modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities"))
     return modules->host.emitError("Weft host requires CPU capabilities");

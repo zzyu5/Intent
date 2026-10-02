@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
@@ -202,24 +203,58 @@ private:
         return operation->emitError("CPU inferred reshape requires a uniquely determined extent");
       Value source = values.lookup(operation->getOperand(0));
       Value sourceElements = constant(loc, 1);
-      for (int64_t axis = 0; axis < cast<MemRefType>(source.getType()).getRank(); ++axis)
+      for (int64_t axis = 0; axis < cast<ShapedType>(source.getType()).getRank(); ++axis)
         sourceElements = builder.createOrFold<arith::MulIOp>(loc, sourceElements,
-            builder.createOrFold<memref::DimOp>(loc, source, axis));
+            dimension(builder, loc, source, axis));
       // A legal inferred reshape has a nonzero known product and exact quotient.
       dimensions[*inferred] = builder.createOrFold<arith::DivSIOp>(loc, sourceElements, knownElements);
     }
     return success();
   }
 
-  Value allocate(RankedTensorType tensor, ArrayRef<Value> sizes, Location loc) {
+  static RankedTensorType tensorType(Type type) {
+    auto tensor = cast<RankedTensorType>(type);
+    return RankedTensorType::get(tensor.getShape(), tensor.getElementType());
+  }
+
+  static Type valueType(Type type) {
+    return isa<RankedTensorType>(type) ? Type(tensorType(type)) : type;
+  }
+
+  static Value dimension(OpBuilder &b, Location loc, Value value, int64_t axis) {
+    return isa<RankedTensorType>(value.getType())
+        ? Value(b.createOrFold<tensor::DimOp>(loc, value, axis))
+        : Value(b.createOrFold<memref::DimOp>(loc, value, axis));
+  }
+
+  static Value extractElement(OpBuilder &b, Location loc, Value value,
+                              ValueRange indices) {
+    return isa<RankedTensorType>(value.getType())
+        ? Value(b.create<tensor::ExtractOp>(loc, value, indices))
+        : Value(b.create<memref::LoadOp>(loc, value, indices));
+  }
+
+  Value emptyTensor(RankedTensorType tensor, ArrayRef<Value> sizes, Location loc) {
     SmallVector<Value> dynamic;
     for (auto [axis, size] : llvm::enumerate(sizes))
       if (tensor.isDynamicDim(axis))
         dynamic.push_back(size);
-    Value allocation = builder.create<memref::AllocOp>(
-        loc, MemRefType::get(tensor.getShape(), tensor.getElementType()), dynamic);
-    allocations.back().push_back(allocation);
-    return allocation;
+    return builder.create<tensor::EmptyOp>(loc, tensor.getShape(),
+                                           tensor.getElementType(), dynamic);
+  }
+
+  FailureOr<SmallVector<Value>> emptyResults(TypeRange types, Location loc) {
+    SmallVector<Type> leaves;
+    appendProductLeafTypes(types, leaves);
+    SmallVector<Value> result;
+    for (Type leaf : leaves) {
+      auto tensor = dyn_cast<RankedTensorType>(leaf);
+      if (!tensor) tensor = RankedTensorType::get({}, leaf);
+      auto sizes = extents(tensor, loc);
+      if (failed(sizes)) return failure();
+      result.push_back(emptyTensor(tensor, *sizes, loc));
+    }
+    return result;
   }
 
   SmallVector<Value> flattened(Value value) {
@@ -240,49 +275,22 @@ private:
 
   void bindDimensions(Type original, Value value, Location loc) {
     auto tensor = dyn_cast<RankedTensorType>(original);
-    if (!tensor || !isa<MemRefType>(value.getType())) return;
+    if (!tensor || !isa<ShapedType>(value.getType())) return;
     auto identities = cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions();
     for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef()))
-      dimensions[identity] = builder.create<memref::DimOp>(loc, value, axis);
+      dimensions[identity] = dimension(builder, loc, value, axis);
   }
 
-  SmallVector<Value> makeSlots(TypeRange types, Location loc) {
-    SmallVector<Value> result;
-    SmallVector<Type> leaves;
-    appendProductLeafTypes(types, leaves);
-    for (Type leaf : leaves) {
-      auto tensor = dyn_cast<RankedTensorType>(leaf);
-      if (!tensor) tensor = RankedTensorType::get({}, leaf);
-      auto sizes = extents(tensor, loc);
-      if (failed(sizes)) return {};
-      result.push_back(allocate(tensor, *sizes, loc));
-    }
-    return result;
-  }
-
-  Value slotValue(Value slot, Location loc) {
-    if (cast<MemRefType>(slot.getType()).getRank() == 0)
-      return builder.create<memref::LoadOp>(loc, slot, ValueRange{});
-    return slot;
-  }
-
-  void copyToSlot(Value value, Value slot, Location loc) {
-    if (isa<MemRefType>(value.getType())) builder.create<memref::CopyOp>(loc, value, slot);
-    else if (cast<MemRefType>(slot.getType()).getRank())
-      builder.create<linalg::FillOp>(loc, ValueRange{value}, ValueRange{slot});
-    else builder.create<memref::StoreOp>(loc, value, slot, ValueRange{});
-  }
-
-  void bindSlots(ValueRange originals, ValueRange slots, Location loc) {
+  void bindValues(ValueRange originals, ValueRange components, Location loc) {
     auto ranges = getProductLeafRanges(originals.getTypes());
     for (auto [original, range] : llvm::zip(originals, ranges)) {
       SmallVector<Type> leaves;
       appendProductLeafTypes(original.getType(), leaves);
       SmallVector<Value> parts;
       for (auto [leaf, value] :
-           llvm::zip(leaves, slots.slice(range.offset, range.size))) {
+           llvm::zip(leaves, components.slice(range.offset, range.size))) {
         bindDimensions(leaf, value, loc);
-        parts.push_back(isa<RankedTensorType>(leaf) ? value : slotValue(value, loc));
+        parts.push_back(value);
       }
       bindProduct(original, parts);
     }
@@ -299,51 +307,38 @@ private:
     return builder.getArrayAttr(fields);
   }
 
-  LogicalResult helper(Region &original, Region &target, TypeRange inputTypes,
-                       TypeRange destinationTypes, bool scalarResults = false) {
+  LogicalResult helper(Region &original, Region &target, ValueRange captures = {}) {
     auto savedDimensions = dimensions;
     OpBuilder::InsertionGuard guard(builder);
     Block *body = new Block;
     target.push_back(body);
-    for (Type type : inputTypes) body->addArgument(type, original.getLoc());
-    for (Type type : destinationTypes) body->addArgument(type, original.getLoc());
+    SmallVector<Type> inputTypes;
+    appendProductLeafTypes(original.front().getArgumentTypes(), inputTypes);
+    if (captures.size() > inputTypes.size())
+      return original.getParentOp()->emitError("CPU helper capture schema is incomplete");
+    for (auto [index, capture] : llvm::enumerate(captures))
+      inputTypes[inputTypes.size() - captures.size() + index] = capture.getType();
+    for (Type type : inputTypes) body->addArgument(valueType(type), original.getLoc());
     builder.setInsertionPointToStart(body);
     auto ranges = getProductLeafRanges(original.front().getArgumentTypes());
-    size_t inputCount = ranges.empty() ? 0 : ranges.back().offset + ranges.back().size;
-    if (inputCount != inputTypes.size())
-      return original.getParentOp()->emitError("CPU helper argument partition mismatch");
     for (auto [argument, range] : llvm::zip(original.front().getArguments(), ranges)) {
       SmallVector<Type> leaves;
       appendProductLeafTypes(argument.getType(), leaves);
       SmallVector<Value> parts;
       for (auto [leaf, target] :
            llvm::zip(leaves, body->getArguments().slice(range.offset, range.size))) {
-        Value value = target;
-        bindDimensions(leaf, value, original.getLoc());
-        if (!isa<RankedTensorType>(leaf) && isa<MemRefType>(value.getType()))
-          value = slotValue(value, original.getLoc());
-        parts.push_back(value);
+        bindDimensions(leaf, target, original.getLoc());
+        parts.push_back(target);
       }
       bindProduct(argument, parts);
     }
-    allocations.emplace_back();
-    for (Operation &operation : original.front().without_terminator())
-      if (failed(lowerOperation(&operation))) return failure();
+    if (failed(lowerBlock(original.front()))) return failure();
     auto results = flattened(original.front().getTerminator()->getOperands());
-    if (!scalarResults && results.size() != destinationTypes.size())
-      return original.getParentOp()->emitError("CPU helper destination schema mismatch");
-    if (!scalarResults)
-      for (auto [value, slot] : llvm::zip(results, body->getArguments().drop_front(inputCount)))
-        copyToSlot(value, slot, original.getLoc());
-    for (Value allocation : llvm::reverse(allocations.back())) builder.create<memref::DeallocOp>(original.getLoc(), allocation);
-    allocations.pop_back();
     if (isa<cpu::SliceReduceOp>(target.getParentOp()))
-      builder.create<cpu::SliceReduceYieldOp>(original.getLoc(),
-          scalarResults ? ValueRange(results) : ValueRange{});
+      builder.create<cpu::SliceReduceYieldOp>(original.getLoc(), results);
     else if (isa<cpu::ScanOp>(target.getParentOp()))
-      builder.create<cpu::ScanYieldOp>(original.getLoc(),
-          scalarResults ? ValueRange(results) : ValueRange{});
-    else builder.create<cpu::RegionYieldOp>(original.getLoc());
+      builder.create<cpu::ScanYieldOp>(original.getLoc(), results);
+    else builder.create<cpu::RegionYieldOp>(original.getLoc(), results);
     dimensions = std::move(savedDimensions);
     return success();
   }
@@ -357,15 +352,11 @@ private:
     auto stateValues = flattened(schema.getInitialStates());
     auto captures = flattened(schema.getCaptures());
     Location loc = operation->getLoc();
-    auto destinations = makeSlots(operation->getResultTypes(), loc);
-    if (destinations.empty()) return failure();
-    SmallVector<Type> identityTypes;
-    appendProductLeafTypes(schema.getIdentities().getTypes(), identityTypes);
-    SmallVector<Type> summarySlots;
-    for (Type type : identityTypes) {
-      auto tensor = dyn_cast<RankedTensorType>(type);
-      summarySlots.push_back(tensor ? MemRefType::get(tensor.getShape(), tensor.getElementType()) : MemRefType::get({}, type));
-    }
+    SmallVector<Type> results;
+    appendProductLeafTypes(operation->getResultTypes(), results);
+    for (Type &type : results) type = valueType(type);
+    auto outputs = emptyResults(operation->getResultTypes(), loc);
+    if (failed(outputs)) return failure();
     auto outputFields = fieldPaths(schema.getEmittedResults().getTypes());
     SmallVector<int64_t> outputAxes;
     if (scan) {
@@ -385,50 +376,27 @@ private:
         }
       }
     }
-    SmallVector<Type> stateSlots;
-    if (scan) llvm::append_range(stateSlots, TypeRange(destinations).drop_front(outputFields.size()));
     Operation *target;
     if (scan)
-      target = builder.create<cpu::RegionScanOp>(loc, sources, identityValues, stateValues,
-          captures, ValueRange(destinations).take_front(outputFields.size()),
-          ValueRange(destinations).drop_front(outputFields.size()), axis,
+      target = builder.create<cpu::RegionScanOp>(loc,
+          TypeRange(results).take_front(outputFields.size()),
+          TypeRange(results).drop_front(outputFields.size()),
+          sources, identityValues, stateValues, captures,
+          ValueRange(*outputs).take_front(outputFields.size()),
+          ValueRange(*outputs).drop_front(outputFields.size()), axis,
           fieldPaths(schema.getIdentities().getTypes()), fieldPaths(schema.getInitialStates().getTypes()),
           builder.getDenseI64ArrayAttr(outputAxes), IntegerAttr());
     else
-      target = builder.create<cpu::RegionFoldOp>(loc, sources, identityValues, captures,
-          destinations, axis, fieldPaths(schema.getIdentities().getTypes()), IntegerAttr());
+      target = builder.create<cpu::RegionFoldOp>(loc, results, sources, identityValues, captures,
+          *outputs, axis, fieldPaths(schema.getIdentities().getTypes()), IntegerAttr());
     auto targetSchema = cast<cpu::RegionOpInterface>(target);
-    SmallVector<Type> sliceTypes;
-    for (Value source : sources) {
-      auto type = cast<MemRefType>(source.getType());
-      SmallVector<int64_t> shape(type.getShape());
-      shape[axis] = ShapedType::kDynamic;
-      auto layout = StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
-          SmallVector<int64_t>(type.getRank(), ShapedType::kDynamic));
-      sliceTypes.push_back(MemRefType::get(shape, type.getElementType(), layout));
-    }
-    SmallVector<Type> summarizeInputs(sliceTypes);
-    llvm::append_range(summarizeInputs, TypeRange(captures));
-    if (failed(helper(*schema.getSummarizeRegion(), targetSchema.getSummarize(), summarizeInputs, summarySlots))) return failure();
-    SmallVector<Type> combineInputs(summarySlots);
-    llvm::append_range(combineInputs, summarySlots);
-    if (failed(helper(schema.getCombine(), targetSchema.getCombine(), combineInputs, summarySlots))) return failure();
+    if (failed(helper(*schema.getSummarizeRegion(), targetSchema.getSummarize(), captures))) return failure();
+    if (failed(helper(schema.getCombine(), targetSchema.getCombine()))) return failure();
     if (scan) {
-      SmallVector<Type> applyInputs(summarySlots);
-      llvm::append_range(applyInputs, stateSlots);
-      if (failed(helper(*schema.getApplyRegion(), *targetSchema.getApplyRegion(), applyInputs, stateSlots))) return failure();
-      SmallVector<Type> emitInputs(sliceTypes), emitSlots;
-      llvm::append_range(emitInputs, stateSlots); llvm::append_range(emitInputs, TypeRange(captures));
-      for (auto [output, outputAxis] : llvm::zip(ValueRange(destinations).take_front(outputFields.size()), outputAxes)) {
-        auto type = cast<MemRefType>(output.getType());
-        SmallVector<int64_t> shape(type.getShape()); shape[outputAxis] = ShapedType::kDynamic;
-        emitSlots.push_back(MemRefType::get(shape, type.getElementType(),
-            StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
-                SmallVector<int64_t>(type.getRank(), ShapedType::kDynamic))));
-      }
-      if (failed(helper(*schema.getEmitRegion(), *targetSchema.getEmitRegion(), emitInputs, emitSlots))) return failure();
+      if (failed(helper(*schema.getApplyRegion(), *targetSchema.getApplyRegion()))) return failure();
+      if (failed(helper(*schema.getEmitRegion(), *targetSchema.getEmitRegion(), captures))) return failure();
     }
-    bindSlots(operation->getResults(), destinations, loc);
+    bindValues(operation->getResults(), target->getResults(), loc);
     return success();
   }
 
@@ -436,7 +404,7 @@ private:
     SmallVector<AffineMap> maps;
     for (Value input : inputs) {
       SmallVector<AffineExpr> axes;
-      if (auto memory = dyn_cast<MemRefType>(input.getType()))
+      if (auto memory = dyn_cast<RankedTensorType>(input.getType()))
         for (int64_t axis = 0; axis < memory.getRank(); ++axis)
           axes.push_back(memory.getDimSize(axis) == 1
               ? builder.getAffineConstantExpr(0)
@@ -448,14 +416,14 @@ private:
   }
 
   Value elementAt(Value input, ValueRange members, OpBuilder &nested, Location loc) {
-    auto type = dyn_cast<MemRefType>(input.getType());
+    auto type = dyn_cast<ShapedType>(input.getType());
     if (!type) return input;
     SmallVector<Value> indices;
     for (int64_t axis = 0; axis < type.getRank(); ++axis)
       indices.push_back(type.getDimSize(axis) == 1
           ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
           : members[members.size() - type.getRank() + axis]);
-    return nested.create<memref::LoadOp>(loc, input, indices);
+    return extractElement(nested, loc, input, indices);
   }
 
   LogicalResult verifyIndexTerms(Operation *operation, const IndexRelationFact &fact) {
@@ -488,16 +456,16 @@ private:
         int64_t literal = *term.staticValues[0];
         coordinate = nested.create<arith::ConstantIndexOp>(loc, literal);
         if (literal < 0) coordinate = nested.create<arith::AddIOp>(loc,
-            nested.create<memref::DimOp>(loc, source, *term.sourceAxis), coordinate);
+            dimension(nested, loc, source, *term.sourceAxis), coordinate);
       } else {
         coordinate = values.lookup(term.operands[0]);
-        if (auto type = dyn_cast<MemRefType>(coordinate.getType())) {
+        if (auto type = dyn_cast<ShapedType>(coordinate.getType())) {
           SmallVector<Value> indices;
           for (int64_t axis = 0; axis < type.getRank(); ++axis)
             indices.push_back(type.getDimSize(axis) == 1
                 ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
                 : members[term.indexAxes[axis]]);
-          coordinate = nested.create<memref::LoadOp>(loc, coordinate, indices);
+          coordinate = extractElement(nested, loc, coordinate, indices);
         }
         if (!coordinate.getType().isIndex()) {
           auto logical = cast<IntegerType>(getElementTypeOrSelf(term.operands[0].getType()));
@@ -519,9 +487,9 @@ private:
     Value input = values.lookup(access.getStoredValue()), destination = values.lookup(fact->source);
     Location loc = operation->getLoc();
     SmallVector<Value> sizes, members;
-    if (auto type = dyn_cast<MemRefType>(input.getType()))
+    if (auto type = dyn_cast<RankedTensorType>(input.getType()))
       for (int64_t axis = 0; axis < type.getRank(); ++axis)
-        sizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
+        sizes.push_back(dimension(builder, loc, input, axis));
     std::function<void(unsigned)> traverse = [&](unsigned axis) {
       if (axis == sizes.size()) {
         auto coordinates = indexedCoordinates(*fact, destination, members, builder, loc);
@@ -548,7 +516,7 @@ private:
     auto read = [&](OpBuilder &nested, Location loc, ValueRange members) -> Value {
       auto load = [&]() -> Value {
         auto coordinates = indexedCoordinates(fact, source, members, nested, loc);
-        return nested.create<memref::LoadOp>(loc, source, coordinates);
+        return extractElement(nested, loc, source, coordinates);
       };
       if (alwaysValid(operation)) return load();
       Value active = elementAt(values.lookup(access.getAccessValidity()), members, nested, loc);
@@ -566,8 +534,8 @@ private:
     if (!tensor) return read(builder, operation->getLoc(), {});
     auto shape = extents(tensor, operation->getLoc());
     if (failed(shape)) return failure();
-    Value output = allocate(tensor, *shape, operation->getLoc());
-    builder.create<linalg::GenericOp>(operation->getLoc(), ValueRange{}, ValueRange{output},
+    Value output = emptyTensor(tensor, *shape, operation->getLoc());
+    auto result = builder.create<linalg::GenericOp>(operation->getLoc(), TypeRange{output.getType()}, ValueRange{}, ValueRange{output},
         SmallVector<AffineMap>{builder.getMultiDimIdentityMap(tensor.getRank())},
         SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
         [&](OpBuilder &nested, Location loc, ValueRange) {
@@ -576,7 +544,7 @@ private:
             members.push_back(nested.create<linalg::IndexOp>(loc, axis));
           nested.create<linalg::YieldOp>(loc, read(nested, loc, members));
         });
-    return output;
+    return result.getResult(0);
   }
 
   LogicalResult atomicAccess(Operation *operation) {
@@ -600,20 +568,28 @@ private:
       auto extentsOr = extents(tensor, loc);
       if (failed(extentsOr)) return failure();
       sizes = *extentsOr;
-      if (used) outputs = makeSlots(operation->getResultTypes(), loc);
+      if (used)
+        for (Type result : resultTypes)
+          outputs.push_back(emptyTensor(cast<RankedTensorType>(result), sizes, loc));
     }
     auto operand = [&](Value value) {
       return elementAt(values.lookup(value), members, builder, loc);
     };
-    std::function<void(unsigned)> traverse = [&](unsigned axis) {
+    std::function<SmallVector<Value>(unsigned, ValueRange)> traverse =
+        [&](unsigned axis, ValueRange carried) -> SmallVector<Value> {
       if (axis < sizes.size()) {
-        auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
+        auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1), carried);
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(loop.getBody());
         members.push_back(loop.getInductionVar());
-        traverse(axis + 1);
+        auto results = traverse(axis + 1, loop.getRegionIterArgs());
         members.pop_back();
-        return;
+        if (!loop.getBody()->empty() &&
+            loop.getBody()->back().hasTrait<OpTrait::IsTerminator>())
+          loop.getBody()->back().erase();
+        builder.setInsertionPointToEnd(loop.getBody());
+        builder.create<scf::YieldOp>(loc, results);
+        return SmallVector<Value>(loop.getResults().begin(), loop.getResults().end());
       }
       auto coordinates = indexedCoordinates(*fact, target, members, builder, loc);
       SmallVector<Value> results;
@@ -630,13 +606,18 @@ private:
             target, operand(access.getCompareValue()), operand(access.getReplacementValue()), coordinates, ordering);
         llvm::append_range(results, exchange.getResults());
       }
-      if (!used) return;
-      if (!tensor) bindScalars(operation->getResults(), results);
-      else for (auto [value, output] : llvm::zip(results, outputs))
-        builder.create<memref::StoreOp>(loc, value, output, members);
+      if (!used) return {};
+      if (!tensor) {
+        bindValues(operation->getResults(), results, loc);
+        return {};
+      }
+      SmallVector<Value> updated;
+      for (auto [value, output] : llvm::zip(results, carried))
+        updated.push_back(builder.create<tensor::InsertOp>(loc, value, output, members));
+      return updated;
     };
-    traverse(0);
-    if (used && tensor) bindSlots(operation->getResults(), outputs, loc);
+    auto results = traverse(0, outputs);
+    if (used && tensor) bindValues(operation->getResults(), results, loc);
     return success();
   }
 
@@ -648,9 +629,9 @@ private:
     Value target = values.lookup(fact->source);
     Value input = values.lookup(operation.getValue());
     SmallVector<Value> sizes, members;
-    if (auto memory = dyn_cast<MemRefType>(input.getType()))
+    if (auto memory = dyn_cast<RankedTensorType>(input.getType()))
       for (int64_t axis = 0; axis < memory.getRank(); ++axis)
-        sizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
+        sizes.push_back(dimension(builder, loc, input, axis));
     std::function<LogicalResult(unsigned)> traverse = [&](unsigned axis) -> LogicalResult {
       if (axis < sizes.size()) {
         auto loop = builder.create<scf::ForOp>(loc, constant(loc, 0), sizes[axis], constant(loc, 1));
@@ -684,10 +665,10 @@ private:
     Value source = values.lookup(fact->source);
     if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) && (!alwaysValid(operation) || llvm::any_of(fact->terms, [&](const auto &term) {
           return term.kind == 3 && term.operands.size() == 1 &&
-              isa<MemRefType>(values.lookup(term.operands[0]).getType());
+              isa<RankedTensorType>(values.lookup(term.operands[0]).getType());
         })))
       return indexedRead(operation, *fact, source);
-    auto type = dyn_cast<MemRefType>(source.getType());
+    auto type = cast<ShapedType>(source.getType());
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t> resultShape;
     SmallVector<AffineExpr> projection;
@@ -700,7 +681,7 @@ private:
       } else if (term.kind == 0) {
         unsigned axis = *term.sourceAxis;
         offsets.push_back(builder.getIndexAttr(0));
-        sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(builder.create<memref::DimOp>(operation->getLoc(), source, axis).getResult()) : builder.getIndexAttr(type.getDimSize(axis)));
+        sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(dimension(builder, operation->getLoc(), source, axis)) : builder.getIndexAttr(type.getDimSize(axis)));
         resultShape.push_back(type.getDimSize(axis));
         projection.push_back(builder.getAffineDimExpr(term.resultAxes.front()));
       } else if (term.kind == 3 && term.operands.size() == 1) {
@@ -711,7 +692,7 @@ private:
       } else if (term.kind == 2 && !term.staticValues.empty() && term.staticValues[0]) {
         int64_t literal = *term.staticValues[0];
         if (literal < 0) offsets.push_back(builder.create<arith::AddIOp>(operation->getLoc(),
-            builder.create<memref::DimOp>(operation->getLoc(), source, *term.sourceAxis),
+            dimension(builder, operation->getLoc(), source, *term.sourceAxis),
             constant(operation->getLoc(), literal)).getResult());
         else offsets.push_back(builder.getIndexAttr(literal));
         sizes.push_back(builder.getIndexAttr(1));
@@ -743,24 +724,26 @@ private:
       for (OpFoldResult offset : offsets)
         indices.push_back(isa<Value>(offset) ? cast<Value>(offset)
                            : constant(operation->getLoc(), cast<IntegerAttr>(cast<Attribute>(offset)).getInt()));
-      if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation))
-        return Value(builder.create<memref::LoadOp>(operation->getLoc(), source, indices));
+      if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) &&
+          !isa<RankedTensorType>(operation->getResult(0).getType()))
+        return extractElement(builder, operation->getLoc(), source, indices);
     }
-    auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
-        resultShape, type, offsets, sizes, strides));
-    Value selected = builder.create<memref::SubViewOp>(operation->getLoc(), resultType,
-                                                      source, offsets, sizes, strides);
+    Value selected;
+    if (isa<RankedTensorType>(type)) {
+      auto resultType = RankedTensorType::get(resultShape, type.getElementType());
+      selected = builder.create<tensor::ExtractSliceOp>(operation->getLoc(),
+          resultType, source, offsets, sizes, strides);
+    } else {
+      auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          resultShape, cast<MemRefType>(type), offsets, sizes, strides));
+      selected = builder.create<memref::SubViewOp>(operation->getLoc(), resultType,
+                                                  source, offsets, sizes, strides);
+    }
     if (!inserted) {
-      auto view = dyn_cast<ViewType>(fact->source.getType());
-      if (isa<BufferLoadOp>(operation) || (isa<ViewLoadOp>(operation) && view && view.getAccess() != 0)) {
-        auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
-        SmallVector<Value> shape;
-        for (int64_t axis = 0; axis < resultType.getRank(); ++axis)
-          shape.push_back(builder.create<memref::DimOp>(operation->getLoc(), selected, axis));
-        Value snapshot = allocate(tensor, shape, operation->getLoc());
-        builder.create<memref::CopyOp>(operation->getLoc(), selected, snapshot);
-        return snapshot;
-      }
+      if (isa<ViewLoadOp, BufferLoadOp, GatherOp>(operation) &&
+          isa<MemRefType>(selected.getType()))
+        return Value(builder.create<cpu::ReadOp>(operation->getLoc(),
+            tensorType(operation->getResult(0).getType()), selected));
       return selected;
     }
     if (operation->getNumResults() != 1 || !isa<RankedTensorType>(operation->getResult(0).getType()))
@@ -768,12 +751,15 @@ private:
     auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
     auto shape = extents(tensor, operation->getLoc());
     if (failed(shape)) return failure();
-    Value output = allocate(tensor, *shape, operation->getLoc());
-    builder.create<linalg::GenericOp>(operation->getLoc(), ValueRange{selected}, ValueRange{output},
+    Value output = emptyTensor(tensor, *shape, operation->getLoc());
+    if (isa<MemRefType>(selected.getType()))
+      selected = builder.create<cpu::ReadOp>(operation->getLoc(),
+          RankedTensorType::get(resultShape, type.getElementType()), selected);
+    auto result = builder.create<linalg::GenericOp>(operation->getLoc(), TypeRange{output.getType()}, ValueRange{selected}, ValueRange{output},
         SmallVector<AffineMap>{AffineMap::get(tensor.getRank(), 0, projection, builder.getContext()), builder.getMultiDimIdentityMap(tensor.getRank())},
         SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
         [](OpBuilder &nested, Location loc, ValueRange scalars) { nested.create<linalg::YieldOp>(loc, scalars[0]); });
-    return output;
+    return result.getResult(0);
   }
 
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder) {
@@ -883,9 +869,9 @@ private:
     }
     auto sizes = extents(tensor, operation->getLoc());
     if (failed(sizes)) return failure();
-    Value output = allocate(tensor, *sizes, operation->getLoc());
+    Value output = emptyTensor(tensor, *sizes, operation->getLoc());
     LogicalResult status = success();
-    builder.create<linalg::GenericOp>(operation->getLoc(), arguments,
+    auto result = builder.create<linalg::GenericOp>(operation->getLoc(), TypeRange{output.getType()}, arguments,
         ValueRange{output}, pointwiseMaps(arguments, tensor.getRank()),
         SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
         [&](OpBuilder &nested, Location loc, ValueRange scalars) {
@@ -893,59 +879,22 @@ private:
           if (failed(result)) { status = failure(); return; }
           nested.create<linalg::YieldOp>(loc, *result);
         });
-    values.map(operation->getResult(0), output);
+    values.map(operation->getResult(0), result.getResult(0));
     return status;
   }
 
   LogicalResult scan(ScanOp operation) {
-    auto first = cast<RankedTensorType>(operation.getSources().front().getType());
-    SmallVector<Value> sources, initials, captures, outputs;
-    bool scalar = true;
-    for (auto [source, identity] : llvm::zip(operation.getSources(), operation.getIdentities())) {
-      auto type = cast<RankedTensorType>(source.getType());
-      if (static_cast<uint64_t>(operation.getAxis()) >= static_cast<uint64_t>(type.getRank()))
-        return operation.emitError("CPU scan axis is outside a source component rank");
-      scalar &= type.getShape() == first.getShape() && type.getEncoding() == first.getEncoding() &&
-          identity.getType() == type.getElementType();
-      sources.push_back(values.lookup(source));
-      initials.push_back(values.lookup(identity));
-      auto sizes = extents(type, operation.getLoc());
-      if (failed(sizes)) return failure();
-      outputs.push_back(allocate(type, *sizes, operation.getLoc()));
-    }
-    for (Value input : operation.getCaptures()) {
-      Value capture = values.lookup(input);
-      scalar &= isa<IntegerType, IndexType, FloatType>(capture.getType());
-      captures.push_back(capture);
-    }
-    auto target = builder.create<cpu::ScanOp>(operation.getLoc(), sources, initials, captures, outputs,
+    SmallVector<Type> results;
+    appendProductLeafTypes(operation.getResultTypes(), results);
+    for (Type &type : results) type = valueType(type);
+    auto outputs = emptyResults(operation.getResultTypes(), operation.getLoc());
+    if (failed(outputs)) return failure();
+    auto target = builder.create<cpu::ScanOp>(operation.getLoc(), results,
+        flattened(operation.getSources()), flattened(operation.getIdentities()),
+        flattened(operation.getCaptures()), *outputs,
         operation.getAxis(), operation.getInclusive(), operation.getReverse());
-    if (!scalar) {
-      SmallVector<Type> states, members;
-      for (auto [source, initial] : llvm::zip(sources, initials)) {
-        auto memory = cast<MemRefType>(source.getType());
-        auto state = dyn_cast<MemRefType>(initial.getType());
-        if (!state) state = MemRefType::get({}, initial.getType());
-        SmallVector<int64_t> shape(memory.getShape());
-        shape.erase(shape.begin() + operation.getAxis());
-        if (ArrayRef<int64_t>(shape) != state.getShape())
-          return operation.emitError("CPU slice scan requires a full slice identity for each component");
-        states.push_back(MemRefType::get(shape, state.getElementType()));
-        members.push_back(MemRefType::get(shape, memory.getElementType(),
-            StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
-                SmallVector<int64_t>(shape.size(), ShapedType::kDynamic))));
-      }
-      SmallVector<Type> arguments(states);
-      llvm::append_range(arguments, members);
-      llvm::append_range(arguments, TypeRange(captures));
-      if (failed(helper(operation.getCombine(), target.getCombine(), arguments, states))) return failure();
-      for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
-      return success();
-    }
-    if (failed(helper(operation.getCombine(), target.getCombine(),
-                      operation.getCombine().front().getArgumentTypes(), {}, true)))
-      return failure();
-    for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
+    if (failed(helper(operation.getCombine(), target.getCombine(), flattened(operation.getCaptures())))) return failure();
+    bindValues(operation.getResults(), target.getResults(), operation.getLoc());
     return success();
   }
 
@@ -954,50 +903,33 @@ private:
     auto identities = flattened(operation.getIdentities());
     auto captures = flattened(operation.getCaptures());
     Location loc = operation.getLoc();
-    auto outputs = makeSlots(operation.getResultTypes(), loc);
-    if (outputs.size() != identities.size() || sources.size() != identities.size())
+    SmallVector<Type> results;
+    appendProductLeafTypes(operation.getResultTypes(), results);
+    for (Type &type : results) type = valueType(type);
+    auto outputs = emptyResults(operation.getResultTypes(), loc);
+    if (failed(outputs)) return failure();
+    if (results.size() != identities.size() || sources.size() != identities.size())
       return operation.emitError("CPU reduction source, identity and output leaves differ");
     SmallVector<int64_t> axes;
     for (Attribute axis : operation.getAxes())
       axes.push_back(cast<IntegerAttr>(axis).getInt());
-    auto reduction = builder.create<cpu::SliceReduceOp>(loc, sources, identities,
-        captures, outputs, axes,
+    auto reduction = builder.create<cpu::SliceReduceOp>(loc, results, sources, identities,
+        captures, *outputs, axes,
         cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
-    bool scalar = llvm::none_of(identities, [](Value value) {
-      return isa<MemRefType>(value.getType());
-    });
-    SmallVector<Type> arguments, states;
-    if (scalar) {
-      llvm::append_range(arguments, TypeRange(identities));
-      llvm::append_range(arguments, TypeRange(identities));
-    } else {
-      for (auto [identity, output] : llvm::zip(identities, outputs)) {
-        auto state = cpu::collectiveStateType(output.getType());
-        if (!isa<MemRefType>(identity.getType()) && state.getRank())
-          return operation.emitError("mixed scalar/slice reduction requires complete slice identities for shaped components");
-        states.push_back(state);
-      }
-      llvm::append_range(arguments, states);
-      for (Value source : sources)
-        arguments.push_back(cpu::collectiveMemberType(cast<MemRefType>(source.getType()), axes));
-    }
-    llvm::append_range(arguments, TypeRange(captures));
-    if (failed(helper(operation.getCombine(), reduction.getCombine(), arguments,
-                      states, scalar)))
-      return failure();
-    bindSlots(operation.getResults(), outputs, loc);
+    if (failed(helper(operation.getCombine(), reduction.getCombine(), captures))) return failure();
+    bindValues(operation.getResults(), reduction.getResults(), loc);
     return success();
   }
 
-  void emitContraction(Value lhs, Value rhs, Value destination,
+  Value emitContraction(Value lhs, Value rhs, Value destination,
                        ArrayRef<AffineMap> maps, unsigned parallelRank,
                        unsigned reductionRank, Location loc) {
-    Type accumulator = cast<MemRefType>(destination.getType()).getElementType();
+    Type accumulator = cast<RankedTensorType>(destination.getType()).getElementType();
     Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
-    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination});
+    destination = builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{destination}).getResult(0);
     SmallVector<utils::IteratorType> iterators(parallelRank, utils::IteratorType::parallel);
     iterators.append(reductionRank, utils::IteratorType::reduction);
-    auto contraction = builder.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{destination},
+    auto contraction = builder.create<linalg::GenericOp>(loc, TypeRange{destination.getType()}, ValueRange{lhs, rhs}, ValueRange{destination},
         maps, iterators, [](OpBuilder &b, Location loc, ValueRange arguments) {
           Value value;
           if (isa<FloatType>(arguments[2].getType())) {
@@ -1017,16 +949,17 @@ private:
         });
     contraction->setAttr("intent_cpu.reduction_order",
         cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
+    return contraction.getResult(0);
   }
 
-  void matrix(Value lhs, Value rhs, Value destination, Location loc) {
+  Value matrix(Value lhs, Value rhs, Value destination, Location loc) {
     AffineExpr m, n, k;
     bindDims(builder.getContext(), m, n, k);
     SmallVector<AffineMap> maps = {
         AffineMap::get(3, 0, {m, k}, builder.getContext()),
         AffineMap::get(3, 0, {k, n}, builder.getContext()),
         AffineMap::get(3, 0, {m, n}, builder.getContext())};
-    emitContraction(lhs, rhs, destination, maps, 2, 1, loc);
+    return emitContraction(lhs, rhs, destination, maps, 2, 1, loc);
   }
 
   LogicalResult contract(ContractOp operation) {
@@ -1083,12 +1016,9 @@ private:
     Location loc = operation.getLoc();
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
-    Value output = allocate(resultType, *sizes, loc);
-    emitContraction(values.lookup(operation.getLhs()), values.lookup(operation.getRhs()),
+    Value output = emptyTensor(resultType, *sizes, loc);
+    Value result = emitContraction(values.lookup(operation.getLhs()), values.lookup(operation.getRhs()),
                     output, maps, parallelRank, reductionRank, loc);
-    // Rank-zero logical tensors use the scalar representation in this construction.
-    Value result = parallelRank ? output
-        : Value(builder.create<memref::LoadOp>(loc, output, ValueRange{}));
     values.map(operation.getResult(), result);
     return success();
   }
@@ -1110,19 +1040,19 @@ private:
     Location loc = operation.getLoc();
     auto sizes = extents(resultType, loc);
     if (failed(sizes)) return failure();
-    Value output = allocate(resultType, *sizes, loc);
+    Value output = emptyTensor(resultType, *sizes, loc);
     Value compressed = values.lookup(operation.getCompressed()), rhs = values.lookup(operation.getRhs());
     SmallVector<Value> positions = flattened(ValueRange{operation.getMetadata()});
     int64_t nonzeros = operation.getFormat().getKind() == 0 ? 1 : 2;
     int64_t groupSize = nonzeros * 2;
     Value zero = builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(accumulator));
-    builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{output});
+    output = builder.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{output}).getResult(0);
     AffineExpr m, compressedK, n;
     bindDims(builder.getContext(), m, compressedK, n);
     SmallVector<AffineMap> maps{
         AffineMap::get(3, 0, {m, compressedK}, builder.getContext()),
         AffineMap::get(3, 0, {m, n}, builder.getContext())};
-    builder.create<linalg::GenericOp>(loc, ValueRange{compressed}, ValueRange{output}, maps,
+    auto result = builder.create<linalg::GenericOp>(loc, TypeRange{output.getType()}, ValueRange{compressed}, ValueRange{output}, maps,
         SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::reduction,
                                         utils::IteratorType::parallel},
         [&](OpBuilder &b, Location loc, ValueRange arguments) {
@@ -1131,7 +1061,7 @@ private:
           Value ordinal = b.create<linalg::IndexOp>(loc, 1);
           Value group = b.create<arith::DivSIOp>(loc, ordinal, index(nonzeros));
           auto position = [&](Value memory) -> Value {
-            Value value = b.create<memref::LoadOp>(loc, memory, ValueRange{row, group});
+            Value value = extractElement(b, loc, memory, ValueRange{row, group});
             if (value.getType().isIndex()) return value;
             return cast<IntegerType>(value.getType()).isUnsigned()
                 ? Value(b.create<arith::IndexCastUIOp>(loc, b.getIndexType(), value))
@@ -1145,14 +1075,14 @@ private:
           }
           Value reduction = b.create<arith::AddIOp>(loc,
               b.create<arith::MulIOp>(loc, group, index(groupSize)), relative);
-          Value left = arguments[0], right = b.create<memref::LoadOp>(loc, rhs, ValueRange{reduction, column});
+          Value left = arguments[0], right = extractElement(b, loc, rhs, ValueRange{reduction, column});
           if (element != accumulator) {
             left = b.create<arith::ExtFOp>(loc, accumulator, left);
             right = b.create<arith::ExtFOp>(loc, accumulator, right);
           }
           b.create<linalg::YieldOp>(loc, ValueRange{b.create<math::FmaOp>(loc, left, right, arguments[1])});
         });
-    values.map(operation.getResult(), output);
+    values.map(operation.getResult(), result.getResult(0));
     return success();
   }
 
@@ -1175,7 +1105,7 @@ private:
     Location loc = operation.getLoc();
     int64_t groupSize = operation.getLhsGroupSize();
     Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
-    Value groups = builder.create<memref::DimOp>(loc, lhs, 1);
+    Value groups = dimension(builder, loc, lhs, 1);
     Value depth = builder.create<arith::MulIOp>(loc, groups, constant(loc, groupSize));
     auto sizes = extents(outputType, loc);
     if (failed(sizes)) return failure();
@@ -1183,8 +1113,8 @@ private:
       SmallVector<Value> shape = left ? SmallVector<Value>{(*sizes)[0], depth}
                                      : SmallVector<Value>{depth, (*sizes)[1]};
       auto type = RankedTensorType::get({ShapedType::kDynamic, ShapedType::kDynamic}, builder.getF32Type());
-      Value decoded = allocate(type, shape, loc);
-      builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{decoded},
+      Value decoded = emptyTensor(type, shape, loc);
+      auto result = builder.create<linalg::GenericOp>(loc, TypeRange{decoded.getType()}, ValueRange{}, ValueRange{decoded},
           SmallVector<AffineMap>{builder.getMultiDimIdentityMap(2)},
           SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
           [&](OpBuilder &b, Location loc, ValueRange) {
@@ -1198,7 +1128,7 @@ private:
                 ? Value(b.create<arith::DivSIOp>(loc, inner, index(2))) : inner;
             SmallVector<Value> coordinates = left ? SmallVector<Value>{free, group, position}
                                                   : SmallVector<Value>{group, position, free};
-            Value raw = b.create<memref::LoadOp>(loc, source, coordinates);
+            Value raw = extractElement(b, loc, source, coordinates);
             Value number;
             if (format == ScaledFormat::E4M3) number = b.create<arith::ExtFOp>(loc, b.getF32Type(), raw);
             else {
@@ -1218,7 +1148,7 @@ private:
               Value negative = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, sign, integer(0));
               number = b.create<arith::SelectOp>(loc, negative, b.create<arith::NegFOp>(loc, number), number);
             }
-            Value rawScale = b.create<memref::LoadOp>(loc, scales, ValueRange{free, group});
+            Value rawScale = extractElement(b, loc, scales, ValueRange{free, group});
             Value scale = rawScale;
             if (!scale.getType().isF32()) {
               Value exponent = b.create<arith::ExtUIOp>(loc, b.getI32Type(), rawScale);
@@ -1231,49 +1161,29 @@ private:
             }
             b.create<linalg::YieldOp>(loc, ValueRange{b.create<arith::MulFOp>(loc, number, scale)});
           });
-      return decoded;
+      return result.getResult(0);
     };
     Value left = decode(lhs, values.lookup(operation.getLhsScale()), operation.getLhsFormat(), true);
     Value right = decode(rhs, values.lookup(operation.getRhsScale()), operation.getRhsFormat(), false);
-    Value output = allocate(outputType, *sizes, loc);
-    matrix(left, right, output, loc);
-    values.map(operation.getResult(), output);
+    Value output = emptyTensor(outputType, *sizes, loc);
+    values.map(operation.getResult(), matrix(left, right, output, loc));
     return success();
   }
 
   LogicalResult lowerBlock(Block &block) {
-    allocations.emplace_back();
     for (Operation &operation : block.without_terminator())
       if (failed(lowerOperation(&operation))) return failure();
-    for (Value allocation : llvm::reverse(allocations.back()))
-      builder.create<memref::DeallocOp>(block.getParentOp()->getLoc(), allocation);
-    allocations.pop_back();
+    // Only author-declared mutable buffers have lexical lifetime in this
+    // construction. Storage for immutable values belongs to bufferization.
+    for (auto buffer : block.getOps<BufferOp>())
+      builder.create<memref::DeallocOp>(buffer.getLoc(), values.lookup(buffer.getResult()));
     return success();
   }
 
-  FailureOr<Value> lowerResults(Block &block, ValueRange destinations) {
-    allocations.emplace_back();
-    for (Operation &operation : block.without_terminator())
-      if (failed(lowerOperation(&operation))) return failure();
-    auto condition = dyn_cast<ConditionOp>(block.getTerminator());
-    Value predicate = condition ? values.lookup(condition.getCondition()) : Value();
-    auto results = flattened(condition ? condition.getArgs()
-                                      : cast<YieldOp>(block.getTerminator()).getInputs());
-    if (results.size() != destinations.size())
-      return block.getParentOp()->emitError("CPU ordered control result partition mismatch"), failure();
-    for (auto [result, destination] : llvm::zip(results, destinations)) copyToSlot(result, destination, block.getParentOp()->getLoc());
-    for (Value allocation : llvm::reverse(allocations.back())) builder.create<memref::DeallocOp>(block.getParentOp()->getLoc(), allocation);
-    allocations.pop_back();
-    return predicate;
-  }
-
-  void bindScalars(ValueRange originals, ValueRange components) {
-    auto ranges = getProductLeafRanges(originals.getTypes());
-    for (auto [original, range] : llvm::zip(originals, ranges))
-      bindProduct(original, components.slice(range.offset, range.size));
-  }
-
-  LogicalResult scalarControl(Operation *operation, TypeRange resultTypes) {
+  LogicalResult orderedControl(Operation *operation) {
+    SmallVector<Type> resultTypes;
+    appendProductLeafTypes(operation->getResultTypes(), resultTypes);
+    for (Type &type : resultTypes) type = valueType(type);
     auto savedDimensions = dimensions;
     Location loc = operation->getLoc();
     auto body = [&](Block &source, Block *target) {
@@ -1289,87 +1199,48 @@ private:
       auto target = builder.create<scf::IfOp>(loc, resultTypes, values.lookup(conditional.getCondition()), true);
       if (failed(body(conditional.getThenRegion().front(), target.thenBlock())) ||
           failed(body(conditional.getElseRegion().front(), target.elseBlock()))) return failure();
-      bindScalars(operation->getResults(), target.getResults());
+      bindValues(operation->getResults(), target.getResults(), loc);
       return success();
     }
-    auto loop = cast<ForOp>(operation);
-    if (!domains.count(loop.getSource())) return operation->emitError("CPU ordered for requires a realized domain");
-    Domain domain = domains.lookup(loop.getSource());
-    auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step,
-                                            flattened(loop.getInitArgs()));
-    Block &source = loop.getBody().front();
-    values.map(loop.getInductionVars().front(), target.getInductionVar());
-    bindScalars(loop.getRegionIterArgs(), target.getRegionIterArgs());
-    if (failed(body(source, target.getBody()))) return failure();
-    bindScalars(operation->getResults(), target.getResults());
-    return success();
-  }
-
-  LogicalResult orderedControl(Operation *operation) {
-    SmallVector<Type> leaves;
-    appendProductLeafTypes(operation->getResultTypes(), leaves);
-    if (isa<IfOp, ForOp>(operation) && llvm::all_of(leaves, [](Type type) {
-          return isa<IntegerType, IndexType, FloatType>(type);
-        })) return scalarControl(operation, leaves);
-    Location loc = operation->getLoc();
-    auto destinations = makeSlots(operation->getResultTypes(), loc);
-    if (operation->getNumResults() && destinations.empty()) return failure();
-    auto savedDimensions = dimensions;
-    if (auto conditional = dyn_cast<IfOp>(operation)) {
-      auto target = builder.create<scf::IfOp>(loc, values.lookup(conditional.getCondition()), true);
-      for (auto [source, destination] : llvm::zip(operation->getRegions(), target->getRegions())) {
-        OpBuilder::InsertionGuard guard(builder);
-        builder.setInsertionPointToStart(&destination.front());
-        if (failed(lowerResults(source.front(), destinations))) return failure();
-        dimensions = savedDimensions;
-      }
-    } else {
-      auto loop = dyn_cast<ForOp>(operation);
-      auto whileLoop = dyn_cast<WhileOp>(operation);
-      auto initial = flattened(loop ? loop.getInitArgs() : whileLoop.getInitArgs());
-      if (initial.size() != destinations.size()) return operation->emitError("CPU loop initial and result schemas differ");
-      auto next = makeSlots(operation->getResultTypes(), loc);
-      for (auto [value, destination] : llvm::zip(initial, destinations)) copyToSlot(value, destination, loc);
-      auto advance = [&]() {
-        for (auto [source, destination] : llvm::zip(next, destinations)) copyToSlot(source, destination, loc);
-      };
-      if (loop) {
-        if (!domains.count(loop.getSource())) return operation->emitError("CPU ordered for requires a supported domain");
-        Domain domain = domains.lookup(loop.getSource());
-        auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step);
+    if (auto loop = dyn_cast<ForOp>(operation)) {
+      if (!domains.count(loop.getSource())) return operation->emitError("CPU ordered for requires a realized domain");
+      Domain domain = domains.lookup(loop.getSource());
+      auto target = builder.create<scf::ForOp>(loc, domain.begin, domain.end, domain.step,
+                                              flattened(loop.getInitArgs()));
+      values.map(loop.getInductionVars().front(), target.getInductionVar());
+      {
         OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPointToStart(target.getBody());
-        Block &body = loop.getBody().front();
-        values.map(loop.getInductionVars().front(), target.getInductionVar());
-        bindSlots(loop.getRegionIterArgs(), destinations, loc);
-        if (failed(lowerResults(body, next))) return failure();
-        advance();
-      } else {
-        auto target = builder.create<scf::WhileOp>(loc, TypeRange{}, ValueRange{});
-        target.getBefore().emplaceBlock(); target.getAfter().emplaceBlock();
-        {
-          OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToStart(&target.getBefore().front());
-          Block &before = whileLoop.getBefore().front();
-          bindSlots(whileLoop.getBeforeArguments(), destinations, loc);
-          auto condition = lowerResults(before, next);
-          if (failed(condition)) return failure();
-          advance();
-          builder.create<scf::ConditionOp>(loc, *condition, ValueRange{});
-        }
-        {
-          OpBuilder::InsertionGuard guard(builder);
-          builder.setInsertionPointToStart(&target.getAfter().front());
-          Block &after = whileLoop.getAfter().front();
-          bindSlots(whileLoop.getAfterArguments(), destinations, loc);
-          if (failed(lowerResults(after, next))) return failure();
-          advance();
-          builder.create<scf::YieldOp>(loc);
-        }
+        bindValues(loop.getRegionIterArgs(), target.getRegionIterArgs(), loc);
       }
+      if (failed(body(loop.getBody().front(), target.getBody()))) return failure();
+      bindValues(operation->getResults(), target.getResults(), loc);
+      return success();
     }
-    dimensions = std::move(savedDimensions);
-    bindSlots(operation->getResults(), destinations, loc);
+    auto loop = cast<WhileOp>(operation);
+    auto initial = flattened(loop.getInitArgs());
+    auto target = builder.create<scf::WhileOp>(loc, resultTypes, initial);
+    Block &before = target.getBefore().emplaceBlock();
+    Block &after = target.getAfter().emplaceBlock();
+    for (Type type : TypeRange(initial)) before.addArgument(type, loc);
+    for (Type type : resultTypes) after.addArgument(type, loc);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&before);
+      bindValues(loop.getBeforeArguments(), before.getArguments(), loc);
+      if (failed(lowerBlock(loop.getBefore().front()))) return failure();
+      auto condition = cast<ConditionOp>(loop.getBefore().front().getTerminator());
+      builder.create<scf::ConditionOp>(loc, values.lookup(condition.getCondition()),
+                                       flattened(condition.getArgs()));
+    }
+    dimensions = savedDimensions;
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&after);
+      bindValues(loop.getAfterArguments(), after.getArguments(), loc);
+    }
+    if (failed(body(loop.getAfter().front(), &after))) return failure();
+    bindValues(operation->getResults(), target.getResults(), loc);
     return success();
   }
 
@@ -1466,9 +1337,17 @@ private:
       auto tensor = cast<RankedTensorType>(cast<BufferType>(op.getResult().getType()).getTensor());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
-      Value storage = allocate(tensor, *sizes, loc);
-      if (op.getInitial())
-        copyToSlot(values.lookup(op.getInitial()), storage, loc);
+      SmallVector<Value> dynamic;
+      for (auto [axis, size] : llvm::enumerate(*sizes))
+        if (tensor.isDynamicDim(axis)) dynamic.push_back(size);
+      Value storage = builder.create<memref::AllocOp>(loc,
+          MemRefType::get(tensor.getShape(), tensor.getElementType()), dynamic);
+      if (op.getInitial()) {
+        Value initial = values.lookup(op.getInitial());
+        if (isa<RankedTensorType>(initial.getType()))
+          builder.create<cpu::WriteOp>(loc, initial, storage);
+        else builder.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{storage});
+      }
       values.map(op.getResult(), storage);
       bindDimensions(tensor, storage, loc);
     } else if (isa<AssumeInBoundsOp>(operation)) {
@@ -1488,13 +1367,13 @@ private:
       if (failed(fact)) return failure();
       if (isa<ScatterUniqueOp>(operation) || llvm::any_of(fact->terms, [&](const auto &term) {
             return term.kind == 1 || (term.kind == 3 && term.operands.size() == 1 &&
-                                     isa<MemRefType>(values.lookup(term.operands[0]).getType()));
+                                     isa<RankedTensorType>(values.lookup(term.operands[0]).getType()));
           })) return indexedWrite(operation);
       auto destination = indexed(operation);
       if (failed(destination)) return failure();
       Value input = values.lookup(cast<IndexedAccessOpInterface>(operation).getStoredValue());
-      if (isa<MemRefType>(input.getType()))
-        builder.create<memref::CopyOp>(loc, input, *destination);
+      if (isa<RankedTensorType>(input.getType()))
+        builder.create<cpu::WriteOp>(loc, input, *destination);
       else
         builder.create<memref::StoreOp>(loc, input, *destination, ValueRange{});
     } else if (auto op = dyn_cast<GatherOp>(operation)) {
@@ -1507,9 +1386,9 @@ private:
       auto tensor = cast<RankedTensorType>(op.getResult().getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
-      Value output = allocate(tensor, *sizes, loc);
-      builder.create<linalg::FillOp>(loc, ValueRange{values.lookup(op.getInputs()[0])}, ValueRange{output});
-      values.map(op.getResult(), output);
+      Value output = emptyTensor(tensor, *sizes, loc);
+      auto fill = builder.create<linalg::FillOp>(loc, ValueRange{values.lookup(op.getInputs()[0])}, ValueRange{output});
+      values.map(op.getResult(), fill.getResult(0));
     } else if (auto op = dyn_cast<IndicesOp>(operation)) {
       auto type = cast<RankedTensorType>(op.getResult().getType());
       auto sizes = extents(type, loc);
@@ -1524,8 +1403,8 @@ private:
         Domain domain = domains.lookup(op.getSource());
         begin = domain.begin; step = domain.step;
       }
-      Value output = allocate(type, *sizes, loc);
-      builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{output},
+      Value output = emptyTensor(type, *sizes, loc);
+      auto result = builder.create<linalg::GenericOp>(loc, TypeRange{output.getType()}, ValueRange{}, ValueRange{output},
           SmallVector<AffineMap>{builder.getMultiDimIdentityMap(type.getRank())},
           SmallVector<utils::IteratorType>(type.getRank(), utils::IteratorType::parallel),
           [&](OpBuilder &nested, Location location, ValueRange) {
@@ -1535,17 +1414,17 @@ private:
             if (!type.getElementType().isIndex()) coordinate = nested.create<arith::IndexCastOp>(location, type.getElementType(), coordinate);
             nested.create<linalg::YieldOp>(location, coordinate);
           });
-      values.map(op.getResult(), output);
+      values.map(op.getResult(), result.getResult(0));
     } else if (auto op = dyn_cast<JoinOp>(operation)) {
       auto tensor = cast<RankedTensorType>(op.getResult().getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
-      Value output = allocate(tensor, *sizes, loc);
+      Value output = emptyTensor(tensor, *sizes, loc);
       SmallVector<AffineExpr> prefix;
       for (int64_t axis = 0; axis + 1 < tensor.getRank(); ++axis)
         prefix.push_back(builder.getAffineDimExpr(axis));
       auto inputMap = AffineMap::get(tensor.getRank(), 0, prefix, builder.getContext());
-      builder.create<linalg::GenericOp>(loc,
+      auto result = builder.create<linalg::GenericOp>(loc, TypeRange{output.getType()},
           ValueRange{values.lookup(op.getLhs()), values.lookup(op.getRhs())}, ValueRange{output},
           SmallVector<AffineMap>{inputMap, inputMap, builder.getMultiDimIdentityMap(tensor.getRank())},
           SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
@@ -1556,139 +1435,42 @@ private:
             Value selected = nested.create<arith::SelectOp>(location, first, inputs[0], inputs[1]);
             nested.create<linalg::YieldOp>(location, selected);
           });
-      values.map(op.getResult(), output);
+      values.map(op.getResult(), result.getResult(0));
     } else if (isa<TransposeOp, ReshapeOp>(operation)) {
       Value input = values.lookup(operation->getOperand(0));
-      auto source = cast<MemRefType>(input.getType());
+      auto source = cast<RankedTensorType>(input.getType());
       auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
-      auto allocation = input.getDefiningOp<memref::AllocOp>();
-      Value logicalInput = operation->getOperand(0);
-      if (isa<ReshapeOp>(operation) && logicalInput.hasOneUse() &&
-          isa_and_nonnull<ViewLoadOp, GatherOp>(logicalInput.getDefiningOp()) && allocation &&
-          allocation->getBlock() == builder.getInsertionBlock() && source.getLayout().isIdentity() &&
-          source.getElementType() == tensor.getElementType()) {
-        auto type = MemRefType::get(tensor.getShape(), tensor.getElementType(),
-            MemRefLayoutAttrInterface(), source.getMemorySpace());
-        SmallVector<int64_t> staticStrides;
-        int64_t offset;
-        if (failed(type.getStridesAndOffset(staticStrides, offset)))
-          return operation->emitError("CPU contiguous reshape has no row-major strides");
-        SmallVector<OpFoldResult> shape(tensor.getRank()), strides(tensor.getRank());
-        Value stride = constant(loc, 1);
-        for (int64_t axis = tensor.getRank() - 1; axis >= 0; --axis) {
-          shape[axis] = tensor.isDynamicDim(axis) ? OpFoldResult((*sizes)[axis])
-              : OpFoldResult(builder.getIndexAttr(tensor.getDimSize(axis)));
-          strides[axis] = ShapedType::isDynamic(staticStrides[axis]) ? OpFoldResult(stride)
-              : OpFoldResult(builder.getIndexAttr(staticStrides[axis]));
-          if (axis) stride = builder.createOrFold<arith::MulIOp>(loc, stride, (*sizes)[axis]);
-        }
-        Value view = builder.create<memref::ReinterpretCastOp>(loc, type, input,
-            builder.getIndexAttr(0), shape, strides);
-        values.map(operation->getResult(0), view);
+      if (isa<ReshapeOp>(operation)) {
+        Value shape = builder.create<tensor::FromElementsOp>(loc,
+            RankedTensorType::get({tensor.getRank()}, builder.getIndexType()), *sizes);
+        values.map(operation->getResult(0),
+            builder.create<tensor::ReshapeOp>(loc, tensorType(tensor), input, shape));
         return success();
       }
       SmallVector<AffineExpr> coordinates(source.getRank());
-      if (auto transpose = dyn_cast<TransposeOp>(operation)) {
-        for (auto [axis, permuted] : llvm::enumerate(transpose.getPermutation()))
-          coordinates[cast<IntegerAttr>(permuted).getInt()] = builder.getAffineDimExpr(axis);
-      } else {
-        unsigned next = 0;
-        bool unitAxesOnly = true;
-        auto sourceTensor = cast<RankedTensorType>(operation->getOperand(0).getType());
-        auto sourceShape = dyn_cast_or_null<TensorShapeAttr>(sourceTensor.getEncoding());
-        auto resultShape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
-        for (int64_t axis = 0; axis < source.getRank(); ++axis) {
-          if (source.getDimSize(axis) == 1) { coordinates[axis] = builder.getAffineConstantExpr(0); continue; }
-          while (next < tensor.getRank() && tensor.getDimSize(next) == 1) ++next;
-          if (next == tensor.getRank() || source.getDimSize(axis) != tensor.getDimSize(next)) {
-            unitAxesOnly = false;
-            break;
-          }
-          if (source.isDynamicDim(axis) && (!sourceShape || !resultShape ||
-              sourceShape.getDimensions()[axis] != resultShape.getDimensions()[next])) {
-            unitAxesOnly = false;
-            break;
-          }
-          coordinates[axis] = builder.getAffineDimExpr(next++);
-        }
-        while (next < tensor.getRank() && tensor.getDimSize(next) == 1) ++next;
-        unitAxesOnly &= next == tensor.getRank();
-        if (unitAxesOnly && llvm::all_of(logicalInput.getUsers(), [&](Operation *user) {
-              return user == operation || isa<DimOp>(user);
-            })) {
-          auto reassociation = [](ArrayRef<int64_t> shape) {
-            SmallVector<ReassociationIndices> groups;
-            ReassociationIndices group;
-            bool nonunit = false;
-            for (auto [axis, size] : llvm::enumerate(shape)) {
-              if (size != 1 && nonunit) { groups.push_back(group); group.clear(); }
-              group.push_back(axis);
-              nonunit |= size != 1;
-            }
-            if (nonunit) groups.push_back(group);
-            return groups;
-          };
-          Value view = input;
-          if (llvm::is_contained(source.getShape(), int64_t{1}))
-            view = builder.create<memref::CollapseShapeOp>(loc, view, reassociation(source.getShape()));
-          if (llvm::is_contained(tensor.getShape(), int64_t{1})) {
-            SmallVector<OpFoldResult> shape;
-            for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
-              shape.push_back(tensor.isDynamicDim(axis) ? OpFoldResult((*sizes)[axis])
-                  : OpFoldResult(builder.getIndexAttr(tensor.getDimSize(axis))));
-            view = builder.create<memref::ExpandShapeOp>(loc, tensor.getShape(), view,
-                reassociation(tensor.getShape()), shape);
-          }
-          values.map(operation->getResult(0), view);
-          return success();
-        }
-        if (!unitAxesOnly) {
-          SmallVector<Value> sourceSizes;
-          for (int64_t axis = 0; axis < source.getRank(); ++axis)
-            sourceSizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
-          Value output = allocate(tensor, *sizes, loc);
-          builder.create<linalg::GenericOp>(loc, ValueRange{}, ValueRange{output},
-              SmallVector<AffineMap>{builder.getMultiDimIdentityMap(tensor.getRank())},
-              SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
-              [&](OpBuilder &nested, Location location, ValueRange) {
-                Value linear = nested.create<arith::ConstantIndexOp>(location, 0);
-                for (auto [axis, size] : llvm::enumerate(*sizes))
-                  linear = nested.create<arith::AddIOp>(location,
-                      nested.create<arith::MulIOp>(location, linear, size), nested.create<linalg::IndexOp>(location, axis));
-                SmallVector<Value> indices(source.getRank());
-                for (int64_t axis = source.getRank() - 1; axis >= 0; --axis) {
-                  if (axis == 0) { indices[axis] = linear; break; }
-                  indices[axis] = nested.create<arith::RemSIOp>(location, linear, sourceSizes[axis]);
-                  linear = nested.create<arith::DivSIOp>(location, linear, sourceSizes[axis]);
-                }
-                Value value = nested.create<memref::LoadOp>(location, input, indices);
-                nested.create<linalg::YieldOp>(location, value);
-              });
-          values.map(operation->getResult(0), output);
-          return success();
-        }
-      }
-      Value output = allocate(tensor, *sizes, loc);
-      builder.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
+      for (auto [axis, permuted] : llvm::enumerate(cast<TransposeOp>(operation).getPermutation()))
+        coordinates[cast<IntegerAttr>(permuted).getInt()] = builder.getAffineDimExpr(axis);
+      Value output = emptyTensor(tensor, *sizes, loc);
+      auto result = builder.create<linalg::GenericOp>(loc, TypeRange{output.getType()}, ValueRange{input}, ValueRange{output},
           SmallVector<AffineMap>{AffineMap::get(tensor.getRank(), 0, coordinates, builder.getContext()), builder.getMultiDimIdentityMap(tensor.getRank())},
           SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
           [](OpBuilder &nested, Location location, ValueRange args) { nested.create<linalg::YieldOp>(location, args[0]); });
-      values.map(operation->getResult(0), output);
+      values.map(operation->getResult(0), result.getResult(0));
     } else if (auto op = dyn_cast<BroadcastOp>(operation)) {
       auto tensor = cast<RankedTensorType>(op.getResult().getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
       Value input = values.lookup(op.getInputs()[0]);
-      Value output = allocate(tensor, *sizes, loc);
-      builder.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
+      Value output = emptyTensor(tensor, *sizes, loc);
+      auto result = builder.create<linalg::GenericOp>(loc, TypeRange{output.getType()}, ValueRange{input}, ValueRange{output},
           pointwiseMaps(ValueRange{input}, tensor.getRank()),
           SmallVector<utils::IteratorType>(tensor.getRank(), utils::IteratorType::parallel),
           [](OpBuilder &nested, Location loc, ValueRange scalars) {
             nested.create<linalg::YieldOp>(loc, scalars[0]);
           });
-      values.map(op.getResult(), output);
+      values.map(op.getResult(), result.getResult(0));
     } else if (auto op = dyn_cast<MakeRecordOp>(operation)) {
       bindProduct(op.getResult(), flattened(op.getFields()));
     } else if (auto op = dyn_cast<MakeTupleOp>(operation)) {
@@ -1704,12 +1486,12 @@ private:
     } else if (auto op = dyn_cast<HistogramOp>(operation)) {
       auto type = cast<RankedTensorType>(op.getResult().getType());
       Value bins = values.lookup(op.getBins());
-      Value output = allocate(type, {bins}, loc);
+      Value output = emptyTensor(type, {bins}, loc);
       auto integer = dyn_cast<IntegerType>(getElementTypeOrSelf(op.getValues().getType()));
-      builder.create<cpu::HistogramOp>(loc, values.lookup(op.getValues()), values.lookup(op.getValid()), output,
+      auto result = builder.create<cpu::HistogramOp>(loc, tensorType(type), values.lookup(op.getValues()), values.lookup(op.getValid()), output,
           integer && integer.isUnsigned());
-      values.map(op.getResult(), output);
-      bindDimensions(type, output, loc);
+      values.map(op.getResult(), result.getResult());
+      bindDimensions(type, result.getResult(), loc);
     } else if (auto op = dyn_cast<ScanOp>(operation)) {
       return scan(op);
     } else if (auto op = dyn_cast<ReduceOp>(operation)) {
@@ -1718,20 +1500,15 @@ private:
       auto tensor = cast<RankedTensorType>(op.getResult().getType());
       auto sizes = extents(tensor, loc);
       if (failed(sizes)) return failure();
-      Value output = allocate(tensor, *sizes, loc);
-      output.getDefiningOp<memref::AllocOp>().setAlignment(4);
-      if (tensor.getShape()[0] != 0)
-        builder.create<cpu::QuantizeOp>(loc, values.lookup(op.getInput()), output, op.getFormatAttr());
-      values.map(op.getResult(), output);
+      Value output = emptyTensor(tensor, *sizes, loc);
+      auto result = builder.create<cpu::QuantizeOp>(loc, tensorType(tensor),
+          values.lookup(op.getInput()), output, op.getFormatAttr());
+      values.map(op.getResult(), result.getResult());
     } else if (auto op = dyn_cast<QuantizedDotOp>(operation)) {
-      if (cast<RankedTensorType>(op.getLhs().getType()).getShape()[0] == 0) {
-        values.map(op.getResult(), builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0)));
-        return success();
-      }
-      Value output = allocate(cast<RankedTensorType>(op.getResult().getType()), {}, loc);
-      builder.create<cpu::QuantizedDotOp>(loc, values.lookup(op.getLhs()), values.lookup(op.getRhs()),
+      Value output = emptyTensor(cast<RankedTensorType>(op.getResult().getType()), {}, loc);
+      auto result = builder.create<cpu::QuantizedDotOp>(loc, output.getType(), values.lookup(op.getLhs()), values.lookup(op.getRhs()),
           output, op.getLhsFormatAttr(), op.getRhsFormatAttr());
-      values.map(op.getResult(), output);
+      values.map(op.getResult(), result.getResult());
     } else if (auto op = dyn_cast<ContractOp>(operation)) {
       return contract(op);
     } else if (auto op = dyn_cast<ScaledContractOp>(operation)) {
@@ -1755,7 +1532,6 @@ private:
   llvm::DenseMap<Value, SmallVector<Value>> products;
   llvm::DenseMap<int64_t, Value> dimensions;
   llvm::DenseMap<Value, Domain> domains;
-  SmallVector<SmallVector<Value>> allocations;
 };
 
 }

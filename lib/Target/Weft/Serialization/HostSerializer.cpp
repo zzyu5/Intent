@@ -1,6 +1,7 @@
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Target/Weft/IR/HostScalar.h"
 #include "Intent/Serialization/Source.h"
+#include "Intent/Serialization/MemoryDescriptor.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "TaskABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -25,11 +26,7 @@ FailureOr<NativeABI> queryHostABI(func::FuncOp function) {
 
 namespace {
 
-struct Memory {
-  std::string base;
-  std::string offset;
-  SmallVector<std::string> shape, strides;
-};
+using Memory = MemoryDescriptor;
 
 class HostSerializer : public SourceEmitter {
 public:
@@ -52,7 +49,7 @@ public:
       auto abi = queryHostABI(function);
       if (mlir::failed(abi)) return failure();
       ScopedValues local(*this);
-      memories.clear(); allocations.clear();
+      memories.clear();
       output << "void " << function.getName() << "(";
       bool first = true;
       auto parameter = [&](const std::string &type, const std::string &name) {
@@ -61,9 +58,18 @@ public:
       };
       for (auto [i, argument] : llvm::enumerate(function.getArguments())) {
         std::string name = "a" + std::to_string(i);
-        if (auto type = dyn_cast<MemRefType>(argument.getType()))
-          memories[argument] = Memory{name, "0", SmallVector<std::string>(type.getRank()),
-                                     SmallVector<std::string>(type.getRank())};
+        if (auto type = dyn_cast<MemRefType>(argument.getType())) {
+          Memory memory{name, "0", {}, {}};
+          SmallVector<int64_t> strides;
+          int64_t offset;
+          if (mlir::failed(type.getStridesAndOffset(strides, offset)))
+            return function.emitError("host entry requires a strided memory descriptor");
+          for (int64_t size : type.getShape())
+            memory.sizes.push_back(ShapedType::isDynamic(size) ? "" : std::to_string(size));
+          for (int64_t stride : strides)
+            memory.strides.push_back(ShapedType::isDynamic(stride) ? "" : std::to_string(stride));
+          memories[argument] = std::move(memory);
+        }
         else values[argument] = name;
       }
       for (const NativeSlot &slot : abi->slots) {
@@ -72,7 +78,7 @@ public:
             ? scalarType(slot.element) + " *" : scalarType(slot.carrier), name);
         if (slot.axis) {
           auto &memory = memories.find(function.getArgument(slot.parameter))->second;
-          auto &entries = slot.role == NativeSlotRole::Extent ? memory.shape : memory.strides;
+          auto &entries = slot.role == NativeSlotRole::Extent ? memory.sizes : memory.strides;
           entries[*slot.axis] = name;
         }
       }
@@ -104,6 +110,46 @@ private:
     return entry.offset == "0" ? entry.base : "(" + entry.base + " + (" + entry.offset + "))";
   }
 
+  SmallVector<std::string> components(Value input) {
+    if (isa<MemRefType>(input.getType())) return memories.at(input).components();
+    return {value(input)};
+  }
+  SmallVector<std::string> componentTypes(Type type) {
+    if (auto memory = dyn_cast<MemRefType>(type)) {
+      SmallVector<std::string> types{scalarType(memory.getElementType()) + " *"};
+      types.append(1 + 2 * memory.getRank(), "int64_t");
+      return types;
+    }
+    return {scalarType(type)};
+  }
+  void declare(Value input, Value initial = {}) {
+    SmallVector<std::string> fields;
+    auto sources = initial ? components(initial) : SmallVector<std::string>{};
+    for (auto [index, type] : llvm::enumerate(componentTypes(input.getType()))) {
+      fields.push_back(fresh());
+      line(type + " " + fields.back() + (initial ? " = " + sources[index] : "") + ";");
+    }
+    if (auto memory = dyn_cast<MemRefType>(input.getType()))
+      memories[input] = Memory::fromComponents(memory, fields);
+    else values[input] = fields.front();
+  }
+  void alias(Value result, Value source) {
+    if (isa<MemRefType>(result.getType())) memories[result] = memories.at(source);
+    else values[result] = value(source);
+  }
+  void transfer(ValueRange from, ValueRange to) {
+    SmallVector<std::pair<std::string, std::string>> assignments;
+    for (auto [source, target] : llvm::zip(from, to)) {
+      auto sources = components(source), targets = components(target);
+      for (auto [index, type] : llvm::enumerate(componentTypes(source.getType()))) {
+        auto temporary = fresh();
+        line(type + " " + temporary + " = " + sources[index] + ";");
+        assignments.emplace_back(targets[index], temporary);
+      }
+    }
+    for (auto &[destination, temporary] : assignments) line(destination + " = " + temporary + ";");
+  }
+
   LogicalResult view(Operation *operation) {
     if (auto cast = dyn_cast<memref::CastOp>(operation)) {
       if (!isa<MemRefType>(cast.getSource().getType()) ||
@@ -111,17 +157,13 @@ private:
         return cast.emitError("native host cast requires ranked memory descriptors");
       Memory source = memories.at(cast.getSource());
       memories[cast.getResult()] = std::move(source);
-      if (auto allocation = allocations.find(cast.getSource()); allocation != allocations.end()) {
-        std::string owner = allocation->second;
-        allocations[cast.getResult()] = std::move(owner);
-      }
       return success();
     }
     if (auto metadata = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) {
       const Memory source = memories.at(metadata.getSource());
       memories[metadata.getBaseBuffer()] = Memory{source.base, "0", {}, {}};
       values[metadata.getOffset()] = source.offset;
-      for (auto [result, size] : llvm::zip(metadata.getSizes(), source.shape)) values[result] = size;
+      for (auto [result, size] : llvm::zip(metadata.getSizes(), source.sizes)) values[result] = size;
       for (auto [result, stride] : llvm::zip(metadata.getStrides(), source.strides)) values[result] = stride;
       return success();
     }
@@ -132,7 +174,7 @@ private:
       // must not add the source view's offset to the replacement offset.
       Memory target{memories.at(reinterpret.getSource()).base,
                     bound(reinterpret.getMixedOffsets().front()), {}, {}};
-      for (OpFoldResult size : reinterpret.getMixedSizes()) target.shape.push_back(bound(size));
+      for (OpFoldResult size : reinterpret.getMixedSizes()) target.sizes.push_back(bound(size));
       for (OpFoldResult stride : reinterpret.getMixedStrides()) target.strides.push_back(bound(stride));
       memories[reinterpret.getResult()] = std::move(target);
       return success();
@@ -145,7 +187,7 @@ private:
     for (unsigned axis = 0; axis < offsets.size(); ++axis) {
       target.offset += " + (" + bound(offsets[axis]) + ") * (" + source.strides[axis] + ")";
       if (!dropped.test(axis)) {
-        target.shape.push_back(bound(sizes[axis]));
+        target.sizes.push_back(bound(sizes[axis]));
         target.strides.push_back("(" + source.strides[axis] + ") * (" + bound(steps[axis]) + ")");
       }
     }
@@ -164,7 +206,7 @@ private:
     return success();
   }
   LogicalResult emit(Operation *operation) {
-    if (isa<scf::YieldOp, scf::ReduceOp>(operation)) return success();
+    if (isa<scf::YieldOp, scf::ConditionOp, scf::ReduceOp>(operation)) return success();
     if (isa<func::ReturnOp>(operation)) { line("return;"); return success(); }
     if (isStandardScalarOperation(operation)) {
       SmallVector<std::string> operands;
@@ -178,7 +220,11 @@ private:
     if (auto dim = dyn_cast<memref::DimOp>(operation)) {
       auto axis = dim.getConstantIndex();
       if (!axis) return dim.emitError("host dimension must name a constant axis");
-      values[dim.getResult()] = memories.at(dim.getSource()).shape[*axis];
+      values[dim.getResult()] = memories.at(dim.getSource()).sizes[*axis];
+      return success();
+    }
+    if (auto pointer = dyn_cast<memref::ExtractAlignedPointerAsIndexOp>(operation)) {
+      bind(pointer.getResult(), "(int64_t)(uintptr_t)" + memories.at(pointer.getSource()).base);
       return success();
     }
     if (isa<memref::CastOp, memref::ExtractStridedMetadataOp,
@@ -191,11 +237,11 @@ private:
       Memory memory{name, "0", {}, {}};
       unsigned dynamic = 0;
       for (int64_t size : type.getShape())
-        memory.shape.push_back(ShapedType::isDynamic(size) ? value(operation->getOperand(dynamic++)) : std::to_string(size));
+        memory.sizes.push_back(ShapedType::isDynamic(size) ? value(operation->getOperand(dynamic++)) : std::to_string(size));
       memory.strides.resize(type.getRank());
       for (int64_t axis = type.getRank() - 1; axis >= 0; --axis) {
         memory.strides[axis] = elements;
-        elements = "(" + elements + ") * (" + memory.shape[axis] + ")";
+        elements = "(" + elements + ") * (" + memory.sizes[axis] + ")";
       }
       auto element = scalarType(type.getElementType());
       int64_t alignment = 16;
@@ -207,15 +253,11 @@ private:
         line(element + " *" + name + " = aligned_alloc(" + std::to_string(alignment) + ", ((" + bytes +
             " + " + std::to_string(alignment - 1) + ") / " + std::to_string(alignment) + ") * " + std::to_string(alignment) + ");");
         line("if (!" + name + " && (" + elements + ")) abort();");
-        allocations[operation->getResult(0)] = name;
       }
       memories[operation->getResult(0)] = memory; return success();
     }
     if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) {
-      auto allocation = allocations.find(dealloc.getMemref());
-      if (allocation == allocations.end())
-        return dealloc.emitError("native host deallocation must reference its owning heap allocation");
-      line("free(" + allocation->second + ");"); return success();
+      line("free(" + memories.at(dealloc.getMemref()).base + ");"); return success();
     }
     if (auto load = dyn_cast<memref::LoadOp>(operation)) {
       bind(load.getResult(), "*" + address(load.getMemref(), load.getIndices())); return success();
@@ -241,32 +283,36 @@ private:
       ++indent; if (mlir::failed(block(*loop.getBody()))) return failure(); --indent; line("}"); return success();
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-      for (auto [argument, initial] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) bind(argument, value(initial));
+      for (auto [argument, initial] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) declare(argument, initial);
       std::string iv = fresh(); values[loop.getInductionVar()] = iv;
       line("for (int64_t " + iv + " = " + value(loop.getLowerBound()) + "; " + iv + " < " + value(loop.getUpperBound()) +
           "; " + iv + " += " + value(loop.getStep()) + ") {");
       ++indent; if (mlir::failed(block(*loop.getBody()))) return failure();
-      SmallVector<std::string> next;
-      for (Value yielded : loop.getBody()->getTerminator()->getOperands()) {
-        next.push_back(fresh());
-        line(scalarType(yielded.getType()) + " " + next.back() + " = " + value(yielded) + ";");
-      }
-      for (auto [argument, yielded] : llvm::zip(loop.getRegionIterArgs(), next))
-        line(value(argument) + " = " + yielded + ";");
+      transfer(loop.getBody()->getTerminator()->getOperands(), loop.getRegionIterArgs());
       --indent; line("}");
-      for (auto [result, argument] : llvm::zip(loop.getResults(), loop.getRegionIterArgs())) values[result] = value(argument);
+      for (auto [result, argument] : llvm::zip(loop.getResults(), loop.getRegionIterArgs())) alias(result, argument);
+      return success();
+    }
+    if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+      Block &before = loop.getBefore().front(), &after = loop.getAfter().front();
+      for (auto [argument, initial] : llvm::zip(before.getArguments(), loop.getInits())) declare(argument, initial);
+      for (Value argument : after.getArguments()) declare(argument);
+      line("while (1) {"); ++indent;
+      if (mlir::failed(block(before))) return failure();
+      auto condition = cast<scf::ConditionOp>(before.getTerminator());
+      transfer(condition.getArgs(), after.getArguments());
+      line("if (!(" + value(condition.getCondition()) + ")) break;");
+      if (mlir::failed(block(after))) return failure();
+      transfer(after.getTerminator()->getOperands(), before.getArguments());
+      --indent; line("}");
+      for (auto [result, argument] : llvm::zip(loop.getResults(), after.getArguments())) alias(result, argument);
       return success();
     }
     if (auto condition = dyn_cast<scf::IfOp>(operation)) {
-      for (Value result : condition.getResults()) {
-        std::string name = fresh();
-        line(scalarType(result.getType()) + " " + name + ";");
-        values[result] = name;
-      }
+      for (Value result : condition.getResults()) declare(result);
       auto branch = [&](Block &body) {
         if (mlir::failed(block(body))) return failure();
-        for (auto [result, yielded] : llvm::zip(condition.getResults(), body.getTerminator()->getOperands()))
-          line(value(result) + " = " + value(yielded) + ";");
+        transfer(body.getTerminator()->getOperands(), condition.getResults());
         return success();
       };
       line("if (" + value(condition.getCondition()) + ") {");
@@ -282,7 +328,6 @@ private:
 
   ModuleOp module;
   llvm::DenseMap<Value, Memory> memories;
-  llvm::DenseMap<Value, std::string> allocations;
 };
 
 }

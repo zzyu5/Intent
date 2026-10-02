@@ -8,7 +8,8 @@ class CPUTransform<string argument, string summaryText> : Pass<argument, "mlir::
   let dependentDialects = [
     "intent::cpu::IntentCPUDialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect",
     "mlir::linalg::LinalgDialect", "mlir::math::MathDialect", "mlir::memref::MemRefDialect",
-    "mlir::scf::SCFDialect", "mlir::vector::VectorDialect"
+    "mlir::scf::SCFDialect", "mlir::vector::VectorDialect", "mlir::tensor::TensorDialect",
+    "mlir::bufferization::BufferizationDialect"
   ];
 }
 
@@ -27,6 +28,9 @@ def CPUConfigureTarget : CPUTransform<"intent-cpu-configure-target",
 
 def CPUNormalizeSource : CPUTransform<"intent-cpu-normalize-source",
     "Normalize source computations before CPU implementation selection">;
+
+def CPUBufferizeValues : CPUTransform<"intent-cpu-bufferize-values",
+    "Optimize CPU tensor SSA and materialize owned storage with native bufferization">;
 
 def CPUMaterializeConfigurations : CPUTransform<"intent-cpu-materialize-configurations",
     "Bind complete CPU implementation candidates into the current program"> {

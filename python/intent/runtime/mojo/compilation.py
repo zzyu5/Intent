@@ -64,7 +64,7 @@ def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
 
 def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
     signature, arguments = flattened_signature(abi)
-    sections = ["\nfrom std.time import monotonic\n"]
+    sections = ["\nfrom std.time import monotonic\nfrom std.memory import Layout, alloc, dealloc\n"]
     mutable = abi.trial_regions()
     entry = candidate.entry
     sections.append(

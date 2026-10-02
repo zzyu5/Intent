@@ -2,6 +2,7 @@
 #include "Legalize.h"
 #include "Intent/Target/Mojo/Serialization/Scalar.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Bufferization.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
@@ -97,7 +98,7 @@ LogicalResult checkSurface(ModuleOp module) {
     }
     bool supported = isa<memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp,
-        memref::ExtractStridedMetadataOp,
+        memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::FromElementsOp, vector::ShuffleOp, vector::StepOp,
         vector::ExtractElementOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
@@ -111,8 +112,6 @@ LogicalResult checkSurface(ModuleOp module) {
       supported &= stack.getType().hasStaticShape();
     if (auto prefetch = dyn_cast<memref::PrefetchOp>(operation))
       supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
-    if (auto conditional = dyn_cast<scf::IfOp>(operation))
-      supported &= llvm::none_of(conditional.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (auto call = dyn_cast<func::CallOp>(operation)) {
       auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
           call, call.getCalleeAttr());
@@ -121,8 +120,6 @@ LogicalResult checkSurface(ModuleOp module) {
                   llvm::all_of(call->getOperandTypes(), supportedType) &&
                   llvm::all_of(call->getResultTypes(), supportedType);
     }
-    if (auto loop = dyn_cast<scf::WhileOp>(operation))
-      supported &= llvm::none_of(loop.getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
     if (isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation)) {
       Type element = cast<MemRefType>(operation->getOperand(0).getType()).getElementType();
       supported &= directAtomicAdd(element) || element.isF16() || element.isBF16();
@@ -225,6 +222,7 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
 }
 
 LogicalResult prepareNativeProgram(ModuleOp module) {
+  if (failed(cpu::lowerOwnership(module))) return failure();
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
