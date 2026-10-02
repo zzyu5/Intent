@@ -271,6 +271,7 @@ Intent 另外保留 logical view 的公共合同，但同样由编译结果决�
 | DSA family 优化 | [DSA/Transforms/](lib/Dialect/DSA/Transforms/)、[Passes.cpp](lib/Dialect/DSA/Transforms/Passes.cpp) | 从当前 local-memory program 形成矩阵供数、索引与局部值复用；不回读 KIR 选择整算子路径 |
 | 修改 IR 与 verifier | [include/Intent/Dialect/](include/Intent/Dialect/)、[lib/Dialect/](lib/Dialect/) 中相应 `IR/` | 前者声明 types/ops/attributes，后者实现与验证；优先使用已有 carrier |
 | Provider primitive/form | [lib/Target/](lib/Target/) 中相应 `Transforms/` | 处理真实目标能力、合法性和必要 local structure |
+| 源码翻译 | [Source.h](include/Intent/Serialization/Source.h)、[GPU PythonEmitter](include/Intent/Dialect/GPU/Serialization/PythonEmitter.h)、各目标 `Serialization/` | 共用 SSA 作用域和 typed operation 注册；目标模块只拼写自身语言与原生能力 |
 | CPU micro-kernel | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Mojo implementations](lib/Target/Mojo/Transforms/Implementations.cpp)、[Weft implementations](lib/Target/Weft/Transforms/Implementations.cpp) | 按当前 operation、dtype 和 capability 选择局部实现；外层分块/供数仍由 CPU passes 负责 |
 | 设备与运行时接入 | [targets/](python/intent/targets/)、[targets/base.py](python/intent/targets/base.py)、[runtime/](python/intent/runtime/) | Host 解析目标、绑定产物与 launch；不把设备分支加入 KIR |
 
@@ -318,6 +319,61 @@ GEMM 的 lowering 子树。Intent 的局部矩阵也消费已形成的 operand �
 额外承担显式 local-memory/task 构造；BANG C 局部实现不接管作者的整函数算法。
 
 ## 共享分析与完整变换
+
+### Canonical 关系与 physical construction
+
+[CanonicalKernelAnalysis](include/Intent/Analysis/CanonicalKernel.h) 查询 immutable
+KIR 的实际 def-use 与类型关系。`indexRelation` 同时返回每项索引贡献的
+`resultAxes` 和 tensor index 的 `indexAxes`；GPU、CPU、DSA construction
+直接消费这份映射，不各自计算 advanced-index block 的位置。
+`operandProjections` 描述操作数轴到结果轴的投影，`axisProvenance` 跟踪坐标来源，
+`tensorExtent` 查询当前值上已有的 extent 表达。相同 extent 不证明相同坐标；
+row-major reshape 也不自动成为 transpose。
+
+GPU 的私有 [ConstructionSchema](lib/Conversion/KIRToGPU/ConstructionSchema.h)
+把这些 canonical 关系接到现有 physical value schema：构造实际 projection 后，
+复用 GPU 的 current-IR schema 查询。这里是 KIR 到 GPU 的单次边界，
+后续 GPU passes 只读当前 GPU IR。CPU 的 memref/linalg 构造和 DSA 的
+local-memory/workset 构造保留各自实现；共同轴映射不决定它们的 storage 或 task。
+
+构造 region 时用 `StructuredOpInterface::getRegionArgumentRelations` 查询
+当前 block signature 的输入来源；`getValueRelations` 还包含 yield/result 边，
+要求整个 operation 构造完成。两者共用入边定义，不能为了提前分析而制造占位 yield。
+
+职责对照：本地 Triton `lib/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.cpp:33–44`
+用 typed adaptor/type converter 建目标操作，`:377–409` 保留 reduce/scan 的 helper；
+TileLang `src/transform/lower_tile_op.cc:410–445` 先检查 shape/layout 合同，再映射
+原多维索引。Intent 的 `ConstructionSchema.cpp:24` 同样消费明确关系，但 workset
+可能给同一 KIR 类型附加不同执行前缀，因此桥接以当前 value 和作用域为单位。
+
+阶段之间转交分块责任时，应使用接收方的实际能力查询。
+[PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/PointwiseAnalysis.cpp) 只有在
+`hasRangeContractForm` 成立时才把输出 ranges 交给 contraction realization；
+坐标可重放本身不证明后续阶段能够接管，否则仍由普通 pointwise ownership 负责。
+
+### 同源的源码支持与发射
+
+[OperationEmitters](include/Intent/Serialization/Source.h) 用 typed operation
+注册 legality check 和 emission handler。最终支持检查与实际发射查询同一个表；
+新增操作时在所属表登记，不再另加一份“允许操作”的白名单。
+这只决定终端能否表达当前操作，不能替代 provider 对资源、effects 和物理结构的完整验证。
+
+Triton/cuTile 共用 [PythonEmitter.cpp](lib/Dialect/GPU/Serialization/PythonEmitter.cpp)
+中的 SSA、helper、record、结构化控制流与普通 GPU 操作遍历。
+各自 serializer 注册 memory、collective、descriptor、MMA 等目标操作，并通过
+明确的语言钩子拼写 range、cast 和 scalar/fragment 表达；发射层不选择新的算法或物理形式。
+
+Mojo、BANG C 与 Weft host 通过 [ScalarOps.def](include/Intent/Serialization/ScalarOps.def)
+共用标准 scalar operation 的登记和语义解码。新增标准标量能力先补这份 catalog
+及 [Scalar.cpp](lib/Serialization/Scalar.cpp)，再实现实际目标 renderer；
+renderer 同时用于无输出的支持检查。C 家族共用整数宽度、除法、比较和转换表达，
+Mojo 保留自己的 SIMD 语法，BANG C 保留 bf16 存储载体转换。
+合法的未实现表达明确报错，不通过默认表达式继续生成源码。
+
+职责参考：本地 TileLang `src/cuda/codegen/codegen_cuda.h:23–65` 与
+`src/backend/common/codegen/codegen_c_host.h:45–86` 复用公共 codegen 并覆写目标能力；
+Intent 在相同职责边界共享遍历与语言状态，GPU 原生 collective/layout 仍交给
+Triton/cuTile，CPU/DSA 的 physical program 仍由各自 transforms 形成。
 
 ### Canonical product 的结构查询
 
