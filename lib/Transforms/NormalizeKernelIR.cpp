@@ -1,4 +1,5 @@
 #include "Intent/Transforms/Passes.h"
+#include "Intent/Analysis/ProductSchema.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Transforms/PassManager.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
@@ -42,32 +43,13 @@ Reference resolve(Reference reference) {
   return reference;
 }
 
-ArrayAttr components(Type type) {
-  if (auto record = dyn_cast<RecordType>(type))
-    return record.getFieldTypes();
-  if (auto tuple = dyn_cast<intent::TupleType>(type))
-    return tuple.getComponentTypes();
-  return {};
-}
-
-void appendLeaves(Value value, Type type, SmallVector<unsigned, 4> path,
-                  SmallVectorImpl<std::pair<Reference, Type>> &leaves) {
-  if (auto fields = components(type)) {
-    for (auto [index, field] : llvm::enumerate(fields)) {
-      auto nested = path;
-      nested.push_back(index);
-      appendLeaves(value, cast<TypeAttr>(field).getValue(), std::move(nested),
-                   leaves);
-    }
-  } else {
-    leaves.emplace_back(resolve({value, std::move(path)}), type);
-  }
-}
-
 SmallVector<std::pair<Reference, Type>> leaves(ValueRange values) {
   SmallVector<std::pair<Reference, Type>> result;
   for (Value value : values)
-    appendLeaves(value, value.getType(), {}, result);
+    walkProductLeaves(value.getType(), [&](Type type, ArrayRef<unsigned> path) {
+      result.emplace_back(
+          resolve({value, SmallVector<unsigned, 4>(path)}), type);
+    });
   return result;
 }
 
@@ -312,7 +294,7 @@ struct DimensionSubstitution {
           shape, tensor.getElementType(),
           TensorShapeAttr::get(context, DenseI64ArrayAttr::get(context, dimensions)));
     }
-    if (auto fields = components(type)) {
+    if (auto fields = getProductComponents(type)) {
       SmallVector<Attribute> remapped;
       for (Attribute field : fields)
         remapped.push_back(TypeAttr::get(remap(cast<TypeAttr>(field).getValue())));

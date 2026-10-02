@@ -1,6 +1,7 @@
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Analysis/ProductSchema.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
@@ -251,20 +252,8 @@ private:
     return allocation;
   }
 
-  ArrayAttr componentTypes(Type type) {
-    if (auto record = dyn_cast<RecordType>(type)) return record.getFieldTypes();
-    if (auto tuple = dyn_cast<intent::TupleType>(type)) return tuple.getComponentTypes();
-    return {};
-  }
-
-  void flattenTypes(Type type, SmallVectorImpl<Type> &result) {
-    if (auto components = componentTypes(type)) {
-      for (Attribute component : components) flattenTypes(cast<TypeAttr>(component).getValue(), result);
-    } else result.push_back(type);
-  }
-
   SmallVector<Value> flattened(Value value) {
-    if (componentTypes(value.getType())) return products.at(value);
+    if (getProductComponents(value.getType())) return products.at(value);
     return {values.lookup(value)};
   }
 
@@ -275,7 +264,7 @@ private:
   }
 
   void bindProduct(Value original, ValueRange components) {
-    if (componentTypes(original.getType())) products[original] = llvm::to_vector(components);
+    if (getProductComponents(original.getType())) products[original] = llvm::to_vector(components);
     else values.map(original, components.front());
   }
 
@@ -289,16 +278,14 @@ private:
 
   SmallVector<Value> makeSlots(TypeRange types, Location loc) {
     SmallVector<Value> result;
-    for (Type type : types) {
-      SmallVector<Type> leaves;
-      flattenTypes(type, leaves);
-      for (Type leaf : leaves) {
-        auto tensor = dyn_cast<RankedTensorType>(leaf);
-        if (!tensor) tensor = RankedTensorType::get({}, leaf);
-        auto sizes = extents(tensor, loc);
-        if (failed(sizes)) return {};
-        result.push_back(allocate(tensor, *sizes, loc));
-      }
+    SmallVector<Type> leaves;
+    appendProductLeafTypes(types, leaves);
+    for (Type leaf : leaves) {
+      auto tensor = dyn_cast<RankedTensorType>(leaf);
+      if (!tensor) tensor = RankedTensorType::get({}, leaf);
+      auto sizes = extents(tensor, loc);
+      if (failed(sizes)) return {};
+      result.push_back(allocate(tensor, *sizes, loc));
     }
     return result;
   }
@@ -317,13 +304,13 @@ private:
   }
 
   void bindSlots(ValueRange originals, ValueRange slots, Location loc) {
-    unsigned offset = 0;
-    for (Value original : originals) {
+    auto ranges = getProductLeafRanges(originals.getTypes());
+    for (auto [original, range] : llvm::zip(originals, ranges)) {
       SmallVector<Type> leaves;
-      flattenTypes(original.getType(), leaves);
+      appendProductLeafTypes(original.getType(), leaves);
       SmallVector<Value> parts;
-      for (Type leaf : leaves) {
-        Value value = slots[offset++];
+      for (auto [leaf, value] :
+           llvm::zip(leaves, slots.slice(range.offset, range.size))) {
         bindDimensions(leaf, value, loc);
         parts.push_back(isa<RankedTensorType>(leaf) ? value : slotValue(value, loc));
       }
@@ -333,16 +320,12 @@ private:
 
   ArrayAttr fieldPaths(TypeRange types) {
     SmallVector<Attribute> fields;
-    std::function<void(Type, std::string)> visit = [&](Type type, std::string path) {
-      if (auto components = componentTypes(type)) {
-        auto record = dyn_cast<RecordType>(type);
-        for (auto [index, component] : llvm::enumerate(components)) {
-          auto name = record ? cast<StringAttr>(record.getFieldNames()[index]).getValue().str() : std::to_string(index);
-          visit(cast<TypeAttr>(component).getValue(), path + "." + name);
-        }
-      } else fields.push_back(builder.getStringAttr(path));
-    };
-    for (auto [index, type] : llvm::enumerate(types)) visit(type, std::to_string(index));
+    for (auto [index, type] : llvm::enumerate(types))
+      walkProductLeaves(type, [&](Type, ArrayRef<unsigned> path) {
+        std::string name = std::to_string(index);
+        if (!path.empty()) name += "." + getProductPathName(type, path);
+        fields.push_back(builder.getStringAttr(name));
+      });
     return builder.getArrayAttr(fields);
   }
 
@@ -355,13 +338,17 @@ private:
     for (Type type : inputTypes) body->addArgument(type, original.getLoc());
     for (Type type : destinationTypes) body->addArgument(type, original.getLoc());
     builder.setInsertionPointToStart(body);
-    unsigned cursor = 0;
-    for (Value argument : original.front().getArguments()) {
+    auto ranges = getProductLeafRanges(original.front().getArgumentTypes());
+    size_t inputCount = ranges.empty() ? 0 : ranges.back().offset + ranges.back().size;
+    if (inputCount != inputTypes.size())
+      return original.getParentOp()->emitError("CPU helper argument partition mismatch");
+    for (auto [argument, range] : llvm::zip(original.front().getArguments(), ranges)) {
       SmallVector<Type> leaves;
-      flattenTypes(argument.getType(), leaves);
+      appendProductLeafTypes(argument.getType(), leaves);
       SmallVector<Value> parts;
-      for (Type leaf : leaves) {
-        Value value = body->getArgument(cursor++);
+      for (auto [leaf, target] :
+           llvm::zip(leaves, body->getArguments().slice(range.offset, range.size))) {
+        Value value = target;
         bindDimensions(leaf, value, original.getLoc());
         if (!isa<RankedTensorType>(leaf) && isa<MemRefType>(value.getType()))
           value = slotValue(value, original.getLoc());
@@ -369,14 +356,13 @@ private:
       }
       bindProduct(argument, parts);
     }
-    if (cursor != inputTypes.size()) return original.getParentOp()->emitError("CPU helper argument partition mismatch");
     allocations.emplace_back();
     for (Operation &operation : original.front().without_terminator())
       if (failed(lowerOperation(&operation))) return failure();
     auto results = flattened(original.front().getTerminator()->getOperands());
     if (results.size() != destinationTypes.size())
       return original.getParentOp()->emitError("CPU helper destination schema mismatch");
-    for (auto [value, slot] : llvm::zip(results, body->getArguments().drop_front(cursor)))
+    for (auto [value, slot] : llvm::zip(results, body->getArguments().drop_front(inputCount)))
       copyToSlot(value, slot, original.getLoc());
     for (Value allocation : llvm::reverse(allocations.back())) builder.create<memref::DeallocOp>(original.getLoc(), allocation);
     allocations.pop_back();
@@ -398,7 +384,7 @@ private:
     auto destinations = makeSlots(operation->getResultTypes(), loc);
     if (destinations.empty()) return failure();
     SmallVector<Type> identityTypes;
-    for (Type type : schema.getIdentities().getTypes()) flattenTypes(type, identityTypes);
+    appendProductLeafTypes(schema.getIdentities().getTypes(), identityTypes);
     SmallVector<Type> summarySlots;
     for (Type type : identityTypes) {
       auto tensor = dyn_cast<RankedTensorType>(type);
@@ -409,11 +395,11 @@ private:
     if (scan) {
       Block &emit = schema.getEmitRegion()->front();
       SmallVector<Type> sourceLeaves;
-      flattenTypes(schema.getEmitSources().front().getType(), sourceLeaves);
+      appendProductLeafTypes(schema.getEmitSources().front().getType(), sourceLeaves);
       auto sourceType = cast<RankedTensorType>(sourceLeaves.front());
       int64_t member = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions()[axis];
       for (Type type : emit.getTerminator()->getOperandTypes()) {
-        SmallVector<Type> leaves; flattenTypes(type, leaves);
+        SmallVector<Type> leaves; appendProductLeafTypes(type, leaves);
         for (Type leaf : leaves) {
           auto tensor = cast<RankedTensorType>(leaf);
           auto axes = cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions().asArrayRef();
@@ -631,7 +617,7 @@ private:
     Type element = cast<MemRefType>(target.getType()).getElementType();
     auto ordering = operation->getAttrOfType<AtomicOrderingAttr>("ordering");
     SmallVector<Type> resultTypes;
-    for (Type type : operation->getResultTypes()) flattenTypes(type, resultTypes);
+    appendProductLeafTypes(operation->getResultTypes(), resultTypes);
     Type accessType = resultTypes.empty()
         ? access.getStoredValue().getType()
         : resultTypes.front();
@@ -1219,12 +1205,7 @@ private:
       SmallVector<Value> arguments(scalars.drop_front(inputs.size()));
       llvm::append_range(arguments, scalars.take_front(sources.size()));
       llvm::append_range(arguments, scalars.slice(sources.size(), captures.size()));
-      unsigned offset = 0;
-      for (Value argument : combine.getArguments()) {
-        SmallVector<Type> leaves; flattenTypes(argument.getType(), leaves);
-        bindProduct(argument, ValueRange(arguments).slice(offset, leaves.size()));
-        offset += leaves.size();
-      }
+      bindScalars(combine.getArguments(), arguments);
       scalarized = true;
       for (Operation &nested : combine.without_terminator())
         if (failed(lowerOperation(&nested))) { status = failure(); break; }
@@ -1517,13 +1498,9 @@ private:
   }
 
   void bindScalars(ValueRange originals, ValueRange components) {
-    unsigned offset = 0;
-    for (Value original : originals) {
-      SmallVector<Type> leaves;
-      flattenTypes(original.getType(), leaves);
-      bindProduct(original, components.slice(offset, leaves.size()));
-      offset += leaves.size();
-    }
+    auto ranges = getProductLeafRanges(originals.getTypes());
+    for (auto [original, range] : llvm::zip(originals, ranges))
+      bindProduct(original, components.slice(range.offset, range.size));
   }
 
   LogicalResult scalarControl(Operation *operation, TypeRange resultTypes) {
@@ -1560,7 +1537,7 @@ private:
 
   LogicalResult orderedControl(Operation *operation) {
     SmallVector<Type> leaves;
-    for (Type type : operation->getResultTypes()) flattenTypes(type, leaves);
+    appendProductLeafTypes(operation->getResultTypes(), leaves);
     if (isa<IfOp, ForOp>(operation) && llvm::all_of(leaves, [](Type type) {
           return isa<IntegerType, IndexType, FloatType>(type);
         })) return scalarControl(operation, leaves);
@@ -1947,14 +1924,11 @@ private:
     } else if (auto op = dyn_cast<MakeTupleOp>(operation)) {
       bindProduct(op.getResult(), flattened(op.getComponents()));
     } else if (auto op = dyn_cast<ExtractOp>(operation)) {
-      auto components = componentTypes(op.getProduct().getType());
-      unsigned offset = 0;
-      SmallVector<Type> leaves;
-      for (uint64_t field = 0; field < op.getField(); ++field)
-        flattenTypes(cast<TypeAttr>(components[field]).getValue(), leaves);
-      offset = leaves.size(); leaves.clear();
-      flattenTypes(op.getResult().getType(), leaves);
-      bindProduct(op.getResult(), ValueRange(products.at(op.getProduct())).slice(offset, leaves.size()));
+      auto range = getProductLeafRange(op.getProduct().getType(),
+                                      {static_cast<unsigned>(op.getField())});
+      if (failed(range)) return op.emitError("CPU extract has no canonical field schema");
+      bindProduct(op.getResult(), ValueRange(products.at(op.getProduct()))
+                                      .slice(range->offset, range->size));
     } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
       return region(operation);
     } else if (auto op = dyn_cast<HistogramOp>(operation)) {

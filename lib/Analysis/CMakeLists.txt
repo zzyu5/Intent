@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentAnalysis
   IntegerRelations.cpp
   RegionSemantics.cpp
   OnlineSummary.cpp
+  ProductSchema.cpp
 
   LINK_LIBS PUBLIC
   MLIRFuncDialect

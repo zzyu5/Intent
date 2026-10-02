@@ -1,6 +1,7 @@
 #include "Intent/Transforms/Passes.h"
 
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Analysis/ProductSchema.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
@@ -24,11 +25,8 @@ void collectCoordinateSources(Type type,
                               llvm::DenseMap<uint64_t, unsigned> &ranks) {
   if (auto domain = dyn_cast<DomainType>(type))
     ranks.try_emplace(domain.getOriginId(), domain.getRank());
-  if (auto tuple = dyn_cast<intent::TupleType>(type))
-    for (Attribute attribute : tuple.getComponentTypes())
-      collectCoordinateSources(cast<TypeAttr>(attribute).getValue(), ranks);
-  if (auto record = dyn_cast<RecordType>(type))
-    for (Attribute attribute : record.getFieldTypes())
+  if (auto components = getProductComponents(type))
+    for (Attribute attribute : components)
       collectCoordinateSources(cast<TypeAttr>(attribute).getValue(), ranks);
 }
 
@@ -49,13 +47,8 @@ LogicalResult verifyCoordinateSources(
           "subregion references an unknown source identity/rank");
     return success();
   }
-  if (auto tuple = dyn_cast<intent::TupleType>(type))
-    for (Attribute attribute : tuple.getComponentTypes())
-      if (failed(verifyCoordinateSources(
-              owner, cast<TypeAttr>(attribute).getValue(), ranks)))
-        return failure();
-  if (auto record = dyn_cast<RecordType>(type))
-    for (Attribute attribute : record.getFieldTypes())
+  if (auto components = getProductComponents(type))
+    for (Attribute attribute : components)
       if (failed(verifyCoordinateSources(
               owner, cast<TypeAttr>(attribute).getValue(), ranks)))
         return failure();
