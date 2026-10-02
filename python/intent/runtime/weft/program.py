@@ -13,9 +13,10 @@ import sys
 from .buffer import Buffer
 from .compilation import validate_artifact
 from .target import TargetProfile, matrix_capability
+from ..contract import ProgramContract
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
-from ..native import NativeABI, NativePreparedRuntime
+from ..native import NativePreparedRuntime
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -161,10 +162,12 @@ class NativeProgram(NativePreparedRuntime):
         self.directory = Path(directory)
         manifest_text = (self.directory / "artifact.json").read_text()
         manifest = json.loads(manifest_text)
-        validate_artifact(manifest)
+        contract = ProgramContract.read((self.directory / "canonical.mlir").read_text(encoding="utf-8"),
+                                        manifest["program"])
+        validate_artifact(manifest, contract)
         self.profile = TargetProfile(**manifest["profile"])
-        self.metadata = manifest["program"]
-        abi = NativeABI.read(self.metadata)
+        self.facts = contract.facts
+        abi = contract.abi
         self.interface = abi.interface
         self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
@@ -174,11 +177,11 @@ class NativeProgram(NativePreparedRuntime):
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.dtype, facts.offset, group),
             scalar_key=lambda parameter, value: (parameter.dtype.name, value),
         )
-        self.candidates = self.metadata["candidates"]
+        self.candidates = self.facts.candidates
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
         self.candidate_extensions = tuple(frozenset(
-            extension for task in self.metadata["tasks"] if task["cpu_entry"] == candidate["entry"]
-            for extension in kernels[task["abi"]["symbol"]]["used_extensions"])
+            extension for task in self.facts.tasks if task.cpu_entry == candidate.entry
+            for extension in kernels[task.abi.symbol]["used_extensions"])
             for candidate in self.candidates)
         self.used_extensions = frozenset(extension for kernel in manifest["weft"]["kernels"]
                                          for extension in kernel["used_extensions"])
@@ -191,9 +194,9 @@ class NativeProgram(NativePreparedRuntime):
         types = abi.argument_types()
         self.functions, self.measurements = [], []
         for candidate in self.candidates:
-            function = getattr(self.library, candidate["entry"] + "_invoke")
+            function = getattr(self.library, candidate.entry + "_invoke")
             function.argtypes, function.restype = types, None
-            measure = getattr(self.library, candidate["entry"] + "_benchmark")
+            measure = getattr(self.library, candidate.entry + "_benchmark")
             measure.argtypes, measure.restype = [*types, ctypes.c_int64], ctypes.c_double
             self.functions.append(function)
             self.measurements.append(measure)

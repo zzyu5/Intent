@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from intent.runtime import CompiledArtifact
 from intent.runtime.cutile import materialize_cutile_artifact
@@ -11,11 +12,14 @@ from intent.runtime.triton import materialize_triton_artifact
 from ..specification import GPUCompilationTarget, require_matching_target
 from .device import resolve_gpu_device
 
+if TYPE_CHECKING:
+    from intent.runtime.contract import ProgramContract
+
 
 @dataclass(frozen=True, slots=True)
 class _Provider:
     name: str
-    materialize: Callable[[str, str, str, int, dict[str, object]], CompiledArtifact]
+    materialize: Callable[[str, str, str, int, ProgramContract], CompiledArtifact]
 
 
 _PROVIDERS = {
@@ -42,7 +46,7 @@ class ResolvedGPUTarget:
         current = GPUCompilationTarget(self.compilation.provider, resolve_gpu_device(self.device))
         require_matching_target(program.target, current)
         return _provider(self.compilation.provider).materialize(
-            program.source, program.ir, program.entry_name, self.device, program.metadata)
+            program.source, program.ir, program.entry_name, self.device, program._contract)
 
 
 @dataclass(frozen=True, slots=True)

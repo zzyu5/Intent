@@ -7,6 +7,7 @@ import statistics
 import torch
 
 from .compilation import compile_library
+from .contract import MojoFacts
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, build_invocation_binders, invocation_result
 from ..native import NativeABI, NativePreparedRuntime
@@ -71,10 +72,9 @@ class NativeCall:
 
 
 class NativeProgram(NativePreparedRuntime):
-    def __init__(self, source: str, metadata: dict[str, object], target) -> None:
-        abi = NativeABI.read(metadata)
+    def __init__(self, abi: NativeABI, facts: MojoFacts, target) -> None:
         self.interface = abi.interface
-        self.candidates = metadata["candidates"]
+        self.candidates = facts.candidates
         self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
@@ -88,16 +88,16 @@ class NativeProgram(NativePreparedRuntime):
             allocate_output=type(self)._abstract_output,
             check_relation=check_abstract_relation, abstract=True,
         )[0]
-        self.compilation = compile_library(source, metadata, target, abi=abi)
+        self.compilation = compile_library(facts, target, abi=abi)
         argument_types = abi.argument_types()
         self.functions = []
         self.measurements = []
         for candidate, compilation in zip(self.candidates, self.compilation.libraries):
-            function = getattr(compilation.library, candidate["entry"])
+            function = getattr(compilation.library, candidate.entry)
             function.argtypes = argument_types
             function.restype = None
             self.functions.append(function)
-            measure = getattr(compilation.library, candidate["entry"] + "_benchmark")
+            measure = getattr(compilation.library, candidate.entry + "_benchmark")
             measure.argtypes = [*argument_types, ctypes.c_int64]
             measure.restype = ctypes.c_double
             self.measurements.append(measure)

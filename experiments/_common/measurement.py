@@ -22,7 +22,7 @@ from .model import PreparedLaunch
 from .model import TensorTree
 from .model import Tolerance
 from .model import IntegerTolerance, SimilarityTolerance, NumericalTolerance
-from intent.runtime.cutile_compilation import CuTileCompilation
+from intent.runtime.cutile.compilation import CuTileCompilation
 
 
 class PipelineStageError(RuntimeError):

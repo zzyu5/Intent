@@ -9,6 +9,7 @@ from .options import CompileOptions
 
 if TYPE_CHECKING:
     from intent.runtime import CompiledArtifact, PublicInterface
+    from intent.runtime.contract import ProgramContract
     from intent.targets.base import ResolvedTarget, Target
     from intent.targets.specification import CompilationTarget
 
@@ -36,7 +37,7 @@ class OptimizedIR:
     cache_directory: Path
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class GeneratedProgram:
     """Provider source, IR and metadata, with an optional process-local binding.
 
@@ -45,14 +46,36 @@ class GeneratedProgram:
 
     source: str
     ir: str
-    metadata: dict[str, object]
     cache_directory: Path
     entry_name: str
     _binding: ResolvedTarget | None = field(default=None, repr=False, compare=False)
+    _contract: ProgramContract = field(repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        self.compile_options
-        self.interface
+    def __init__(self, source: str, ir: str, metadata: dict[str, object],
+                 cache_directory: Path, entry_name: str,
+                 _binding: ResolvedTarget | None = None) -> None:
+        from intent.runtime.contract import ProgramContract
+
+        contract = ProgramContract.read(source, metadata)
+        if not isinstance(ir, str) or not ir.strip():
+            raise ValueError("generated program IR must be nonempty text")
+        if not isinstance(entry_name, str) or not entry_name.strip():
+            raise ValueError("generated program requires a nonempty diagnostic name")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "ir", ir)
+        object.__setattr__(self, "cache_directory", Path(cache_directory))
+        object.__setattr__(self, "entry_name", entry_name)
+        object.__setattr__(self, "_binding", _binding)
+        object.__setattr__(self, "_contract", contract)
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        """An inspection copy of the validated compiler metadata.
+
+        Editing the returned object does not change this program or a runtime
+        already materialized from it. The saved compiler contract remains fixed.
+        """
+        return self._contract.metadata
 
     @property
     def compile_options(self) -> CompileOptions:
@@ -61,14 +84,12 @@ class GeneratedProgram:
         Loading or materializing preserves this policy; it does not replace it
         with the current compiler's defaults or a runtime fast-math setting.
         """
-        return CompileOptions.read(self.metadata["compile_options"])
+        return self._contract.options
 
     @property
     def target(self) -> CompilationTarget:
         """Compiler target facts from this program's authoritative metadata, without runtime probing."""
-        from intent.targets.specification import read_compilation_target
-
-        return read_compilation_target(self.metadata["provider"], self.metadata["target"])
+        return self._contract.target
 
     @property
     def interface(self) -> PublicInterface:
@@ -78,15 +99,7 @@ class GeneratedProgram:
         The returned declaration excludes native slots and compiler-private
         resources; materialization consumes the same authoritative metadata.
         """
-        from intent.targets.specification import GPUCompilationTarget
-
-        if isinstance(self.target, GPUCompilationTarget):
-            from intent.runtime.gpu.interface import GPUInterface
-
-            return GPUInterface(self.metadata).public
-        from intent.runtime.native import NativeABI
-
-        return NativeABI.read(self.metadata).interface
+        return self._contract.interface
 
     def save(self, directory: str | Path) -> Path:
         """Save source, final IR and compiler metadata into a new directory.
@@ -99,8 +112,6 @@ class GeneratedProgram:
 
         path = Path(directory).expanduser().absolute()
         try:
-            self.compile_options
-            self.interface
             if path.exists():
                 raise FileExistsError(f"generated program destination already exists: {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +150,10 @@ class GeneratedProgram:
                 raise ValueError("generated program requires a nonempty diagnostic name")
             return cls(source, ir, metadata, path, diagnostic_name)
         except (OSError, UnicodeError, ValueError, KeyError, TypeError, NotImplementedError) as error:
-            raise CompilationStageError("generated_program_loading", str(error), cache_directory=path) from error
+            detail = str(error)
+            if isinstance(error, (ValueError, KeyError, TypeError, NotImplementedError)):
+                detail += "\nRegenerate an incompatible artifact from its original Intent definition or KIR; generated source is not the original algorithm."
+            raise CompilationStageError("generated_program_loading", detail, cache_directory=path) from error
 
     def materialize(self, *, target: Target | None = None) -> CompiledArtifact:
         """Bind this program to a matching runtime target, without recompiling KIR.
@@ -154,8 +168,6 @@ class GeneratedProgram:
         from .toolchain import CompilationStageError
 
         try:
-            self.compile_options
-            self.interface
             binding = target.resolve() if target is not None else self._binding
             if binding is None:
                 raise ValueError("materialize requires an explicit runtime target for this generated program")

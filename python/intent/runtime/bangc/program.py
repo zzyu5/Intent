@@ -6,9 +6,9 @@ import statistics
 
 from .buffer import DeviceBuffer, DeviceView, runtime
 from .compilation import compile_library
-from ..interface import ScalarParameter, ViewParameter
+from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
-from ..native import NativeABI, NativePreparedRuntime
+from ..native import NativePreparedRuntime
 
 
 @dataclass
@@ -96,19 +96,23 @@ def benchmark_calls(calls: tuple[NativeCall, ...], *, prepare=None, repetitions:
 
 
 class NativeProgram(NativePreparedRuntime):
-    def __init__(self, source: str, metadata: dict[str, object], target) -> None:
-        from intent.targets.specification import read_compilation_target, require_matching_target
+    def __init__(self, source: str, contract, target) -> None:
+        from intent.targets.specification import require_matching_target
 
-        compilation = read_compilation_target(metadata["provider"], metadata["target"])
-        require_matching_target(compilation, target.compilation)
+        require_matching_target(contract.target, target.compilation)
         self.target = target
-        self.metadata = metadata
-        abi = NativeABI.read(metadata)
+        self.facts = contract.facts
+        abi = contract.abi
         self.interface = abi.interface
         self.requirements = requirements = abi.requirements
+        converters = {"bool": bool, "i8": int, "i16": int, "i32": int, "i64": int,
+                      "f32": float, "f64": float}
+        scalar_converters = {slot.parameter.position: converters[slot.carrier]
+                             for slot in abi.slots if slot.role == "scalar"}
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            check_alias=requirements.check_pair, scalar_argument=type(self)._scalar,
+            check_alias=requirements.check_pair,
+            scalar_argument=lambda parameter, value: scalar_converters[parameter.position](value),
             check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
             check_dimensions=type(self)._check_dimensions,
         )
@@ -124,7 +128,7 @@ class NativeProgram(NativePreparedRuntime):
         self.runtime.select(target.device)
         self.queue = ctypes.c_void_p()
         self.runtime.invoke("cnrtQueueCreate", ctypes.byref(self.queue))
-        self.function = getattr(self.compilation.library, metadata["entry"])
+        self.function = getattr(self.compilation.library, self.facts.entry)
         self.function.argtypes = (ctypes.c_void_p, *abi.argument_types())
         self.function.restype = ctypes.c_int
 
@@ -153,13 +157,9 @@ class NativeProgram(NativePreparedRuntime):
                                 0, value.dtype, lower, upper, value.allocation_pointer)
 
     def _check_dimensions(self, dimensions: dict[int, int]) -> None:
-        for identity in self.metadata["full_extent_dimensions"]:
+        for identity in self.facts.full_extent_dimensions:
             if dimensions[identity] > self.target.compilation.tile:
                 raise NotImplementedError("this row reduction requires a larger DSA tile binding")
-
-    @staticmethod
-    def _scalar(parameter: ScalarParameter, value):
-        return float(value) if parameter.dtype.name == "f32" else int(value)
 
     def close(self) -> None:
         if self.queue.value:

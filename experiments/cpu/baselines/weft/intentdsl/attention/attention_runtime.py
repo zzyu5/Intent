@@ -52,7 +52,7 @@ def serve(directory: Path) -> None:
             "generated_ms": generated_ms, "source_ms": source_ms,
             "generated": flattened(generated_call.result()),
             "source": flattened(source_call.result()),
-            "winner": generated.candidates[generated_call.winner],
+            "winner": generated.candidates[generated_call.winner].metadata(),
         }), flush=True)
     finally:
         generated.close()

@@ -69,7 +69,7 @@ Lowering 的共同构造能力有明确入口：
 
 Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构验证、合法 region 归一、输出 canonical 验证在同一 pass 中闭合，之后才建立 canonical analyses。它同时服务 `intent-compile` 和 `intent-opt`。新的跨目标 KIR 规范化放在 [lib/Transforms/](lib/Transforms/)，需要满足相应语言合同；GPU/CPU 的物理变换继续留在各自 family。
 
-只检查既有作者程序时，可用 `intent.compile_ir(definition)` 或 `intent compile path/to/program.py:kernel --stage kir --json`；这个阶段无需 target、后端 SDK 或设备。`--stage shared --target …` 输出共享物理 IR，默认 `provider` 阶段输出 provider IR、source 和 metadata。`intent-compile --compiler-info` 查询当前二进制实际编入的 providers；它不证明外部 provider 编译器或设备可用。
+只检查既有作者程序时，可用 `intent.compile_ir(definition)` 或 `intent compile path/to/program.py:kernel --stage kir --json`；这个阶段无需 target、后端 SDK 或设备。`--stage shared --target …` 输出共享物理 IR，默认 `provider` 阶段输出 provider IR、source 和 metadata。`intent-compile --compiler-info` 的 provider catalog 描述每个后端的 family、实际编入状态和编译所读的 profile 路径；它不证明外部 provider 编译器或设备可用。资源由 [Backend::profilePaths](lib/Compiler/Backend.cpp) 按真实 pipeline 声明，doctor 与缓存直接消费，不再分别推导文件名。CLI 拒绝当前 family 或阶段不消费的显式参数；shared IR 续编译核对已有目标事实，不重新解释构造参数。
 
 ### 编译许可与优化开关
 
@@ -175,6 +175,14 @@ vector、workers 和 private-memory 预算不包含 Mojo executable 路径。
 `program.save(directory)` 保存 `kernel.source`、`kernel.mlir`、`artifact.json`；
 `intent.GeneratedProgram.load(directory)` 恢复同一产物，包括诊断入口名字。
 新目录完整写出后才发布，已有目录不会被覆盖。加载过程不执行生成源码。
+创建与加载都经过 [ProgramContract](python/intent/runtime/contract.py)：先解析公共
+target、数值策略和 GPU/Native ABI，再调用对应 provider 目录的 `contract.py`
+解析其执行事实。Triton descriptor 参数、cuTile 编译配置、Mojo 候选源码区间、
+Weft host/task 绑定及 BANG C extent 绑定由其实际消费者拥有，无需 SDK 即可读取。
+Runtime 接收这一份已解析合同，不再各自从原始 metadata 重建参数和候选。
+`program.metadata` 返回用于检查的副本，修改它不改变产物或已经绑定的运行时。
+不兼容的字段应明确报错；重新生成需要调用方保留原 Intent definition 或 KIR，
+保存的 provider source 不承担恢复原算法或跨目标重新编译的职责。
 恢复的程序调用 `materialize(target=...)` 时必须显式选择本机运行环境；
 生成时使用了本机 target 的程序可无参沿用其进程内绑定。
 运行绑定检查编译事实一致，GPU 还重新查询所选设备，不能把另一架构的产物
@@ -646,14 +654,20 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 | 已导出的整数表达式 | [gpu/expressions.py](python/intent/runtime/gpu/expressions.py) | 只求值 compiler 已声明的表达式，不按算法名或观察到的 shape 发明策略 |
 | 候选、deferred coverage 与资源条件 | [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) | 唯一解析已导出的候选表；provider 明确选择用于执行或展示的现有行，不再重建第二份配置 |
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
-| Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
+| Provider 的 JIT、调优和发射 | [runtime/triton/program.py](python/intent/runtime/triton/program.py)、[runtime/cutile/program.py](python/intent/runtime/cutile/program.py) | 消费 `BoundInvocation` 与本 provider 的已解析合同，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
 | 原生资源与候选观察 | [runtime/diagnostics.py](python/intent/runtime/diagnostics.py) | 不可变 `NativeObservation` 保存实际调用、已选配置、SDK 返回值与失败；不持有 tensor，不参与候选策略 |
 | PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `TorchOutputInference` 能力注册 CPU/CUDA opaque 调用；GPU 与 Mojo CPU 支持只读 In/scalar 和 fresh Out，backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
 
 新增 GPU provider 时，先让 legalization 交付可独立验证的当前程序，再导出共同 interface 与必要 provider facts，实现上述 provider 调用接口，并由 `ResolvedTarget.materialize` 接入。不要复制 serializer 中的 Python host 模板，也不要让 framework adapter 自己猜输出或解析生成源码。CPU、DSA 可以保留自己的 ABI/buffer 类型；共同 `ArtifactRuntime` 协议不要求它们采用 GPU 的 grid、workspace 或 tensor binder。
 
-GPU 的纯编译事实位于 [targets/specification.py](python/intent/targets/specification.py)，设备观察位于 [gpu/device.py](python/intent/targets/gpu/device.py)，本机绑定与 materialization 共用 [gpu/target.py](python/intent/targets/gpu/target.py)。三个公开本机 Target 只声明 provider；`ResolvedGPUTarget` 分别保存 compilation 与 device，provider 表只连接实际 materializer。显式 compilation target 不经过设备观察或 SDK import。
+GPU 的纯编译事实位于 [targets/specification.py](python/intent/targets/specification.py)，设备观察位于 [gpu/device.py](python/intent/targets/gpu/device.py)，本机绑定与 materialization 共用 [gpu/target.py](python/intent/targets/gpu/target.py)。两个公开本机 Target 只声明 provider；`ResolvedGPUTarget` 分别保存 compilation 与 device，provider 表只连接实际 materializer。显式 compilation target 不经过设备观察或 SDK import。
+
+GPU provider 的 `contract.py`、`program.py`、`math.py` 在同一目录；cuTile 的
+`compilation.py` 也归该 provider。源码所引用的辅助函数与 native SDK 调用随
+provider 维护，共同 `runtime/gpu/` 只负责 host 参数依赖、候选和调用生命周期。
+SDK 更换时先定位源码拼写、纯产物字段或 native 调用哪一层变化，修改所属模块；
+不要在共同 ABI 或无关 provider 中加入版本猜测、默认字段或失败回退。
 
 实验适配若需要准备候选、观察调优或绑定调用，使用 `artifact.runtime` 的明确对象与 provider 扩展点。Compiler 生成的 source 不再承担 host `launch/run` 协议；只有显式作者提供的 Python source 由 [runtime/source.py](python/intent/runtime/source.py) 的独立 source loader 承接其已有 host callable。不要通过生成模块的私有字典改写编译器产物的执行语义。
 
@@ -791,7 +805,10 @@ SDK loader 路径，调用已有 doctor、公开声明、MCP 服务启动与 EOF
 也不证明 provider 的数值与性能。此 recipe 不承诺 manylinux 或逐字节一致；
 其他平台仍可手工源构建，实际生产运行继续使用对应实验组的原入口。
 
-普通用户可先运行 `intent describe --json` 查询实际公开 API，`intent doctor --json`
+安装 wheel 后，`intent setup --target BACKEND` 使用包内的依赖声明配置当前 Python
+环境；[environment/install.py](environment/install.py) 也调用这个入口。它只安装
+Python 依赖，外部编译器和设备由实际 target/doctor 检查。普通用户可先运行
+`intent describe --json` 查询实际公开 API，`intent doctor --json`
 检查基础 compiler/KIR；选择后端后再用 `--target triton` 等检查相应包、SDK 与设备。
 `intent compile path/to/program.py:kernel --target triton --json` 返回真实阶段与编译产物，
 `--materialize` 调用同一个 `GeneratedProgram.materialize()`，不会重新 lowering。

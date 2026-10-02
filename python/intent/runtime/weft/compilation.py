@@ -7,6 +7,7 @@ import subprocess
 
 
 from .target import TargetProfile
+from ..contract import ProgramContract
 from ..native import NativeABI
 
 
@@ -48,26 +49,24 @@ def _validate_target(artifact: dict, profile: TargetProfile) -> None:
         raise ValueError("Weft program does not use the required matrix extension")
 
 
-def validate_artifact(manifest: dict) -> None:
-    NativeABI.read(manifest["program"])
+def validate_artifact(manifest: dict, contract: ProgramContract) -> None:
+    facts = contract.facts
     artifact = manifest["weft"]
     _validate_target(artifact, TargetProfile(**manifest["profile"]))
     kernels = {kernel["symbol"]: kernel for kernel in artifact["kernels"]}
-    expected = {task["abi"]["symbol"]: task["abi"] for task in manifest["program"]["tasks"]}
+    expected = {task.abi.symbol: task.abi for task in facts.tasks}
     if (len(kernels) != len(artifact["kernels"]) or
-            len(expected) != len(manifest["program"]["tasks"]) or kernels.keys() != expected.keys()):
+            len(expected) != len(facts.tasks) or kernels.keys() != expected.keys()):
         raise ValueError("Weft artifact kernel symbols disagree with the CPU task calls")
     for symbol, abi in expected.items():
-        for field in ("arguments", "shape_parameters"):
-            if kernels[symbol][field] != abi[field]:
-                raise ValueError(f"Weft artifact {symbol} {field} disagree with the CPU task ABI")
+        abi.verify_native(kernels[symbol])
     profile = TargetProfile(**manifest["profile"])
-    for candidate in manifest["program"]["candidates"]:
-        used = {extension for task in manifest["program"]["tasks"]
-                if task["cpu_entry"] == candidate["entry"]
-                for extension in kernels[task["abi"]["symbol"]]["used_extensions"]}
+    for candidate in facts.candidates:
+        used = {extension for task in facts.tasks
+                if task.cpu_entry == candidate.entry
+                for extension in kernels[task.abi.symbol]["used_extensions"]}
         required = set(profile.required_extensions)
-        if candidate["requires_matrix_i8_i32"]:
+        if candidate.requires_matrix_i8_i32:
             if profile.matrix_extension is None:
                 raise ValueError("Weft candidate requires an unavailable integer matrix capability")
             required.add(profile.matrix_extension)
@@ -86,12 +85,12 @@ def export_artifact(program, directory: Path, *, compiler: str, profile: TargetP
         raise ValueError("CPU program matrix capability disagrees with native materialization")
     artifact = lower_artifact(program.source, compiler=compiler, profile=profile)
     manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
-    validate_artifact(manifest)
+    validate_artifact(manifest, program._contract)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "canonical.mlir").write_text(program.source, encoding="utf-8")
     (directory / "cpu.mlir").write_text(program.ir, encoding="utf-8")
     (directory / "kernels.c").write_text(artifact["intrinsic_c"], encoding="utf-8")
-    (directory / "host.c").write_text(program.metadata["host_source"], encoding="utf-8")
+    (directory / "host.c").write_text(program._contract.facts.host_source, encoding="utf-8")
     (directory / "artifact.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
@@ -110,11 +109,11 @@ def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
     return signature, arguments
 
 
-def native_exports(metadata: dict) -> str:
-    signature, arguments = flattened_signature(NativeABI.read(metadata))
+def native_exports(contract: ProgramContract) -> str:
+    signature, arguments = flattened_signature(contract.abi)
     sections = ["#include <stdint.h>\n#include <time.h>\n#include <fenv.h>\n"]
-    for candidate in metadata["candidates"]:
-        entry = candidate["entry"]
+    for candidate in contract.facts.candidates:
+        entry = candidate.entry
         sections.append(
             f"extern void {entry}({', '.join(signature)});\n"
             f"void {entry}_invoke({', '.join(signature)}) {{\n"
@@ -137,17 +136,17 @@ def native_exports(metadata: dict) -> str:
 
 def compile_artifact(directory: Path, *, cc: tuple[str, ...], cflags: tuple[str, ...] = ()) -> Path:
     manifest = json.loads((directory / "artifact.json").read_text())
-    validate_artifact(manifest)
+    contract = ProgramContract.read((directory / "canonical.mlir").read_text(encoding="utf-8"), manifest["program"])
+    validate_artifact(manifest, contract)
     profile = TargetProfile(**manifest["profile"])
-    metadata = manifest["program"]
     exports = directory / "exports.c"
-    exports.write_text(native_exports(metadata), encoding="utf-8")
+    exports.write_text(native_exports(contract), encoding="utf-8")
     library = directory / "kernel.so"
     invoke_compiler([
         *cc, "-O3", "-shared", "-fPIC", "-std=c11", "-D_POSIX_C_SOURCE=200809L",
         f"-march={profile.march}", f"-mabi={profile.abi}", *cflags,
         "-fno-fast-math", "-ffp-contract=off",
-        *(["-fopenmp"] if metadata["target"]["workers"] > 1 else []),
+        *(["-fopenmp"] if contract.target.workers > 1 else []),
         str(directory / "host.c"), str(directory / "kernels.c"), str(exports),
         "-lm", "-o", str(library),
     ])

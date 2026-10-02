@@ -18,7 +18,7 @@ class ResolvedBangCTarget:
     def materialize(self, program) -> CompiledArtifact:
         from intent.runtime.bangc import materialize_bangc_artifact
         require_matching_target(program.target, self.compilation)
-        return materialize_bangc_artifact(program.source, program.ir, program.metadata, self)
+        return materialize_bangc_artifact(program.source, program.ir, program._contract, self)
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,8 +8,8 @@ from pathlib import Path
 import intent
 from intent.runtime.artifact import CompiledArtifact
 from intent.runtime.source import materialize_python_source
-from intent.runtime.cutile_compilation import CuTileCompilation
-from intent.runtime.triton import TuningHooks
+from intent.runtime.cutile.compilation import CuTileCompilation
+from intent.runtime.triton.program import TuningHooks
 from intent.targets import CuTileTarget, TritonTarget
 import triton
 from triton.compiler.errors import CompileTimeAssertionFailure

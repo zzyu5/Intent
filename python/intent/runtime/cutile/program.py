@@ -1,11 +1,11 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from .artifact import CompiledArtifact
-from .gpu.expressions import evaluate_shape, read_expressions
-from .gpu.program import LaunchResult, materialize_gpu_program
-from .tuning import TuningState
-from .diagnostics import CandidateObservation, bindings, observation, unavailable_resources
+from ..artifact import CompiledArtifact
+from ..gpu.expressions import evaluate_shape
+from ..gpu.program import LaunchResult, materialize_gpu_program
+from ..tuning import TuningState
+from ..diagnostics import CandidateObservation, bindings, observation, unavailable_resources
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -71,17 +71,16 @@ def _search(*arguments, **keywords):
 
 
 class CuTileProgram:
-    def __init__(self, interface, namespace: dict, facts: dict, target: dict) -> None:
+    def __init__(self, interface, namespace: dict, facts, target: dict) -> None:
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
         self.target = target
-        self.kernel = namespace[facts["kernel"]]
-        self.narrow_kernel = None if facts["narrow_kernel"] is None else namespace[facts["narrow_kernel"]]
-        self.native_kernels = {name: namespace[name] for name in (facts["kernel"], facts["narrow_kernel"])
+        self.kernel = namespace[facts.kernel]
+        self.narrow_kernel = None if facts.narrow_kernel is None else namespace[facts.narrow_kernel]
+        self.native_kernels = {name: namespace[name] for name in (facts.kernel, facts.narrow_kernel)
                                if name is not None}
-        self.tile_bounds = (None if facts["index_tile_bounds"] is None else
-                            tuple(read_expressions(bounds) for bounds in facts["index_tile_bounds"]))
+        self.tile_bounds = facts.index_tile_bounds
         self.search = _search
         self.trial_state = TuningState
         self.observe_tuning = None
@@ -90,19 +89,19 @@ class CuTileProgram:
         self._compiling = False
 
     def _array_values(self, values: dict) -> None:
-        for entry in self.facts["array_views"]:
-            values[entry["name"]], values[entry["eligible"]] = bind_array_view(
-                values[entry["base"]], tuple(entry["group_ends"]))
+        for entry in self.facts.array_views:
+            values[entry.name], values[entry.eligible] = bind_array_view(
+                values[entry.base], entry.group_ends)
 
     def _hints(self, config) -> dict:
-        hints = {hint: getattr(config, parameter) for hint, parameter in self.facts["compiler_hints"].items()}
-        if hints.get("num_worker_warps") == self.facts["inferred_worker_warps"]:
+        hints = {hint: getattr(config, parameter) for hint, parameter in self.facts.compiler_hints}
+        if hints.get("num_worker_warps") == self.facts.inferred_worker_warps:
             hints["num_worker_warps"] = None
         return hints
 
     def _arguments(self, values: dict, config) -> tuple:
         bindings = {**values, **vars(config)}
-        return tuple(self.interface.native_value(name, bindings) for name in self.facts["kernel_arguments"])
+        return tuple(self.interface.native_value(name, bindings) for name in self.facts.kernel_arguments)
 
     def _grid(self, values: dict, config) -> tuple:
         return (*evaluate_shape(self.interface.grid, {**values, **vars(config)}), 1, 1)
@@ -110,10 +109,10 @@ class CuTileProgram:
     def _key(self, invocation, values: dict) -> tuple:
         return (tuple((tuple(view.shape), tuple(view.stride()), view.dtype, view.device)
                       for view in invocation.views),
-                tuple(self.interface.native_value(name, values) for name in self.facts["tuning_key_scalars"]),
+                tuple(self.interface.native_value(name, values) for name in self.facts.tuning_key_scalars),
                 tuple(values[name] for name in self.configurations.coverage_names),
-                tuple(values[entry["eligible"]] for entry in self.facts["array_views"]),
-                tuple(values[entry["name"]] for entry in self.interface.overlaps))
+                tuple(values[entry.eligible] for entry in self.facts.array_views),
+                tuple(values[entry.name] for entry in self.interface.overlaps))
 
     def launch(self, invocation) -> LaunchResult:
         import torch
@@ -138,7 +137,7 @@ class CuTileProgram:
             trial_values.update((view.id, trial) for view, trial in
                                 zip(self.interface.public_views, state.views, strict=True))
             self._array_values(trial_values)
-            hints = (self._hints,) if self.facts["compiler_hints"] else ()
+            hints = (self._hints,) if self.facts.compiler_hints else ()
             try:
                 result = self.search(configurations, torch.cuda.current_stream(),
                                       lambda config: self._grid(values, config), kernel,
@@ -208,10 +207,10 @@ def materialize_cutile_artifact(
     module_text: str,
     entry_name: str,
     device: int,
-    metadata: dict,
+    contract,
 ) -> CompiledArtifact:
     return materialize_gpu_program(
-        provider_name="cutile", provider_type=CuTileProgram, metadata=metadata,
+        provider_name="cutile", provider_type=CuTileProgram, contract=contract,
         source=source,
         module_text=module_text,
         entry_name=entry_name,

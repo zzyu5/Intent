@@ -1,8 +1,8 @@
-from .artifact import CompiledArtifact
-from .gpu.expressions import evaluate_shape, read_expressions
-from .gpu.program import LaunchResult, materialize_gpu_program
-from .tuning import TuningState
-from .diagnostics import CandidateRecorder, observation, resource, unavailable_resources
+from ..artifact import CompiledArtifact
+from ..gpu.expressions import evaluate_shape
+from ..gpu.program import LaunchResult, materialize_gpu_program
+from ..tuning import TuningState
+from ..diagnostics import CandidateRecorder, observation, resource, unavailable_resources
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -73,24 +73,20 @@ def _descriptor_allocator(size, alignment, stream):
 
 
 class TritonProgram:
-    def __init__(self, interface, namespace: dict, facts: dict, target: dict) -> None:
+    def __init__(self, interface, namespace: dict, facts, target: dict) -> None:
         import triton
 
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
         self.target = target
-        self.descriptors = tuple({**entry,
-                                  "shape": read_expressions(entry["shape"]),
-                                  "strides": read_expressions(entry["strides"]),
-                                  "block_shape": read_expressions(entry["block_shape"])}
-                                 for entry in facts["descriptors"])
+        self.descriptors = facts.descriptors
         self.hooks = TuningHooks(tuple(view.kernel_name for view in interface.public_views),
                                  tuple(view.writable for view in interface.public_views),
                                  tuple(view.access != 1 for view in interface.public_views))
-        kernel_parameters = tuple(name for name in facts["kernel_parameters"]
+        kernel_parameters = tuple(name for name in facts.kernel_parameters
                                   if name not in self.configurations.coverage_names)
-        native_options = facts["native_options"]
+        native_options = dict(facts.native_options)
         configs = [triton.Config(
             {name: row[name] for name in kernel_parameters},
             num_warps=row[native_options["num_warps"]],
@@ -99,27 +95,27 @@ class TritonProgram:
         ) for row in self.configurations.rows]
         self._config_rows = {id(config): row for config, row in
                              zip(configs, self.configurations.rows, strict=True)}
-        kernel = namespace[facts["kernel"]]
+        kernel = namespace[facts.kernel]
         if self.descriptors:
-            kernel = triton.heuristics({entry["name"]: self._descriptor_hook(entry)
+            kernel = triton.heuristics({entry.name: self._descriptor_hook(entry)
                                         for entry in self.descriptors})(kernel)
         options = {}
-        if facts["descriptor_choice"] is not None or self.configurations.requirements:
+        if facts.descriptor_choice is not None or self.configurations.requirements:
             options["prune_configs_by"] = {"early_config_prune": self._prune}
-        kernel = triton.autotune(configs=configs, key=facts["autotune_key"],
+        kernel = triton.autotune(configs=configs, key=facts.autotune_key,
                                 pre_hook=self.hooks.before, post_hook=self.hooks.after,
                                 **options)(kernel)
         self.kernel = kernel
 
     def _trial_configuration(self, arguments):
-        row = {name: arguments[name] for name in self.facts["kernel_parameters"]
+        row = {name: arguments[name] for name in self.facts.kernel_parameters
                if name not in self.configurations.coverage_names}
-        row.update((parameter, arguments[option]) for option, parameter in self.facts["native_options"].items())
+        row.update((parameter, arguments[option]) for option, parameter in self.facts.native_options)
         return row
 
     def _context(self, arguments: dict) -> dict:
         values = self.interface.callback_values(arguments)
-        packed = self.facts["metadata_argument"]
+        packed = self.facts.metadata_argument
         if packed is not None:
             for entry, value in zip(self.interface.metadata, values[packed], strict=True):
                 values[entry.id] = value
@@ -129,54 +125,54 @@ class TritonProgram:
         def bind(arguments):
             from triton.tools.tensor_descriptor import TensorDescriptor
 
-            choice = self.facts["descriptor_choice"]
+            choice = self.facts.descriptor_choice
             values = self._context(arguments)
-            if not arguments[choice["config"]]:
-                return values[entry["base"]]
-            return TensorDescriptor(values[entry["base"]],
-                                    shape=list(evaluate_shape(entry["shape"], values)),
-                                    strides=list(evaluate_shape(entry["strides"], values)),
-                                    block_shape=list(evaluate_shape(entry["block_shape"], values)),
-                                    padding=entry["padding"])
+            if not arguments[choice.config]:
+                return values[entry.base]
+            return TensorDescriptor(values[entry.base],
+                                    shape=list(evaluate_shape(entry.shape, values)),
+                                    strides=list(evaluate_shape(entry.strides, values)),
+                                    block_shape=list(evaluate_shape(entry.block_shape, values)),
+                                    padding=entry.padding)
         return bind
 
     @staticmethod
     def _eligible(entry, values) -> bool:
-        tensor = values[entry["base"]]
-        shape = evaluate_shape(entry["shape"], values)
-        strides = evaluate_shape(entry["strides"], values)
-        alignment = entry["alignment"]
-        return (tensor.ndim == entry["rank"] and tensor.data_ptr() % alignment == 0
-                and (not entry["require_positive_shape"] or all(extent > 0 for extent in shape))
-                and all(extent <= entry["maximum_shape_extent"] for extent in shape)
-                and (not entry["require_positive_strides"] or all(stride > 0 for stride in strides))
+        tensor = values[entry.base]
+        shape = evaluate_shape(entry.shape, values)
+        strides = evaluate_shape(entry.strides, values)
+        alignment = entry.alignment
+        return (tensor.ndim == entry.rank and tensor.data_ptr() % alignment == 0
+                and (not entry.require_positive_shape or all(extent > 0 for extent in shape))
+                and all(extent <= entry.maximum_shape_extent for extent in shape)
+                and (not entry.require_positive_strides or all(stride > 0 for stride in strides))
                 and strides[-1] == 1
-                and all(tensor.stride(axis) == 1 for axis in entry["unit_stride_axes"])
+                and all(tensor.stride(axis) == 1 for axis in entry.unit_stride_axes)
                 and all(tensor.stride(axis) * tensor.element_size() % alignment == 0
-                        for axis in entry["aligned_stride_axes"]))
+                        for axis in entry.aligned_stride_axes))
 
     @staticmethod
     def _block_legal(entry, values, stages) -> bool:
         from math import prod
 
-        shape = evaluate_shape(entry["block_shape"], values)
-        if any(extent <= 0 or (entry["require_power_of_two_block_shape"] and extent & (extent - 1))
+        shape = evaluate_shape(entry.block_shape, values)
+        if any(extent <= 0 or (entry.require_power_of_two_block_shape and extent & (extent - 1))
                for extent in shape):
             return False
         elements = prod(shape)
-        size = values[entry["base"]].element_size()
-        return (elements <= entry["maximum_block_elements"]
-                and shape[-1] * size >= entry["minimum_contiguous_bytes"]
-                and (stages <= 1 or elements * size % entry["pipeline_block_alignment"] == 0))
+        size = values[entry.base].element_size()
+        return (elements <= entry.maximum_block_elements
+                and shape[-1] * size >= entry.minimum_contiguous_bytes
+                and (stages <= 1 or elements * size % entry.pipeline_block_alignment == 0))
 
     def _prune(self, configs, named_args, **kwargs):
         invocation_values = self._context({**named_args, **kwargs})
         retained = []
         for config in configs:
             values = {**invocation_values, **self._config_rows[id(config)]}
-            choice = self.facts["descriptor_choice"]
-            if choice is not None and values[choice["config"]]:
-                if not values[choice["eligibility"]] or not all(
+            choice = self.facts.descriptor_choice
+            if choice is not None and values[choice.config]:
+                if not values[choice.eligibility] or not all(
                     self._block_legal(entry, values, config.num_stages) for entry in self.descriptors
                 ):
                     continue
@@ -194,16 +190,16 @@ class TritonProgram:
         import triton
 
         values = dict(invocation.values)
-        packed = self.facts["metadata_argument"]
+        packed = self.facts.metadata_argument
         if packed is not None:
             values[packed] = tuple(values[entry.id] for entry in self.interface.metadata)
-        packed = self.facts["overlap_argument"]
+        packed = self.facts.overlap_argument
         if packed is not None:
-            values[packed] = tuple(values[entry["name"]] for entry in self.interface.overlaps)
-        choice = self.facts["descriptor_choice"]
+            values[packed] = tuple(values[entry.name] for entry in self.interface.overlaps)
+        choice = self.facts.descriptor_choice
         if choice is not None:
-            values[choice["eligibility"]] = all(self._eligible(entry, values) for entry in self.descriptors)
-        arguments = tuple(self.interface.native_value(name, values) for name in self.facts["kernel_arguments"])
+            values[choice.eligibility] = all(self._eligible(entry, values) for entry in self.descriptors)
+        arguments = tuple(self.interface.native_value(name, values) for name in self.facts.kernel_arguments)
         coverage = {name: values[name] for name in self.configurations.coverage_names}
         recorder = CandidateRecorder()
 
@@ -218,7 +214,7 @@ class TritonProgram:
             previous = self.hooks.observe_trial
             self.hooks.observe_trial = trial
             try:
-                if self.facts["allocator"] is not None:
+                if self.facts.allocator:
                     triton.set_allocator(_descriptor_allocator)
                 with self.hooks:
                     return self.kernel[grid](*arguments, **coverage,
@@ -280,10 +276,10 @@ def materialize_triton_artifact(
     module_text: str,
     entry_name: str,
     device: int,
-    metadata: dict,
+    contract,
 ) -> CompiledArtifact:
     return materialize_gpu_program(
-        provider_name="triton", provider_type=TritonProgram, metadata=metadata,
+        provider_name="triton", provider_type=TritonProgram, contract=contract,
         source=source,
         module_text=module_text,
         entry_name=entry_name,

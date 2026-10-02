@@ -38,7 +38,7 @@ class ResolvedMojoTarget:
     def materialize(self, program) -> CompiledArtifact:
         from intent.runtime.mojo import materialize_mojo_artifact
         require_matching_target(program.target, self.compilation)
-        return materialize_mojo_artifact(program.source, program.ir, program.metadata, self)
+        return materialize_mojo_artifact(program.source, program.ir, program._contract, self)
 
 
 @dataclass(frozen=True, slots=True)

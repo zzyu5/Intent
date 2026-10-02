@@ -4,12 +4,12 @@ from pathlib import Path
 
 from intent.runtime.artifact import CompiledArtifact
 from .buffer import DeviceBuffer, DeviceView
-from .compilation import compile_library
-from .program import NativeProgram
 
 
-def materialize_bangc_artifact(source, module_text, metadata, target) -> CompiledArtifact:
-    program = NativeProgram(source, metadata, target)
+def materialize_bangc_artifact(source, module_text, contract, target) -> CompiledArtifact:
+    from .program import NativeProgram
+
+    program = NativeProgram(source, contract, target)
 
     return CompiledArtifact(source=source, mlir=module_text, device=target.device,
                             runtime=program, _backend_ir_collector=None,
@@ -27,3 +27,13 @@ def load_artifact(directory: str | Path, *, target) -> CompiledArtifact:
 
 
 __all__ = ["DeviceBuffer", "DeviceView", "NativeProgram", "compile_library", "export_artifact", "load_artifact"]
+
+
+def __getattr__(name):
+    if name == "NativeProgram":
+        from .program import NativeProgram
+        return NativeProgram
+    if name == "compile_library":
+        from .compilation import compile_library
+        return compile_library
+    raise AttributeError(name)

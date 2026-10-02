@@ -10,6 +10,7 @@ from ..torch import torch_dtype
 from ..torch_views import allocate_output, check_abstract_relation, observe_view, view_byte_span
 from .configurations import ConfigurationSpace, CoverageBinding
 from .expressions import Expression, evaluate_shape, read_expressions
+from .contract import require_references
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,13 @@ class WorkspaceArgument(Argument):
     @property
     def writable(self) -> bool:
         return True
+
+
+@dataclass(frozen=True, slots=True)
+class OverlapBinding:
+    name: str
+    lhs: int
+    rhs: int
 
 
 @dataclass(slots=True)
@@ -119,8 +127,23 @@ class GPUInterface:
         self.views = tuple(entry for entry in arguments if isinstance(entry, WorkspaceArgument) or entry in self.public_views)
         self.metadata = tuple(entry for entry in arguments if isinstance(entry, MetadataArgument))
         self.grid = read_expressions(physical["grid"])
-        self.overlaps = tuple(physical["overlaps"])
         self.configuration_space = ConfigurationSpace(physical)
+        overlap_names = set()
+        overlaps = []
+        view_ids = {view.id for view in self.views}
+        parameter_names = {parameter.name for parameter in self.configuration_space.parameters}
+        for entry in physical["overlaps"]:
+            name, lhs, rhs = entry["name"], entry["lhs"], entry["rhs"]
+            if not isinstance(name, str) or not name or name in overlap_names | parameter_names | self.by_name.keys():
+                raise ValueError("GPU overlap binding requires a unique native name")
+            if any(type(identity) is not int or identity not in view_ids for identity in (lhs, rhs)):
+                raise ValueError("GPU overlap binding must reference two declared views")
+            overlap_names.add(name)
+            overlaps.append(OverlapBinding(name, lhs, rhs))
+        self.overlaps = tuple(overlaps)
+        require_references(self.grid, self)
+        for requirement in self.configuration_space.requirements:
+            require_references((requirement.usage, requirement.limit), self)
         self._binders = build_invocation_binders(
             self.public, observe_view=self._observe_view, allocate_output=self._allocate_output)
         self._abstract_binders = build_invocation_binders(
@@ -256,9 +279,9 @@ class GPUInterface:
         spans = {}
         for overlap in self.overlaps:
             pair = []
-            for identity in (overlap["lhs"], overlap["rhs"]):
+            for identity in (overlap.lhs, overlap.rhs):
                 if identity not in spans:
                     spans[identity] = view_byte_span(values[identity])
                 pair.append(spans[identity])
-            values[overlap["name"]] = byte_spans_overlap(*pair)
+            values[overlap.name] = byte_spans_overlap(*pair)
         return result

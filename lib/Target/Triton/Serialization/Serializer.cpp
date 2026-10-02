@@ -147,7 +147,7 @@ private:
   void emitPreamble() {
     output << "import triton\nimport triton.language as tl\n"
               "from triton.language.extra import libdevice\n"
-              "from intent.runtime.triton_math import contract_fma\n\n";
+              "from intent.runtime.triton.math import contract_fma\n\n";
   }
 
   void emitHelper(Operation *owner, Region &region, StringRef role) {

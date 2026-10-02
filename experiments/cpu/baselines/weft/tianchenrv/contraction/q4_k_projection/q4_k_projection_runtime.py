@@ -60,7 +60,7 @@ def serve(directory: Path) -> None:
             "generated_ms": generated_ms, "source_ms": source_ms,
             "generated": list(generated_call.result().storage.cast("f")),
             "source": list(source_call.result().storage.cast("f")),
-            "winner": generated.candidates[generated_call.winner],
+            "winner": generated.candidates[generated_call.winner].metadata(),
             "used_extensions": sorted(generated.candidate_extensions[generated_call.winner]),
         }), flush=True)
     finally:

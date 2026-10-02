@@ -2,6 +2,8 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from intent.runtime.mojo.program import NativeProgram
+from intent.runtime.mojo.contract import MojoFacts
+from intent.runtime.native import NativeABI
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,10 @@ def prepare_source(path: Path, entry: str, parameters, target, arguments):
                 "native": {"requirements": requirements,
                            "slots": [{**slot, "parameter": position} for position, parameter in enumerate(parameters)
                                      for slot in parameter.slots]},
-                "source_prelude_end": 0,
+                "source_prelude_end": 0, "native_dependencies": [],
                 "candidates": [{"entry": entry, "values": [],
+                                "implementations": [],
                                 "source_range": [0, len(source.encode("utf-8"))]}]}
-    return NativeProgram(source, metadata, target).prepare(arguments)
+    abi = NativeABI.read(metadata)
+    facts = MojoFacts.read(source, metadata, abi)
+    return NativeProgram(abi, facts, target).prepare(arguments)

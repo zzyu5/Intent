@@ -17,6 +17,7 @@ from uuid import uuid4
 from intent.compiler.cache import cache_root, file_identity, locked_cache_entry
 from intent.compiler.toolchain import CompilationStageError
 from .toolchain import resolve_toolchain, runtime_dependencies
+from .contract import MojoCandidate, MojoFacts
 from ..native import NativeABI
 
 
@@ -61,46 +62,45 @@ def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
     return signature, arguments
 
 
-def benchmark_exports(metadata: dict[str, object], abi: NativeABI) -> str:
+def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
     signature, arguments = flattened_signature(abi)
     sections = ["\nfrom std.time import monotonic\nfrom std.sys import size_of\n"]
     mutable = [(parameter.position, parameter) for parameter in abi.interface.mutable_inputs]
-    for candidate in metadata["candidates"]:
-        entry = candidate["entry"]
+    entry = candidate.entry
+    sections.append(
+        f'\n@export("{entry}_benchmark")\n'
+        f"def {entry}_benchmark({', '.join(signature)}, repetitions: Int64) abi(\"C\") -> Float64:\n"
+    )
+    if not mutable:
         sections.append(
-            f'\n@export("{entry}_benchmark")\n'
-            f"def {entry}_benchmark({', '.join(signature)}, repetitions: Int64) abi(\"C\") -> Float64:\n"
-        )
-        if not mutable:
-            sections.append(
-                "    var begin = monotonic()\n"
-                "    for iteration in range(Int(repetitions)):\n"
-                f"        {entry}({', '.join(arguments)})\n"
-                "    return Float64(monotonic() - begin) * 1.0e-6 / Float64(repetitions)\n"
-            )
-            continue
-        for index, parameter in mutable:
-            dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter.shape))) or "1"
-            element = ELEMENT_TYPES[abi.pointer_slots[index].element.name]
-            sections.append(
-                f"    var bytes_a{index} = ({dimensions}) * size_of[{element}]()\n"
-                f"    var saved_a{index} = alloc(Layout[UInt8](count=bytes_a{index}))\n"
-                f'    external_call["memcpy", NoneType](saved_a{index}.unsafe_ptr(), a{index}, UInt(bytes_a{index}))\n'
-            )
-        sections.append("    var elapsed = Float64(0)\n    for iteration in range(Int(repetitions)):\n")
-        for index, _ in mutable:
-            sections.append(f'        external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n')
-        sections.append(
-            "        var begin = monotonic()\n"
+            "    var begin = monotonic()\n"
+            "    for iteration in range(Int(repetitions)):\n"
             f"        {entry}({', '.join(arguments)})\n"
-            "        elapsed += Float64(monotonic() - begin)\n"
+            "    return Float64(monotonic() - begin) * 1.0e-6 / Float64(repetitions)\n"
         )
-        for index, _ in mutable:
-            sections.append(
-                f'    external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n'
-                f"    dealloc(saved_a{index}^)\n"
-            )
-        sections.append("    return elapsed * 1.0e-6 / Float64(repetitions)\n")
+        return "".join(sections)
+    for index, parameter in mutable:
+        dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter.shape))) or "1"
+        element = ELEMENT_TYPES[abi.pointer_slots[index].element.name]
+        sections.append(
+            f"    var bytes_a{index} = ({dimensions}) * size_of[{element}]()\n"
+            f"    var saved_a{index} = alloc(Layout[UInt8](count=bytes_a{index}))\n"
+            f'    external_call["memcpy", NoneType](saved_a{index}.unsafe_ptr(), a{index}, UInt(bytes_a{index}))\n'
+        )
+    sections.append("    var elapsed = Float64(0)\n    for iteration in range(Int(repetitions)):\n")
+    for index, _ in mutable:
+        sections.append(f'        external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n')
+    sections.append(
+        "        var begin = monotonic()\n"
+        f"        {entry}({', '.join(arguments)})\n"
+        "        elapsed += Float64(monotonic() - begin)\n"
+    )
+    for index, _ in mutable:
+        sections.append(
+            f'    external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n'
+            f"    dealloc(saved_a{index}^)\n"
+        )
+    sections.append("    return elapsed * 1.0e-6 / Float64(repetitions)\n")
     return "".join(sections)
 
 
@@ -240,10 +240,9 @@ def _load_library(path: Path, entry: str):
         return library
 
 
-def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
+def _compile_unit(source: str, candidate: MojoCandidate, key: str, target,
                   environment: dict[str, str], snapshot, fp_object: Path) -> NativeLibrary:
-    candidate, = metadata["candidates"]
-    entry = candidate["entry"]
+    entry = candidate.entry
     root = cache_root() / "mojo"
     source_path = None
     stage = "artifact_lookup"
@@ -270,7 +269,7 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
             root = cache.directory
             _write_source(source_path, source)
             root = cache.create_attempt()
-            (root / "artifact.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            (root / "artifact.json").write_text(json.dumps(candidate.metadata(), indent=2) + "\n", encoding="utf-8")
             (root / "request.json").write_text(json.dumps({
                 "source": str(source_path), "fp_object": str(fp_object),
                 "cache_unavailable_reason": snapshot.reason,
@@ -313,28 +312,22 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
         ) from error
 
 
-def compile_library(source: str, metadata: dict[str, object], target, *, abi: NativeABI) -> NativeCompilation:
+def compile_library(facts: MojoFacts, target, *, abi: NativeABI) -> NativeCompilation:
     environment = dict(os.environ)
     try:
-        snapshot = resolve_toolchain(target.executable, tuple(metadata.get("native_dependencies", ())), environment)
+        snapshot = resolve_toolchain(target.executable, facts.native_dependencies, environment)
         fp_object, fp_bytes = _compile_fp_environment(environment)
     except CompilationStageError:
         raise
     except Exception as error:
         raise CompilationStageError("native_toolchain_resolution", str(error)) from error
-    encoded = source.encode("utf-8")
-    prelude = encoded[:metadata["source_prelude_end"]]
     units = []
-    for candidate in metadata["candidates"]:
-        begin, end = candidate["source_range"]
-        body = prelude + encoded[begin:end]
-        binding = {**candidate, "source_range": [len(prelude), len(body)]}
-        unit_metadata = {**metadata, "candidates": [binding]}
-        complete_source = body.decode("utf-8") + benchmark_exports(unit_metadata, abi)
-        unit_key = json.dumps((complete_source, unit_metadata, target.executable,
+    for candidate in facts.candidates:
+        complete_source = candidate.source + benchmark_exports(candidate, abi)
+        unit_key = json.dumps((complete_source, candidate.metadata(), facts.native_dependencies, target.executable,
                               _BUILD_OPTIONS, target.native_options, snapshot.identity,
                               base64.b64encode(fp_bytes).decode("ascii")), sort_keys=True)
-        units.append((complete_source, unit_metadata, unit_key))
+        units.append((complete_source, candidate, unit_key))
     # An unclosed toolchain is always delegated to Mojo, including repeated
     # requests in this process. It must never acquire a weak native cache key.
     key = (str(cache_root()), tuple(unit[2] for unit in units),
@@ -350,8 +343,8 @@ def compile_library(source: str, metadata: dict[str, object], target, *, abi: Na
 
     futures = []
     try:
-        for unit, unit_metadata, unit_key in units:
-            futures.append(_compilers.submit(_compile_unit, unit, unit_metadata, unit_key,
+        for unit, candidate, unit_key in units:
+            futures.append(_compilers.submit(_compile_unit, unit, candidate, unit_key,
                                              target, environment, snapshot, fp_object))
         libraries = tuple(future.result() for future in futures)
         result = NativeCompilation(libraries, (key, tuple(

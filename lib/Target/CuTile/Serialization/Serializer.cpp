@@ -167,7 +167,7 @@ private:
       libraryMath |= mma.getReductionChunk().has_value();
     });
     if (libraryMath)
-      output << "from intent.runtime import cutile_math\n";
+      output << "from intent.runtime.cutile import math as cutile_math\n";
     output << "from typing import Annotated\n"
               "import cuda.tile as ct\n"
               "from intent.runtime.cutile import array_index_kernels\n\n"
