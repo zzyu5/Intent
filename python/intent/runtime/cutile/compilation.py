@@ -125,7 +125,9 @@ class CuTileCompilation:
                 if first is None:
                     first = config
             if first is None:
-                raise RuntimeError("no cuTile configuration compiled for the current device") from last_error
+                raise RuntimeError(
+                    f"no cuTile configuration compiled for the current device: {last_error}"
+                ) from last_error
             return SimpleNamespace(best=SimpleNamespace(config=first))
 
         class CompilationState:

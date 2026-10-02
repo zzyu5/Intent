@@ -1024,10 +1024,13 @@ StructuredRangeUses classifyStructuredRanges(
                  });
         });
     if (replayableFreeCoordinates) {
-      llvm::SmallPtrSet<Operation *, 16> visited;
-      collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
       SmallVector<StoreOp> stores;
       if (contraction::hasRangeContractForm(contract, &stores)) {
+        // Defer output ownership only when the contraction realizer actually
+        // accepts this form. Replayable coordinates alone do not transfer the
+        // workset: unsupported forms retain their ordinary pointwise owner.
+        llvm::SmallPtrSet<Operation *, 16> visited;
+        collectStoreRanges(contract.getResult(), internalTraversalRanges, visited);
         for (const auto &axis : freeAxes.axes)
           for (MakeRangeOp range : axis.ranges.roots)
             contractionOwnedRanges.insert(range.getOperation());
