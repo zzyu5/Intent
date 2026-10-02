@@ -12,6 +12,11 @@ mlir::MemRefType collectiveStateType(mlir::Type type);
 mlir::MemRefType collectiveMemberType(mlir::MemRefType source,
                                      llvm::ArrayRef<int64_t> axes);
 
+// Helper inputs are read-only during invocation, including opaque incoming
+// states. This does not imply that the formal owns a fresh allocation.
+bool isCollectiveArgument(mlir::BlockArgument argument);
+bool isReadOnlyCollectiveArgument(mlir::BlockArgument argument);
+
 // Read-only explicit inputs and caller-owned destinations. The body may own
 // temporary allocations and nested pure structured computations.
 mlir::LogicalResult verifyCollectiveHelper(

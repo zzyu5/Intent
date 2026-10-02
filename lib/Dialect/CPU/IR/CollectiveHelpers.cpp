@@ -26,6 +26,70 @@ MemRefType collectiveMemberType(MemRefType source, ArrayRef<int64_t> axes) {
           SmallVector<int64_t>(shape.size(), ShapedType::kDynamic)));
 }
 
+namespace {
+
+template <typename Collective>
+Value borrowedCollectiveInput(Collective operation, BlockArgument argument) {
+  unsigned count = operation.getSources().size();
+  unsigned index = argument.getArgNumber();
+  if (operation.isDestinationPassing() && index >= count && index < 2 * count)
+    return operation.getSources()[index - count];
+  if (index >= 2 * count && index < 2 * count + operation.getCaptures().size())
+    return operation.getCaptures()[index - 2 * count];
+  return {};
+}
+
+template <typename Collective>
+void populateCollectiveDependencies(
+    Collective operation,
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  for (BlockArgument argument : operation.getCombine().getArguments())
+    if (isa<BaseMemRefType>(argument.getType()))
+      if (Value source = borrowedCollectiveInput(operation, argument))
+        registerDependencies(source, argument);
+}
+
+} // namespace
+
+bool isCollectiveArgument(BlockArgument argument) {
+  return isa<SliceReduceOp, ScanOp, RegionOpInterface>(
+      argument.getOwner()->getParentOp());
+}
+
+bool isReadOnlyCollectiveArgument(BlockArgument argument) {
+  Operation *owner = argument.getOwner()->getParentOp();
+  if (auto program = dyn_cast<RegionOpInterface>(owner)) {
+    auto schema = program.getRegionSchema(*argument.getOwner()->getParent());
+    if (failed(schema)) return false;
+    return (*schema)[argument.getArgNumber()].kind != RegionArgumentKind::Destinations;
+  }
+  auto isInput = [&](auto operation) {
+    unsigned destinations = operation.isDestinationPassing() ? operation.getSources().size() : 0;
+    return argument.getArgNumber() < argument.getOwner()->getNumArguments() - destinations;
+  };
+  if (auto reduce = dyn_cast<SliceReduceOp>(owner)) return isInput(reduce);
+  if (auto scan = dyn_cast<ScanOp>(owner)) return isInput(scan);
+  return false;
+}
+
+void SliceReduceOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  populateCollectiveDependencies(*this, registerDependencies);
+}
+
+bool SliceReduceOp::mayBeTerminalBuffer(Value value) {
+  return !borrowedCollectiveInput(*this, cast<BlockArgument>(value));
+}
+
+void ScanOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  populateCollectiveDependencies(*this, registerDependencies);
+}
+
+bool ScanOp::mayBeTerminalBuffer(Value value) {
+  return !borrowedCollectiveInput(*this, cast<BlockArgument>(value));
+}
+
 LogicalResult verifyCollectiveHelper(Operation *owner, Region &region,
                                      unsigned destinations) {
   Block &body = region.front();

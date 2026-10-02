@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
@@ -29,6 +30,14 @@ LogicalResult TasksOp::verify() {
   return success();
 }
 
+void TasksOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  for (auto [capture, argument] :
+       llvm::zip_equal(getCaptures(), getBody().front().getArguments().drop_front()))
+    if (isa<BaseMemRefType>(capture.getType()))
+      registerDependencies(capture, argument);
+}
+
 LogicalResult TaskDispatchOp::verify() {
   Block &body = getBody().front();
   if (body.empty() || body.getNumArguments() != 1 ||
@@ -49,6 +58,41 @@ LogicalResult TaskYieldOp::verify() {
   if (!isa<TasksOp, TaskDispatchOp>(getOperation()->getParentOp()))
     return emitOpError("must terminate tasks or task_dispatch");
   return success();
+}
+
+LogicalResult InvokeOp::verify() {
+  if (getAccesses().size() != getArguments().size())
+    return emitOpError("requires one explicit storage access mask per argument");
+  for (auto [argument, access] : llvm::zip_equal(getArguments(), getAccesses())) {
+    if (access < 0 || access > 3)
+      return emitOpError("argument access must be none, read, write or read-write");
+    if (!isa<BaseMemRefType>(argument.getType()) && access != 0)
+      return emitOpError("only storage arguments may carry memory effects");
+  }
+  return success();
+}
+
+LogicalResult InvokeOp::verifySymbolUses(SymbolTableCollection &symbols) {
+  auto callee = symbols.lookupNearestSymbolFrom<func::FuncOp>(
+      getOperation(), getCalleeAttr());
+  if (!callee || !callee.isExternal())
+    return emitOpError("requires a declaration for its lowered callable");
+  if (!callee.getResultTypes().empty() ||
+      !llvm::equal(callee.getArgumentTypes(), getArguments().getTypes()))
+    return emitOpError("arguments must exactly match a callable without SSA results");
+  return success();
+}
+
+void InvokeOp::populateDependencies(bufferization::RegisterDependenciesFn) {}
+
+bool InvokeOp::mayBeTerminalBuffer(Value) { return false; }
+
+void InvokeOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  for (auto [operand, access] :
+       llvm::zip_equal(getOperation()->getOpOperands(), getAccesses())) {
+    if (access & 1) effects.emplace_back(MemoryEffects::Read::get(), &operand);
+    if (access & 2) effects.emplace_back(MemoryEffects::Write::get(), &operand);
+  }
 }
 
 void ReduceOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

@@ -8,6 +8,7 @@ add_mlir_dialect_library(MLIRIntentCPUDialect
   LINK_LIBS PUBLIC
   MLIRIntentDialect
   MLIRArithDialect
+  MLIRBufferizationDialect
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMemRefDialect

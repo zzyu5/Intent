@@ -5,13 +5,16 @@ include "Intent/Dialect/CPU/IR/CPUAttrs.td"
 include "Intent/Dialect/CPU/IR/CPUOpInterfaces.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "mlir/IR/OpBase.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Dialect/Bufferization/IR/BufferViewFlowOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class IntentCPU_Op<string name, list<Trait> traits = []>
     : Op<IntentCPU_Dialect, name, traits>;
 
 def IntentCPU_TasksOp : IntentCPU_Op<"tasks", [SingleBlock,
-    IsolatedFromAbove, AutomaticAllocationScope, RecursiveMemoryEffects]> {
+    IsolatedFromAbove, AutomaticAllocationScope, RecursiveMemoryEffects,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>]> {
   let summary = "Synchronous tasks over [0, count), with explicit captured values";
   let arguments = (ins Index:$count, Variadic<AnyType>:$captures);
   let regions = (region AnyRegion:$body);
@@ -28,6 +31,27 @@ def IntentCPU_TaskDispatchOp : IntentCPU_Op<"task_dispatch", [SingleBlock,
 
 def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator]> {
   let hasVerifier = 1;
+}
+
+def IntentCPU_InvokeOp : IntentCPU_Op<"invoke", [
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Synchronous invocation borrowing its explicitly accessed storage";
+  let description = [{
+    Invokes a lowered callable and completes all its work before returning.
+    Arguments remain owned by the caller: the callee neither retains their
+    addresses nor releases their storage. Results are written to explicit
+    destination operands. Each operand has a data-access mask: 0 for none,
+    1 for read, 2 for write, or 3 for both; scalar arguments require 0.
+    The provider binding verifier checks these effects against the callable.
+  }];
+  let arguments = (ins FlatSymbolRefAttr:$callee, Variadic<AnyType>:$arguments,
+      DenseI32ArrayAttr:$accesses);
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
+  }];
 }
 
 def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
@@ -49,6 +73,7 @@ def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
 
 def IntentCPU_SliceReduceOp : IntentCPU_Op<"slice_reduce", [SingleBlock,
     IsolatedFromAbove, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Product reduction over complete source slices with explicit combine";
   let arguments = (ins Variadic<AnyMemRef>:$sources,
@@ -58,6 +83,7 @@ def IntentCPU_SliceReduceOp : IntentCPU_Op<"slice_reduce", [SingleBlock,
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
   let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
     bool isDestinationPassing() {
       return !getCombine().empty() && getCombine().front().getNumArguments() ==
           3 * getSources().size() + getCaptures().size();
@@ -71,6 +97,7 @@ def IntentCPU_SliceReduceYieldOp : IntentCPU_Op<"slice_reduce_yield", [Pure,
 }
 
 def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Ordered prefixes with typed scalar or destination-passing slice combines";
   let arguments = (ins Variadic<AnyMemRef>:$sources,
@@ -80,6 +107,7 @@ def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, Att
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
   let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
     bool isDestinationPassing() {
       return !getCombine().empty() && getCombine().front().getNumArguments() ==
           3 * getSources().size() + getCaptures().size();
@@ -107,25 +135,25 @@ class IntentCPU_AtomicOp<string name> : IntentCPU_Op<name,
 }
 
 def IntentCPU_AtomicLoadOp : IntentCPU_AtomicOp<"atomic_load"> {
-  let arguments = (ins AnyMemRef:$target, Variadic<Index>:$indices,
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$target, Variadic<Index>:$indices,
       Intent_AtomicOrderingAttr:$ordering);
   let results = (outs AnyType:$value);
 }
 
 def IntentCPU_AtomicStoreOp : IntentCPU_AtomicOp<"atomic_store"> {
-  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+  let arguments = (ins Arg<AnyMemRef, "", [MemWrite]>:$target, AnyType:$value,
       Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
 }
 
 def IntentCPU_AtomicRMWOp : IntentCPU_AtomicOp<"atomic_rmw"> {
-  let arguments = (ins AnyMemRef:$target, AnyType:$value,
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead, MemWrite]>:$target, AnyType:$value,
       Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering,
       Intent_AtomicRMWKindAttr:$kind, BoolAttr:$unsigned_integer);
   let results = (outs AnyType:$old_value);
 }
 
 def IntentCPU_AtomicCompareExchangeOp : IntentCPU_AtomicOp<"atomic_compare_exchange"> {
-  let arguments = (ins AnyMemRef:$target, AnyType:$expected, AnyType:$desired,
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead, MemWrite]>:$target, AnyType:$expected, AnyType:$desired,
       Variadic<Index>:$indices, Intent_AtomicOrderingAttr:$ordering);
   let results = (outs AnyType:$old_value, I1:$success);
 }
@@ -148,8 +176,12 @@ def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
 
 class IntentCPU_RegionOp<string name> : IntentCPU_Op<name,
     [IsolatedFromAbove, AttrSizedOperandSegments, IntentCPU_RegionOpInterface,
+     DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
+  }];
 }
 
 def IntentCPU_RegionFoldOp : IntentCPU_RegionOp<"region_fold"> {
@@ -170,6 +202,7 @@ def IntentCPU_RegionScanOp : IntentCPU_RegionOp<"region_scan"> {
   let regions = (region SizedRegion<1>:$summarize, SizedRegion<1>:$combine,
       SizedRegion<1>:$apply, SizedRegion<1>:$emit);
   let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
     ::mlir::Region *getApplyRegion() { return &getApply(); }
     ::mlir::Region *getEmitRegion() { return &getEmit(); }
   }];

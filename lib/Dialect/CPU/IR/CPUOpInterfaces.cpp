@@ -88,6 +88,28 @@ Block::BlockArgListType intent::cpu::detail::regionArguments(
 
 namespace {
 
+Value borrowedRegionInput(RegionOpInterface program, BlockArgument argument) {
+  auto schema = program.getRegionSchema(*argument.getOwner()->getParent());
+  assert(succeeded(schema) && "buffer flow requires a verified helper schema");
+  const auto &relation = (*schema)[argument.getArgNumber()];
+  if (relation.kind == RegionArgumentKind::Sources ||
+      relation.kind == RegionArgumentKind::Captures)
+    return relation.prototype;
+  // A state/summary prototype declares shape and dtype, not storage identity.
+  // Its actual binding is formed by region realization, as are destinations.
+  return {};
+}
+
+void populateRegionDependencies(
+    RegionOpInterface program,
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  for (Region &region : program->getRegions())
+    for (BlockArgument argument : region.getArguments())
+      if (isa<BaseMemRefType>(argument.getType()))
+        if (Value source = borrowedRegionInput(program, argument))
+          registerDependencies(source, argument);
+}
+
 void regionEffects(RegionOpInterface program,
                    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   // Helper destination formals are separate scratch/state bindings, not aliases
@@ -178,4 +200,26 @@ void RegionFoldOp::getEffects(
 void RegionScanOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   regionEffects(cast<RegionOpInterface>(getOperation()), effects);
+}
+
+void RegionFoldOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  populateRegionDependencies(cast<RegionOpInterface>(getOperation()),
+                             registerDependencies);
+}
+
+bool RegionFoldOp::mayBeTerminalBuffer(Value value) {
+  return !borrowedRegionInput(cast<RegionOpInterface>(getOperation()),
+                             cast<BlockArgument>(value));
+}
+
+void RegionScanOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  populateRegionDependencies(cast<RegionOpInterface>(getOperation()),
+                             registerDependencies);
+}
+
+bool RegionScanOp::mayBeTerminalBuffer(Value value) {
+  return !borrowedRegionInput(cast<RegionOpInterface>(getOperation()),
+                             cast<BlockArgument>(value));
 }
