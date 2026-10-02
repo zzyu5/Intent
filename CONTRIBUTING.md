@@ -217,7 +217,7 @@ Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14
 | 一次 GPU analysis 中的参数查询 | [GPU/Analysis/ProgramInterface](include/Intent/Dialect/GPU/Analysis/ProgramInterface.h)：读取当前 signature；改动后重建 snapshot |
 | 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/ProgramInterface.h)：同步维护 function type 与参数属性 |
 | CPU/DSA 的外部原生参数槽 | [Serialization/NativeABI](include/Intent/Serialization/NativeABI.h)：从最终 physical entry 展开参数，供源码签名和 metadata 共用 |
-| Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析及 shape/stride 关系；不观察或缓存实际 tensor |
+| Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析、shape/stride 关系及 `BindingRelations` 的自动输出构造资格；不观察或缓存实际 tensor |
 | 公共实参绑定 | [runtime/invocation.py](python/intent/runtime/invocation.py)：按同一声明生成 allocating/explicit binders，统一 shape/stride、Out 分配与作者 alias 检查 |
 | 原生调用绑定 | [runtime/native.py](python/intent/runtime/native.py)：消费公共绑定结果与 compiler 导出的 native slots，不重推参数顺序、返回值或入口资格 |
 
@@ -495,6 +495,7 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 需要的能力 | 接口 | 使用方式 |
 |---|---|---|
 | 当前 value/access 的坐标、范围和复用事实 | [Analysis/PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) | 只读 current IR；相关 def-use、类型或范围改变后重算 |
+| 资源 allocation 身份与别名 | [Analysis/ResourceAlias.h](include/Intent/Dialect/GPU/Analysis/ResourceAlias.h) | 从真实 allocation、公共参数和标准 control-flow/view forwarding 查询；不同 SSA 不代表不重叠，未知返回 MayAlias；资源定义或控制流改写后重建 |
 | GPU 类型与形状属性自身的不变量 | [IR/TypeVerification.h](include/Intent/Dialect/GPU/IR/TypeVerification.h) | `verifyGPUTypeInvariants` 用 MLIR `AttrTypeWalker` 复用各类型/属性的 `verify`；完整 GPU verifier 在操作验证前调用，避免 release 构造绕过 checked constructor 后漏检 |
 | 执行组构造、重建与 provider 展开 | [Transforms/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
@@ -509,6 +510,13 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 改写后的 value/access/aggregate 关系闭合 | [Transforms/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
 | predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
+
+资源查询的职责可对照本地 Triton `lib/Analysis/Alias.cpp:36–45`：真实 allocation
+建立根，view 与 select 传播可能来源。Intent 的
+[ResourceAlias.cpp](lib/Dialect/GPU/Analysis/ResourceAlias.cpp) 面向共同 GPU 的
+buffer/public view/workspace，沿标准 region、branch、view 接口传播来源，供读取重放、
+私有写入调度与 Triton 供数共用。未知来源不能证明不别名；不同 allocation 的证明也不能
+替代同一 allocation 内的坐标不重叠证明。该查询不选择目标存储空间或建立另一份 lifetime 计划。
 
 共享 GPU 的 `ExecutionGroupOp`（[GPUOps.td](include/Intent/Dialect/GPU/IR/GPUOps.td)）
 拥有实际执行 body、坐标 block arguments、runtime/launch extents、coordinate roles
@@ -629,6 +637,8 @@ Intent 将可参数化的 block 条件写入当前 IR，保留真实 view 检查
 
 CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pipeline](lib/Dialect/CPU/Transforms/Passes.cpp) 依次完成 source 规范化、候选形成、region 实现、供数与分块、task 形成；每个完整组包含所需规范化并验证当前 CPU program。Mojo 和 Weft 共用这些 family 机制，provider 的微程序及机器表示仍各自实现。
 
+Pointwise combine 的普通 reduce 在 construction 中统一形成 `linalg.generic`，保留 source、identity、captures 和归约轴。[NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/NormalizeReductions.cpp) 在候选选择前查询当前单轴归约与私有 rank-zero 结果槽：只有初始化、全部使用与生命周期闭合时才形成标量 SSA `cpu.reduce` 并删除结果槽，不按 f32 或原 KIR rank 选择另一套构造。Shaped DPS 和多分量 combine 保持原表示；无法证明时保留 generic。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为两种表示提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
+
 普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
 
 同一 source 规范化阶段先调用私有 `normalizeContractionSources`，将满足条件的 f32 乘法与零初始化普通求和组合为显式乘加 contraction，再由上述 normalizer 和 implementation registry 处理。它仅穿过纯轴投影与 unit views，用 [Storage analysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 证明读取快照稳定，不跨越数值 cast 或其它计算；没有独立 free 轴的逐行点积仍交给普通归约路径。只有一侧 free 轴时，还要求能够形成连续矩阵列，否则保留原 producer-fused reduction，避免为了单个向量结果物化和打包矩阵。源识别、投影视图折叠和零初始化证明集中在相邻 `ContractionSources.cpp`，矩阵展平、batch 循环与 pack 保留在 `NormalizeContractions.cpp`。修改其中一个阶段不需要在 provider serializer 新增算子分支。
@@ -742,12 +752,20 @@ native packing 都按一次声明生成，prepared launch 不重新遍历公共 
 同名 alias group 要求同 allocation，允许不同 offset/shape 和不重叠子视图；
 `noalias` 检查 allocation 范围，不能与后端的写入重叠限制混为一条规则。
 
+`BindingRelations.require_output_allocation` 统一判断省略 `Out` 的调用是否成立：
+shape 必须由输入或公共声明中的静态维度确定；涉及 `Out` 的同 allocation 关系
+需要调用方显式提供 buffers。普通 run、prepare、fake 与 PyTorch 注册消费同一判断，
+不因此拒绝只能显式调用的产物。默认输出仍使用 runtime 的独立分配布局；stride
+关系依据真实输出检查，不能满足时提供显式 outputs，不猜测共享 storage 或 offset。
+
 原生入口要求由 [queryNativeEntryRequirements](include/Intent/Serialization/NativeABI.h)
 读取当前 family 的 typed IR，导出 `native.requirements` 中逐 view 的 layout/alignment
 及 disjoint 参数对。[NativeRequirements](python/intent/runtime/native_requirements.py)
 是 Python 的唯一解释器，`NativeABI.read` 同时检查 slots 和 requirements，保存、加载
 与 materialize 都消费这份事实。修改后端支持范围时先改 IR 的合法性与导出，不能只删
 runtime 检查，也不能从 provider 名字推断所有输入必须 contiguous。
+其中 `check_geometry` 只检查 shape/stride，Mojo fake 通过 `torch._check` 复用；
+`check_storage` 与 `check_pair` 检查真实地址及跨度，只用于 concrete binding。
 Mojo 的空指针 ABI 限制、BANG C 设备/队列/整行 tile 资格和 Weft 的调用线程
 affinity、stack、RVV/VLEN 检查继续留在各自 runtime。
 
