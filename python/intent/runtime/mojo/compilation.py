@@ -64,8 +64,8 @@ def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
 
 def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
     signature, arguments = flattened_signature(abi)
-    sections = ["\nfrom std.time import monotonic\nfrom std.sys import size_of\n"]
-    mutable = [(parameter.position, parameter) for parameter in abi.interface.mutable_inputs]
+    sections = ["\nfrom std.time import monotonic\n"]
+    mutable = abi.trial_regions()
     entry = candidate.entry
     sections.append(
         f'\n@export("{entry}_benchmark")\n'
@@ -79,23 +79,25 @@ def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
             "    return Float64(monotonic() - begin) * 1.0e-6 / Float64(repetitions)\n"
         )
         return "".join(sections)
-    for index, parameter in mutable:
-        dimensions = " * ".join(f"Int(a{index}_d{axis})" for axis in range(len(parameter.shape))) or "1"
-        element = ELEMENT_TYPES[abi.pointer_slots[index].element.name]
+    for region in mutable:
+        index = region.pointer.parameter.position
+        dimensions = " * ".join(f"Int({slot.name})" for slot in region.extents) or "1"
         sections.append(
-            f"    var bytes_a{index} = ({dimensions}) * size_of[{element}]()\n"
+            f"    var bytes_a{index} = ({dimensions}) * {region.element_bytes}\n"
             f"    var saved_a{index} = alloc(Layout[UInt8](count=bytes_a{index}))\n"
             f'    external_call["memcpy", NoneType](saved_a{index}.unsafe_ptr(), a{index}, UInt(bytes_a{index}))\n'
         )
     sections.append("    var elapsed = Float64(0)\n    for iteration in range(Int(repetitions)):\n")
-    for index, _ in mutable:
+    for region in mutable:
+        index = region.pointer.parameter.position
         sections.append(f'        external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n')
     sections.append(
         "        var begin = monotonic()\n"
         f"        {entry}({', '.join(arguments)})\n"
         "        elapsed += Float64(monotonic() - begin)\n"
     )
-    for index, _ in mutable:
+    for region in mutable:
+        index = region.pointer.parameter.position
         sections.append(
             f'    external_call["memcpy", NoneType](a{index}, saved_a{index}.unsafe_ptr(), UInt(bytes_a{index}))\n'
             f"    dealloc(saved_a{index}^)\n"

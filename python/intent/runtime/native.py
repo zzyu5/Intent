@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 import ctypes
 from dataclasses import dataclass
+from math import prod
 
 from ..language.dtypes import DType, dtype
 from .interface import AliasCheck, PublicInterface, ScalarParameter, ViewParameter
@@ -36,6 +37,20 @@ class NativeSlot:
     def name(self) -> str:
         name = f"a{self.parameter.position}"
         return name if self.axis is None else f"{name}_{'d' if self.role == 'extent' else 's'}{self.axis}"
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTrialRegion:
+    """Contiguous readable state preserved around native benchmark invocations."""
+
+    pointer: NativeSlot
+    extents: tuple[NativeSlot, ...]
+    element_bytes: int
+
+    def byte_count(self, shape: tuple[int, ...]) -> int:
+        if len(shape) != len(self.extents):
+            raise ValueError("native trial region shape disagrees with its extent slots")
+        return prod(shape) * self.element_bytes
 
 
 class NativeABI:
@@ -96,6 +111,28 @@ class NativeABI:
 
     def argument_types(self) -> tuple[object, ...]:
         return tuple(_CARRIERS[slot.carrier] for slot in self.slots)
+
+    def trial_regions(self) -> tuple[NativeTrialRegion, ...]:
+        """Derive readable mutable byte ranges from this entry's actual ABI.
+
+        Out-only views need no initial content. Arguments keep their original
+        pointers, so restoring these ranges preserves all accepted view aliases.
+        """
+        regions = []
+        for parameter in self.interface.mutable_inputs:
+            if self.requirements.views[parameter.position].layout != "contiguous":
+                raise NotImplementedError("native benchmark state requires contiguous InOut views")
+            pointer = self.pointer_slots[parameter.position]
+            bits = pointer.element.bits
+            if bits is None:
+                raise NotImplementedError("native benchmark state requires a known pointee byte width")
+            extents = tuple(sorted(
+                (slot for slot in self.slots
+                 if slot.parameter.position == parameter.position and slot.role == "extent"),
+                key=lambda slot: slot.axis,
+            ))
+            regions.append(NativeTrialRegion(pointer, extents, (bits + 7) // 8))
+        return tuple(regions)
 
     def binders(
         self, *,

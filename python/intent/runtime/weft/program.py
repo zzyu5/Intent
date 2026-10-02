@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -103,6 +105,13 @@ class _ExecutionContract:
 _winners: dict[tuple, int] = {}
 
 
+def _measure(measure, arguments: tuple, repetitions: int = 1) -> float:
+    elapsed = measure(*arguments, repetitions)
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise RuntimeError("native benchmark returned no valid positive duration")
+    return elapsed
+
+
 @dataclass
 class NativeCall(ObservedCall):
     program: NativeProgram
@@ -111,15 +120,24 @@ class NativeCall(ObservedCall):
     outputs: tuple[Buffer, ...]
     key: tuple
     description: tuple
-    trial_inputs: tuple[tuple[Buffer, bytes], ...] = ()
+    trial_storage: tuple[memoryview, ...]
     winner: int | None = None
 
     def inspect_configurations(self):
         return self.program.inspect_configurations()
 
-    def restore_trial_inputs(self) -> None:
-        for buffer, snapshot in self.trial_inputs:
-            buffer.storage[:] = snapshot
+    @contextmanager
+    def _trial_state(self):
+        snapshots = tuple((storage, bytes(storage)) for storage in self.trial_storage)
+
+        def restore() -> None:
+            for storage, snapshot in snapshots:
+                storage[:] = snapshot
+
+        try:
+            yield restore
+        finally:
+            restore()
 
     def choose(self, prepare=None) -> int:
         if self.winner is not None:
@@ -131,16 +149,16 @@ class NativeCall(ObservedCall):
             self.winner = 0
         elif not reused:
             timings = []
-            try:
+            with self._trial_state() as restore:
                 for candidate, measure, configuration in zip(self.program.candidates, self.program.measurements,
                                                              self.program.configuration_descriptions, strict=True):
                     samples = []
                     try:
                         for _ in range(3):
-                            self.restore_trial_inputs()
+                            restore()
                             if prepare is not None:
                                 prepare()
-                            samples.append(measure(*self.native_arguments, 1))
+                            samples.append(_measure(measure, self.native_arguments))
                     except Exception as error:
                         observed.append(CandidateObservation(configuration, "failed", "provider_tuning",
                                                              type(error).__name__, str(error)))
@@ -154,8 +172,6 @@ class NativeCall(ObservedCall):
                     observed.append(CandidateObservation(configuration, "trial_completed", "provider_tuning",
                                                          elapsed_ms=elapsed))
                 _winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
-            finally:
-                self.restore_trial_inputs()
         if not single:
             self.winner = _winners[self.key]
         self._record_observation(observation("weft", self.program.target, self.description,
@@ -191,11 +207,12 @@ class NativeCall(ObservedCall):
         self.program.check_execution()
         measure = self.program.measurements[self.choose(prepare)]
         values = []
-        for _ in range(samples):
-            self.restore_trial_inputs()
-            if prepare is not None:
-                prepare()
-            values.append(measure(*self.native_arguments, 1))
+        with self._trial_state() as restore:
+            for _ in range(samples):
+                restore()
+                if prepare is not None:
+                    prepare()
+                values.append(_measure(measure, self.native_arguments))
         elapsed = statistics.median(values)
         self._record_execution("benchmarked")
         return elapsed
@@ -220,6 +237,7 @@ class NativeProgram(NativePreparedRuntime):
             "The native runtime loads an existing external AOT artifact and does not observe its build cache"),)
         abi = contract.abi
         self.interface = abi.interface
+        self.trial_regions = abi.trial_regions()
         self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
@@ -277,11 +295,16 @@ class NativeProgram(NativePreparedRuntime):
 
     def prepare(self, arguments: tuple, *, explicit_outputs: bool = False) -> NativeCall:
         bound = self._binders[bool(explicit_outputs)](self, arguments)
-        snapshots = tuple((bound.arguments[parameter.position],
-                           bytes(bound.arguments[parameter.position].storage))
-                          for parameter in self.interface.mutable_inputs)
+        trial_storage = []
+        for region in self.trial_regions:
+            position = region.pointer.parameter.position
+            storage = bound.arguments[position].storage
+            if storage.nbytes != region.byte_count(bound.views[position].shape):
+                raise ValueError("native trial byte range disagrees with the bound buffer storage")
+            trial_storage.append(storage)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
-                          (self.identity, bound.key), self.describe_arguments(bound, "cpu"), snapshots)
+                          (self.identity, bound.key), self.describe_arguments(bound, "cpu"),
+                          tuple(trial_storage))
 
     def close(self) -> None:
         import _ctypes
