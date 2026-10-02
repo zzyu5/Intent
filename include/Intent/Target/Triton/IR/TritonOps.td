@@ -7,6 +7,7 @@ include "Intent/Target/Triton/IR/TritonDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
 
 class IntentTriton_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentTriton_Dialect, mnemonic, traits>;
@@ -38,7 +39,8 @@ def IntentTriton_TensorDescriptorAllocatorOp :
 
 def IntentTriton_TensorDescriptorOp : IntentTriton_Op<"tensor_descriptor", [
     Pure,
-    AttrSizedOperandSegments
+    AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<ViewLikeOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$base,
                        Variadic<Index>:$shape,
@@ -62,37 +64,11 @@ def IntentTriton_TensorDescriptorOp : IntentTriton_Op<"tensor_descriptor", [
   let hasVerifier = 1;
 }
 
-def IntentTriton_BlockLoadOp : IntentTriton_Op<"block_load", [
-    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
-  ]> {
-  let arguments = (ins IntentGPU_ViewValue:$view,
-                       Variadic<Index>:$offsets,
-                       DenseI64ArrayAttr:$block_axes,
-                       DenseI64ArrayAttr:$order,
-                       DenseI64ArrayAttr:$boundary_axes,
-                       StrAttr:$padding);
-  let results = (outs IntentGPU_FragmentValue:$result);
-  let hasVerifier = 1;
-}
-
-def IntentTriton_BlockStoreOp : IntentTriton_Op<"block_store", [
-    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
-  ]> {
-  let arguments = (ins IntentGPU_ViewValue:$view,
-                       Variadic<Index>:$offsets,
-                       IntentGPU_FragmentValue:$value,
-                       DenseI64ArrayAttr:$block_axes,
-                       DenseI64ArrayAttr:$order,
-                       DenseI64ArrayAttr:$boundary_axes);
-  let hasVerifier = 1;
-}
-
 def IntentTriton_DescriptorLoadOp : IntentTriton_Op<"descriptor_load", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$descriptor,
-                       Variadic<Index>:$offsets,
-                       DenseI64ArrayAttr:$boundary_axes);
+                       Variadic<I32>:$offsets);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
 }
@@ -101,9 +77,8 @@ def IntentTriton_DescriptorStoreOp : IntentTriton_Op<"descriptor_store", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
   ]> {
   let arguments = (ins IntentGPU_ViewValue:$descriptor,
-                       Variadic<Index>:$offsets,
-                       IntentGPU_FragmentValue:$value,
-                       DenseI64ArrayAttr:$boundary_axes);
+                       Variadic<I32>:$offsets,
+                       IntentGPU_FragmentValue:$value);
   let hasVerifier = 1;
 }
 

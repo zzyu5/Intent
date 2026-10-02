@@ -116,10 +116,15 @@ class CuTileProgram:
     def _configurations(self, values):
         return tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
 
-    def _kernel(self, invocation, values):
+    def _kernel(self, values):
         if self.tile_bounds is not None:
-            bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
-            if can_use_i32_array_indices(invocation.views, bounds):
+            arrays, bounds = [], []
+            for entry in self.tile_bounds:
+                if entry.eligible is not None and not values[entry.eligible]:
+                    continue
+                arrays.append(self.interface.native_value(entry.array, values))
+                bounds.append(evaluate_shape(entry.bounds, values))
+            if can_use_i32_array_indices(tuple(arrays), tuple(bounds)):
                 return self.narrow_kernel
         return self.kernel
 
@@ -136,7 +141,7 @@ class CuTileProgram:
 
         try:
             configurations = self._configurations(values)
-            kernel = self._kernel(invocation, values)
+            kernel = self._kernel(values)
             failures = self.compilation.compile(tuple(
                 (kernel.replace_hints(**self._hints(config)), self._arguments(values, config))
                 for config in configurations))
@@ -177,7 +182,7 @@ class CuTileProgram:
                 error.observation = observation("cutile", self.target, invocation.description, None, _native_resources(),
                                                 stage="failed", history_unavailable="Candidate binding failed before native tuning")
                 raise
-            kernel = self._kernel(invocation, values)
+            kernel = self._kernel(values)
             state = TuningState(invocation.public_views,
                                 tuple(view.writable for view in self.interface.public_views))
             trial_values = dict(values)

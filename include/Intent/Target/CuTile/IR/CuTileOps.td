@@ -7,15 +7,19 @@ include "Intent/Target/CuTile/IR/CuTileDialect.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
 
 class IntentCuTile_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentCuTile_Dialect, mnemonic, traits>;
 
-def IntentCuTile_ArrayViewOp : IntentCuTile_Op<"array_view", [Pure]> {
+def IntentCuTile_ArrayViewOp : IntentCuTile_Op<"array_view", [Pure,
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    DeclareOpInterfaceMethods<ViewLikeOpInterface>]> {
   let summary = "Conditional host alias collapsing contiguous full inner axes";
   let arguments = (ins IntentGPU_ViewValue:$base,
                        DenseI64ArrayAttr:$group_ends);
-  // Preserve logical resource identity; group_ends declares the provider rank.
+  // The result owns its collapsed layout and aliases the original resource.
+  // Its accesses require the host-computed eligibility condition to hold.
   let results = (outs IntentGPU_ViewValue:$result, I1:$eligible);
   let hasVerifier = 1;
 }

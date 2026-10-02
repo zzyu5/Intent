@@ -90,224 +90,20 @@ FailureOr<SmallVector<Value>> orderedCoordinates(gpu::AccessOpInterface access) 
   return result;
 }
 
-bool samePhysicalDomain(gpu::FragmentType lhs, gpu::FragmentType rhs) {
-  return lhs.getShape() == rhs.getShape() &&
-         lhs.getAxisMaps() == rhs.getAxisMaps() &&
-         lhs.getValidity() == rhs.getValidity() &&
-         lhs.getOwner() == rhs.getOwner();
-}
-
-
-FailureOr<SmallVector<unsigned>>
-coordinateTargetAxes(gpu::FragmentType source, gpu::FragmentType target) {
-  if (source.getOwner() != target.getOwner() ||
-      source.getShape().size() > target.getShape().size())
-    return failure();
-  SmallVector<unsigned> result(source.getShape().size());
-  bool positional = source.getShape().size() == target.getShape().size();
-  for (unsigned axis = 0; positional && axis < source.getShape().size(); ++axis) {
-    if (isUnitExtent(source.getShape()[axis]))
-      continue;
-    auto left = cast<gpu::AxisMapAttr>(source.getAxisMaps()[axis]);
-    auto right = cast<gpu::AxisMapAttr>(target.getAxisMaps()[axis]);
-    positional = gpu::sourceAxisIdentity(left) == gpu::sourceAxisIdentity(right) ||
-                 (left.getDimensionId() > 0 &&
-                  left.getDimensionId() == right.getDimensionId());
-  }
-  if (positional) {
-    auto projection = gpu::queryBroadcastProjection(source, target);
-    if (projection.isExact()) {
-      for (auto [axis, origin] : llvm::enumerate(projection.targetToSource))
-        if (origin)
-          result[*origin] = axis;
-      return result;
-    }
-  }
-  SmallVector<unsigned> unitAxes;
-  SmallVector<bool> usedTargetAxes(target.getShape().size(), false);
-  for (auto [sourceIndex, sourceAttribute] :
-       llvm::enumerate(source.getAxisMaps())) {
-    auto extent = cast<gpu::PhysicalExprAttr>(source.getShape()[sourceIndex]);
-    if (extent.getKind() ==
-            gpu::PhysicalExprKind::Constant &&
-        extent.getValue() == 1) {
-      unitAxes.push_back(sourceIndex);
-      continue;
-    }
-    auto sourceMap = cast<gpu::AxisMapAttr>(sourceAttribute);
-    std::optional<unsigned> targetIndex;
-    for (auto [index, targetAttribute] :
-         llvm::enumerate(target.getAxisMaps())) {
-      auto targetMap = cast<gpu::AxisMapAttr>(targetAttribute);
-      if (usedTargetAxes[index] ||
-          source.getShape()[sourceIndex] != target.getShape()[index] ||
-          sourceMap.getSourceId() != targetMap.getSourceId() ||
-          sourceMap.getSourceAxis() != targetMap.getSourceAxis() ||
-          sourceMap.getDimensionId() != targetMap.getDimensionId() ||
-          sourceMap.getDerived() != targetMap.getDerived())
-        continue;
-      if (targetIndex)
-        return failure();
-      targetIndex = index;
-    }
-    if (!targetIndex && sourceMap.getDimensionId() > 0) {
-      unsigned occurrences = 0;
-      for (auto [axis, mapping] : llvm::enumerate(source.getAxisMaps()))
-        occurrences += cast<gpu::AxisMapAttr>(mapping).getDimensionId() ==
-                           sourceMap.getDimensionId() &&
-                       source.getShape()[axis] == source.getShape()[sourceIndex];
-      if (occurrences != 1)
-        return failure();
-      for (auto [axis, mapping] : llvm::enumerate(target.getAxisMaps())) {
-        if (usedTargetAxes[axis] ||
-            cast<gpu::AxisMapAttr>(mapping).getDimensionId() !=
-                sourceMap.getDimensionId() ||
-            target.getShape()[axis] != source.getShape()[sourceIndex])
-          continue;
-        if (targetIndex)
-          return failure();
-        targetIndex = axis;
-      }
-    }
-    if (!targetIndex)
-      return failure();
-    Attribute sourceExtent = source.getShape()[sourceIndex];
-    Attribute targetExtent = target.getShape()[*targetIndex];
-    if (sourceExtent != targetExtent)
-      return failure();
-    usedTargetAxes[*targetIndex] = true;
-    result[sourceIndex] = *targetIndex;
-  }
-  // Singleton axes carry no coordinate variation.  Match the varying axes
-  // first, then embed singleton axes into the remaining broadcast dimensions.
-  // A newaxis introduced by author indexing need not share the access axis's
-  // provenance identity.
-  unsigned nextTargetAxis = 0;
-  for (unsigned sourceAxis : unitAxes) {
-    while (usedTargetAxes[nextTargetAxis])
-      ++nextTargetAxis;
-    result[sourceAxis] = nextTargetAxis;
-    usedTargetAxes[nextTargetAxis] = true;
-  }
-  return result;
-}
-
 FailureOr<SmallVector<Value>> materializeCoordinateDomains(
-    OpBuilder &builder, Operation *owner, ValueRange coordinates,
-    gpu::FragmentType target) {
-  SmallVector<Value> results;
-  results.reserve(coordinates.size());
-  bool cartesian = static_cast<size_t>(llvm::count_if(coordinates, [](Value value) {
-    return isa<gpu::FragmentType>(value.getType());
-  })) == target.getShape().size() &&
-      llvm::all_of(coordinates, [](Value value) {
-        auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
-        return !fragment || fragment.getShape().size() == 1;
-      });
-  unsigned fragmentSlot = 0;
-  for (Value coordinate : coordinates) {
-    auto source = dyn_cast<gpu::FragmentType>(coordinate.getType());
-    unsigned position = source ? fragmentSlot++ : 0;
-    if (!source || samePhysicalDomain(source, target)) {
-      results.push_back(coordinate);
-      continue;
-    }
-    FailureOr<SmallVector<unsigned>> targetAxes =
-        coordinateTargetAxes(source, target);
-    if (failed(targetAxes) && cartesian && source.getOwner() == target.getOwner() &&
-        source.getShape()[0] == target.getShape()[position]) {
-      auto sourceAxis = cast<gpu::AxisMapAttr>(source.getAxisMaps()[0]);
-      auto targetAxis = cast<gpu::AxisMapAttr>(target.getAxisMaps()[position]);
-      // Cartesian coordinates are ordered by resource axis. Reusing the same
-      // range on two axes retains those distinct positional occurrences.
-      if (gpu::sourceAxisIdentity(sourceAxis) == gpu::sourceAxisIdentity(targetAxis) &&
-          sourceAxis.getDimensionId() == targetAxis.getDimensionId())
-        targetAxes = SmallVector<unsigned>{position};
-    }
-    if (failed(targetAxes))
-      return owner->emitOpError(
-          "cuTile coordinate cannot adopt the selected physical domain");
-    auto preserveOrigin = [&](Operation *operation) {
-      if (Operation *definition = coordinate.getDefiningOp())
-        if (Attribute origin = definition->getAttr(gpu::originAttr))
-          operation->setAttr(gpu::originAttr, origin);
-    };
-
-    SmallVector<int64_t> permutation;
-    permutation.reserve(source.getShape().size());
-    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
-      permutation.push_back(axis);
-    llvm::sort(permutation, [&](int64_t lhs, int64_t rhs) {
-      return (*targetAxes)[lhs] < (*targetAxes)[rhs];
-    });
-    bool identityPermutation = llvm::all_of(
-        llvm::enumerate(permutation), [](auto item) {
-          return static_cast<int64_t>(item.index()) == item.value();
-        });
-    if (!identityPermutation) {
-      SmallVector<Attribute> shape;
-      SmallVector<Attribute> mappings;
-      SmallVector<unsigned> reorderedTargetAxes;
-      shape.reserve(permutation.size());
-      mappings.reserve(permutation.size());
-      reorderedTargetAxes.reserve(permutation.size());
-      for (auto [resultAxis, sourceAxis] : llvm::enumerate(permutation)) {
-        shape.push_back(source.getShape()[sourceAxis]);
-        auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-        mappings.push_back(gpu::AxisMapAttr::get(
-            owner->getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-            mapping.getDimensionId(), resultAxis, mapping.getDerived()));
-        reorderedTargetAxes.push_back((*targetAxes)[sourceAxis]);
-      }
-      auto transposedType = gpu::FragmentType::get(
-          owner->getContext(), source.getElementType(),
-          ArrayAttr::get(owner->getContext(), shape),
-          ArrayAttr::get(owner->getContext(), mappings), source.getValidity(),
-          source.getOwner());
-      auto transpose = builder.create<gpu::TransposeOp>(
-          owner->getLoc(), transposedType, coordinate, permutation);
-      preserveOrigin(transpose);
-      coordinate = transpose.getResult();
-      source = transposedType;
-      *targetAxes = std::move(reorderedTargetAxes);
-    }
-
-    auto unit = gpu::PhysicalExprAttr::get(
-        owner->getContext(),
-        gpu::PhysicalExprKind::Constant, 1,
-        StringAttr::get(owner->getContext()),
-        ArrayAttr::get(owner->getContext(), {}));
-    SmallVector<Attribute> expandedShape(target.getShape().size(), unit);
-    for (auto [sourceAxis, targetAxis] : llvm::enumerate(*targetAxes))
-      expandedShape[targetAxis] = source.getShape()[sourceAxis];
-    auto expandedType = gpu::FragmentType::get(
-        owner->getContext(), source.getElementType(),
-        ArrayAttr::get(owner->getContext(), expandedShape),
-        target.getAxisMaps(), target.getValidity(), target.getOwner());
-    if (!samePhysicalDomain(source, expandedType)) {
-      FailureOr<ArrayAttr> reassociation =
-          gpu::inferReshapeReassociation(source, expandedType);
-      if (failed(reassociation))
-        return owner->emitOpError(
-            "cuTile coordinate occurrence has no row-major domain expansion");
-      auto reshape = builder.create<gpu::ReshapeOp>(
-          owner->getLoc(), expandedType, coordinate, *reassociation);
-      preserveOrigin(reshape);
-      coordinate = reshape.getResult();
-      source = expandedType;
-    }
-    auto resultType = gpu::FragmentType::get(
-        owner->getContext(), source.getElementType(), target.getShape(),
-        target.getAxisMaps(), target.getValidity(), target.getOwner());
-    if (samePhysicalDomain(source, resultType)) {
-      results.push_back(coordinate);
-      continue;
-    }
-    auto broadcast = builder.create<gpu::BroadcastOp>(
-        owner->getLoc(), resultType, coordinate);
-    preserveOrigin(broadcast);
-    results.push_back(broadcast.getResult());
+    OpBuilder &builder, gpu::AccessOpInterface access) {
+  Operation *owner = access.getOperation();
+  auto sourceAxes = access.getAccessSourceAxes();
+  auto view = cast<gpu::ViewType>(access.getAccessResource().getType());
+  SmallVector<Value> results(view.getRank());
+  for (auto [slot, resourceAxis] : llvm::enumerate(sourceAxes)) {
+    auto coordinate = gpu::materializeAccessCoordinate(builder, access, slot);
+    if (failed(coordinate))
+      return failure();
+    results[resourceAxis] = *coordinate;
   }
+  if (llvm::any_of(results, [](Value value) { return !value; }))
+    return owner->emitOpError("cuTile coordinates do not cover every native resource axis");
   return results;
 }
 
@@ -757,6 +553,26 @@ bool isIdentityPermutation(ArrayRef<int64_t> permutation) {
                       });
 }
 
+Value materializeFullTileCondition(OpBuilder &builder, Location location,
+                                   Value resource, gpu::FragmentType tile) {
+  Value fullTiles = builder.create<arith::ConstantIntOp>(location, 1, 1);
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  for (auto [axis, attribute] : llvm::enumerate(tile.getShape())) {
+    auto extent = cast<gpu::PhysicalExprAttr>(attribute);
+    if (extent.getKind() == gpu::PhysicalExprKind::Constant && extent.getValue() == 1)
+      continue;
+    Value size = builder.create<gpu::DimOp>(location, builder.getIndexType(), resource, axis);
+    Value width = builder.create<gpu::PhysicalExprOp>(location, builder.getIndexType(), extent);
+    Value remainder = builder.create<gpu::BinaryOp>(
+        location, builder.getIndexType(), size, width, BinaryOperator::Remainder);
+    Value divisible = builder.create<gpu::CompareOp>(
+        location, builder.getI1Type(), remainder, zero, ComparePredicate::Eq);
+    fullTiles = builder.create<gpu::BinaryOp>(
+        location, builder.getI1Type(), fullTiles, divisible, BinaryOperator::LogicalAnd);
+  }
+  return fullTiles;
+}
+
 SmallVector<int64_t> identityAxes(unsigned rank) {
   SmallVector<int64_t> result;
   result.reserve(rank);
@@ -918,28 +734,8 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       loopLatency = loadPolicy;
     }
     auto emitNativeLoad = [&](OpBuilder &nested) {
-      Value fullTiles = nested.create<arith::ConstantIntOp>(load.getLoc(), 1, 1);
-      Value zero = nested.create<arith::ConstantIndexOp>(load.getLoc(), 0);
-      for (auto [axis, attribute] : llvm::enumerate(plan->resourceType.getShape())) {
-        auto extent = cast<gpu::PhysicalExprAttr>(attribute);
-        if (extent.getKind() ==
-                gpu::PhysicalExprKind::Constant &&
-            extent.getValue() == 1)
-          continue;
-        Value size = nested.create<gpu::DimOp>(
-            load.getLoc(), nested.getIndexType(), access.getAccessResource(), axis);
-        Value width = nested.create<gpu::PhysicalExprOp>(
-            load.getLoc(), nested.getIndexType(), extent);
-        Value remainder = nested.create<gpu::BinaryOp>(
-            load.getLoc(), nested.getIndexType(), size, width,
-            BinaryOperator::Remainder);
-        Value divisible = nested.create<gpu::CompareOp>(
-            load.getLoc(), nested.getI1Type(), remainder, zero,
-            ComparePredicate::Eq);
-        fullTiles = nested.create<gpu::BinaryOp>(
-            load.getLoc(), nested.getI1Type(), fullTiles, divisible,
-            BinaryOperator::LogicalAnd);
-      }
+      Value fullTiles = materializeFullTileCondition(
+          nested, load.getLoc(), access.getAccessResource(), plan->resourceType);
       auto tile = nested.create<TileLoadOp>(
           load.getLoc(), plan->resourceType, access.getAccessResource(), *allowTMA,
           indices->values, loopLatency, fullTiles);
@@ -961,9 +757,6 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       return value;
     };
     auto emitGatherLoad = [&](OpBuilder &nested) -> FailureOr<Value> {
-      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
-      if (failed(coordinates))
-        return failure();
       Value fill = uniformScalarFill(access.getAccessFill());
       bool fragmentFill = access.getAccessFill() && !fill;
       if (fragmentFill) {
@@ -978,7 +771,7 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         fill = *zero;
       }
       FailureOr<SmallVector<Value>> materialized =
-          materializeCoordinateDomains(nested, load, *coordinates, result);
+          materializeCoordinateDomains(nested, access);
       if (failed(materialized))
         return failure();
       auto replacement = nested.create<GatherLoadOp>(
@@ -1080,8 +873,9 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         1, builder.getStringAttr(""), builder.getArrayAttr({}));
     SmallVector<Attribute> extractionShape(source.getShape().size(), unit);
     SmallVector<bool> slicedAxes(source.getShape().size(), false);
-    for (auto [coordinate, sourceAxis] :
-         llvm::zip(access.getAccessCoordinates(), access.getAccessSourceAxes())) {
+    for (auto [slot, originalCoordinate] : llvm::enumerate(access.getAccessCoordinates())) {
+      Value coordinate = originalCoordinate;
+      int64_t sourceAxis = access.getAccessSourceAxes()[slot];
       if (sourceAxis < 0 ||
           sourceAxis >= static_cast<int64_t>(coordinates.size()) ||
           coordinates[sourceAxis])
@@ -1112,14 +906,12 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
             return failure();
           }
           auto range = ranges.roots.front();
-          auto projections = gpu::queryRangeProjections(result, range);
-          if (projections.size() != 1 ||
-              result.getShape()[projections.front().fragmentAxis] !=
+          auto resultAxis = nativeAccessRangeAxis(access, slot, range);
+          if (failed(resultAxis) || result.getShape()[*resultAxis] !=
                   range.getResult().getType().getShape()[0])
             return gather.emitOpError(
                 "cuTile tile extraction coordinate has no unique result axis");
-          extractionShape[sourceAxis] =
-              result.getShape()[projections.front().fragmentAxis];
+          extractionShape[sourceAxis] = result.getShape()[*resultAxis];
           auto fullExtent =
               cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]);
           Value full;
@@ -1342,17 +1134,13 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
         continue;
       }
     }
-    FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
+    OpBuilder builder(atomic);
+    auto target = dyn_cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
+    FailureOr<SmallVector<Value>> coordinates = target
+        ? materializeCoordinateDomains(builder, access)
+        : orderedCoordinates(access);
     if (failed(coordinates))
       return failure();
-    OpBuilder builder(atomic);
-    if (auto target = dyn_cast<gpu::FragmentType>(access.getAccessPayloads().front().getType())) {
-      FailureOr<SmallVector<Value>> materialized =
-          materializeCoordinateDomains(builder, atomic, *coordinates, target);
-      if (failed(materialized))
-        return failure();
-      coordinates = std::move(*materialized);
-    }
     if (access.getAccessValidity()) {
       // Native array atomics suppress out-of-bounds lanes but leave their
       // returned old values unspecified. The old value is unused here, so
@@ -1494,12 +1282,8 @@ LogicalResult formNativeAccesses(func::FuncOp kernel,
       outOfBounds.create<scf::YieldOp>(store.getLoc());
     };
     auto emitScatterStore = [&](OpBuilder &nested) -> LogicalResult {
-      FailureOr<SmallVector<Value>> coordinates = orderedCoordinates(access);
-      if (failed(coordinates))
-        return failure();
-      auto target = cast<gpu::FragmentType>(access.getAccessPayloads().front().getType());
       FailureOr<SmallVector<Value>> materialized =
-          materializeCoordinateDomains(nested, store, *coordinates, target);
+          materializeCoordinateDomains(nested, access);
       if (failed(materialized))
         return failure();
       auto replacement = nested.create<ScatterStoreOp>(

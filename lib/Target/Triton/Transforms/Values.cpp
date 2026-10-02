@@ -179,8 +179,6 @@ void canonicalizeBroadcastProjections(func::FuncOp kernel) {
     Value resource;
     if (auto load = reshape.getValue().getDefiningOp<gpu::LoadOp>())
       resource = load.getResource();
-    else if (auto load = reshape.getValue().getDefiningOp<BlockLoadOp>())
-      resource = load.getView();
     else
       return;
     // A vector resource may be loaded across several execution axes.

@@ -278,7 +278,7 @@ private:
     for (const ViewABI &view : views)
       arrayArgument(view.name, view.viewType().getLayout().getExtents().size());
     for (ArrayViewABI view : arrayViews) {
-      arrayArgument(view.name, view.operation.getGroupEnds().size());
+      arrayArgument(view.name, view.operation.getResult().getType().getRank());
       argument(view.eligible + ": ct.Constant[bool]");
     }
     for (const ScalarABI &scalar : scalars) {
@@ -659,8 +659,7 @@ private:
     llvm_unreachable("unhandled Intent unary operator");
   }
 
-  std::string broadcastValue(Value value, gpu::FragmentType target,
-                             std::optional<unsigned> = std::nullopt) override {
+  std::string broadcastValue(Value value, gpu::FragmentType target) override {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source)
       return "ct.full(" + fragmentShape(target) + ", " + valueString(value) +
@@ -755,14 +754,19 @@ private:
     details["narrow_kernel"] = nullptr;
     if (kernel->hasAttr(arrayIndexTileBoundsAttr)) {
       llvm::json::Array encoded;
-      for (const ViewABI &view : views) {
+      auto encodeArray = [&](Value resource, StringRef name, StringRef eligible) {
         llvm::json::Array axes;
-        auto bounds = kernel.getArgAttrOfType<ArrayAttr>(
-            view.value.getArgNumber(), arrayIndexTileBoundsAttr);
-        for (Attribute bound : bounds)
+        for (Attribute bound : getNativeArrayIndexBounds(resource))
           axes.push_back(gpu::serializeExpression(cast<gpu::PhysicalExprAttr>(bound)));
-        encoded.push_back(std::move(axes));
-      }
+        encoded.push_back(llvm::json::Object{
+            {"array", name.str()}, {"bounds", std::move(axes)},
+            {"eligible", eligible.empty() ? llvm::json::Value(nullptr)
+                                         : llvm::json::Value(eligible.str())}});
+      };
+      for (const ViewABI &view : views)
+        encodeArray(view.value, view.name, {});
+      for (ArrayViewABI view : arrayViews)
+        encodeArray(view.operation.getResult(), view.name, view.eligible);
       details["index_tile_bounds"] = std::move(encoded);
       details["narrow_kernel"] = "_intent_i32_kernel";
     }

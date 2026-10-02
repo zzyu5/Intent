@@ -166,6 +166,50 @@ LogicalResult verifyFullTileCondition(TileLoadOp load) {
              : load.emitOpError("full-tile proof does not cover every view axis");
 }
 
+FailureOr<gpu::ViewType> collapsedArrayType(gpu::ViewType source,
+                                          DenseI64ArrayAttr groups) {
+  if (!source || !groups || groups.size() < 2 ||
+      groups.size() >= source.getRank() || groups.asArrayRef().back() != source.getRank())
+    return failure();
+  SmallVector<Attribute> shape, strides;
+  SmallVector<int64_t> dimensions;
+  auto layout = source.getLayout();
+  unsigned begin = 0;
+  for (int64_t end : groups.asArrayRef()) {
+    if (end <= begin || end > source.getRank())
+      return failure();
+    Attribute extent = layout.getExtents()[begin];
+    for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis) {
+      auto inner = dyn_cast<gpu::PhysicalExprAttr>(layout.getExtents()[axis]);
+      if (!inner || inner.getKind() != gpu::PhysicalExprKind::Constant || inner.getValue() <= 1)
+        return failure();
+      extent = gpu::PhysicalExprAttr::get(
+          source.getContext(), gpu::PhysicalExprKind::Multiply, 0,
+          StringAttr::get(source.getContext()),
+          ArrayAttr::get(source.getContext(), {extent, inner}));
+    }
+    shape.push_back(extent);
+    strides.push_back(layout.getStrides()[end - 1]);
+    dimensions.push_back(end == begin + 1 ? layout.getDimensionIds()[begin] : 0);
+    begin = end;
+  }
+  return gpu::ViewType::get(
+      source.getContext(), source.getElementType(), source.getAccess(), source.getSourceId(),
+      gpu::ViewLayoutAttr::get(source.getContext(), ArrayAttr::get(source.getContext(), shape),
+          DenseI64ArrayAttr::get(source.getContext(), dimensions),
+          ArrayAttr::get(source.getContext(), strides)));
+}
+
+bool guardedByArrayEligibility(Operation *operation, ArrayViewOp array) {
+  for (Region *region = operation->getParentRegion(); region;
+       region = region->getParentRegion())
+    if (auto branch = dyn_cast_or_null<scf::IfOp>(region->getParentOp());
+        branch && region == &branch.getThenRegion() &&
+        branch.getCondition() == array.getEligible())
+      return true;
+  return false;
+}
+
 } // namespace
 
 Attribute getCompileTimeScalar(Value value) {
@@ -217,62 +261,46 @@ LogicalResult ArrayViewOp::verify() {
   auto kernel = (*this)->getParentOfType<func::FuncOp>();
   auto view = getBase().getType();
   if (!base || !kernel || base.getOwner() != &kernel.getBody().front() ||
-      (*this)->getBlock() != base.getOwner() || view.getAccess() != 0 ||
-      getResult().getType() != view)
+      (*this)->getBlock() != base.getOwner() || view.getAccess() != 0)
     return emitOpError(
-        "requires a read-only kernel view and preserves its logical ABI");
-  auto ends = getGroupEnds();
-  if (ends.size() < 2 || ends.size() >= view.getRank() ||
-      ends.back() != view.getRank())
-    return emitOpError("requires an ordered partition that reduces the array rank");
-  unsigned begin = 0;
-  for (int64_t end : ends) {
-    if (end <= begin || end > view.getRank())
-      return emitOpError("array collapse groups must partition every source axis");
-    for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis) {
-      auto extent =
-          dyn_cast<gpu::PhysicalExprAttr>(view.getLayout().getExtents()[axis]);
-      if (!extent ||
-          extent.getKind() !=
-              gpu::PhysicalExprKind::Constant ||
-          extent.getValue() <= 1)
-        return emitOpError(
-            "collapsed inner axes require positive non-unit static extents");
-    }
-    begin = end;
-  }
+        "requires a read-only kernel view as its source resource");
+  auto expected = collapsedArrayType(view, getGroupEndsAttr());
+  if (failed(expected) || getResult().getType() != *expected)
+    return emitOpError("result must carry the collapsed source layout with positive non-unit inner extents");
   for (Operation *user : getResult().getUsers())
-    if (!isa<TileLoadOp>(user))
+    if (!isa<TileLoadOp, gpu::DimOp>(user) || !guardedByArrayEligibility(user, *this))
       return emitOpError(
-          "conditional array aliases are only consumed by native tile loads");
+          "conditional array aliases require loads and dimensions inside their eligible control region");
   return success();
 }
 
-FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load) {
-  auto array = load.getResource().getDefiningOp<ArrayViewOp>();
-  auto choice = load->getParentOfType<scf::IfOp>();
-  if (!array || !choice || choice.getCondition() != array.getEligible() ||
-      load->getBlock() != choice.thenBlock() ||
-      choice.thenBlock()->getOperations().size() != 3 ||
-      choice.getElseRegion().empty() ||
-      choice.elseBlock()->getOperations().size() != 2)
+LogicalResult ArrayViewOp::inferReturnTypes(MLIRContext *context,
+    std::optional<Location> location, ValueRange operands, DictionaryAttr attributes,
+    OpaqueProperties properties, RegionRange regions, SmallVectorImpl<Type> &results) {
+  Adaptor operation(operands, attributes, properties, regions);
+  if (failed(operation.verify(location.value_or(UnknownLoc::get(context)))))
     return failure();
-  auto original = dyn_cast<TileLoadOp>(&choice.elseBlock()->front());
-  auto restore = dyn_cast<gpu::ReshapeOp>(load->getNextNode());
-  auto thenYield = dyn_cast<scf::YieldOp>(choice.thenBlock()->getTerminator());
-  auto elseYield = dyn_cast<scf::YieldOp>(choice.elseBlock()->getTerminator());
-  if (!original || !restore || !thenYield || !elseYield ||
-      thenYield.getNumOperands() != 1 || elseYield.getNumOperands() != 1 ||
-      original.getResource() != array.getBase() ||
-      original.getAllowTma() != load.getAllowTma() ||
-      original.getLatencyPolicy() != load.getLatencyPolicy() ||
-      original.getFullTiles() != load.getFullTiles() ||
-      restore.getValue() != load.getResult() ||
-      restore.getResult().getType() != original.getResult().getType() ||
-      thenYield.getOperand(0) != restore.getResult() ||
-      elseYield.getOperand(0) != original.getResult())
-    return failure();
-  return original;
+  auto view = collapsedArrayType(cast<gpu::ViewType>(operation.getBase().getType()),
+                                 operation.getGroupEndsAttr());
+  if (failed(view))
+    return emitOptionalError(location, "invalid contiguous array collapse groups");
+  results.push_back(*view);
+  results.push_back(IntegerType::get(context, 1));
+  return success();
+}
+
+Value ArrayViewOp::getViewSource() { return getBase(); }
+
+ArrayAttr getNativeArrayIndexBounds(Value resource) {
+  if (auto argument = dyn_cast<BlockArgument>(resource)) {
+    auto function = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+    return function ? function.getArgAttrOfType<ArrayAttr>(argument.getArgNumber(),
+                                                         arrayIndexTileBoundsAttr)
+                    : ArrayAttr();
+  }
+  if (auto array = resource.getDefiningOp<ArrayViewOp>())
+    return array->getAttrOfType<ArrayAttr>(arrayIndexTileBoundsAttr);
+  return {};
 }
 
 LogicalResult TileLoadOp::verify() {
@@ -282,54 +310,20 @@ LogicalResult TileLoadOp::verify() {
     return emitOpError("allow_tma must be a compile-time i1 access decision");
   if (failed(verifyLoadLatency(*this, getLatencyPolicy())))
     return failure();
-  auto array = getResource().getDefiningOp<ArrayViewOp>();
-  unsigned rank = array ? array.getGroupEnds().size() : view.getRank();
-  if (failed(verifyResourceOrderedTile(*this, rank, result,
+  if (failed(verifyResourceOrderedTile(*this, view.getRank(), result,
                                        getTileIndices())))
     return failure();
   if (view.getElementType() != result.getElementType())
     return emitOpError("view and tile element types disagree");
-  if (!array)
-    return verifyFullTileCondition(*this);
-  if (failed(array.verify()))
-    return failure();
-  auto original = unfoldedArrayLoad(*this);
-  if (failed(original))
-    return emitOpError(
-        "collapsed load must have a guarded reshape and unchanged alternative");
-  auto source = original->getResult().getType();
-  if (source.getShape().size() != view.getRank() ||
-      original->getTileIndices().size() != view.getRank() ||
-      source.getOwner() != result.getOwner() ||
-      source.getValidity() != result.getValidity())
-    return emitOpError("collapsed load must preserve the original physical domain");
-  unsigned begin = 0;
-  for (auto [group, end] : llvm::enumerate(array.getGroupEnds())) {
-    Attribute extent = source.getShape()[begin];
-    if (getTileIndices()[group] != original->getTileIndices()[begin])
-      return emitOpError(
-          "collapsed tile origin must be the original outer tile origin");
-    for (unsigned axis = begin + 1; axis < static_cast<unsigned>(end); ++axis) {
-      if (source.getShape()[axis] != view.getLayout().getExtents()[axis] ||
-          !matchPattern(original->getTileIndices()[axis], m_Zero()))
-        return emitOpError(
-            "collapsed inner tile axes must cover the full source axis from zero");
-      extent = gpu::PhysicalExprAttr::get(
-          getContext(), gpu::PhysicalExprKind::Multiply, 0,
-          StringAttr::get(getContext()),
-          ArrayAttr::get(getContext(), {extent, source.getShape()[axis]}));
-    }
-    if (result.getShape()[group] != extent)
-      return emitOpError(
-          "collapsed tile extent must equal the original contiguous product");
-    begin = end;
-  }
-  return success();
+  if (auto array = getResource().getDefiningOp<ArrayViewOp>();
+      array && !guardedByArrayEligibility(*this, array))
+    return emitOpError("collapsed array load requires its eligibility guard");
+  return verifyFullTileCondition(*this);
 }
 
 void TileLoadOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
 }
 
 LogicalResult TileStoreOp::verify() {
@@ -348,7 +342,7 @@ LogicalResult TileStoreOp::verify() {
 
 void TileStoreOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult TileAtomicAddOp::verify() {
@@ -365,8 +359,8 @@ LogicalResult TileAtomicAddOp::verify() {
 
 void TileAtomicAddOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult ScalarLoadOp::verify() {
@@ -385,7 +379,7 @@ LogicalResult ScalarLoadOp::verify() {
 
 void ScalarLoadOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
 }
 
 LogicalResult ScalarStoreOp::verify() {
@@ -400,7 +394,7 @@ LogicalResult ScalarStoreOp::verify() {
 
 void ScalarStoreOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult GatherLoadOp::verify() {
@@ -432,7 +426,7 @@ LogicalResult GatherLoadOp::verify() {
 
 void GatherLoadOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
 }
 
 LogicalResult ScatterStoreOp::verify() {
@@ -458,7 +452,7 @@ LogicalResult ScatterStoreOp::verify() {
 
 void ScatterStoreOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult AtomicRMWOp::verify() {
@@ -475,8 +469,12 @@ LogicalResult AtomicRMWOp::verify() {
 
 void AtomicRMWOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
+  if (getOrdering() != AtomicOrdering::Relaxed) {
+    effects.emplace_back(MemoryEffects::Read::get());
+    effects.emplace_back(MemoryEffects::Write::get());
+  }
 }
 
 LogicalResult ExtractOp::verify() {

@@ -128,91 +128,6 @@ LogicalResult verifyResourceSharing(Operation *owner, Type resource,
                    "sharing domain disagrees with the physical resource scope");
 }
 
-LogicalResult verifyAccessAxisExtents(Operation *owner, Type payload,
-                                      ValueRange coordinates) {
-  auto fragment = dyn_cast<FragmentType>(payload);
-  if (!fragment)
-    return success();
-  SmallVector<Value> fragmentCoordinates;
-  for (Value coordinate : coordinates)
-    if (isa<FragmentType>(coordinate.getType()))
-      fragmentCoordinates.push_back(coordinate);
-  bool cartesian = fragmentCoordinates.size() == fragment.getShape().size() &&
-      llvm::all_of(fragmentCoordinates, [](Value coordinate) {
-        return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
-      });
-  for (auto [payloadAxis, payloadAttribute] :
-       llvm::enumerate(fragment.getAxisMaps())) {
-    auto payloadMapping = cast<AxisMapAttr>(payloadAttribute);
-    Value positionalCoordinate;
-    if (cartesian) {
-      Value coordinate = fragmentCoordinates[payloadAxis];
-      auto mapping = cast<AxisMapAttr>(
-          cast<FragmentType>(coordinate.getType()).getAxisMaps()[0]);
-      if (mapping.getSourceId() == payloadMapping.getSourceId() &&
-          mapping.getSourceAxis() == payloadMapping.getSourceAxis() &&
-          mapping.getDerived() == payloadMapping.getDerived() &&
-          mapping.getDimensionId() == payloadMapping.getDimensionId())
-        positionalCoordinate = coordinate;
-    }
-    std::optional<Attribute> coordinateExtent;
-    for (Value coordinate : coordinates) {
-      if (positionalCoordinate && coordinate != positionalCoordinate)
-        continue;
-      auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
-      if (!coordinateType)
-        continue;
-      bool positional = coordinateType.getOwner() == fragment.getOwner() &&
-                        coordinateType.getAxisMaps() == fragment.getAxisMaps();
-      for (auto [coordinateAxis, coordinateAttribute] :
-           llvm::enumerate(coordinateType.getAxisMaps())) {
-        if (positional && coordinateAxis != payloadAxis)
-          continue;
-        auto coordinateMapping = cast<AxisMapAttr>(coordinateAttribute);
-        bool sameSource =
-            payloadMapping.getSourceId() == coordinateMapping.getSourceId() &&
-            payloadMapping.getSourceAxis() ==
-                coordinateMapping.getSourceAxis() &&
-            payloadMapping.getDerived() == coordinateMapping.getDerived();
-        if (!sameSource)
-          continue;
-        if (payloadMapping.getDimensionId() !=
-            coordinateMapping.getDimensionId()) {
-          bool anotherOccurrence = llvm::any_of(
-              fragment.getAxisMaps(), [&](Attribute attribute) {
-                auto other = cast<AxisMapAttr>(attribute);
-                return other.getSourceId() == coordinateMapping.getSourceId() &&
-                       other.getSourceAxis() == coordinateMapping.getSourceAxis() &&
-                       other.getDerived() == coordinateMapping.getDerived() &&
-                       other.getDimensionId() == coordinateMapping.getDimensionId();
-              });
-          if (anotherOccurrence)
-            continue;
-          return owner->emitOpError(
-              "access payload and coordinate disagree on logical dimension");
-        }
-        Attribute extent = coordinateType.getShape()[coordinateAxis];
-        if (coordinateExtent && *coordinateExtent != extent)
-          return owner->emitOpError(
-              "access payload axis has ambiguous coordinate extents")
-                 << "; payload_axis=" << payloadAxis
-                 << "; selected_extent=" << *coordinateExtent
-                 << "; coordinate_extent=" << extent
-                 << "; coordinate=" << coordinate;
-        coordinateExtent = extent;
-      }
-    }
-    if (coordinateExtent &&
-        *coordinateExtent != fragment.getShape()[payloadAxis])
-      return owner->emitOpError(
-                 "access payload and coordinate extents disagree")
-             << "; payload_axis=" << payloadAxis
-             << "; payload_extent=" << fragment.getShape()[payloadAxis]
-             << "; coordinate_extent=" << *coordinateExtent;
-  }
-  return success();
-}
-
 LogicalResult verifyContractAxes(Operation *owner, FragmentType lhs,
                                  FragmentType rhs, FragmentType result,
                                  ArrayRef<int64_t> lhsReduction,
@@ -793,7 +708,17 @@ LogicalResult verifyAccessSchema(AccessOpInterface access) {
                                 : resourceElementType(resource);
   if (resourceElement != elementType(payload))
     return access.emitOpError("access resource/value element types disagree");
-  return verifyAccessAxisExtents(access, payload, access.getAccessCoordinates());
+  for (auto [index, coordinate] : llvm::enumerate(access.getAccessCoordinates())) {
+    auto projection = queryAccessCoordinateProjection(access, index);
+    if (!projection.isExact())
+      return access.emitOpError(
+          "access coordinate has no exact projection into its payload lanes")
+             << "; coordinate_slot=" << index
+             << "; resource_axis=" << access.getAccessSourceAxes()[index]
+             << "; coordinate=" << coordinate.getType()
+             << "; payload=" << payload;
+  }
+  return success();
 }
 
 LogicalResult AssumeInBoundsOp::verify() {

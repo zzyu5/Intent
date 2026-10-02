@@ -524,6 +524,19 @@ Footprint、关系闭合、predication、workspace 与 provider 的访问分析�
 CAS 的两个 payload 依次是 expected、desired，谓词 shape 取 payload schema，
 不能把 `{old_value, success}` record 当作单个数据值。
 
+坐标到访问结果或 payload 的投影统一查询 `queryAccessCoordinateProjection(access, slot)`。
+`slot` 是原 coordinate operand 的位置，`source_axes` 另行说明它访问 resource 的哪一轴。
+同一个 SSA range 在两个位置出现，可以构成两个独立的 Cartesian 轴；不能按 SSA 去重，
+也不能先按 resource 轴排序再重推投影。Provider 必须携带原投影完成重排、扩轴与广播。
+Schema 闭合使用 `queryAccessCoordinateAxes` 的已知轴对；它可以返回部分关系，
+只有完整且 extent 相容的 `Exact` projection 才能用于实际访问 lowering。
+Verifier、value relations、Triton pointer/descriptor 与 cuTile native access 共用这两个查询，
+新增访问规则不再各自实现 Cartesian、重复 provenance 或 singleton 轴匹配。
+需要展开实际 coordinate SSA 时，两个 provider 共用
+[ValueMaterialization](include/Intent/Dialect/GPU/Transforms/ValueMaterialization.h) 的
+`materializeAccessCoordinate`，由它按同一投影形成 transpose、显式扩轴和 broadcast。
+它不重放 producer 或重新分块；目标访问选择和 load orientation 仍由 provider 决定。
+
 访问接口不是优化许可：Gather 仍是纯 SSA 读取；atomic 的 ordering、sharing 和目标能力
 独立验证；普通 store 的 payload 投影也不自动适用于 atomic 或 scatter。
 读取共同字段以后，消费者仍需保留自己原有的别名、effect、重放与 predication 资格。
@@ -1067,17 +1080,44 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 
 | Provider | 模块 | 职责 |
 |---|---|---|
-| Triton | [AccessForms.cpp](lib/Target/Triton/Transforms/AccessForms.cpp) | 从当前 access facts 形成 descriptor、block pointer 与 pointer 表示；对齐关系复用 GPU 分析 |
+| Triton | [AccessForms.cpp](lib/Target/Triton/Transforms/AccessForms.cpp) | 从当前 access facts 形成 tensor descriptor 或普通 pointer 访问；对齐与坐标投影复用 GPU 分析 |
 | Triton | [Collectives.cpp](lib/Target/Triton/Transforms/Collectives.cpp) | gather/scatter 的目标表达、scan tail 与原生 reduce/scan callback |
 | Triton | [Supply.cpp](lib/Target/Triton/Transforms/Supply.cpp) | ordered access dependencies、CTA 同步与 load-loop policy |
 | Triton | [Values.cpp](lib/Target/Triton/Transforms/Values.cpp)、[Verify.cpp](lib/Target/Triton/Transforms/Verify.cpp) | 前者形成 contract/value 表示，后者验证完整 Triton surface |
 | cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeAccess.h](lib/Target/CuTile/Transforms/NativeAccess.h) | 收集本次输入、声明 provider 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
 | cuTile | [NativeAccessAnalysis.cpp](lib/Target/CuTile/Transforms/NativeAccessAnalysis.cpp) | 只读坐标、shape 与原生访问资格 |
 | cuTile | [NativeAccess.cpp](lib/Target/CuTile/Transforms/NativeAccess.cpp) | 构造原生 memory/extraction forms 及保持语义的 guards |
+| cuTile | [CollapseArrayViews.cpp](lib/Target/CuTile/Transforms/CollapseArrayViews.cpp) | 从已有原生 tile load 形成具有真实 collapsed layout 的条件视图，保留原访问语义 |
 | cuTile | [ComputeForms.cpp](lib/Target/CuTile/Transforms/ComputeForms.cpp) | 构造 reduce、scan、histogram 和 MMA primitives |
 | cuTile | [Legalize.cpp](lib/Target/CuTile/Transforms/Legalize.cpp) | 共享输入准备、宽索引与循环收尾、完整 surface 验证 |
 
 这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与其携带的 resolved profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 提交替换后才进入后续循环与配置变换。
+
+Triton descriptor 的 offsets 在 pass 中显式形成 `i32` SSA，serializer 只拼写已决定的
+操作数；shape、stride 和 block shape 通过当前 view layout 与 launch-expression 查询取得。
+普通 pointer 的地址仍由 coordinate projection 和实际 resource stride 组成。
+两者不再经过 `BlockLoad`/`BlockStore` 或 `make_block_ptr` 路线。职责对照是本地 Triton
+`lib/Dialect/Triton/Transforms/RewriteTensorDescriptorToPointer.cpp:90–211`：descriptor 与 pointer
+之间的转换在 IR/pass 中表达，而不是留给源码打印时猜测。该 ref 的
+`python/triton/language/core.py:2444–2464` 已移除 block-pointer API；公开安装的 Triton 3.6 仍支持它，
+删除本项目旧路径不等于已完成所有新 SDK 版本的适配。
+
+cuTile `ArrayViewOp` 复用 GPU `ViewType/ViewLayout`，结果直接携带折叠后的 rank、extent
+乘积和 stride；单轴组保留 dimension identity，合并轴不伪造逻辑 dimension。
+`InferTypeOpInterface` 与 verifier 使用同一类型推导；`ViewLikeOpInterface` 将它和
+Triton descriptor 连接到真实 base，使共同 alias analysis 能沿标准接口查询。
+Native load/store/atomic 的 memory effects 指向实际 resource，非 relaxed atomic 另外
+保留跨资源的 ordering effect。新增 provider handle 应提供相应接口，而不是让共同分析
+按 provider 名字或操作名猜别名。
+
+条件 array view 的访问受其 eligibility 控制，full-tile 判断读取当前视图尺寸。
+合法性不再依赖 if 内有几个操作、相邻 reshape 或 else 分支里的另一条 load。
+索引宽度的 tile bounds 分别附在实际参数和 `ArrayViewOp` 上；serializer 导出当前 native
+array、bounds 与 eligibility，[cuTile contract](python/intent/runtime/cutile/contract.py)
+解析后由 [program.py](python/intent/runtime/cutile/program.py) 检查实际绑定的数组。
+未启用的 alias 不参与该数组的范围检查，原始 base 仍保留自己的检查。
+这与 cuTile SDK 的 `_ir/type.py:524–572` 中 `ArrayTy` 用实际 shape、strides 和 index dtype 描述数组一致；
+无需从已改变 rank 的访问反推一份原始参数轴表。
 
 对齐推断中的参数域必须是当前证明可依赖的域。`ResidentWorkers` 会由 provider 配置重绑定，公共关系查询不把它的临时候选当作常量或整除事实；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
 

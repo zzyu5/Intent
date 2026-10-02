@@ -28,6 +28,11 @@ materializeNonOverlappingView(mlir::func::FuncOp kernel, mlir::Value resource);
 mlir::FailureOr<mlir::Value>
 materializeScalarConstant(mlir::OpBuilder &builder, mlir::Location location,
                           mlir::Attribute value, mlir::Type resultType);
+// Expands one coordinate occurrence into the access's payload lane domain.
+// Keeps scalar coordinates scalar and never replays or retile its producer.
+mlir::FailureOr<mlir::Value>
+materializeAccessCoordinate(mlir::OpBuilder &builder, AccessOpInterface access,
+                            unsigned coordinateIndex);
 mlir::FailureOr<mlir::Value>
 projectPhysicalValueToSchema(mlir::OpBuilder &builder, mlir::Location location,
                              mlir::Value value, mlir::Type target,

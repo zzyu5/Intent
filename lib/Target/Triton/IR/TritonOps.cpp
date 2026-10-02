@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -32,61 +33,9 @@ LogicalResult inferCollectiveTypes(MLIRContext *context,
       location, operation.getSources(), operation.getAxis(), scan, results);
 }
 
-LogicalResult verifyBlockAccess(Operation *owner, Value viewValue,
-                                gpu::FragmentType fragment,
-                                ValueRange offsets, ArrayRef<int64_t> blockAxes,
-                                ArrayRef<int64_t> order,
-                                ArrayRef<int64_t> boundaryAxes) {
-  auto view = cast<gpu::ViewType>(viewValue.getType());
-  if (!isa<BlockArgument>(viewValue))
-    return owner->emitOpError(
-        "requires an external-view kernel argument as its pointer base");
-  if (offsets.size() != view.getRank())
-    return owner->emitOpError(
-        "requires one source-ordered offset per external-view axis");
-  if (view.getElementType() != fragment.getElementType() ||
-      blockAxes.size() != fragment.getShape().size())
-    return owner->emitOpError(
-        "block axes and fragment type do not match the external view");
-  llvm::SmallBitVector blocked(view.getRank());
-  for (int64_t axis : blockAxes) {
-    if (axis < 0 || axis >= static_cast<int64_t>(view.getRank()) ||
-        blocked.test(axis))
-      return owner->emitOpError(
-          "block axes must be distinct axes of the external view");
-    blocked.set(axis);
-  }
-  unsigned blockRank = fragment.getShape().size();
-  if (order.size() != blockRank)
-    return owner->emitOpError(
-        "block-pointer order must cover every fragment axis");
-  llvm::SmallBitVector ordered(blockRank);
-  for (int64_t axis : order) {
-    if (axis < 0 || axis >= static_cast<int64_t>(blockRank) ||
-        ordered.test(axis))
-      return owner->emitOpError(
-          "block-pointer order must be a permutation of the fragment axes");
-    ordered.set(axis);
-  }
-  for (unsigned index = 1; index < order.size(); ++index)
-    if (blockAxes[order[index - 1]] <= blockAxes[order[index]])
-      return owner->emitOpError(
-          "block-pointer order must follow descending external-view data order");
-  llvm::SmallBitVector checked(blockRank);
-  for (int64_t axis : boundaryAxes) {
-    if (axis < 0 || axis >= static_cast<int64_t>(blockRank) ||
-        checked.test(axis))
-      return owner->emitOpError(
-          "boundary axes must be distinct block-pointer axes");
-    checked.set(axis);
-  }
-  return success();
-}
-
 LogicalResult verifyDescriptorAccess(Operation *owner, Value descriptorValue,
                                      gpu::FragmentType fragment,
-                                     ValueRange offsets,
-                                     ArrayRef<int64_t> boundaryAxes) {
+                                     ValueRange offsets) {
   auto descriptor = descriptorValue.getDefiningOp<TensorDescriptorOp>();
   if (!descriptor)
     return owner->emitOpError(
@@ -101,18 +50,10 @@ LogicalResult verifyDescriptorAccess(Operation *owner, Value descriptorValue,
         "descriptor offsets and fragment rank must match its declared shape");
   for (auto [extent, blockShape] :
        llvm::zip(fragment.getShape(), descriptor.getBlockShape())) {
-    auto expression = blockShape.getDefiningOp<gpu::PhysicalExprOp>();
-    if (!expression || expression.getExpression() != extent)
+    auto expression = gpu::queryLaunchExpression(blockShape);
+    if (!expression || expression != extent)
       return owner->emitOpError(
           "fragment extents must equal the declared descriptor block shape");
-  }
-  llvm::SmallBitVector checked(fragment.getShape().size());
-  for (int64_t axis : boundaryAxes) {
-    if (axis < 0 || axis >= static_cast<int64_t>(checked.size()) ||
-        checked.test(axis))
-      return owner->emitOpError(
-          "descriptor boundary axes must be distinct fragment axes");
-    checked.set(axis);
   }
   return success();
 }
@@ -320,24 +261,21 @@ LogicalResult TensorDescriptorOp::verify() {
     return emitOpError(
         "tensor descriptor element type must occupy whole bytes");
   for (unsigned axis = 0; axis < rank; ++axis) {
-    auto dimension = getShape()[axis].getDefiningOp<gpu::DimOp>();
-    if (!dimension || dimension.getView() != getBase() ||
-        dimension.getAxis() != axis ||
+    auto dimension = gpu::queryLaunchExpression(getShape()[axis]);
+    if (!dimension || dimension != base.getLayout().getExtents()[axis] ||
         (axis + 1 < rank &&
          !matchesStrideBinding(kernel, base, axis, getStrides()[axis])))
       return emitOpError(
           "descriptor shape and strides must preserve each source axis");
-    auto extent = getBlockShape()[axis].getDefiningOp<gpu::PhysicalExprOp>();
-    if (!extent)
-      return emitOpError("descriptor block shape must use physical expressions");
+    auto extent = gpu::queryLaunchExpression(getBlockShape()[axis]);
+    if (!extent || !gpu::isCompileTimePhysicalExpr(extent))
+      return emitOpError("descriptor block shape must use compile-time physical expressions");
     if (!blocked.test(axis) &&
-        (extent.getExpression().getKind() !=
-             gpu::PhysicalExprKind::Constant ||
-         extent.getExpression().getValue() != 1))
+        gpu::constantPhysicalExpression(extent) != 1)
       return emitOpError("scalar source axes must have descriptor block extent one");
   }
-  auto unitStride = getStrides().back().getDefiningOp<arith::ConstantIndexOp>();
-  if (!unitStride || unitStride.value() != 1)
+  auto unitStride = gpu::queryLaunchExpression(getStrides().back());
+  if (!unitStride || gpu::constantPhysicalExpression(unitStride) != 1)
     return emitOpError("tensor descriptor final stride must be one");
   unsigned choices = 0;
   unsigned allocators = 0;
@@ -353,49 +291,29 @@ LogicalResult TensorDescriptorOp::verify() {
   return success();
 }
 
-LogicalResult BlockLoadOp::verify() {
-  if (getPadding() != "zero")
-    return emitOpError("supports only zero padding for proven tail loads");
-  return verifyBlockAccess(*this, getView(), getResult().getType(),
-                           getOffsets(), getBlockAxes(), getOrder(),
-                           getBoundaryAxes());
-}
-
-void BlockLoadOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
-}
-
-LogicalResult BlockStoreOp::verify() {
-  return verifyBlockAccess(*this, getView(), getValue().getType(),
-                           getOffsets(), getBlockAxes(), getOrder(),
-                           getBoundaryAxes());
-}
-
-void BlockStoreOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
-}
-
 LogicalResult DescriptorLoadOp::verify() {
   return verifyDescriptorAccess(*this, getDescriptor(), getResult().getType(),
-                                getOffsets(), getBoundaryAxes());
+                                getOffsets());
 }
 
 void DescriptorLoadOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getDescriptorMutable());
 }
 
 LogicalResult DescriptorStoreOp::verify() {
+  if (cast<gpu::ViewType>(getDescriptor().getType()).getAccess() == 0)
+    return emitOpError("In-only external view cannot be written");
   return verifyDescriptorAccess(*this, getDescriptor(), getValue().getType(),
-                                getOffsets(), getBoundaryAxes());
+                                getOffsets());
 }
 
 void DescriptorStoreOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getDescriptorMutable());
 }
+
+Value TensorDescriptorOp::getViewSource() { return getBase(); }
 
 LogicalResult SplitOp::verify() {
   auto source = cast<gpu::FragmentType>(getSource().getType());

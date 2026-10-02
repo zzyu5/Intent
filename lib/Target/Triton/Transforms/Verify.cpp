@@ -47,9 +47,16 @@ bool isTritonDataType(Type type) {
 LogicalResult verifyAccess(gpu::AccessOpInterface access) {
   Operation *operation = access.getOperation();
   auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
-  if (!view)
+  auto argument = dyn_cast<BlockArgument>(access.getAccessResource());
+  auto kernel = operation->getParentOfType<func::FuncOp>();
+  if (!view || !argument || !kernel ||
+      argument.getOwner() != &kernel.getBody().front())
     return operation->emitOpError(
-        "Triton pointer access requires a legalized external-view resource");
+        "Triton pointer access requires a kernel-entry view or workspace argument");
+  for (unsigned index = 0; index < access.getAccessCoordinates().size(); ++index)
+    if (!gpu::queryAccessCoordinateProjection(access, index).isExact())
+      return operation->emitOpError(
+          "Triton pointer access requires a complete coordinate projection");
   return success();
 }
 

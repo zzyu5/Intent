@@ -99,7 +99,7 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
       expression.getSymbol(), ArrayAttr::get(kernel.getContext(), operands));
 }
 
-using ArrayIndexBounds = SmallVector<std::pair<BlockArgument, ArrayAttr>>;
+using ArrayIndexBounds = SmallVector<std::pair<Value, ArrayAttr>>;
 
 std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {
   MLIRContext *context = kernel.getContext();
@@ -107,21 +107,22 @@ std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {
       context, gpu::PhysicalExprKind::Constant, 1,
       StringAttr::get(context), ArrayAttr::get(context, {}));
   llvm::DenseMap<Value, SmallVector<Attribute>> bounds;
+  SmallVector<Value> resources;
   for (BlockArgument argument : kernel.getArguments())
-    if (auto view = dyn_cast<gpu::ViewType>(argument.getType()))
+    if (auto view = dyn_cast<gpu::ViewType>(argument.getType())) {
       bounds[argument].assign(view.getRank(), one);
+      resources.push_back(argument);
+    }
+  kernel.walk([&](ArrayViewOp array) {
+    Value resource = array.getResult();
+    bounds[resource].assign(array.getResult().getType().getRank(), one);
+    resources.push_back(resource);
+  });
   bool hasArrayAccess = false;
   auto result = kernel.walk([&](Operation *operation) {
     Value resource;
     gpu::FragmentType tile;
     if (auto load = dyn_cast<TileLoadOp>(operation)) {
-      if (load.getResource().getDefiningOp<ArrayViewOp>()) {
-        auto original = unfoldedArrayLoad(load);
-        if (failed(original) || failed(load.verify()))
-          return WalkResult::interrupt();
-        // The original rectangular padding also bounds its contiguous alias.
-        load = *original;
-      }
       resource = load.getResource();
       tile = load.getResult().getType();
     } else if (auto store = dyn_cast<TileStoreOp>(operation)) {
@@ -141,12 +142,12 @@ std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {
       return WalkResult::advance();
     }
     hasArrayAccess = true;
-    auto argument = dyn_cast<BlockArgument>(resource);
-    if (!argument || argument.getOwner() != &kernel.getBody().front())
+    auto known = bounds.find(resource);
+    if (known == bounds.end())
       return WalkResult::interrupt();
     if (!tile)
       return WalkResult::advance();
-    auto &viewBounds = bounds[argument];
+    auto &viewBounds = known->second;
     if (tile.getShape().size() != viewBounds.size())
       return WalkResult::interrupt();
     for (auto [axis, extent] : llvm::enumerate(tile.getShape())) {
@@ -165,9 +166,8 @@ std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {
   if (result.wasInterrupted() || !hasArrayAccess)
     return {};
   ArrayIndexBounds resultBounds;
-  for (BlockArgument argument : kernel.getArguments())
-    if (auto entry = bounds.find(argument); entry != bounds.end())
-      resultBounds.emplace_back(argument, ArrayAttr::get(context, entry->second));
+  for (Value resource : resources)
+    resultBounds.emplace_back(resource, ArrayAttr::get(context, bounds.find(resource)->second));
   return resultBounds;
 }
 
@@ -189,14 +189,23 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     auto expected = arrayIndexTileBounds(kernel);
     if (!kernel->getAttrOfType<UnitAttr>(arrayIndexTileBoundsAttr) || !expected)
       return kernel.emitError("cuTile array-index bounds do not cover the current native accesses");
-    for (auto [argument, bounds] : *expected)
-      if (kernel.getArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr) != bounds)
-        return kernel.emitError("cuTile array-index bounds do not match their view argument");
+    for (auto [resource, bounds] : *expected)
+      if (getNativeArrayIndexBounds(resource) != bounds)
+        return kernel.emitError("cuTile array-index bounds do not match their current native array");
   }
   for (BlockArgument argument : kernel.getArguments())
     if (kernel.getArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr) &&
         (!kernel->hasAttr(arrayIndexTileBoundsAttr) || !isa<gpu::ViewType>(argument.getType())))
       return kernel.emitError("cuTile array-index bounds require a selected view binding");
+  auto arrayBounds = kernel.walk([&](ArrayViewOp array) {
+    if (array->hasAttr(arrayIndexTileBoundsAttr) && !kernel->hasAttr(arrayIndexTileBoundsAttr)) {
+      array.emitOpError("array-index bounds require a selected native index width binding");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (arrayBounds.wasInterrupted())
+    return failure();
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.size() != 1)
     return kernel.emitError(
@@ -672,8 +681,12 @@ LogicalResult finalizeProgram(ModuleOp module) {
     return failure();
   if (auto bounds = arrayIndexTileBounds(*kernel)) {
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, UnitAttr::get(module.getContext()));
-    for (auto [argument, shape] : *bounds)
-      kernel->setArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr, shape);
+    for (auto [resource, shape] : *bounds) {
+      if (auto argument = dyn_cast<BlockArgument>(resource))
+        kernel->setArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr, shape);
+      else
+        resource.getDefiningOp()->setAttr(arrayIndexTileBoundsAttr, shape);
+    }
   }
   if (failed(finalizeConfigurationRequirements(*kernel)))
     return failure();

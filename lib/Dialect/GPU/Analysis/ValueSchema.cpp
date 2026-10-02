@@ -416,29 +416,20 @@ FailureOr<FragmentType> queryValueSchema(func::FuncOp kernel,
 }
 
 FailureOr<FragmentType> queryAccessResultSchema(
-    func::FuncOp kernel, FragmentType target, ValueRange coordinates) {
+    func::FuncOp kernel, AccessOpInterface access) {
+  auto target = cast<FragmentType>(access.getAccessValueType());
   SmallVector<Attribute> shape(target.getShape().begin(),
                                target.getShape().end());
   SmallVector<bool> refined(shape.size(), false);
   bool changed = false;
   PhysicalProgramAnalysis analysis(kernel);
-  SmallVector<Value> fragmentCoordinates;
-  for (Value coordinate : coordinates)
-    if (isa<FragmentType>(coordinate.getType()))
-      fragmentCoordinates.push_back(coordinate);
-  bool cartesian = fragmentCoordinates.size() == target.getShape().size() &&
-      llvm::all_of(fragmentCoordinates, [](Value coordinate) {
-        return cast<FragmentType>(coordinate.getType()).getShape().size() == 1;
-      });
-  unsigned fragmentSlot = 0;
-  for (Value coordinate : coordinates) {
+  for (auto [coordinateIndex, coordinate] : llvm::enumerate(access.getAccessCoordinates())) {
     auto source = dyn_cast<FragmentType>(coordinate.getType());
     if (!source)
       continue;
-    unsigned coordinateSlot = fragmentSlot++;
-    bool positional = source.getOwner() == target.getOwner() &&
-                      source.getShape() == target.getShape() &&
-                      source.getAxisMaps() == target.getAxisMaps();
+    auto projection = queryAccessCoordinateAxes(access, coordinateIndex);
+    if (projection.state == BroadcastProjectionState::Ambiguous)
+      return failure();
     for (unsigned sourceAxis = 0; sourceAxis < source.getShape().size();
          ++sourceAxis) {
       PhysicalAxisRealizationFact realization =
@@ -459,37 +450,10 @@ FailureOr<FragmentType> queryAccessResultSchema(
            realization.constructionScalarSeed || singleton))
         continue;
 
-      auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
       std::optional<unsigned> targetAxis;
-      if (positional) {
-        // Matching access schemas already identify each occurrence. Refining
-        // repeated-source extents still requires a unique propagation relation.
-        targetAxis = sourceAxis;
-      } else if (cartesian) {
-        auto candidate = cast<AxisMapAttr>(target.getAxisMaps()[coordinateSlot]);
-        if (sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping) &&
-            candidate.getDimensionId() == mapping.getDimensionId())
-          targetAxis = coordinateSlot;
-      }
-      for (auto [axis, attribute] : llvm::enumerate(target.getAxisMaps())) {
-        if ((positional || cartesian) && targetAxis)
-          break;
-        auto candidate = cast<AxisMapAttr>(attribute);
-        if (!(sourceAxisIdentity(candidate) == sourceAxisIdentity(mapping)) ||
-            candidate.getDimensionId() != mapping.getDimensionId())
-          continue;
-        if (targetAxis)
-          return failure();
-        targetAxis = axis;
-      }
-      if (!targetAxis) {
-        PhysicalAxisProjection sourceProjection =
-            queryFragmentAxis(target, sourceAxisIdentity(mapping));
-        if (sourceProjection.isExact())
-          targetAxis = sourceProjection.fragmentAxis;
-        else if (sourceProjection.state == PhysicalFactState::Ambiguous)
-          return failure();
-      }
+      for (auto [axis, from] : llvm::enumerate(projection.targetToSource))
+        if (from && *from == sourceAxis)
+          targetAxis = axis;
       // A coordinate may carry an ownership axis that the indexed result does
       // not expose.  Such an axis is not an access-result extent authority.
       if (!targetAxis)

@@ -7,6 +7,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 
 #define GET_OP_CLASSES
 #include "Intent/Target/CuTile/IR/CuTileOps.h.inc"
@@ -18,8 +19,8 @@ inline constexpr int64_t inferredLoadPolicy = 11;
 inline bool isLegalLoadPolicy(int64_t value) {
   return value >= 1 && value <= inferredLoadPolicy;
 }
-mlir::FailureOr<TileLoadOp> unfoldedArrayLoad(TileLoadOp load);
 mlir::Attribute getCompileTimeScalar(mlir::Value value);
+mlir::ArrayAttr getNativeArrayIndexBounds(mlir::Value resource);
 }
 
 #endif

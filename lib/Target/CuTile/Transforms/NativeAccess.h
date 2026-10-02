@@ -72,6 +72,8 @@ struct NativeTileAccessPlan {
 mlir::FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     gpu::AccessOpInterface access, mlir::func::FuncOp kernel,
     const gpu::PhysicalAccessBoundsFact &accessBounds);
+mlir::FailureOr<unsigned> nativeAccessRangeAxis(gpu::AccessOpInterface access,
+    unsigned coordinateIndex, gpu::MakeRangeOp range);
 mlir::Value uniformScalarFill(mlir::Value fill);
 bool isUnitExtent(mlir::Attribute attribute);
 bool isProvably(mlir::Value value, int64_t expected);
@@ -83,6 +85,8 @@ mlir::scf::ForOp completeAlignedTileLoop(mlir::Value start, mlir::Value extent);
 bool scalarCoordinatesInView(mlir::ValueRange coordinates, gpu::ViewType view,
                              mlir::func::FuncOp kernel);
 mlir::Type withElementType(mlir::Type type, mlir::Type elementType);
+mlir::Value materializeFullTileCondition(mlir::OpBuilder &builder,
+    mlir::Location location, mlir::Value resource, gpu::FragmentType tile);
 bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities);
 mlir::LogicalResult formNativeAccesses(mlir::func::FuncOp kernel,
     const gpu::TuningProfiles &profiles, const NativeProgramInputs &inputs,

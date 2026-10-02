@@ -488,6 +488,30 @@ bool scalarCoordinatesInView(ValueRange coordinates, gpu::ViewType view,
   return true;
 }
 
+FailureOr<unsigned> nativeAccessRangeAxis(gpu::AccessOpInterface access,
+                                         unsigned coordinateIndex,
+                                         gpu::MakeRangeOp range) {
+  auto projection = gpu::queryAccessCoordinateProjection(access, coordinateIndex);
+  auto coordinate = dyn_cast<gpu::FragmentType>(
+      access.getAccessCoordinates()[coordinateIndex].getType());
+  if (!projection.isExact() || !coordinate)
+    return failure();
+  auto ranges = gpu::queryRangeProjections(coordinate, range);
+  if (ranges.size() != 1)
+    return failure();
+  std::optional<unsigned> result;
+  for (auto [targetAxis, sourceAxis] : llvm::enumerate(projection.targetToSource)) {
+    if (!sourceAxis || *sourceAxis != ranges.front().fragmentAxis)
+      continue;
+    if (result)
+      return failure();
+    result = targetAxis;
+  }
+  if (result)
+    return *result;
+  return failure();
+}
+
 FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     gpu::AccessOpInterface access, func::FuncOp kernel,
     const gpu::PhysicalAccessBoundsFact &accessBounds) {
@@ -504,12 +528,15 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
     return failure();
 
   SmallVector<Value> resourceCoordinates(resourceRank);
-  for (auto [coordinate, sourceAxis] : llvm::zip(coordinates, sourceAxes)) {
+  SmallVector<unsigned> coordinateSlots(resourceRank);
+  for (auto [slot, coordinate] : llvm::enumerate(coordinates)) {
+    int64_t sourceAxis = sourceAxes[slot];
     if (sourceAxis < 0 ||
         sourceAxis >= static_cast<int64_t>(resourceRank) ||
         resourceCoordinates[sourceAxis])
       return failure();
     resourceCoordinates[sourceAxis] = coordinate;
+    coordinateSlots[sourceAxis] = slot;
   }
 
   NativeTileAccessPlan plan;
@@ -609,10 +636,9 @@ FailureOr<NativeTileAccessPlan> analyzeNativeTileAccess(
         return lhs.second > rhs.second;
       });
       for (auto [range, stride] : axis.ranges) {
-        auto projections = gpu::queryRangeProjections(computationType, range);
+        auto resultAxis = nativeAccessRangeAxis(access, coordinateSlots[resourceAxis], range);
         auto rangeType = dyn_cast<gpu::FragmentType>(range.getResult().getType());
-        if (projections.size() != 1 ||
-            !assignComputationAxis(resourceAxis, projections.front().fragmentAxis) ||
+        if (failed(resultAxis) || !assignComputationAxis(resourceAxis, *resultAxis) ||
             !gpu::isUnitStepRange(range) || !rangeType ||
             rangeType.getShape().size() != 1 ||
             rangeType.getShape()[0] !=

@@ -57,7 +57,6 @@ public:
       addNative<MapElementwiseOp>(result);
       addNative<SplitOp>(result);
       addNative<DescriptorLoadOp>(result);
-      addNative<BlockLoadOp>(result);
       addNative<gpu::LoadOp>(result);
       addNative<gpu::GatherOp>(result);
       addNative<gpu::ContractOp>(result);
@@ -70,7 +69,6 @@ public:
       addNative<gpu::AtomicRMWOp>(result);
       addNative<gpu::AtomicCompareExchangeOp>(result);
       addNative<DescriptorStoreOp>(result);
-      addNative<BlockStoreOp>(result);
       addNative<gpu::StoreOp>(result);
       return result;
     }();
@@ -323,23 +321,7 @@ private:
   void emitTyped(DescriptorLoadOp load) {
       assign(load.getResult(),
              valueString(load.getDescriptor()) + ".load(" +
-                 descriptorOffsets(load.getOffsets()) + ")");
-      return;
-      }
-
-  void emitTyped(BlockLoadOp load) {
-      auto fragment = load.getResult().getType();
-      std::string call = "tl.load(" +
-                         blockPointer(load.getView(), load.getOffsets(),
-                                      load.getBlockAxes(), load.getOrder(),
-                                      fragment);
-      if (!load.getBoundaryAxes().empty())
-        call += ", boundary_check=" + axisTuple(load.getBoundaryAxes()) +
-                ", padding_option=\"" + load.getPadding().str() + "\"";
-      call += ")";
-      if (fragment.getElementType().isInteger(1))
-        call = "tl.cast(" + call + ", tl.int1)";
-      assign(load.getResult(), call);
+                 tuple(load.getOffsets()) + ")");
       return;
       }
 
@@ -535,26 +517,9 @@ private:
   void emitTyped(DescriptorStoreOp store) {
       auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
       line(valueString(store.getDescriptor()) + ".store(" +
-           descriptorOffsets(store.getOffsets()) +
+           tuple(store.getOffsets()) +
            ", tl.cast(" + valueString(store.getValue()) + ", " +
            pythonType(fragment.getElementType()) + "))");
-      return;
-      }
-
-  void emitTyped(BlockStoreOp store) {
-      auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
-      std::string storageType = fragment.getElementType().isInteger(1)
-                                    ? "tl.int8"
-                                    : pythonType(fragment.getElementType());
-      std::string call =
-          "tl.store(" +
-          blockPointer(store.getView(), store.getOffsets(),
-                       store.getBlockAxes(), store.getOrder(), fragment) +
-          ", tl.cast(" + valueString(store.getValue()) + ", " +
-          storageType + ")";
-      if (!store.getBoundaryAxes().empty())
-        call += ", boundary_check=" + axisTuple(store.getBoundaryAxes());
-      line(call + ")");
       return;
       }
 
@@ -728,22 +693,12 @@ private:
     llvm_unreachable("unhandled atomic sharing domain");
   }
 
-  std::string broadcastValue(Value value, gpu::FragmentType target,
-                             std::optional<unsigned> coordinateAxis = std::nullopt) {
+  std::string projectedValue(Value value, gpu::FragmentType target,
+                             const gpu::BroadcastProjection &projection) {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
     if (!source)
       return "tl.full(" + fragmentShape(target) + ", " + valueString(value) +
              ", " + pythonType(elementType(value.getType())) + ")";
-    if (source == target)
-      return valueString(value);
-    gpu::BroadcastProjection projection;
-    if (coordinateAxis) {
-      projection.state = gpu::BroadcastProjectionState::Exact;
-      projection.targetToSource.resize(target.getShape().size());
-      projection.targetToSource[*coordinateAxis] = 0;
-    } else {
-      projection = gpu::queryBroadcastProjection(source, target);
-    }
     if (!projection.isExact()) {
       kernel.emitError("Triton broadcast lost its shared axis projection")
           << "; source=" << source << "; target=" << target
@@ -751,13 +706,23 @@ private:
       failed = true;
       return {};
     }
+    SmallVector<int64_t> order;
+    for (std::optional<unsigned> sourceAxis : projection.targetToSource)
+      if (sourceAxis)
+        order.push_back(*sourceAxis);
+    bool identity = llvm::all_of(llvm::enumerate(order), [](auto item) {
+      return item.index() == static_cast<unsigned>(item.value());
+    });
+    std::string input = identity ? valueString(value) : permute(value, order);
+    if (source == target && identity)
+      return input;
     if (source.getShape().size() == target.getShape().size())
-      return "tl.broadcast_to(" + valueString(value) + ", " +
+      return "tl.broadcast_to(" + input + ", " +
              fragmentShape(target) + ")";
     SmallVector<std::string> selectors;
     for (std::optional<unsigned> sourceIndex : projection.targetToSource)
       selectors.push_back(sourceIndex ? ":" : "None");
-    std::string result = valueString(value) + "[";
+    std::string result = input + "[";
     for (auto [index, selector] : llvm::enumerate(selectors)) {
       if (index)
         result += ", ";
@@ -766,68 +731,10 @@ private:
     return "tl.broadcast_to(" + result + "], " + fragmentShape(target) + ")";
   }
 
-  std::string descriptorOffsets(ValueRange offsets) {
-    SmallVector<std::string> expressions;
-    for (Value offset : offsets)
-      expressions.push_back("tl.cast(" + valueString(offset) + ", tl.int32)");
-    return stringList(expressions);
-  }
-
-  std::string blockPointer(Value viewValue, ValueRange offsets,
-                           ArrayRef<int64_t> blockAxes,
-                           ArrayRef<int64_t> order,
-                           gpu::FragmentType fragment) {
-    auto view = cast<gpu::ViewType>(viewValue.getType());
-    auto strides = view.getLayout().getStrides();
-    auto strideString = [&](int64_t axis) -> std::string {
-      return expressionString(cast<gpu::PhysicalExprAttr>(strides[axis]));
-    };
-
-    SmallVector<std::string> baseOffsets;
-    SmallVector<std::string> offsetLimits(view.getRank());
-    for (auto [blockAxis, viewAxis] : llvm::enumerate(blockAxes))
-      offsetLimits[viewAxis] = "(2147483648 - " +
-          expressionString(cast<gpu::PhysicalExprAttr>(
-                               fragment.getShape()[blockAxis])) + ")";
-    std::string base = valueString(viewValue);
-    for (int64_t viewAxis = 0;
-         viewAxis < static_cast<int64_t>(view.getRank()); ++viewAxis) {
-      std::string offset = "tl.cast(" + valueString(offsets[viewAxis]) +
-                           ", tl.int64)";
-      // Keep ordinary coordinates in the native i32 offset. Only rebase when
-      // the end of the block would exceed that range, preserving a fixed view
-      // shape for native loop-bound and memory-pipeline optimization.
-      if (!offsetLimits[viewAxis].empty())
-        offset = "(tl.maximum(" + offset + ", " + offsetLimits[viewAxis] +
-                 ") - " + offsetLimits[viewAxis] + ")";
-      baseOffsets.push_back(offset);
-      base += " + " + offset + " * " + strideString(viewAxis);
-    }
-
-    SmallVector<std::string> shape;
-    SmallVector<std::string> blockStrides;
-    SmallVector<std::string> offsetExpressions;
-    for (int64_t viewAxis : blockAxes) {
-      shape.push_back(
-          "tl.maximum((" +
-          expressionString(cast<gpu::PhysicalExprAttr>(
-                               view.getLayout().getExtents()[viewAxis])) +
-          " - " + baseOffsets[viewAxis] + "), 0)");
-      blockStrides.push_back(strideString(viewAxis));
-      // A block has at most 2^20 lanes, so an offset below INT32_MIN is
-      // entirely padding. Clamping it preserves that fact without wrapping.
-      offsetExpressions.push_back(
-          "tl.cast(tl.maximum(tl.minimum(tl.cast(" +
-          valueString(offsets[viewAxis]) +
-          ", tl.int64), " + offsetLimits[viewAxis] +
-          "), -2147483648), tl.int32)");
-    }
-    return "tl.make_block_ptr(base=(" + base + ")" +
-           ", shape=" + stringTuple(shape) +
-           ", strides=" + stringTuple(blockStrides) +
-           ", offsets=" + stringTuple(offsetExpressions) +
-           ", block_shape=" + fragmentShape(fragment) +
-           ", order=" + axisTuple(order) + ")";
+  std::string broadcastValue(Value value, gpu::FragmentType target) override {
+    auto source = dyn_cast<gpu::FragmentType>(value.getType());
+    return projectedValue(value, target, source
+        ? gpu::queryBroadcastProjection(source, target) : gpu::BroadcastProjection());
   }
 
   std::string pointer(gpu::AccessOpInterface access) {
@@ -843,37 +750,13 @@ private:
     auto view = cast<gpu::ViewType>(resource.getType());
     auto strides = view.getLayout().getStrides();
     auto fragment = dyn_cast<gpu::FragmentType>(valueType);
-    SmallVector<Value> fragmentCoordinates;
-    for (Value coordinate : coordinates)
-      if (isa<gpu::FragmentType>(coordinate.getType()))
-        fragmentCoordinates.push_back(coordinate);
-    bool cartesian = fragment &&
-        fragmentCoordinates.size() == fragment.getShape().size() &&
-        llvm::all_of(fragmentCoordinates, [](Value coordinate) {
-          return cast<gpu::FragmentType>(coordinate.getType()).getShape().size() == 1;
-        });
-    unsigned coordinateSlot = 0;
     std::string result = values.lookup(resource);
     for (auto [axis, coordinate] : llvm::enumerate(coordinates)) {
       std::string stride = expressionString(
           cast<gpu::PhysicalExprAttr>(strides[sourceAxes[axis]]));
-      std::optional<unsigned> coordinateAxis;
-      if (cartesian && isa<gpu::FragmentType>(coordinate.getType())) {
-        auto source = cast<gpu::FragmentType>(coordinate.getType());
-        auto sourceMap = cast<gpu::AxisMapAttr>(source.getAxisMaps()[0]);
-        auto targetMap = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[coordinateSlot]);
-        // A Cartesian coordinate slot already defines its result axis, even
-        // when two slots carry the same logical source provenance.
-        if (sourceMap.getSourceId() == targetMap.getSourceId() &&
-            sourceMap.getSourceAxis() == targetMap.getSourceAxis() &&
-            sourceMap.getDerived() == targetMap.getDerived() &&
-            sourceMap.getDimensionId() == targetMap.getDimensionId() &&
-            source.getShape()[0] == fragment.getShape()[coordinateSlot])
-          coordinateAxis = coordinateSlot;
-        ++coordinateSlot;
-      }
       std::string coordinateExpression = fragment
-          ? broadcastValue(coordinate, fragment, coordinateAxis)
+          ? projectedValue(coordinate, fragment,
+                           gpu::queryAccessCoordinateProjection(access, axis))
           : valueString(coordinate);
       result += " + (" + coordinateExpression + ") * " + stride;
     }
@@ -891,40 +774,6 @@ private:
   }
 
   FailureOr<llvm::json::Value> descriptorHostValue(Value value) {
-    if (auto dimension = value.getDefiningOp<gpu::DimOp>()) {
-      auto view = cast<gpu::ViewType>(dimension.getView().getType());
-      return gpu::serializeExpression(cast<gpu::PhysicalExprAttr>(
-          view.getLayout().getExtents()[dimension.getAxis()]));
-    }
-    if (auto physical = value.getDefiningOp<gpu::PhysicalExprOp>())
-      return gpu::serializeExpression(physical.getExpression());
-    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
-      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-        return llvm::json::Value(llvm::json::Object{
-            {"kind", "constant"}, {"value", integer.getInt()}});
-    }
-    if (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-      StringRef kind;
-      switch (binary.getOperatorKind()) {
-      case BinaryOperator::Add: kind = "add"; break;
-      case BinaryOperator::Subtract: kind = "subtract"; break;
-      case BinaryOperator::Multiply: kind = "multiply"; break;
-      case BinaryOperator::FloorDivide: kind = "floor_div"; break;
-      case BinaryOperator::Maximum: kind = "max"; break;
-      case BinaryOperator::Minimum: kind = "min"; break;
-      default: break;
-      }
-      if (!kind.empty()) {
-        auto lhs = descriptorHostValue(binary.getLhs());
-        auto rhs = descriptorHostValue(binary.getRhs());
-        if (mlir::failed(lhs) || mlir::failed(rhs)) return failure();
-        llvm::json::Array operands;
-        operands.push_back(std::move(*lhs));
-        operands.push_back(std::move(*rhs));
-        return llvm::json::Value(llvm::json::Object{
-            {"kind", kind}, {"operands", std::move(operands)}});
-      }
-    }
     if (auto expression = gpu::queryLaunchExpression(value))
       return gpu::serializeExpression(expression);
     return kernel.emitError("Triton descriptor has no host-evaluable value binding");

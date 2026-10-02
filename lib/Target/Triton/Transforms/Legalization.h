@@ -20,8 +20,7 @@ inline constexpr llvm::StringLiteral legalizedAttr = "intent_gpu.triton.legalize
 // AccessForms owns source representations of already-decided GPU accesses.
 mlir::FailureOr<TensorDescriptorChoiceOp> materializeTensorDescriptorForms(
     mlir::func::FuncOp kernel, llvm::ArrayRef<TritonLocalOptions> localOptions);
-mlir::LogicalResult materializeBlockPointerForms(mlir::func::FuncOp kernel);
-void orientPointerLoads(mlir::func::FuncOp kernel);
+mlir::LogicalResult orientPointerLoads(mlir::func::FuncOp kernel);
 
 // Collectives owns local gather/scatter and native callback legalization.
 void foldIntegerScanTails(mlir::func::FuncOp kernel);

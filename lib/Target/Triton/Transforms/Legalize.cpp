@@ -52,10 +52,10 @@ LogicalResult formTritonProgram(ModuleOp module) {
   detail::selectOrderedLoadUnrolling(*kernel);
   auto descriptors =
       detail::materializeTensorDescriptorForms(*kernel, *localOptions);
-  if (failed(descriptors) ||
-      failed(detail::materializeBlockPointerForms(*kernel)))
+  if (failed(descriptors))
     return failure();
-  detail::orientPointerLoads(*kernel);
+  if (failed(detail::orientPointerLoads(*kernel)))
+    return failure();
   if (failed(materializeLegalConfigs(*kernel, *descriptors, *localOptions)))
     return failure();
   detail::selectContractForms(*kernel);

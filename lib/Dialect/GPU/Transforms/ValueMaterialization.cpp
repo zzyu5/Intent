@@ -95,6 +95,81 @@ FailureOr<Value> zeroValue(OpBuilder &builder, Location location, Type type) {
 
 } // namespace
 
+FailureOr<Value> materializeAccessCoordinate(OpBuilder &builder,
+                                             AccessOpInterface access,
+                                             unsigned coordinateIndex) {
+  auto projection = queryAccessCoordinateProjection(access, coordinateIndex);
+  if (!projection.isExact())
+    return access.emitOpError("coordinate has no exact access operand projection");
+  Value value = access.getAccessCoordinates()[coordinateIndex];
+  auto source = dyn_cast<FragmentType>(value.getType());
+  if (!source)
+    return value;
+  auto domain = cast<FragmentType>(access.getAccessValueType());
+  auto target = FragmentType::get(
+      domain.getContext(), source.getElementType(), domain.getShape(),
+      domain.getAxisMaps(), domain.getValidity(), domain.getOwner());
+  if (source == target)
+    return value;
+
+  Attribute origin;
+  if (Operation *producer = value.getDefiningOp())
+    origin = producer->getAttr(originAttr);
+  auto rememberOrigin = [&](Operation *operation) {
+    if (origin)
+      operation->setAttr(originAttr, origin);
+  };
+  SmallVector<int64_t> order;
+  SmallVector<Attribute> shape, groups;
+  auto one = PhysicalExprAttr::get(
+      domain.getContext(), PhysicalExprKind::Constant, 1,
+      builder.getStringAttr(""), builder.getArrayAttr({}));
+  for (auto [axis, sourceAxis] : llvm::enumerate(projection.targetToSource)) {
+    SmallVector<int64_t> sources;
+    if (sourceAxis) {
+      sources.push_back(order.size());
+      order.push_back(*sourceAxis);
+    }
+    shape.push_back(sourceAxis ? source.getShape()[*sourceAxis] : Attribute(one));
+    groups.push_back(ReshapeGroupAttr::get(
+        domain.getContext(), builder.getDenseI64ArrayAttr(sources),
+        builder.getDenseI64ArrayAttr({static_cast<int64_t>(axis)})));
+  }
+  if (!llvm::all_of(llvm::enumerate(order), [](auto item) {
+        return item.index() == static_cast<unsigned>(item.value());
+      })) {
+    SmallVector<Attribute> permutedShape, mappings;
+    for (auto [axis, from] : llvm::enumerate(order)) {
+      permutedShape.push_back(source.getShape()[from]);
+      auto mapping = cast<AxisMapAttr>(source.getAxisMaps()[from]);
+      mappings.push_back(AxisMapAttr::get(
+          domain.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+          mapping.getDimensionId(), axis, mapping.getDerived()));
+    }
+    auto type = FragmentType::get(
+        domain.getContext(), source.getElementType(), builder.getArrayAttr(permutedShape),
+        builder.getArrayAttr(mappings), source.getValidity(), source.getOwner());
+    auto transpose = builder.create<TransposeOp>(access.getLoc(), type, value, order);
+    rememberOrigin(transpose);
+    value = transpose.getResult();
+  }
+  auto expanded = FragmentType::get(
+      domain.getContext(), source.getElementType(), builder.getArrayAttr(shape),
+      domain.getAxisMaps(), domain.getValidity(), domain.getOwner());
+  if (value.getType() != expanded) {
+    auto reshape = builder.create<ReshapeOp>(
+        access.getLoc(), expanded, value, builder.getArrayAttr(groups));
+    rememberOrigin(reshape);
+    value = reshape.getResult();
+  }
+  if (expanded != target) {
+    auto broadcast = builder.create<BroadcastOp>(access.getLoc(), target, value);
+    rememberOrigin(broadcast);
+    value = broadcast.getResult();
+  }
+  return value;
+}
+
 LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
   if (!target.empty())
     return target.getParentOp()->emitOpError(

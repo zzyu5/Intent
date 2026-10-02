@@ -18,10 +18,17 @@ class ArrayView:
 
 
 @dataclass(frozen=True, slots=True)
+class ArrayIndexBound:
+    array: str
+    bounds: tuple[Expression, ...]
+    eligible: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CuTileFacts:
     kernel: str
     narrow_kernel: str | None
-    index_tile_bounds: tuple[tuple[Expression, ...], ...] | None
+    index_tile_bounds: tuple[ArrayIndexBound, ...] | None
     array_views: tuple[ArrayView, ...]
     compiler_hints: tuple[tuple[str, str], ...]
     inferred_worker_warps: int
@@ -43,14 +50,28 @@ class CuTileFacts:
         narrow = optional_name(entry["narrow_kernel"], "cuTile narrow kernel")
         bounds = entry["index_tile_bounds"]
         if bounds is not None:
-            bounds = tuple(read_expressions(value) for value in sequence_field(bounds, "cuTile index bounds"))
-            if len(bounds) != len(interface.views):
-                raise ValueError("cuTile index bounds must cover the physical view arguments")
-            for view, extents in zip(interface.views, bounds):
-                rank = len(view.parameter.shape) if isinstance(view, PublicArgument) else len(view.shape)
-                if len(extents) != rank:
-                    raise ValueError("cuTile index bounds must cover every view axis")
+            expected = {
+                view.kernel_name: (len(view.parameter.shape) if isinstance(view, PublicArgument)
+                                   else len(view.shape), None)
+                for view in interface.views
+            }
+            for array in arrays:
+                if array.name in expected:
+                    raise ValueError("cuTile array aliases require distinct native names")
+                expected[array.name] = (len(array.group_ends), array.eligible)
+            parsed = []
+            for value in sequence_field(bounds, "cuTile index bounds"):
+                value = object_field(value, "cuTile array index bound")
+                array = name_field(value["array"], "bounded native array")
+                eligible = optional_name(value["eligible"], "bounded array eligibility")
+                extents = read_expressions(sequence_field(value["bounds"], "array tile bounds"))
+                if array not in expected or expected.pop(array) != (len(extents), eligible):
+                    raise ValueError("cuTile index bounds must identify each native array and its axes")
                 require_references(extents, interface)
+                parsed.append(ArrayIndexBound(array, extents, eligible))
+            if expected:
+                raise ValueError("cuTile index bounds must cover every native array")
+            bounds = tuple(parsed)
         if (bounds is None) != (narrow is None):
             raise ValueError("cuTile narrow kernel requires its index-bound recipes")
         hints = object_field(entry["compiler_hints"], "cuTile compiler hints")

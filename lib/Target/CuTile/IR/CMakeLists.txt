@@ -13,5 +13,6 @@ add_mlir_dialect_library(MLIRIntentCuTileDialect
   MLIRIntentGPUAnalysis
   MLIRSideEffectInterfaces
   MLIRInferTypeOpInterface
+  MLIRViewLikeInterface
   MLIRSupport
 )

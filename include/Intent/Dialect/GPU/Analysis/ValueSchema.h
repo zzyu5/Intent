@@ -39,8 +39,7 @@ mlir::FailureOr<FragmentType> queryValueSchema(
     mlir::func::FuncOp kernel, FragmentType target,
     mlir::ValueRange contributors);
 mlir::FailureOr<FragmentType> queryAccessResultSchema(
-    mlir::func::FuncOp kernel, FragmentType target,
-    mlir::ValueRange coordinates);
+    mlir::func::FuncOp kernel, AccessOpInterface access);
 mlir::FailureOr<uint64_t> blockedDimension(mlir::Attribute attribute);
 bool hasBlockedDimension(mlir::func::FuncOp kernel, uint64_t dimension);
 

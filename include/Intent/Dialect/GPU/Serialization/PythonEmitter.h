@@ -8,7 +8,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
-#include <optional>
 
 namespace intent::gpu {
 
@@ -57,8 +56,8 @@ public:
   virtual std::string join(JoinOp operation) = 0;
   virtual std::string unaryExpression(UnaryOp operation) = 0;
   virtual std::string binaryExpression(BinaryOp operation) = 0;
-  virtual std::string broadcastValue(mlir::Value value, FragmentType result,
-                         std::optional<unsigned> coordinateAxis = std::nullopt) = 0;
+  virtual std::string broadcastValue(mlir::Value value,
+                                     FragmentType result) = 0;
   virtual std::string controlValueString(mlir::Value value);
   virtual std::string loopInitialValue(mlir::Value value);
   virtual std::string forRange(mlir::scf::ForOp operation) = 0;

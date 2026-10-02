@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
+#include "NativeAccess.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -95,8 +96,7 @@ LogicalResult collapseArrayViews(ModuleOp module) {
       OpBuilder declarations(&kernel.getBody().front(),
                              kernel.getBody().front().begin());
       array = declarations.create<ArrayViewOp>(
-          load.getLoc(), load.getResource().getType(), declarations.getI1Type(),
-          load.getResource(), groups);
+          load.getLoc(), load.getResource(), groups);
       views.push_back(array);
     }
     OpBuilder builder(load);
@@ -110,9 +110,12 @@ LogicalResult collapseArrayViews(ModuleOp module) {
       indices.push_back(load.getTileIndices()[begin]);
       begin = end;
     }
+    Value fullTiles = load.getFullTiles()
+        ? materializeFullTileCondition(folded, load.getLoc(), array.getResult(), tile)
+        : Value();
     auto native = folded.create<TileLoadOp>(
         load.getLoc(), tile, array.getResult(), load.getAllowTma(), indices,
-        load.getLatencyPolicy(), load.getFullTiles());
+        load.getLatencyPolicy(), fullTiles);
     auto restored = folded.create<gpu::ReshapeOp>(
         load.getLoc(), load.getResult().getType(), native.getResult(),
         *reassociation);
