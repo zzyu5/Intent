@@ -100,6 +100,19 @@ Weft's vector width and worker count above are an example of explicit constructi
 
 ## Build the package directly
 
+The distribution recipe for Ubuntu 22.04, Linux x86-64, CPython 3.10–3.12 and the LLVM/MLIR 20 SDK is:
+
+```bash
+python3 environment/build.py \
+  --output-dir /path/outside-checkout/dist \
+  --work-dir /path/outside-checkout/build \
+  --jobs 8
+```
+
+Use a new work directory and a separate output directory. The command builds the source distribution first, builds the wheel from that archive, and installs it into an isolated environment outside the checkout. It then runs the existing base doctor, API discovery, both MCP entry points, the original softmax definition's KIR compilation, and standard IR optimization. It needs no GPU or provider SDK. The output directory receives the source archive and wheel after these steps complete; the work directory retains the installed environment, command output and compiler artifacts, including on failure.
+
+This recipe fixes the native build route to GCC, Ninja and Release mode and uses the existing CMake runtime bundling rules. It accepts `--mlir-dir`, `--llvm-dir`, `--runtime-notices`, and the paired `--weft-source-dir` / `--weft-binary-dir` options. It does not publish the package or assign a manylinux tag. System ABI compatibility still follows the selected build SDK and platform; the recipe is not a claim of byte-identical builds. Other environments can use the manual source build below.
+
 Once the SDK and selected backend dependencies are installed:
 
 ```bash

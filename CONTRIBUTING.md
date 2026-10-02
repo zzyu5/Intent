@@ -774,6 +774,23 @@ INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
 
 这个调用示例用于理解公开入口；修改具体能力时，选择实际受影响的既有生产程序及其所属实验组入口，保留原输入、容差和完整 callable 计时合同。
 
+可安装分发使用 [environment/build.py](environment/build.py)，基线为 Ubuntu 22.04
+x86-64、CPython 3.10–3.12 和 LLVM/MLIR 20。它先生成 sdist，再从该归档构建 wheel，
+沿现有 CMake `IntentRuntime` 安装规则收集编译器、优化器、profiles、手册和依赖 notices：
+
+```bash
+python3 environment/build.py --output-dir /path/to/distributions \
+  --work-dir /path/to/new-build-workspace --jobs 8
+```
+
+输出和工作目录必须在 checkout 外；工作目录为本次新建，已有分发文件不覆盖。
+可显式选择 `--mlir-dir`、`--llvm-dir`、`--runtime-notices`，或同时提供 Weft 的
+`--weft-source-dir` 与 `--weft-binary-dir`。构建后在隔离环境安装 wheel，清除源码和
+SDK loader 路径，调用已有 doctor、公开声明、MCP 服务启动与 EOF 退出，以及归档中原 softmax
+定义的 KIR 编译和标准 MLIR 优化入口；失败保留工作目录与诊断。它不启动 kernel，
+也不证明 provider 的数值与性能。此 recipe 不承诺 manylinux 或逐字节一致；
+其他平台仍可手工源构建，实际生产运行继续使用对应实验组的原入口。
+
 普通用户可先运行 `intent describe --json` 查询实际公开 API，`intent doctor --json`
 检查基础 compiler/KIR；选择后端后再用 `--target triton` 等检查相应包、SDK 与设备。
 `intent compile path/to/program.py:kernel --target triton --json` 返回真实阶段与编译产物，
