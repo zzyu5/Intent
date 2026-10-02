@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -2445,31 +2446,16 @@ bool sameLogicalRange(MakeRangeOp lhs, MakeRangeOp rhs) {
 bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
   if (!load || !insertionAnchor)
     return false;
+  ResourceAliasAnalysis aliases;
   auto preservesRead = [&](Operation *operation) {
     return !operation->walk([&](Operation *nested) {
       if (isa<LoadOp, GatherOp, scf::ForOp, scf::IfOp, scf::WhileOp>(nested) ||
           isMemoryEffectFree(nested))
         return WalkResult::advance();
       Value written = accessResource(nested);
-      if (written && written != load.getResource()) {
-        auto readBuffer = dyn_cast<BufferType>(load.getResource().getType());
-        auto writtenBuffer = dyn_cast<BufferType>(written.getType());
-        auto readView = dyn_cast<ViewType>(load.getResource().getType());
-        auto writtenView = dyn_cast<ViewType>(written.getType());
-        bool privateAllocation =
-            (readBuffer && isa<ViewType>(written.getType())) ||
-            (writtenBuffer && isa<ViewType>(load.getResource().getType())) ||
-            (readBuffer && writtenBuffer &&
-             readBuffer.getInstance() != writtenBuffer.getInstance());
-        auto publicRead = getPublicView(load.getResource());
-        auto publicWrite = getPublicView(written);
-        bool disjointViews = readView && writtenView &&
-            (isInvocationWorkspace(load.getResource()) || isInvocationWorkspace(written) ||
-             (publicRead && publicRead.getConstraints().getNoalias()) ||
-             (publicWrite && publicWrite.getConstraints().getNoalias()));
-        if ((privateAllocation || disjointViews) && isa<StoreOp>(nested))
-          return WalkResult::advance();
-      }
+      if (written && isa<StoreOp>(nested) &&
+          aliases.alias(load.getResource(), written).isNo())
+        return WalkResult::advance();
       return WalkResult::interrupt();
     }).wasInterrupted();
   };
@@ -4851,8 +4837,10 @@ bool haveDisjointPrivateBufferAccesses(Operation *lhs, Operation *rhs) {
   if (!buffer || buffer.getScope().getValue() != BufferScope::ProgramPrivate ||
       buffer.isInvocationWorkspace() || !left.resource.getDefiningOp<BufferOp>())
     return false;
-  if (left.resource != right.resource)
-    return true;
+  if (left.resource != right.resource) {
+    ResourceAliasAnalysis aliases;
+    return aliases.alias(left.resource, right.resource).isNo();
+  }
 
   auto scalar = [](Value value) {
     value = stripBroadcast(value);

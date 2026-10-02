@@ -2,6 +2,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -16,19 +17,6 @@
 using namespace mlir;
 
 namespace intent::triton::detail {
-
-bool viewsMayAlias(Value lhs, Value rhs) {
-  if (lhs == rhs)
-    return true;
-  if (gpu::isInvocationWorkspace(lhs) || gpu::isInvocationWorkspace(rhs))
-    return false;
-  auto left = gpu::getPublicView(lhs);
-  auto right = gpu::getPublicView(rhs);
-  // Compiler-private workspaces own distinct allocations. External views use
-  // the author contract; their current pointer relation is checked at launch.
-  return !(left && left.getConstraints().getNoalias()) &&
-         !(right && right.getConstraints().getNoalias());
-}
 
 using ViewAccessModes = llvm::DenseMap<Value, unsigned>;
 
@@ -46,10 +34,12 @@ ViewAccessModes readViewAccessModes(Operation *owner) {
 }
 
 bool hasOrderedViewDependencies(func::FuncOp kernel) {
+  gpu::ResourceAliasAnalysis aliases;
   auto modes = readViewAccessModes(kernel);
   return llvm::any_of(modes, [&](auto read) {
     return (read.second & 1) && llvm::any_of(modes, [&](auto write) {
-      return (write.second & 2) && viewsMayAlias(read.first, write.first);
+      return (write.second & 2) &&
+             !aliases.alias(read.first, write.first).isNo();
     });
   });
 }
@@ -57,12 +47,14 @@ bool hasOrderedViewDependencies(func::FuncOp kernel) {
 LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   if (!hasOrderedViewDependencies(kernel))
     return success();
+  gpu::ResourceAliasAnalysis aliases;
   using Accesses = ViewAccessModes;
   auto accesses = readViewAccessModes;
-  auto conflicts = [](const Accesses &pending, const Accesses &current) {
+  auto conflicts = [&](const Accesses &pending, const Accesses &current) {
     for (auto [resource, mode] : pending)
       for (auto [other, otherMode] : current)
-        if (((mode | otherMode) & 2) && viewsMayAlias(resource, other))
+        if (((mode | otherMode) & 2) &&
+            !aliases.alias(resource, other).isNo())
           return true;
     return false;
   };
@@ -182,7 +174,7 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
     };
     for (auto [resource, mode] : pending)
       for (auto [other, otherMode] : current) {
-        if (!((mode | otherMode) & 2) || !viewsMayAlias(resource, other))
+        if (!((mode | otherMode) & 2) || aliases.alias(resource, other).isNo())
           continue;
         if (resource == other)
           if (auto proof = disjointIterations.find(resource);

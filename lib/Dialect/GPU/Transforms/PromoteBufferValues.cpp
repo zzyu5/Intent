@@ -364,8 +364,9 @@ static LogicalResult promoteBufferValuesImpl(ModuleOp module) {
     return failure();
   auto capabilities = (*kernel)->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   SmallVector<BufferOp> buffers;
-  for (BufferOp buffer : (*kernel).getOps<BufferOp>())
-    buffers.push_back(buffer);
+  // Allocations belong to their execution group or lexical control scope.
+  // Promotion starts after the dominating initialization in that same block.
+  kernel->walk([&](BufferOp buffer) { buffers.push_back(buffer); });
   llvm::DenseSet<int64_t> removedEffects;
   bool changed = false;
   // Limit promoted words by the maximum CTA thread count. Native lowering still
