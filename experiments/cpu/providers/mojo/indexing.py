@@ -53,7 +53,7 @@ def scaled_index_add(context):
     scaling = torch.randn((4096,), dtype=torch.float16)
     report_stage("generated_compilation")
     artifact = intent.compile(scaled_index_add_unique, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

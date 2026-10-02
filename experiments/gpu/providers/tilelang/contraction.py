@@ -337,6 +337,7 @@ def grouped_gemm_backward(context: Context) -> PreparedComparison:
         ragged_grouped_gemm_backward_weight,
         target=context.target,
         compiler=context.compiler,
+        options=context.compile_options,
     )
     generated = PreparedLaunch(
         launch=prepare_kernel_call(

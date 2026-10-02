@@ -110,13 +110,13 @@ def causal_conv1d_backward(context):
         causal_conv1d_backward_partials,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     reduce = intent.compile(
         causal_conv1d_backward_reduce,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
@@ -161,9 +161,9 @@ def varlen_conv1d(context):
     bias = torch.randn((4096,), dtype=torch.float32)
     report_stage("generated_compilation")
     forward = intent.compile(varlen_aligned_causal_depthwise_conv1d, target=context.target,
-                             compiler=context.compiler, tuning_config=context.tuning_config)
+                             compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     final_state = intent.compile(varlen_causal_conv1d_final_state, target=context.target,
-                                 compiler=context.compiler, tuning_config=context.tuning_config)
+                                 compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -191,7 +191,7 @@ def causal_conv_update(context):
     bias = torch.randn((4096,), dtype=torch.float16) * 0.1
     report_stage("generated_compilation")
     artifact = intent.compile(causal_depthwise_conv1d_update, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config,
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"SILU": True})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
@@ -220,7 +220,7 @@ def causal_conv_update_bf16(context):
     bias = torch.randn((4096,), dtype=torch.float32)
     report_stage("generated_compilation")
     artifact = intent.compile(causal_depthwise_conv1d_update_bf16, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config,
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"SILU": True})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 

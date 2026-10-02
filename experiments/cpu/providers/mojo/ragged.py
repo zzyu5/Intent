@@ -86,7 +86,7 @@ def grouped_gemm_backward(context):
     source = torch.empty_like(generated)
     report_stage("generated_compilation")
     artifact = intent.compile(ragged_grouped_gemm_backward_weight, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config)
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     report_stage("adapter_preparation")
     return PreparedComparison(
@@ -152,7 +152,7 @@ def nested_pool_split(context):
     document_offsets, sentence_offsets, values = _nested_pool_inputs()
     report_stage("generated_compilation")
     sentences, documents = (intent.compile(definition, target=context.target, compiler=context.compiler,
-                                           tuning_config=context.tuning_config)
+                                           tuning_config=context.tuning_config, options=context.compile_options)
                             for definition in (nested_sentence_pool, nested_document_pool))
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}
@@ -210,7 +210,7 @@ def moe_expert_ffn_case(context):
         moe_expert_ffn,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",

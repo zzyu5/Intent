@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 import torch
+
+if TYPE_CHECKING:
+    from intent import CompileOptions
 
 
 TensorTree: TypeAlias = torch.Tensor | tuple["TensorTree", ...]
@@ -77,6 +80,7 @@ class Context:
     provider: str
     compiler_timeout_seconds: int = 15
     tuning_config: Path | None = None
+    compile_options: CompileOptions | None = None
 
 
 @dataclass(frozen=True)

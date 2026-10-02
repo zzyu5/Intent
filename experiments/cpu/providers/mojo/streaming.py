@@ -268,7 +268,7 @@ def chunk_gated_delta(context):
     arguments = (query, key, value, gate, beta, 128**-0.5)
     report_stage("generated_compilation")
     preparation, recurrence = (intent.compile(definition, target=context.target, compiler=context.compiler,
-                                              tuning_config=context.tuning_config)
+                                              tuning_config=context.tuning_config, options=context.compile_options)
                                for definition in (chunk_gated_delta_prepare, chunk_gated_delta_recurrence))
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}

@@ -13,7 +13,7 @@ def fp8_groupwise(context):
     x = torch.randn((8192, 4096), dtype=torch.bfloat16)
     report_stage("generated_compilation")
     artifact = intent.compile(bf16_groupwise_fp8_quantize, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config)
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -38,7 +38,7 @@ def per_token_fp8(context):
     x = torch.randn((8192, 8192), dtype=torch.float32)
     report_stage("generated_compilation")
     artifact = intent.compile(f32_groupwise_fp8_quantize, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config)
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -77,7 +77,7 @@ def nvfp4_quantize(context):
         nvfp4_quantize_definition,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",

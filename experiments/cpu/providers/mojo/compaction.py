@@ -31,7 +31,7 @@ def unique_consecutive(context: Context) -> PreparedComparison:
         unique_consecutive_rows,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",

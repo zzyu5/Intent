@@ -104,9 +104,9 @@ def splitk_decode(context):
     arguments = _absorbed_decode_inputs()
     report_stage("generated_compilation")
     partials = intent.compile(splitk_mla_decode_partials, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs={"SPLITS": 16, "SPLIT_SIZE": 512})
+                              tuning_config=context.tuning_config, options=context.compile_options, constexprs={"SPLITS": 16, "SPLIT_SIZE": 512})
     reduction = intent.compile(splitk_attention_reduce_f16, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}
 
@@ -137,10 +137,10 @@ def paged_mla_partials(context):
                       cache_rope.reshape(65536, 1, 64), offsets, indices, lengths, 576**-0.5)
     report_stage("generated_compilation")
     partials = intent.compile(paged_mla_decode_partials, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config,
+                              tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"PAGE_SIZE": 16, "HEAD_GROUP": 128, "SPLITS": 8})
     reduction = intent.compile(splitk_attention_f32_to_f16_reduce, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}
 

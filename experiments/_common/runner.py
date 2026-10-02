@@ -4,7 +4,7 @@ import argparse
 from contextlib import nullcontext
 import csv
 import fcntl
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -150,6 +150,7 @@ def _run_entry(
     tuning_config: Path | None, before_benchmark, *, target: str,
     source_time_ms: float | None = None,
     measure_source: bool = True,
+    compile_options: intent.CompileOptions | None = None,
 ) -> ResultRow:
     report_stage("device_setup")
     if provider == "mojo":
@@ -166,6 +167,7 @@ def _run_entry(
         provider=provider,
         compiler_timeout_seconds=compiler_timeout,
         tuning_config=tuning_config,
+        compile_options=compile_options,
     )
     report_stage("adapter_loading")
     try:
@@ -346,6 +348,8 @@ def _run_batch(arguments, indexes, publish) -> None:
                     ]
                     if arguments.tuning_config is not None:
                         command.extend(("--tuning-config", str(arguments.tuning_config)))
+                    if arguments.compile_options is not None:
+                        command.extend(("--compile-options", json.dumps(asdict(arguments.compile_options))))
                     if arguments.source_results is not None:
                         command.extend(("--source-results", str(arguments.source_results)))
                     if arguments.gpu_lock is not None:
@@ -415,6 +419,12 @@ def _run_batch(arguments, indexes, publish) -> None:
 
 
 def main(*, providers: tuple[str, ...] | None = None) -> None:
+    def compile_options(value: str) -> intent.CompileOptions:
+        try:
+            return intent.CompileOptions.read(json.loads(value))
+        except (ValueError, TypeError) as error:
+            raise argparse.ArgumentTypeError(str(error)) from error
+
     parser = argparse.ArgumentParser()
     parser.add_argument("provider", choices=sorted(BY_PROVIDER if providers is None else providers))
     parser.add_argument("--target", choices=sorted(BY_PROVIDER),
@@ -426,6 +436,8 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                         help="maximum concurrent preparation workers; measurement is isolated")
     parser.add_argument("--tuning-config", type=Path,
                         help="compile-time JSON profile override; cuTile defaults to its production profile")
+    parser.add_argument("--compile-options", type=compile_options,
+                        help="explicit generated-program policy JSON with numerics, online_reduction and optimization_remarks")
     parser.add_argument("--source-results", type=Path,
                         help="reuse source_p50_ms from an existing result CSV; still compare outputs")
     parser.add_argument("--gpu-lock", type=Path,
@@ -514,6 +526,7 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
                     target=arguments.target,
                     source_time_ms=saved_source_time(entry),
                     measure_source=source_rows is None,
+                    compile_options=arguments.compile_options,
                 )], target=arguments.target)
         return
 
@@ -527,6 +540,9 @@ def main(*, providers: tuple[str, ...] | None = None) -> None:
         parser.error("output CSV contains kernels from a different registry")
 
     def publish(row: ResultRow) -> None:
+        if arguments.compile_options is not None:
+            policy = json.dumps(asdict(arguments.compile_options), separators=(",", ":"))
+            row = replace(row, note=f"compile_options={policy}. {row.note}".rstrip())
         rows[row.kernel] = row
         _write(
             arguments.output,

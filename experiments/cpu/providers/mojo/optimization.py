@@ -15,7 +15,7 @@ def adamw(context):
     scalars = (1e-3, 0.9, 0.999, 1.0 - 0.9**10, 1.0 - 0.999**10, 1e-8, 0.01)
     report_stage("generated_compilation")
     artifact = intent.compile(adamw_update, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -40,7 +40,7 @@ def adamw_split(context):
     initial = (torch.randn_like(gradient), torch.randn_like(gradient) * 0.01, torch.rand_like(gradient) * 0.01)
     report_stage("generated_compilation")
     moments, parameter = (intent.compile(definition, target=context.target, compiler=context.compiler,
-                                         tuning_config=context.tuning_config)
+                                         tuning_config=context.tuning_config, options=context.compile_options)
                           for definition in (adamw_update_moments, adamw_update_parameter))
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
@@ -74,7 +74,7 @@ def adafactor(context, apply_definition=adafactor_apply, parameter_atol=2e-5):
     report_stage("generated_compilation")
     rows, columns, apply = (
         intent.compile(definition, target=context.target, compiler=context.compiler,
-                       tuning_config=context.tuning_config)
+                       tuning_config=context.tuning_config, options=context.compile_options)
         for definition in (adafactor_update_rows, adafactor_update_columns, apply_definition)
     )
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")

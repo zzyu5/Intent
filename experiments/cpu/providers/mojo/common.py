@@ -40,7 +40,7 @@ def _compile(context, definition, *, constexprs=None):
     report_stage("generated_compilation")
     started = time.monotonic()
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs=constexprs)
+                              tuning_config=context.tuning_config, options=context.compile_options, constexprs=constexprs)
     elapsed = time.monotonic() - started
     libraries = artifact.runtime.compilation.libraries
     reasons = sorted({library.cache_reason for library in libraries if library.cache_reason})

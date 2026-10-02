@@ -15,7 +15,7 @@ def triangular_solve(context):
     initial = torch.randn((4096, 16), dtype=torch.float32)
     report_stage("generated_compilation")
     artifact = intent.compile(batched_lower_triangular_solve, target=context.target,
-                              compiler=context.compiler, tuning_config=context.tuning_config)
+                              compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -34,7 +34,7 @@ def triangular_solve(context):
 def _factorization(context, definition, initial, reference, tolerance):
     report_stage("generated_compilation")
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

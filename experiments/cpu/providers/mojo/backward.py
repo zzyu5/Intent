@@ -51,7 +51,7 @@ def group_norm(context):
     rstd = torch.rsqrt(grouped.var(dim=(2, 3), unbiased=False) + 1e-5)
     report_stage("generated_compilation")
     artifact = intent.compile(group_norm_silu_backward, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -93,13 +93,13 @@ def layer_norm_backward(context):
         layer_norm_backward_rows,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     reduce_artifact = intent.compile(
         layer_norm_backward_reduce,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
@@ -177,13 +177,13 @@ def group_norm_backward(context):
         group_norm_backward_dx,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     affine_artifact = intent.compile(
         group_norm_backward_weight_bias,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
@@ -267,21 +267,21 @@ def attention_backward_case(context):
         attention_backward_delta,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     constexprs = {"HEAD_GROUP": ATTENTION_HEAD_GROUP, "CAUSAL": True}
     dkdv_artifact = intent.compile(
         attention_backward_dkdv,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs=constexprs,
     )
     dq_artifact = intent.compile(
         attention_backward_dq,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs=constexprs,
     )
     delta = torch.empty(shape_q[:-1], dtype=torch.float32)
@@ -379,21 +379,21 @@ def sparse_mla_backward_case(context: Context) -> PreparedComparison:
         sparse_mla_backward_delta,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     constexprs = {"HEAD_GROUP": heads // key_value_groups}
     main_artifact = intent.compile(
         sparse_mla_backward_main,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs=constexprs,
     )
     cast_artifact = intent.compile(
         sparse_mla_grad_kv_cast,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     delta = torch.empty((batch, sequence, heads), dtype=torch.float32)
     grad_key_value = torch.zeros_like(key_value, dtype=torch.float32)

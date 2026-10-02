@@ -67,7 +67,7 @@ def prepare(context, rows):
     report_stage("generated_compilation")
     with ThreadPoolExecutor(max_workers=2) as executor:
         generated = executor.submit(intent.generate, gemm_i8, target=context.target,
-                                    compiler=context.compiler, tuning_config=context.tuning_config)
+                                    compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
         source = executor.submit(compile_source, context, profile, compiler, rows)
         program = generated.result()
         canonical, artifact = source.result()

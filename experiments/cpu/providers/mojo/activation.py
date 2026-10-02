@@ -79,7 +79,7 @@ def geglu(context):
     x = torch.randn((4096, 2 * 14336), dtype=torch.float16)
     report_stage("generated_compilation")
     artifact = intent.compile(geglu_tanh, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

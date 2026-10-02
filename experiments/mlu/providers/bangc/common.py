@@ -48,7 +48,8 @@ class RemoteSequence:
             strides={name: tuple(value.stride()) for name, value in views.items()})
         report_stage("generated_compilation")
         program = intent.generate(definition, target=target, compiler=self.context.compiler,
-            constexprs=constexprs, tuning_config=self.context.tuning_config)
+            constexprs=constexprs, tuning_config=self.context.tuning_config,
+            options=self.context.compile_options)
         bound = dict(arguments)
         interface = program.interface
         dimensions = {}

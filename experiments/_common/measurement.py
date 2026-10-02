@@ -177,6 +177,7 @@ def compile_single(
             compiler=context.compiler,
             constexprs=constexprs,
             tuning_config=context.tuning_config,
+            options=context.compile_options,
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(f"generated_{error.stage}", str(error)) from error

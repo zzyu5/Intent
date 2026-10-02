@@ -18,7 +18,7 @@ def cross_entropy(context):
     labels[::17] = -100
     report_stage("generated_compilation")
     artifact = intent.compile(fused_cross_entropy, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs={"IGNORE_INDEX": -100})
+                              tuning_config=context.tuning_config, options=context.compile_options, constexprs={"IGNORE_INDEX": -100})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -48,11 +48,11 @@ def linear_cross_entropy(context):
     mean = torch.empty((1,), dtype=torch.float32)
     report_stage("generated_compilation")
     linear = intent.compile(linear_logits_chunk, target=context.target, compiler=context.compiler,
-                            tuning_config=context.tuning_config)
+                            tuning_config=context.tuning_config, options=context.compile_options)
     probability = intent.compile(cross_entropy_probability_chunk, target=context.target, compiler=context.compiler,
-                                 tuning_config=context.tuning_config)
+                                 tuning_config=context.tuning_config, options=context.compile_options)
     reduction = intent.compile(cross_entropy_mean, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
 
     def launch():
         for begin in range(0, TOKENS, CHUNK_SIZE):
@@ -76,7 +76,7 @@ def cross_entropy_bf16(context):
     labels[::17] = -100
     report_stage("generated_compilation")
     artifact = intent.compile(fused_cross_entropy_bf16, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs={"IGNORE_INDEX": -100})
+                              tuning_config=context.tuning_config, options=context.compile_options, constexprs={"IGNORE_INDEX": -100})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

@@ -241,7 +241,7 @@ def scaled_fp8(context):
     rhs = torch.randn((4096, 14336), dtype=torch.bfloat16).to(torch.float8_e4m3fn)
     report_stage("generated_compilation")
     artifact = intent.compile(scaled_fp8_matmul, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     state = {}
 
     def launch():
@@ -258,7 +258,7 @@ def scaled_fp8_splitk(context):
     rhs = torch.randn((4096, 14336), dtype=torch.bfloat16).to(torch.float8_e4m3fn).view(4, 4, 256, 14336)
     report_stage("generated_compilation")
     artifact = intent.compile(scaled_fp8_splitk_matmul, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

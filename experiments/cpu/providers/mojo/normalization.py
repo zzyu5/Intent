@@ -96,7 +96,7 @@ def batch_norm(context):
     epsilon, momentum = 1e-5, 0.1
     report_stage("generated_compilation")
     artifact = intent.compile(batch_norm_training, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

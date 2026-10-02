@@ -66,7 +66,7 @@ def projection(context, deployment_name="rvv.json"):
     root.mkdir(parents=True, exist_ok=True)
     report_stage("generated_compilation")
     program = intent.generate(quantized_projection, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     (root / "input.mlir").write_text(program.source)
     (root / "cpu.mlir").write_text(program.ir)
     report_stage("source_compilation")

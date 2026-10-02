@@ -74,7 +74,7 @@ def prepare(context, linear):
     with ThreadPoolExecutor(max_workers=2) as executor:
         generated = executor.submit(intent.generate,
             causal_linear_attention_f32 if linear else causal_attention_f32,
-            target=context.target, compiler=context.compiler, tuning_config=context.tuning_config)
+            target=context.target, compiler=context.compiler, tuning_config=context.tuning_config, options=context.compile_options)
         source = executor.submit(compile_source, context, profile, compiler, linear)
         canonical, artifact = source.result()
         report_stage("generated_compilation")

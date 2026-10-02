@@ -138,7 +138,7 @@ def gemma_decode(context: Context) -> PreparedComparison:
         gemma_gqa_decode_partials,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs={
             "HEAD_GROUP": query_heads // key_heads,
             "WINDOW": 1024,
@@ -150,7 +150,7 @@ def gemma_decode(context: Context) -> PreparedComparison:
         splitk_attention_reduce,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     partial_lse = torch.empty(
         (batch, query_heads, splits), dtype=torch.float32
@@ -226,7 +226,7 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         paged_gqa_decode_partials,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs={
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
@@ -237,7 +237,7 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         splitk_attention_f32_to_f16_reduce,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     partial_lse = torch.empty(
         (batch, query_heads, splits), dtype=torch.float32
@@ -325,7 +325,7 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         block_sparse_gqa_decode_partials,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs={
             "HEAD_GROUP": query_heads // key_heads,
             "BLOCK_SIZE": block_size,
@@ -336,7 +336,7 @@ def block_sparse_gqa_decode(context: Context) -> PreparedComparison:
         block_sparse_gqa_decode_combine,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
         constexprs={"SPLITS": splits},
     )
     partial_lse = torch.empty(
@@ -414,9 +414,9 @@ def sink_decode(context):
     start = torch.tensor([8191], dtype=torch.int32)
     report_stage("generated_compilation")
     partials = intent.compile(attention_sink_decode_partials, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config, constexprs={"HEAD_GROUP": 4, "WINDOW": 0, "P": 32})
+                              tuning_config=context.tuning_config, options=context.compile_options, constexprs={"HEAD_GROUP": 4, "WINDOW": 0, "P": 32})
     reduction = intent.compile(splitk_attention_reduce, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}
 
@@ -486,10 +486,10 @@ def grouped_flash_decode(context):
     v = torch.randn_like(k)
     report_stage("generated_compilation")
     partials = intent.compile(grouped_flash_decode_partials, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config,
+                              tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"HEAD_GROUP": 4, "P": 32, "SPLIT_SIZE": 256})
     reduction = intent.compile(splitk_attention_reduce, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     generated, source = {}, {}
 
@@ -547,10 +547,10 @@ def _paged_gqa_split(context, reducer, compare):
     arguments = (q, key, value, offsets, indices, lengths, splits, 128**-0.5)
     report_stage("generated_compilation")
     partials = intent.compile(splitk_paged_gqa_decode_partials, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config,
+                              tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"PAGE_SIZE": 16, "HEAD_GROUP": 4, "SPLITS": 8})
     reduction = intent.compile(reducer, target=context.target, compiler=context.compiler,
-                               tuning_config=context.tuning_config)
+                               tuning_config=context.tuning_config, options=context.compile_options)
     generated, source = {}, {}
 
     def launch():

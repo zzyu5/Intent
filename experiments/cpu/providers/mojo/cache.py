@@ -36,7 +36,7 @@ def reshape_and_cache_case(context: Context) -> PreparedComparison:
         reshape_and_cache,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
@@ -97,7 +97,7 @@ def reshape_and_cache_split(context):
     slots = torch.randperm(BLOCKS * BLOCK_SIZE, dtype=torch.int64)[:TOKENS].to(torch.int32)
     report_stage("generated_compilation")
     key_program, value_program = (intent.compile(definition, target=context.target, compiler=context.compiler,
-                                                 tuning_config=context.tuning_config)
+                                                 tuning_config=context.tuning_config, options=context.compile_options)
                                   for definition in (reshape_key_cache, reshape_value_cache))
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 

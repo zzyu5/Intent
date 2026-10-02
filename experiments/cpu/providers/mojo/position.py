@@ -45,7 +45,7 @@ def rope_qk(context):
         rotary_qk_inplace,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_query = query_initial.clone()
     generated_key = key_initial.clone()
@@ -113,7 +113,7 @@ def rope_qk_partial(context):
         rotary_qk_partial_inplace,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_query = query_initial.clone()
     generated_key = key_initial.clone()
@@ -199,7 +199,7 @@ def rope_qk_bf16(context):
         rotary_qk_bf16_inplace,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_query = query_initial.clone()
     generated_key = key_initial.clone()
@@ -267,7 +267,7 @@ def padded_rope_cache_update(context):
         padded_rope_cache_update_definition,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_storage = torch.empty(storage_shape, dtype=torch.float16)
 

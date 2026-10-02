@@ -28,7 +28,7 @@ def embedding_backward(context):
         embedding_backward_atomic,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_weight = initial_weight.clone()
 
@@ -80,7 +80,7 @@ def compare_exchange(context):
         claim_zero_slots,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_state = initial.clone()
     generated_outputs = {"previous": None}

@@ -60,25 +60,25 @@ def moe_alignment(context: Context) -> PreparedComparison:
         moe_count_routes,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     prefix = intent.compile(
         moe_prefix_routes,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     scatter = intent.compile(
         moe_scatter_routes,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     mark = intent.compile(
         moe_mark_expert_blocks,
         target=context.target,
         compiler=context.compiler,
-        tuning_config=context.tuning_config,
+        tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_state: dict[str, tuple[torch.Tensor, ...]] = {}
 
@@ -148,7 +148,7 @@ def moe_count_routes_product_domain_case(context):
     ids = torch.randint(0, 64, (4096, 2), dtype=torch.int32)
     report_stage("generated_compilation")
     artifact = intent.compile(moe_count_routes_product_domain, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -167,9 +167,9 @@ def mhc_gemm_rms_scale(context):
     bias = torch.randn((24,), dtype=torch.bfloat16)
     report_stage("generated_compilation")
     partial = intent.compile(mhc_gemm_rms_partial, target=context.target, compiler=context.compiler,
-                             tuning_config=context.tuning_config, constexprs={"P": 16})
+                             tuning_config=context.tuning_config, options=context.compile_options, constexprs={"P": 16})
     finalize = intent.compile(mhc_gemm_rms_finalize, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config,
+                              tuning_config=context.tuning_config, options=context.compile_options,
                               constexprs={"P": 16, "STREAMS": 4, "ALPHA_PRE": 1.0,
                                           "ALPHA_POST": 1.0, "ALPHA_RESIDUAL": 1.0})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
@@ -199,9 +199,9 @@ def mhc_pre(context):
     base = torch.randn((24,), dtype=torch.float32) * 0.1
     report_stage("generated_compilation")
     first = intent.compile(mhc_pre_gemm_sqrsum, target=context.target, compiler=context.compiler,
-                           tuning_config=context.tuning_config)
+                           tuning_config=context.tuning_config, options=context.compile_options)
     second = intent.compile(mhc_pre_fuse, target=context.target, compiler=context.compiler,
-                            tuning_config=context.tuning_config,
+                            tuning_config=context.tuning_config, options=context.compile_options,
                             constexprs={"RMS_EPS": 1e-6, "PRE_EPS": 1e-6, "SINKHORN_EPS": 1e-6,
                                         "POST_MULTIPLIER": 1.0, "SINKHORN_REPEATS": 10})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
@@ -227,7 +227,7 @@ def mhc_sinkhorn_case(context):
     initial = torch.randn((8192, 4, 4), dtype=torch.float32)
     report_stage("generated_compilation")
     artifact = intent.compile(mhc_sinkhorn, target=context.target, compiler=context.compiler,
-                              tuning_config=context.tuning_config)
+                              tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):

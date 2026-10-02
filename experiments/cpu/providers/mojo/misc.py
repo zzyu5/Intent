@@ -46,9 +46,9 @@ def partitioned_max(context):
     x = -torch.rand((128, 257), dtype=torch.float32)
     report_stage("generated_compilation")
     partial = intent.compile(partitioned_max_partial, target=context.target, compiler=context.compiler,
-                             tuning_config=context.tuning_config)
+                             tuning_config=context.tuning_config, options=context.compile_options)
     reduce = intent.compile(partitioned_max_reduce, target=context.target, compiler=context.compiler,
-                            tuning_config=context.tuning_config)
+                            tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
     state = {}
 
