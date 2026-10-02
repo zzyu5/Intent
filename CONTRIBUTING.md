@@ -267,7 +267,66 @@ Intent 另外保留 logical view 的公共合同，但同样由编译结果决�
 
 DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费已有 LoadTile、MatMul、Store 和循环关系，形成协作或常驻供数；[CollectiveGather.cpp](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 从当前 offsets 写入、task 坐标、只读视图与 stride 关系证明相邻参与者可以共享 gather 供数。两个变换都消费完整的普通 DSA program，不通过 construction 候选侧表选择路径。[BANG C driver](lib/Target/BangC/Transforms/Legalize.cpp) 再依次完成原生计算、workspace、实现选择、局部组合、同步和最终存储绑定。当前 DSA 的矩阵与 group 合同、BANG C 实现仍以 MLU370 为已实现边界，目录分层不代表已经支持其他 DSA 设备。
 
+### DSA 的单一构造入口与局部实现
+
+[KIRToDSA.cpp](lib/Conversion/KIRToDSA/KIRToDSA.cpp) 只建立目标模块并调用一次
+`Construction`。普通矩阵、矩阵后的逐元素计算、region 中的矩阵与一维运算都由
+同一组操作实现构造；没有整函数 matrix 模式或另一套 eager tensor lowering。
+新能力按下面的职责进入相邻私有模块，不另建算子入口：
+
+| 模块 | 负责的事实与构造 |
+|---|---|
+| [Construction.cpp](lib/Conversion/KIRToDSA/Construction.cpp) | 公共参数到原生入口、操作分派、作者控制流与 carry 的生命周期 |
+| [Values.cpp](lib/Conversion/KIRToDSA/Values.cpp) | SSA 物化、标量数值运算、product 字段绑定与控制状态槽 |
+| [Tensors.cpp](lib/Conversion/KIRToDSA/Tensors.cpp) | 局部 shape、storage、已选窗口的投影及逐元素操作 |
+| [Access.cpp](lib/Conversion/KIRToDSA/Access.cpp) | 消费公共 IndexRelation，形成当前窗口的地址、validity 和 load/store |
+| [Contractions.cpp](lib/Conversion/KIRToDSA/Contractions.cpp) | 消费公共 ContractionAxes，形成局部矩阵、K 遍历和独立 accumulator |
+| [Collectives.cpp](lib/Conversion/KIRToDSA/Collectives.cpp) | reduce/scan 的 helper、状态和结果映射；原生 primitive 的适用条件 |
+| [Regions.cpp](lib/Conversion/KIRToDSA/Regions.cpp) | region fold/scan 的 source 遍历、summary 和消费者投影 |
+| [Worksets.cpp](lib/Conversion/KIRToDSA/Worksets.cpp) | 输出域与 task 分配、def-use 切片传播、独立性证明和有序行分段 |
+
+[Construction.h](lib/Conversion/KIRToDSA/Construction.h) 是这一次 construction 的
+私有状态声明。`LocalAxis` 分开源 extent、当前 begin/count 和物理 capacity；
+`valueSlices` 保存已证明的 value/axis 窗口，未决定的 K 轴不必提前拥有完整局部容量。
+真正物化张量时才要求完整 `LocalShape`。这些映射不交给后续 pass 保存或重放；
+construction 的输出必须是含实际循环、存储和访问的完整 DSA program。
+
+`localMatMul` 只处理当前 typed contraction。共享左操作数时，还需证明实际输出
+窗口一致、accumulator 独立、右操作数可重放，且中间没有冲突 effects。
+输出 M/N task 遍历和 K 分段复用普通 workset 切片机制；epilogue 继续走普通操作分派。
+对带有序控制的一维程序，只有逐元素独立、控制不依赖被切片数据且外部访问满足
+同坐标关系时才分段；保留每个元素的原 carry 顺序，也保留空行中的标量控制。
+
+形成协作供数、改变 lifetime 或选择局部资源策略时，修改 DSA transforms；
+修改 MLU 指令和 micro-kernel 时，进入 [BANG C Matrix](lib/Target/BangC/Transforms/Matrix.cpp)。
+`MatrixSupply` 从当前 Alloca/Fill/LoadTile/MatMul 的作用域、完整覆盖和 users 证明
+供数资格，不要求输入 allocation 恰好出现在某一层循环。
+Serializer 只输出已决定的结构，不能补 task 遍历或按算法身份选择实现。
+
+职责对照：TileLang `src/transform/lower_tile_op.cc:1073–1156` 将当前 buffer、layout、
+thread bounds 和 workspace 接口交给局部操作；`src/op/gemm.cc:198–236` 返回当前
+GEMM 的 lowering 子树。Intent 的局部矩阵也消费已形成的 operand 和窗口，DSA
+额外承担显式 local-memory/task 构造；BANG C 局部实现不接管作者的整函数算法。
+
 ## 共享分析与完整变换
+
+### Canonical product 的结构查询
+
+[ProductSchema.h](include/Intent/Analysis/ProductSchema.h) 从已验证的 canonical
+tuple/record 类型读取字段，并按声明顺序递归访问 leaves。`walkProductLeaves`
+同时给出结构字段路径；`getProductLeafRange` 和 `getProductLeafRanges` 返回展平
+SSA components 的范围，不能把它们当内存字节偏移。字段名只用于诊断。
+
+[KIRToCPU](lib/Conversion/KIRToCPU/KIRToCPU.cpp) 的 tuple/record 构造、extract、
+helper 和 carry 使用这份查询；DSA 的 [Values](lib/Conversion/KIRToDSA/Values.cpp)
+与 [Collectives](lib/Conversion/KIRToDSA/Collectives.cpp) 也消费同一顺序和范围。
+CPU 保留自己的 buffer/state 表示，DSA 保留局部内存与惰性 SSA 物化。
+KIR normalize/verifier 复用同一类型查询，不各自递归解释 schema。
+
+参考 Triton `python/triton/language/core.py:771–804` 的 tuple 类型和递归
+flatten/unflatten：共享的是类型结构和 component 顺序，物理存储与执行组织仍由
+消费者决定。新增 product 操作先复用此入口；新的 storage、task 或 provider ABI
+规则进入相应 family，不扩展为公共 product 类型的隐藏目标策略。
 
 ### 运算自身提供结构关系
 

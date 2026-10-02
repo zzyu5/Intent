@@ -33,7 +33,6 @@ struct MatrixSupplyMatch {
   scf::ForOp work, reduction;
   MatMulOp matrix;
   LoadTileOp lhs, rhs;
-  FillOp initial;
   Value m, n, rows, columns, M, N, K;
 };
 std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, ConfigurationAttr config) {
@@ -83,6 +82,7 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   if (!gridM || !tileCount(gridM, row->extent, config.getTileM()) ||
       !tileCount(gridN, column->extent, config.getTileN())) return std::nullopt;
   LoadTileOp lhs, rhs;
+  SmallVector<FillOp> inputInitializers;
   for (Operation &operation : reduction.getBody()->without_terminator()) {
     if (&operation == matrix.getOperation()) continue;
     if (auto load = dyn_cast<LoadTileOp>(operation)) {
@@ -90,6 +90,11 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
       if (load.getOutput() == matrix.getLhs() && !lhs) lhs = load;
       else if (load.getOutput() == matrix.getRhs() && !rhs) rhs = load;
       else return std::nullopt;
+    } else if (auto fill = dyn_cast<FillOp>(operation)) {
+      inputInitializers.push_back(fill);
+    } else if (auto allocation = dyn_cast<memref::AllocaOp>(operation)) {
+      if (allocation.getResult() != matrix.getLhs() &&
+          allocation.getResult() != matrix.getRhs()) return std::nullopt;
     } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
   }
   if (!lhs || !rhs || lhs.getRows() != matrix.getRows() || lhs.getColumns() != matrix.getDepth() ||
@@ -150,7 +155,9 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
       {config.getTileK(), config.getTileN()}, {config.getTileM(), config.getTileN()}};
   for (auto [buffer, shape] : llvm::zip(buffers, shapes)) {
     auto allocation = buffer.getDefiningOp<memref::AllocaOp>();
-    if (!allocation || allocation->getBlock() != work.getBody()) return std::nullopt;
+    if (!allocation || (allocation->getBlock() != work.getBody() &&
+        (buffer == matrix.getAccumulator() ||
+         allocation->getBlock() != reduction.getBody()))) return std::nullopt;
     auto type = allocation.getType();
     if (type.getShape() != ArrayRef<int64_t>(shape) || !type.getLayout().isIdentity() ||
         type.getMemorySpaceAsInt() != nramSpace) return std::nullopt;
@@ -161,6 +168,10 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   for (Operation &operation : work.getBody()->without_terminator()) {
     if (&operation == reduction.getOperation()) break;
     if (auto fill = dyn_cast<FillOp>(operation)) {
+      if (fill.getOutput() == matrix.getLhs() || fill.getOutput() == matrix.getRhs()) {
+        inputInitializers.push_back(fill);
+        continue;
+      }
       FloatAttr zero;
       if (initial || fill.getOutput() != matrix.getAccumulator() ||
           !matchPattern(fill.getValue(), m_Constant(&zero)) || !zero.getValue().isZero()) return std::nullopt;
@@ -168,6 +179,22 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     } else if (!isa<memref::AllocaOp>(operation) && !isMemoryEffectFree(&operation)) return std::nullopt;
   }
   if (!initial) return std::nullopt;
+  // A synchronous LoadTile writes the complete private tile, including zero
+  // padding. Its input initialization may be in either the task or K scope,
+  // provided no other consumer observes that earlier value or aliases storage.
+  for (FillOp fill : inputInitializers) {
+    LoadTileOp load = fill.getOutput() == matrix.getLhs() ? lhs
+        : fill.getOutput() == matrix.getRhs() ? rhs : LoadTileOp{};
+    if (!load || (fill->getBlock() == reduction.getBody()
+        ? !fill->isBeforeInBlock(load) : !fill->isBeforeInBlock(reduction)))
+      return std::nullopt;
+  }
+  for (LoadTileOp load : {lhs, rhs})
+    for (Operation *user : load.getOutput().getUsers()) {
+      if (user == load.getOperation() || user == matrix.getOperation()) continue;
+      auto fill = dyn_cast<FillOp>(user);
+      if (!fill || !llvm::is_contained(inputInitializers, fill)) return std::nullopt;
+    }
   DenseSet<Value> available{matrix.getAccumulator(), row->begin, column->begin,
                             matrix.getRows(), matrix.getColumns()};
   DenseSet<Value> visiting;
@@ -193,7 +220,7 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     if (!llvm::all_of(operation->getOperands(), canCapture)) return std::nullopt;
     available.insert(operation->result_begin(), operation->result_end());
   }
-  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs, initial, row->begin, column->begin,
+  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs, row->begin, column->begin,
       matrix.getRows(), matrix.getColumns(), row->extent, column->extent, depth->extent};
 }
 
