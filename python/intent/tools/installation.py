@@ -29,19 +29,22 @@ def setup_backend(target: str, *, torch_index_url: str | None = None) -> dict:
             raise NotImplementedError("the public backend dependency routes currently require Python 3.10–3.12")
         if torch_index_url is not None and (not torch_index_url.strip() or selected["torch"] is None):
             raise ValueError("torch_index_url requires a nonempty index URL and a backend that installs PyTorch")
-        commands = []
+        requirements = list(selected["requirements"])
         if selected["torch"] is not None:
-            commands.append([sys.executable, "-m", "pip", "install", f"torch=={selected['torch']}",
-                             "--index-url", torch_index_url or selected["torch_index"]])
-        if selected["requirements"]:
-            commands.append([sys.executable, "-m", "pip", "install", *selected["requirements"]])
-        result.update(commands=commands, toolchain=selected["toolchain"])
+            requirements.insert(0, f"torch=={selected['torch']}")
+        steps = []
+        if requirements:
+            command = [sys.executable, "-m", "pip", "install", *requirements]
+            if selected["torch"] is not None:
+                command.extend(("--extra-index-url", torch_index_url or selected["torch_index"]))
+            steps.append(("dependency_installation", command))
+        steps.append(("dependency_consistency", [sys.executable, "-m", "pip", "check"]))
+        result.update(commands=[command for _, command in steps], toolchain=selected["toolchain"])
         environment = dict(os.environ)
         for name in ("PYTHONPATH", "PYTHONHOME"):
             environment.pop(name, None)
         environment["PYTHONNOUSERSITE"] = "1"
-        stage = "dependency_installation"
-        for command in commands:
+        for stage, command in steps:
             print("+ " + shlex.join(command), file=sys.stderr, flush=True)
             subprocess.run(command, check=True, env=environment, stdout=sys.stderr, stderr=sys.stderr)
         result["status"] = "installed"

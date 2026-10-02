@@ -3,7 +3,7 @@
 BACKENDS = {
     "triton": {
         "target": "TritonTarget", "modules": ("torch", "triton"),
-        "requirements": ("triton==3.6.0", "numpy==1.26.4"), "torch": "2.10.0",
+        "requirements": ("triton==3.6.0", "numpy==1.26.4"), "torch": "2.10.0+cu130",
         "torch_index": "https://download.pytorch.org/whl/cu130",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and CUDA-capable PyTorch",
     },
@@ -11,13 +11,13 @@ BACKENDS = {
         "target": "CuTileTarget", "modules": ("torch", "cuda.tile", "cuda.tile.tune"),
         "requirements": ("triton==3.6.0", "numpy==1.26.4",
                          "cuda-toolkit[tileiras,nvvm,nvcc]==13.3.1", "cuda-tile==1.6.0"),
-        "torch": "2.10.0",
-        "torch_index": "https://download.pytorch.org/whl/cu130",
+        "torch": "2.10.0+cu128",
+        "torch_index": "https://download.pytorch.org/whl/cu128",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and the CUDA tile compiler",
     },
     "mojo": {
         "target": "MojoTarget", "modules": ("torch",),
-        "requirements": (), "torch": "2.10.0",
+        "requirements": (), "torch": "2.10.0+cpu",
         "torch_index": "https://download.pytorch.org/whl/cpu",
         "python_max": (3, 12), "toolchain": "An explicitly installed Mojo compiler; Linux x86-64 AVX2/AVX512",
     },

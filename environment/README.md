@@ -20,7 +20,7 @@ These are local Linux platform wheels. They require a compatible host architectu
 
 For compiler/KIR tools and the MCP servers alone, omit `intent setup`: the wheel installation needs no provider SDK or tensor framework. Run `intent doctor --json` to check the installed compiler and its KIR output stage. Add a selected backend's dependencies when you need its runtime; a base compiler check does not establish device or kernel support.
 
-`intent setup --target cutile` selects the public cuTile dependency route. Setup invokes pip in the Python environment containing that `intent` command, with the package's own dependency declarations. It does not install drivers, external CPU/MLU compilers, or probe a device. Follow it with `intent doctor --target BACKEND` and the target options for your deployment. `--torch-index-url` selects another wheel index for the same declared PyTorch release; `--json` returns installation status while pip output goes to stderr. Use separate virtual environments for different GPU routes.
+`intent setup --target cutile` selects the public cuTile dependency route. Setup invokes pip in the Python environment containing that `intent` command, resolving PyTorch and provider dependencies together, then runs `pip check`. A dependency conflict is an installation error. It does not install drivers, external CPU/MLU compilers, or probe a device. Follow it with `intent doctor --target BACKEND` and the target options for your deployment. `--torch-index-url` selects another wheel index for the same declared PyTorch build; `--json` returns installation status while pip output goes to stderr. Use separate virtual environments for different GPU routes.
 
 From a checkout, `python3 environment/install.py --backend triton --venv .venv-triton --wheel "$INTENT_WHEEL"` combines venv creation, wheel installation, the installed setup command and doctor. The checkout's bootstrap does not maintain a second dependency installation path. After installation, [the public softmax example](../examples/softmax.py) demonstrates a complete kernel invocation.
 
@@ -34,9 +34,9 @@ Use a separate virtual environment for each public GPU route. The dependency dec
 
 | Backend | Python runtime route | External requirements and current scope |
 |---|---|---|
-| `triton` | CUDA PyTorch 2.10.0, Triton 3.6.0, NumPy 1.26.4 | NVIDIA driver; callable GPU artifacts |
-| `cutile` | CUDA PyTorch 2.10.0, cuTile 1.6.0, CUDA toolkit 13.3.1; see [dependency declarations](../python/intent/tools/backends.py) | NVIDIA driver compatible with the selected CUDA toolkit; callable GPU artifacts |
-| `mojo` | CPU PyTorch 2.10.0 | Existing Mojo compiler, Linux x86-64 with AVX2/AVX512; callable CPU artifacts |
+| `triton` | PyTorch 2.10.0+cu130, Triton 3.6.0, NumPy 1.26.4 | NVIDIA driver; callable GPU artifacts |
+| `cutile` | PyTorch 2.10.0+cu128, cuTile 1.6.0, CUDA toolkit 13.3.1; see [dependency declarations](../python/intent/tools/backends.py) | NVIDIA driver compatible with the selected CUDA toolkit; callable GPU artifacts |
+| `mojo` | PyTorch 2.10.0+cpu | Existing Mojo compiler, Linux x86-64 with AVX2/AVX512; callable CPU artifacts |
 | `weft` | No additional tensor framework for source generation | Intent compiler built with Weft; public `WeftTarget` generates canonical Weft source, native execution requires its deployment/toolchain |
 | `bangc` | Native buffer interface uses the Python standard library | Existing NeuWare SDK and MLU370 implementation; execution requires an actual compatible MLU device |
 
@@ -60,7 +60,7 @@ intent doctor --target cutile
 python examples/softmax.py --target cutile
 ```
 
-The public cuTile route uses cuda-tile 1.6 and CUDA toolkit 13.3.1. The older [cutile.txt](cutile.txt), including TileGym, remains the historical experiment environment; it is not installed into the public route. This does not change its recorded results. Backend/device support still depends on the selected SDK and the kernel's operations.
+The public cuTile route uses cuda-tile 1.6 and the matched CUDA 13.3 compiler components. Its PyTorch cu128 build uses the separate CUDA 12 runtime packages: PyTorch cu130 locks CUDA 13 runtime-library versions that conflict with this compiler toolkit's requirements. PyTorch supplies tensor storage and streams; cuTile owns TileIR compilation and driver launches. See the [PyTorch builds](https://pytorch.org/get-started/previous-versions/) and [cuTile compiler installation](https://docs.nvidia.com/cuda/cutile-python/quickstart.html). The older [cutile.txt](cutile.txt), including TileGym, remains the historical experiment environment; it is not installed into the public route. This does not change its recorded results. Backend/device support still depends on the selected SDK and the kernel's operations.
 
 The common installer:
 
