@@ -25,31 +25,37 @@ def torch_dtype(element: DType):
 
 
 def register_operator(artifact, name: str):
-    """Register a functional allocating invocation with PyTorch's dispatcher.
+    """Register the public invocation's outputs and mutations with PyTorch.
 
     Device execution is opaque to PyTorch. The fake implementation consumes the
     same exported interface as ordinary calls and never runs provider code.
+    Mutable inputs must not share Torch storage with another input: automatic
+    functionalization may clone those arguments independently of read-only ones.
     """
     import torch
 
     interface = artifact.interface
     if artifact.device_type not in {"cpu", "cuda"} or not isinstance(artifact.runtime, TorchOutputInference):
         raise NotImplementedError("PyTorch registration requires a CPU or CUDA tensor runtime with output inference")
-    if any(isinstance(parameter, ViewParameter) and parameter.writable for parameter in interface.inputs):
-        raise NotImplementedError("PyTorch registration currently requires read-only inputs and fresh Out tensors")
-    if not interface.outputs:
-        raise NotImplementedError("a functional PyTorch registration requires at least one Out tensor")
-    if not any(isinstance(parameter, ViewParameter) for parameter in interface.inputs):
+    inputs = interface.inputs
+    views = tuple((index, parameter) for index, parameter in enumerate(inputs)
+                  if isinstance(parameter, ViewParameter))
+    if not views:
         raise NotImplementedError("PyTorch registration requires an input tensor to determine device dispatch")
     interface.binding_relations(explicit_outputs=False).require_output_allocation()
     pieces = name.split("::")
     if len(pieces) != 2 or not all(piece.isidentifier() for piece in pieces):
         raise ValueError("operator name must be 'your_namespace::your_operator'")
 
+    mutable_names = tuple(f"arg{index}" for index, parameter in views if parameter.writable)
+    mutable_alias_pairs = tuple((left_index, right_index, left.name, right.name)
+                               for index, (left_index, left) in enumerate(views)
+                               for right_index, right in views[index + 1:]
+                               if left.writable or right.writable)
     parameters = []
-    for parameter in interface.inputs:
+    for index, parameter in enumerate(inputs):
         if isinstance(parameter, ViewParameter):
-            scalar = "Tensor"
+            scalar = f"Tensor(a{index}!)" if parameter.writable else "Tensor"
         elif isinstance(parameter, ScalarParameter):
             if parameter.dtype.category is DTypeCategory.BOOL:
                 scalar = "bool"
@@ -68,11 +74,20 @@ def register_operator(artifact, name: str):
 
     def function(invoke):
         def operator(*arguments, **keywords):
-            return invoke(*signature.bind(*arguments, **keywords).args)
+            arguments = signature.bind(*arguments, **keywords).args
+            for left, right, left_name, right_name in mutable_alias_pairs:
+                # Storage identity is available for both real and FakeTensor
+                # inputs, without reading a pointer or tensor contents. The
+                # fake check sees aliases before graph functionalization.
+                if torch._C._is_alias_of(arguments[left], arguments[right]):
+                    raise NotImplementedError(
+                        f"PyTorch mutable calls require independent input storage: "
+                        f"{left_name} and {right_name} share storage; use ordinary artifact calls for this binding")
+            return invoke(*arguments)
 
         return operator
 
-    operator = torch.library.custom_op(name, function(artifact.run), mutates_args=(),
+    operator = torch.library.custom_op(name, function(artifact.run), mutates_args=mutable_names,
                                        device_types=artifact.device_type, schema=schema)
     operator.register_fake(function(lambda *arguments: artifact.runtime.infer_outputs(arguments)))
     return operator

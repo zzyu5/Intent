@@ -17,6 +17,7 @@ from kernels.normalization.softmax import stable_softmax_f16
 from experiments._common.loading import load_module
 from experiments._common.measurement import compile_single
 from experiments._common.measurement import functional_launch
+from experiments._common.measurement import initial_launch
 from experiments._common.model import Context
 from experiments._common.model import PreparedComparison
 from experiments._common.model import PreparedLaunch
@@ -190,14 +191,21 @@ def flaggems_batch_norm_training(context: Context) -> PreparedComparison:
     )
     generated_mean = initial_mean.clone()
     generated_variance = initial_variance.clone()
-    _, generated_base = compile_single(
+    artifact, _ = compile_single(
         context,
         batch_norm_training_kernel,
         (x, weight, bias, generated_mean, generated_variance, 1e-5, 0.1),
     )
+    operator = torch.compile(artifact.as_torch_op("intent_gpu_benchmark::batch_norm_training"), fullgraph=True)
+    generated_state = {}
+
+    def generated_launch():
+        generated_state["outputs"] = operator(x, weight, bias, generated_mean, generated_variance, 1e-5, 0.1)
+
+    initial_launch(generated_launch, side="generated")
     generated = PreparedLaunch(
-        launch=generated_base.launch,
-        outputs=lambda: (*generated_base.outputs(), generated_mean, generated_variance),
+        launch=generated_launch,
+        outputs=lambda: (*generated_state["outputs"], generated_mean, generated_variance),
         prepare=lambda: (
             generated_mean.copy_(initial_mean),
             generated_variance.copy_(initial_variance),
@@ -237,6 +245,7 @@ def flaggems_batch_norm_training(context: Context) -> PreparedComparison:
             Tolerance(atol=1e-4, rtol=1e-4),
         ),
         cuda_graph=False,
+        note="Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理；原输入与容差。",
     )
 
 

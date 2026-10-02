@@ -16,6 +16,7 @@ def adamw(context):
     report_stage("generated_compilation")
     artifact = intent.compile(adamw_update, target=context.target, compiler=context.compiler,
                               tuning_config=context.tuning_config, options=context.compile_options)
+    generated = torch.compile(artifact.as_torch_op("intent_cpu_benchmark::adamw"), fullgraph=True)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function):
@@ -29,9 +30,9 @@ def adamw(context):
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(runtime.adamw), Tolerance(atol=1e-5, rtol=1e-5),
+        side(generated), side(runtime.adamw), Tolerance(atol=1e-5, rtol=1e-5),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
-        note="既有 AdamW N8388608 f32；PyTorch eager CPU reference，单 NUMA 8 核；每次调用前恢复相同的 parameter/moments，恢复不计时；双方计完整 host 调用。",
+        note="既有 AdamW N8388608 f32；Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用；PyTorch eager CPU reference，单 NUMA 8 核；每次调用前恢复相同的 parameter/moments，恢复不计时；双方计完整 host 调用。",
     )
 
 

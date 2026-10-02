@@ -33,7 +33,7 @@ def rope_qk(context: Context) -> PreparedComparison:
     initial_key = key.clone()
     source_query = initial_query.clone()
     source_key = initial_key.clone()
-    _, generated_base = compile_single(
+    artifact, _ = compile_single(
         context,
         rotary_qk_bf16_inplace,
         (query, key, cosine, sine),
@@ -42,9 +42,13 @@ def rope_qk(context: Context) -> PreparedComparison:
         query.copy_(initial_query)
         key.copy_(initial_key)
 
+    operator = torch.compile(artifact.as_torch_op("intent_gpu_benchmark::rope_qk"), fullgraph=True)
+    generated_launch = lambda: operator(query, key, cosine, sine)
+    generated_prepare()
+    initial_launch(generated_launch, side="generated")
     generated_prepare()
     generated = PreparedLaunch(
-        generated_base.launch,
+        generated_launch,
         lambda: (query, key),
         generated_prepare,
     )
@@ -74,7 +78,7 @@ def rope_qk(context: Context) -> PreparedComparison:
         (Tolerance(atol=2e-2, rtol=1e-2), Tolerance(atol=2e-2, rtol=1e-2)),
         cuda_graph=False,
         # Source multiplies/adds bf16 tiles; Intent promotes both products to f32.
-        note="同算法；source 保留 bf16 中间舍入",
+        note="同算法；source 保留 bf16 中间舍入；Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理",
     )
 
 

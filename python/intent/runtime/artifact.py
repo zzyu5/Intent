@@ -152,12 +152,14 @@ class CompiledArtifact:
         return self._invoke(lambda *args: self.runtime.prepare_call(args, outputs=outputs), arguments)
 
     def as_torch_op(self, name: str):
-        """Return a PyTorch CustomOpDef for this allocating tensor call.
+        """Return a PyTorch CustomOpDef with the declared Out and InOut behavior.
 
-        GPU and Mojo CPU calls support read-only In tensors, scalar inputs and fresh Out tensors;
-        InOut and output aliases are unsupported. The fake implementation uses the
-        declared interface without provider execution or data-pointer access.
-        Backward is not inferred; authors may use the result's register_autograd.
+        GPU and Mojo CPU calls return fresh Out tensors, or None with no Out,
+        and declare InOut mutations to the dispatcher. An InOut must not share
+        Torch storage with another input; output aliases remain unsupported.
+        Fake uses the same interface without execution or data-pointer access.
+        Backward is not inferred. Authors may register it for functional calls;
+        PyTorch does not accept register_autograd on mutable custom operators.
         """
         from .torch import register_operator
 
