@@ -1,33 +1,49 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
-import subprocess
+import shutil
+from uuid import uuid4
 
+from intent.compiler.cache import file_identity, locked_cache_entry
+from intent.compiler.toolchain import CompilationStageError
 
 from .target import TargetProfile
 from ..contract import ProgramContract
 from ..native import NativeABI
+from .. import native_artifact
+from ..native_artifact import NativeArtifact, NativeBuildResult, build_native_artifact, run_native_command, write_source
 
 
-def invoke_compiler(command: list[str], source: str | None = None) -> str:
-    result = subprocess.run(command, input=source, text=True, capture_output=True)
-    if result.returncode:
-        raise RuntimeError(f"compiler failed ({command[0]}):\n{result.stderr}{result.stdout}")
-    return result.stdout
+def _executable(command: str) -> Path:
+    resolved = shutil.which(command)
+    if resolved is None:
+        raise FileNotFoundError(f"native compiler is not executable: {command}")
+    return Path(resolved).absolute()
 
 
 def lower_artifact(source: str, *, compiler: str, profile: TargetProfile,
                    source_bindings: tuple[tuple[str, int], ...] = ()) -> dict:
-    artifact = json.loads(invoke_compiler(
-        [compiler, "--emit=artifact", f"--march={profile.march}", f"--abi={profile.abi}",
+    executable = _executable(compiler)
+    command = [str(executable), "--emit=artifact", f"--march={profile.march}", f"--abi={profile.abi}",
          f"--vlen-bits={profile.vlen_bits}",
          f"--private-stack-bytes={profile.private_stack_bytes}",
          *([f"--matrix-extension={profile.matrix_extension}"] if profile.matrix_extension else []),
-         *(f"--meta={name}={value}" for name, value in source_bindings)], source,
-    ))
-    _validate_target(artifact, profile)
+         *(f"--meta={name}={value}" for name, value in source_bindings)]
+    key = json.dumps((file_identity(executable), command, source, asdict(profile)))
+    with locked_cache_entry("weft-source", key) as entry:
+        directory = entry.create_attempt()
+        write_source(directory / "canonical.mlir", source)
+        output = run_native_command(command, directory, "provider_native_lowering", source=source)
+        try:
+            artifact = json.loads(output)
+            _validate_target(artifact, profile)
+        except (KeyError, TypeError, ValueError) as error:
+            raise CompilationStageError("provider_native_lowering", str(error),
+                                        cache_directory=directory) from error
+        write_source(directory / "weft.json", output)
     return artifact
 
 
@@ -74,7 +90,78 @@ def validate_artifact(manifest: dict, contract: ProgramContract) -> None:
             raise ValueError("Weft candidate does not use the required matrix extension")
 
 
-def export_artifact(program, directory: Path, *, compiler: str, profile: TargetProfile) -> None:
+@dataclass(frozen=True, slots=True)
+class WeftArtifact:
+    """A parsed, portable AOT program and its optional local native build."""
+
+    source: str
+    contract: ProgramContract
+    profile: TargetProfile
+    _weft: dict
+    ir: str | None = None
+    directory: Path | None = None
+    native: NativeArtifact | None = None
+    native_cache_observed: bool = False
+
+    @classmethod
+    def create(cls, source: str, contract: ProgramContract, profile: TargetProfile,
+               weft: dict, *, ir: str | None = None) -> WeftArtifact:
+        if contract.provider != "weft":
+            raise ValueError("Weft AOT requires a generated Weft CPU program")
+        artifact = cls(source, contract, profile, deepcopy(weft), ir)
+        validate_artifact(artifact.manifest, contract)
+        return artifact
+
+    @property
+    def manifest(self) -> dict:
+        return {"profile": asdict(self.profile), "program": self.contract.metadata,
+                "weft": deepcopy(self._weft)}
+
+    @property
+    def kernels(self) -> tuple[dict, ...]:
+        return tuple(deepcopy(self._weft["kernels"]))
+
+    @classmethod
+    def read(cls, directory: str | Path, *, load_native: bool = False) -> WeftArtifact:
+        directory = Path(directory).expanduser().resolve()
+        manifest = json.loads((directory / "artifact.json").read_text(encoding="utf-8"))
+        source = (directory / "canonical.mlir").read_text(encoding="utf-8")
+        contract = ProgramContract.read(source, manifest["program"])
+        ir_path = directory / "cpu.mlir"
+        artifact = cls.create(source, contract, TargetProfile(**manifest["profile"]), manifest["weft"],
+                              ir=ir_path.read_text(encoding="utf-8") if ir_path.is_file() else None)
+        artifact = replace(artifact, directory=directory)
+        if load_native:
+            record = json.loads((directory / "native-attempt.json").read_text(encoding="utf-8"))
+            attempt = Path(record["directory"])
+            if not attempt.is_absolute():
+                raise ValueError("Weft native attempt must name an absolute local cache directory")
+            native = NativeArtifact.read(attempt)
+            if ((attempt / "artifact.json").read_text(encoding="utf-8") !=
+                    json.dumps(artifact.manifest, sort_keys=True) or
+                    (attempt / "canonical.mlir").read_text(encoding="utf-8") != source):
+                raise ValueError("Weft native attempt does not belong to this exported program; compile it again")
+            artifact = replace(artifact, native=native)
+        return artifact
+
+    def save(self, directory: str | Path) -> WeftArtifact:
+        """Export portable sources; native attempts remain local and immutable."""
+        directory = Path(directory).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        write_source(directory / "canonical.mlir", self.source)
+        if self.ir is not None:
+            write_source(directory / "cpu.mlir", self.ir)
+        else:
+            (directory / "cpu.mlir").unlink(missing_ok=True)
+        write_source(directory / "kernels.c", self._weft["intrinsic_c"])
+        write_source(directory / "host.c", self.contract.facts.host_source)
+        write_source(directory / "artifact.json", json.dumps(self.manifest))
+        (directory / "native-attempt.json").unlink(missing_ok=True)
+        return replace(self, directory=directory, native=None, native_cache_observed=False)
+
+
+def export_artifact(program, directory: Path | None = None, *, compiler: str,
+                    profile: TargetProfile) -> WeftArtifact:
     """AOT lowering; system compilation and native loading remain separate."""
     from intent.targets.specification import CPUCompilationTarget
 
@@ -83,15 +170,9 @@ def export_artifact(program, directory: Path, *, compiler: str, profile: TargetP
         raise ValueError("Weft AOT requires a generated Weft CPU program")
     if target.matrix_i8_i32 and not profile.matrix_extension:
         raise ValueError("CPU program matrix capability disagrees with native materialization")
-    artifact = lower_artifact(program.source, compiler=compiler, profile=profile)
-    manifest = {"profile": asdict(profile), "program": program.metadata, "weft": artifact}
-    validate_artifact(manifest, program._contract)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "canonical.mlir").write_text(program.source, encoding="utf-8")
-    (directory / "cpu.mlir").write_text(program.ir, encoding="utf-8")
-    (directory / "kernels.c").write_text(artifact["intrinsic_c"], encoding="utf-8")
-    (directory / "host.c").write_text(program._contract.facts.host_source, encoding="utf-8")
-    (directory / "artifact.json").write_text(json.dumps(manifest), encoding="utf-8")
+    weft = lower_artifact(program.source, compiler=compiler, profile=profile)
+    artifact = WeftArtifact.create(program.source, program._contract, profile, weft, ir=program.ir)
+    return artifact if directory is None else artifact.save(directory)
 
 
 def flattened_signature(abi: NativeABI) -> tuple[list[str], list[str]]:
@@ -186,20 +267,47 @@ def native_exports(contract: ProgramContract) -> str:
     return "".join(sections)
 
 
-def compile_artifact(directory: Path, *, cc: tuple[str, ...], cflags: tuple[str, ...] = ()) -> Path:
-    manifest = json.loads((directory / "artifact.json").read_text())
-    contract = ProgramContract.read((directory / "canonical.mlir").read_text(encoding="utf-8"), manifest["program"])
-    validate_artifact(manifest, contract)
-    profile = TargetProfile(**manifest["profile"])
-    exports = directory / "exports.c"
-    exports.write_text(native_exports(contract), encoding="utf-8")
-    library = directory / "kernel.so"
-    invoke_compiler([
-        *cc, "-O3", "-shared", "-fPIC", "-std=c11", "-D_POSIX_C_SOURCE=200809L",
-        f"-march={profile.march}", f"-mabi={profile.abi}", *cflags,
-        "-fno-fast-math", "-ffp-contract=off",
-        *(["-fopenmp"] if contract.target.workers > 1 else []),
-        str(directory / "host.c"), str(directory / "kernels.c"), str(exports),
-        "-lm", "-o", str(library),
-    ])
-    return library
+def compile_artifact(artifact: WeftArtifact | str | Path, *, cc: tuple[str, ...],
+                     cflags: tuple[str, ...] = ()) -> WeftArtifact:
+    if not isinstance(artifact, WeftArtifact):
+        artifact = WeftArtifact.read(artifact)
+    if not cc:
+        raise ValueError("Weft native compilation requires an explicit C compiler command")
+    executable = _executable(cc[0])
+    command = (str(executable), *cc[1:])
+    contract, profile = artifact.contract, artifact.profile
+    exports = native_exports(contract)
+    manifest = json.dumps(artifact.manifest, sort_keys=True)
+    implementation = (Path(__file__), Path(native_artifact.__file__))
+    key = json.dumps((artifact.source, manifest, exports, command, cflags,
+                      file_identity(executable), tuple(file_identity(path) for path in implementation)))
+
+    def build(directory: Path) -> NativeBuildResult:
+        write_source(directory / "canonical.mlir", artifact.source)
+        write_source(directory / "artifact.json", manifest)
+        write_source(directory / "host.c", contract.facts.host_source)
+        write_source(directory / "kernels.c", artifact._weft["intrinsic_c"])
+        write_source(directory / "exports.c", exports)
+        library = directory / "kernel.so"
+        run_native_command([
+            *command, "-O3", "-shared", "-fPIC", "-std=c11", "-D_POSIX_C_SOURCE=200809L",
+            f"-march={profile.march}", f"-mabi={profile.abi}", *cflags,
+            "-fno-fast-math", "-ffp-contract=off",
+            *(["-fopenmp"] if contract.target.workers > 1 else []),
+            str(directory / "host.c"), str(directory / "kernels.c"), str(directory / "exports.c"),
+            "-lm", "-o", str(library),
+        ], directory, "provider_native_compilation")
+        return NativeBuildResult(library, (executable, *implementation,
+            *(directory / name for name in ("canonical.mlir", "artifact.json", "host.c", "kernels.c", "exports.c"))))
+
+    native = build_native_artifact("weft-native", key, build, reusable=False,
+        cache_reason="The supplied C compiler command has no declared complete compiler/linker dependency closure")
+    compiled = replace(artifact, native=native, native_cache_observed=True)
+    if artifact.directory is not None:
+        temporary = artifact.directory / f".native-attempt-{uuid4().hex}"
+        try:
+            temporary.write_text(json.dumps({"directory": str(native.directory)}), encoding="utf-8")
+            temporary.replace(artifact.directory / "native-attempt.json")
+        finally:
+            temporary.unlink(missing_ok=True)
+    return compiled

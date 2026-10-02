@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import asdict, dataclass, replace
+import os
 import statistics
+from threading import RLock
 
 import torch
 
-from .compilation import compile_library
+from .compilation import compile_portfolio, runtime_inputs_current
 from .contract import MojoFacts
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, build_invocation_binders, invocation_result
 from ..native import NativeABI, NativePreparedRuntime
+from ..native_artifact import load_native_library
 from ..torch_views import allocate_output, check_abstract_relation, observe_view
 from ..diagnostics import CacheObservation, CandidateObservation, ObservedCall, bindings, observation
 from intent.compiler.toolchain import CompilationStageError
@@ -62,8 +65,33 @@ class NativeCall(ObservedCall):
     description: tuple
     winner: int | None = None
 
+    def _native_failure(self, error: CompilationStageError) -> None:
+        configuration = next((description for candidate, description in zip(
+            self.program.candidates, self.program.configuration_descriptions, strict=True)
+            if candidate.entry == error.candidate), None)
+        details = observation(
+            "mojo", self.program.target, self.description, None, (),
+            (CandidateObservation(configuration, "failed", error.stage,
+                                  type(error).__name__, str(error)),),
+            stage="failed", caches=self.program.compilation_cache,
+        )
+        self._record_observation(details)
+        error.observation = details
+
     def compile(self) -> None:
-        """The Mojo portfolio is already compiled and loaded by materialization."""
+        """Compile the declared portfolio without loading, choosing or executing it."""
+        try:
+            self.program.compile()
+        except CompilationStageError as error:
+            self._native_failure(error)
+            raise
+        self._record_observation(observation(
+            "mojo", self.program.target, self.description, None, (),
+            tuple(CandidateObservation(configuration, "compiled", "provider_native_compilation")
+                  for configuration in self.program.configuration_descriptions),
+            stage="compiled", caches=self.program.compilation_cache,
+            history_unavailable="Compilation does not select or time a native candidate",
+        ))
 
     def inspect_configurations(self):
         return self.program.inspect_configurations()
@@ -80,6 +108,11 @@ class NativeCall(ObservedCall):
                                     observation=details) from error
 
     def choose(self) -> int:
+        try:
+            self.program.ensure_loaded()
+        except CompilationStageError as error:
+            self._native_failure(error)
+            raise
         if self.winner is not None:
             return self.winner
         reused = self.key in self.program.winners
@@ -111,7 +144,8 @@ class NativeCall(ObservedCall):
         self._record_execution("launched")
 
     def benchmark(self) -> float:
-        elapsed = _timing_samples(self.program.measurements[self.choose()], self.native_arguments, samples=7)
+        selected = self.choose()
+        elapsed = _timing_samples(self.program.measurements[selected], self.native_arguments, samples=7)
         self._record_execution("benchmarked")
         return elapsed
 
@@ -121,6 +155,16 @@ class NativeCall(ObservedCall):
 
 class NativeProgram(NativePreparedRuntime):
     def __init__(self, abi: NativeABI, facts: MojoFacts, target) -> None:
+        self._abi = abi
+        self._facts = facts
+        self._target = target
+        self._lock = RLock()
+        self._closed = False
+        self._loaded_libraries = ()
+        self.compilation = None
+        self.compilation_cache = ()
+        self.functions = ()
+        self.measurements = ()
         self.interface = abi.interface
         self.target = bindings({"family": "cpu", **{name: value for name, value in asdict(target.compilation).items()
                                                   if name != "provider"}})
@@ -142,24 +186,69 @@ class NativeProgram(NativePreparedRuntime):
             check_view_geometry=lambda owner, parameter, facts: requirements.check_geometry(
                 parameter, facts, check_relation=check_abstract_relation),
         )[0]
-        self.compilation = compile_library(facts, target, abi=abi)
-        self.compilation_cache = tuple(CacheObservation("native_compilation", "persistent_artifact",
-            library.cache_hit, "Mojo NativeLibrary.cache_hit", "materialization", library.cache_reason, candidate.entry)
-            for candidate, library in zip(self.candidates, self.compilation.libraries, strict=True))
-        argument_types = abi.argument_types()
-        self.functions = []
-        self.measurements = []
-        for candidate, compilation in zip(self.candidates, self.compilation.libraries):
-            function = getattr(compilation.library, candidate.entry)
-            function.argtypes = argument_types
-            function.restype = None
-            self.functions.append(function)
-            measure = getattr(compilation.library, candidate.entry + "_benchmark")
-            measure.argtypes = [*argument_types, ctypes.c_int64]
-            measure.restype = ctypes.c_double
-            self.measurements.append(measure)
-        self.winners = _winners.setdefault(self.compilation.identity, {})
-        self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise CompilationStageError("provider_native_loading", "Mojo program is closed")
+
+    def compile(self):
+        with self._lock:
+            self._check_open()
+            if self.compilation is None:
+                compilation = compile_portfolio(self._facts, self._target, abi=self._abi)
+                self.compilation_cache = tuple(CacheObservation(
+                    "native_compilation", "persistent_artifact", artifact.cache_hit,
+                    "Mojo NativeArtifact.cache_hit", "compilation", artifact.cache_reason,
+                    candidate.entry,
+                ) for candidate, artifact in zip(self.candidates, compilation.artifacts, strict=True))
+                self.winners = _winners.setdefault(compilation.identity, {})
+                self.timings = _candidate_timings.setdefault(compilation.identity, {})
+                self.compilation = compilation
+            return self.compilation
+
+    def ensure_loaded(self) -> None:
+        with self._lock:
+            compilation = self.compile()
+            if self._loaded_libraries:
+                return
+            libraries, functions, measurements = [], [], []
+            argument_types = self._abi.argument_types()
+            environment = dict(os.environ)
+            try:
+                for candidate, artifact in zip(self.candidates, compilation.artifacts, strict=True):
+                    if artifact.cache_reason is None and not runtime_inputs_current(artifact, environment):
+                        raise RuntimeError("Mojo runtime library resolution changed after native compilation")
+                    library = load_native_library(artifact)
+                    libraries.append(library)
+                    functions.append(library.bind(candidate.entry, argument_types, None))
+                    measurements.append(library.bind(
+                        candidate.entry + "_benchmark", [*argument_types, ctypes.c_int64], ctypes.c_double))
+            except Exception as error:
+                for library in libraries:
+                    library.close()
+                if isinstance(error, CompilationStageError):
+                    raise CompilationStageError(
+                        error.stage, str(error), cache_directory=error.cache_directory,
+                        candidate=candidate.entry, artifacts=error.artifacts,
+                    ) from error
+                raise CompilationStageError(
+                    "provider_native_loading", str(error), cache_directory=artifact.directory,
+                    candidate=candidate.entry, artifacts={"library": artifact.library},
+                ) from error
+            self._loaded_libraries = tuple(libraries)
+            self.functions = tuple(functions)
+            self.measurements = tuple(measurements)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for library in self._loaded_libraries:
+                library.close()
+            self._loaded_libraries = ()
+            self.functions = ()
+            self.measurements = ()
 
     def _view(self, parameter: ViewParameter, tensor) -> ViewFacts:
         facts = observe_view(parameter, tensor, device=torch.device("cpu"))
@@ -174,6 +263,7 @@ class NativeProgram(NativePreparedRuntime):
         return tensor, facts
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
+        self._check_open()
         bound = self._binders[bool(explicit_outputs)](self, arguments)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs, bound.key,
                           self.describe_arguments(bound, "cpu"))

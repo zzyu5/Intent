@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import statistics
+from threading import RLock
 
 from .buffer import DeviceBuffer, DeviceView, runtime
 from .compilation import compile_library
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
 from ..native import NativePreparedRuntime
+from ..native_artifact import load_native_library
 from ..diagnostics import CacheObservation, ObservedCall, bindings, observation
 from intent.compiler.toolchain import CompilationStageError
 
@@ -22,27 +24,28 @@ class NativeCall(ObservedCall):
     description: tuple
 
     def compile(self) -> None:
-        """The fixed BANG C entry is already compiled and loaded by materialization."""
-        if not self.program.queue.value:
-            raise CompilationStageError("provider_native_compilation", "BANG C program is closed")
+        """Compile the fixed entry without loading it or creating a CNRT queue."""
+        try:
+            self.program.compile()
+        except CompilationStageError as error:
+            details = self._observed("failed")
+            self._record_observation(details)
+            error.observation = details
+            raise
+        self._record_observation(self._observed("compiled"))
 
     def inspect_configurations(self):
         """BANG C has a fixed generated entry, not a runtime tuning portfolio."""
         return ()
 
     def _observed(self, stage):
-        if self.observation is not None:
-            return replace(self.observation, stage=stage)
         return observation("bangc", self.program.target_facts, self.description, None, (), stage=stage,
             history_unavailable="The generated DSA entry has fixed bindings; there is no runtime candidate search",
             caches=(CacheObservation("tuning", "not_applicable", None, "BANG C fixed entry", "selection"),
-                    CacheObservation("native_compilation", "process", None, "BANG C compile_library",
-                                     "materialization",
-                                     "The native compilation API does not expose its cache decision")))
+                    *self.program.compilation_observations()))
 
     def _validate(self) -> None:
-        if not self.program.queue.value:
-            raise ValueError("BANG C program is closed")
+        self.program.check_open()
         if any(isinstance(value, (DeviceBuffer, DeviceView)) and not value.pointer for value in self.arguments):
             raise ValueError("BANG C call refers to a closed device allocation")
         self.program.runtime.select(self.program.target.device)
@@ -54,8 +57,14 @@ class NativeCall(ObservedCall):
 
     def enqueue(self, queue: ctypes.c_void_p | None = None) -> None:
         try:
+            self.program.ensure_loaded()
             self._validate()
-            self._submit(self.program.queue if queue is None else queue)
+            self._submit(self.program.ensure_queue() if queue is None else queue)
+        except CompilationStageError as error:
+            details = self._observed("failed")
+            self._record_observation(details)
+            error.observation = details
+            raise
         except Exception as error:
             details = self._observed("failed")
             self._record_observation(details)
@@ -86,8 +95,10 @@ def _queue_owner(calls: tuple[NativeCall, ...]):
     owner = calls[0].program
     if any(call.program.runtime is not owner.runtime or call.program.target.device != owner.target.device for call in calls):
         raise ValueError("a BANG C launch sequence must use one runtime and device")
-    if not owner.queue.value:
-        raise ValueError("BANG C launch sequence queue is closed")
+    for call in calls:
+        call.program.check_open()
+        call.program.ensure_loaded()
+    owner.ensure_queue()
     return owner
 
 
@@ -136,11 +147,20 @@ class NativeProgram(NativePreparedRuntime):
 
         require_matching_target(contract.target, target.compilation)
         self.target = target
+        self.source = source
+        self._state_lock = RLock()
+        self._closed = False
+        self._runtime = None
+        self.compilation = None
+        self.library = None
+        self.function = None
+        self.queue = ctypes.c_void_p()
         self.target_facts = bindings(contract.metadata["target"])
         self.facts = contract.facts
         self.candidates = ()
         self.configuration_descriptions = ()
         abi = contract.abi
+        self._argument_types = (ctypes.c_void_p, *abi.argument_types())
         self.interface = abi.interface
         self.requirements = requirements = abi.requirements
         converters = {"bool": bool, "i8": int, "i16": int, "i32": int, "i64": int,
@@ -162,16 +182,58 @@ class NativeProgram(NativePreparedRuntime):
                 raise ValueError("BANG C artifact and target disagree on bound parameter shapes")
             if any(extent >= 0 and extent != declared for extent, declared in zip(shape, parameter.shape)):
                 raise ValueError("BANG C artifact and target disagree on bound extents")
-        self.compilation = compile_library(source, target)
-        self.runtime = runtime(target.neuware)
-        self.runtime.select(target.device)
-        self.queue = ctypes.c_void_p()
-        self.runtime.invoke("cnrtQueueCreate", ctypes.byref(self.queue))
-        self.function = getattr(self.compilation.library, self.facts.entry)
-        self.function.argtypes = (ctypes.c_void_p, *abi.argument_types())
-        self.function.restype = ctypes.c_int
+
+    def check_open(self) -> None:
+        if self._closed:
+            raise ValueError("BANG C program is closed")
+
+    @property
+    def runtime(self):
+        with self._state_lock:
+            self.check_open()
+            if self._runtime is None:
+                self._runtime = runtime(self.target.neuware)
+            return self._runtime
+
+    def compile(self):
+        with self._state_lock:
+            self.check_open()
+            if self.compilation is None:
+                self.compilation = compile_library(self.source, self.target)
+            return self.compilation
+
+    def ensure_loaded(self) -> None:
+        with self._state_lock:
+            self.check_open()
+            if self.function is not None:
+                return
+            compilation = self.compile()
+            library = load_native_library(compilation)
+            try:
+                function = library.bind(self.facts.entry, self._argument_types, ctypes.c_int)
+            except Exception:
+                library.close()
+                raise
+            self.library, self.function = library, function
+
+    def ensure_queue(self) -> ctypes.c_void_p:
+        with self._state_lock:
+            self.check_open()
+            if not self.queue.value:
+                self.runtime.select(self.target.device)
+                self.runtime.invoke("cnrtQueueCreate", ctypes.byref(self.queue))
+            return self.queue
+
+    def compilation_observations(self):
+        if self.compilation is None:
+            return ()
+        artifact = self.compilation
+        return (CacheObservation("native_compilation", "persistent_artifact", artifact.cache_hit,
+                                 "BANG C native artifact", "native_compilation",
+                                 artifact.cache_reason, str(artifact.directory)),)
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
+        self.check_open()
         bound = self._binders[bool(explicit_outputs)](self, arguments)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
                           self.describe_arguments(bound, f"mlu:{self.target.device}"))
@@ -202,15 +264,26 @@ class NativeProgram(NativePreparedRuntime):
                 raise NotImplementedError("this row reduction requires a larger DSA tile binding")
 
     def close(self) -> None:
-        if self.queue.value:
-            self.runtime.invoke("cnrtSetDevice", self.target.device)
-            self.runtime.invoke("cnrtQueueSync", self.queue)
-            self.runtime.invoke("cnrtQueueDestroy", self.queue)
-            self.queue = ctypes.c_void_p()
+        with self._state_lock:
+            if self._closed:
+                return
+            if self.queue.value:
+                self.runtime.invoke("cnrtSetDevice", self.target.device)
+                self.runtime.invoke("cnrtQueueSync", self.queue)
+                self.runtime.invoke("cnrtQueueDestroy", self.queue)
+                self.queue = ctypes.c_void_p()
+            if self.library is not None:
+                self.library.close()
+                self.library = None
+                self.function = None
+            self._closed = True
 
     def __del__(self):
         queue = getattr(self, "queue", None)
         if queue and queue.value:
-            self.runtime.library.cnrtSetDevice(self.target.device)
-            self.runtime.library.cnrtQueueSync(queue)
-            self.runtime.library.cnrtQueueDestroy(queue)
+            self._runtime.library.cnrtSetDevice(self.target.device)
+            self._runtime.library.cnrtQueueSync(queue)
+            self._runtime.library.cnrtQueueDestroy(queue)
+        library = getattr(self, "library", None)
+        if library is not None:
+            library.close()

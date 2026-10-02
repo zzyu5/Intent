@@ -29,8 +29,9 @@ class PreparedCall(Protocol):
     def compile(self) -> None:
         """Compile eligible native candidates without tuning or executing this call.
 
-        Providers already compiled during materialization require no further work.
-        Compilation does not select a winner or certify native execution.
+        An existing AOT native artifact is validated instead of recompiled.
+        This does not require loading a native library, select a winner or
+        certify native execution.
         """
         ...
 

@@ -18,19 +18,17 @@ def serve(directory: Path) -> None:
         builds = [executor.submit(compile_artifact, directory / side,
                   cc=tuple(configuration["cc"]), cflags=tuple(configuration["cflags"]))
                   for side in ("generated", "source")]
-        for build in builds:
-            build.result()
+        generated_artifact, source_artifact = (build.result() for build in builds)
     os.sched_setaffinity(0, configuration["cpus"])
-    generated = NativeProgram(directory / "generated")
-    source = NativeProgram(directory / "source")
+    generated = NativeProgram(generated_artifact)
+    source = NativeProgram(source_artifact)
     try:
         m, n, k = configuration["shape"]
         arguments = tuple(Buffer(bytearray((directory / f"{name}.bin").read_bytes()), shape=shape, dtype=dtype)
                           for name, shape, dtype in (("a", (m, k), "i8"), ("b", (k, n), "i8"), ("bias", (n,), "i32")))
         generated_call, source_call = generated.prepare(arguments), source.prepare(arguments)
         eviction = Buffer.empty((64 * 1024 * 1024,), "u8")
-        evict = generated.library.intent_weft_evict
-        evict.argtypes, evict.restype = [ctypes.c_void_p, ctypes.c_int64], None
+        evict = generated.library.bind("intent_weft_evict", [ctypes.c_void_p, ctypes.c_int64], None)
         prepare = lambda: evict(eviction.pointer, eviction.nbytes)
         print(json.dumps({"ready": True}), flush=True)
         if sys.stdin.readline() != "benchmark\n":

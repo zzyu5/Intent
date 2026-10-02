@@ -3,7 +3,6 @@ from __future__ import annotations
 import ctypes
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-import json
 import math
 import os
 from pathlib import Path
@@ -11,14 +10,15 @@ import platform
 import resource
 import statistics
 import sys
+from threading import Lock
 
 from .buffer import Buffer
-from .compilation import validate_artifact
+from .compilation import WeftArtifact
 from .target import TargetProfile, matrix_capability
-from ..contract import ProgramContract
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
 from ..native import NativePreparedRuntime
+from ..native_artifact import load_native_library
 from ..diagnostics import CacheObservation, CandidateObservation, ObservedCall, bindings, observation
 from intent.compiler.toolchain import CompilationStageError
 
@@ -65,9 +65,7 @@ class _ExecutionContract:
         self.vlen_probe = None
 
     def bind_library(self, library) -> None:
-        self.vlen_probe = library.intent_weft_vlen_bits
-        self.vlen_probe.argtypes = []
-        self.vlen_probe.restype = ctypes.c_int64
+        self.vlen_probe = library.bind("intent_weft_vlen_bits", [], ctypes.c_int64)
 
     def check(self) -> None:
         stack, _ = resource.getrlimit(resource.RLIMIT_STACK)
@@ -123,10 +121,47 @@ class NativeCall(ObservedCall):
     trial_storage: tuple[memoryview, ...]
     winner: int | None = None
 
+    @contextmanager
+    def _native_stage(self, stage: str, *, candidate=None, observed=()):
+        try:
+            yield
+        except Exception as cause:
+            error = cause if isinstance(cause, CompilationStageError) else CompilationStageError(
+                stage, str(cause), cache_directory=self.program.directory,
+                candidate=None if candidate is None else candidate.entry)
+            failed_entry = error.candidate if error.candidate is not None else (
+                candidate.entry if candidate is not None else None)
+            configuration = next((description for entry, description in zip(
+                self.program.candidates, self.program.configuration_descriptions, strict=True)
+                if entry.entry == failed_entry), None)
+            failed = CandidateObservation(configuration, "failed", error.stage,
+                                          type(cause).__name__, str(cause))
+            if self.observation is not None and not observed:
+                details = replace(self.observation, stage="failed",
+                                  candidates=(*self.observation.candidates, failed))
+            else:
+                details = observation("weft", self.program.target, self.description, configuration, (),
+                                      (*observed, failed), stage="failed", caches=self.program.compilation_cache)
+            self._record_observation(details)
+            error.observation = details
+            if error is cause:
+                raise
+            raise error from cause
+
     def compile(self) -> None:
-        """Weft's AOT portfolio is already compiled and loaded by materialization."""
-        if self.program.library is None:
-            raise CompilationStageError("provider_native_compilation", "native artifact is closed")
+        """Validate the AOT portfolio without loading code or probing a device."""
+        with self._native_stage("provider_native_compilation"):
+            self.program.compile()
+        self._record_observation(observation(
+            "weft", self.program.target, self.description, None, (),
+            tuple(CandidateObservation(configuration, "compiled", "provider_native_compilation")
+                  for configuration in self.program.configuration_descriptions),
+            stage="compiled", caches=self.program.compilation_cache,
+            history_unavailable="AOT artifact validation does not load or time a native candidate"))
+
+    def _prepare_execution(self) -> None:
+        with self._native_stage("provider_invocation"):
+            self.program.check_execution()
 
     def inspect_configurations(self):
         return self.program.inspect_configurations()
@@ -145,6 +180,7 @@ class NativeCall(ObservedCall):
             restore()
 
     def choose(self, prepare=None) -> int:
+        self._prepare_execution()
         if self.winner is not None:
             return self.winner
         observed = []
@@ -158,20 +194,12 @@ class NativeCall(ObservedCall):
                 for candidate, measure, configuration in zip(self.program.candidates, self.program.measurements,
                                                              self.program.configuration_descriptions, strict=True):
                     samples = []
-                    try:
+                    with self._native_stage("provider_tuning", candidate=candidate, observed=observed):
                         for _ in range(3):
                             restore()
                             if prepare is not None:
                                 prepare()
                             samples.append(_measure(measure, self.native_arguments))
-                    except Exception as error:
-                        observed.append(CandidateObservation(configuration, "failed", "provider_tuning",
-                                                             type(error).__name__, str(error)))
-                        details = observation("weft", self.program.target, self.description, None, (), observed,
-                                              stage="failed", caches=self.program.compilation_cache)
-                        self._record_observation(details)
-                        raise CompilationStageError("provider_tuning", str(error), candidate=candidate.entry,
-                                                    observation=details) from error
                     elapsed = statistics.median(samples)
                     timings.append(elapsed)
                     observed.append(CandidateObservation(configuration, "trial_completed", "provider_tuning",
@@ -190,35 +218,23 @@ class NativeCall(ObservedCall):
         return self.winner
 
     def launch(self) -> None:
-        try:
-            self.program.check_execution()
-        except Exception as error:
-            details = observation("weft", self.program.target, self.description, None, (),
-                                  stage="failed", caches=self.program.compilation_cache,
-                                  history_unavailable="Native execution requirements failed before candidate invocation")
-            self._record_observation(details)
-            raise CompilationStageError("provider_invocation", str(error), observation=details) from error
         selected = self.choose()
-        try:
+        with self._native_stage("provider_invocation", candidate=self.program.candidates[selected]):
             self.program.functions[selected](*self.native_arguments)
-        except Exception as error:
-            details = replace(self.observation, stage="failed")
-            self._record_observation(details)
-            raise CompilationStageError("provider_invocation", str(error),
-                                        candidate=self.program.candidates[selected].entry, observation=details) from error
         self._record_execution("launched")
 
     def benchmark(self, *, prepare=None, samples: int = 10) -> float:
-        self.program.check_execution()
-        measure = self.program.measurements[self.choose(prepare)]
+        selected = self.choose(prepare)
+        measure = self.program.measurements[selected]
         values = []
-        with self._trial_state() as restore:
-            for _ in range(samples):
-                restore()
-                if prepare is not None:
-                    prepare()
-                values.append(_measure(measure, self.native_arguments))
-        elapsed = statistics.median(values)
+        with self._native_stage("provider_invocation", candidate=self.program.candidates[selected]):
+            with self._trial_state() as restore:
+                for _ in range(samples):
+                    restore()
+                    if prepare is not None:
+                        prepare()
+                    values.append(_measure(measure, self.native_arguments))
+            elapsed = statistics.median(values)
         self._record_execution("benchmarked")
         return elapsed
 
@@ -227,19 +243,23 @@ class NativeCall(ObservedCall):
 
 
 class NativeProgram(NativePreparedRuntime):
-    def __init__(self, directory: Path) -> None:
-        self.directory = Path(directory)
-        manifest_text = (self.directory / "artifact.json").read_text()
-        manifest = json.loads(manifest_text)
-        contract = ProgramContract.read((self.directory / "canonical.mlir").read_text(encoding="utf-8"),
-                                        manifest["program"])
-        validate_artifact(manifest, contract)
-        self.profile = TargetProfile(**manifest["profile"])
+    def __init__(self, artifact: WeftArtifact | str | Path) -> None:
+        if not isinstance(artifact, WeftArtifact):
+            artifact = WeftArtifact.read(artifact, load_native=True)
+        if artifact.native is None:
+            raise ValueError("Weft native loading requires compile_artifact to finish first")
+        self.artifact = artifact
+        self.directory = artifact.native.directory
+        contract = artifact.contract
+        self.profile = artifact.profile
         self.facts = contract.facts
         self.target = bindings({"family": "cpu", **{name: value for name, value in asdict(contract.target).items()
                                                   if name != "provider"}})
-        self.compilation_cache = (CacheObservation("native_compilation", "external_aot", None, "Weft kernel.so", "materialization",
-            "The native runtime loads an existing external AOT artifact and does not observe its build cache"),)
+        self.compilation_cache = (CacheObservation("native_compilation",
+            "disk" if artifact.native_cache_observed else "external_aot",
+            artifact.native.cache_hit if artifact.native_cache_observed else None,
+            str(artifact.native.directory), "materialization", artifact.native.cache_reason if artifact.native_cache_observed else
+            "A saved native artifact was loaded; its compilation cache use was not observed"),)
         abi = contract.abi
         self.interface = abi.interface
         self.trial_regions = abi.trial_regions()
@@ -254,32 +274,56 @@ class NativeProgram(NativePreparedRuntime):
         )
         self.candidates = self.facts.candidates
         self.configuration_descriptions = tuple(bindings(candidate.metadata()) for candidate in self.candidates)
-        kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
+        kernels = {kernel["symbol"]: kernel for kernel in artifact.kernels}
         self.candidate_extensions = tuple(frozenset(
             extension for task in self.facts.tasks if task.cpu_entry == candidate.entry
             for extension in kernels[task.abi.symbol]["used_extensions"])
             for candidate in self.candidates)
-        self.used_extensions = frozenset(extension for kernel in manifest["weft"]["kernels"]
+        self.used_extensions = frozenset(extension for kernel in kernels.values()
                                          for extension in kernel["used_extensions"])
-        self._execution = _ExecutionContract(self.profile, self.used_extensions)
-        self._execution.check()
-        self.library = ctypes.CDLL(str(self.directory / "kernel.so"))
-        self._execution.bind_library(self.library)
-        self.check_execution()
-        self.identity = (manifest_text, (self.directory / "kernel.so").stat().st_mtime_ns)
-        types = abi.argument_types()
+        self.identity = artifact.native.identity
+        self._argument_types = abi.argument_types()
+        self._library = None
+        self._execution = None
+        self._closed = False
+        self._load_lock = Lock()
         self.functions, self.measurements = [], []
-        for candidate in self.candidates:
-            function = getattr(self.library, candidate.entry + "_invoke")
-            function.argtypes, function.restype = types, None
-            measure = getattr(self.library, candidate.entry + "_benchmark")
-            measure.argtypes, measure.restype = [*types, ctypes.c_int64], ctypes.c_double
-            self.functions.append(function)
-            self.measurements.append(measure)
+
+    def compile(self) -> None:
+        if self._closed:
+            raise CompilationStageError("provider_native_compilation", "native artifact is closed")
+        self.artifact.native.validate()
+
+    def ensure_loaded(self):
+        with self._load_lock:
+            if self._closed:
+                raise CompilationStageError("native_loading", "native artifact is closed")
+            if self._library is not None:
+                return self._library
+            execution = _ExecutionContract(self.profile, self.used_extensions)
+            execution.check()
+            library = load_native_library(self.artifact.native)
+            try:
+                execution.bind_library(library)
+                execution.check()
+                functions = [library.bind(candidate.entry + "_invoke", self._argument_types, None)
+                             for candidate in self.candidates]
+                measurements = [library.bind(candidate.entry + "_benchmark",
+                                              [*self._argument_types, ctypes.c_int64], ctypes.c_double)
+                                for candidate in self.candidates]
+            except Exception:
+                library.close()
+                raise
+            self._execution, self._library = execution, library
+            self.functions, self.measurements = functions, measurements
+            return library
+
+    @property
+    def library(self):
+        return self.ensure_loaded()
 
     def check_execution(self) -> None:
-        if self.library is None:
-            raise RuntimeError("native artifact is closed")
+        self.ensure_loaded()
         self._execution.check()
 
     def _view(self, parameter: ViewParameter, value) -> ViewFacts:
@@ -299,6 +343,9 @@ class NativeProgram(NativePreparedRuntime):
         return value, facts
 
     def prepare(self, arguments: tuple, *, explicit_outputs: bool = False) -> NativeCall:
+        if self._closed:
+            raise CompilationStageError("native_loading", "native artifact is closed",
+                                        cache_directory=self.directory)
         bound = self._binders[bool(explicit_outputs)](self, arguments)
         trial_storage = []
         for region in self.trial_regions:
@@ -312,10 +359,12 @@ class NativeProgram(NativePreparedRuntime):
                           tuple(trial_storage))
 
     def close(self) -> None:
-        import _ctypes
-        if self.library is not None:
+        with self._load_lock:
+            self._closed = True
             self.functions.clear()
             self.measurements.clear()
-            self._execution.vlen_probe = None
-            _ctypes.dlclose(self.library._handle)
-            self.library = None
+            if self._execution is not None:
+                self._execution.vlen_probe = None
+            if self._library is not None:
+                self._library.close()
+                self._library = None

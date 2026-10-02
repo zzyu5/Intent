@@ -54,4 +54,6 @@ def prepare_source(path: Path, entry: str, parameters, target, arguments):
                                 "source_range": [0, len(source.encode("utf-8"))]}]}
     abi = NativeABI.read(metadata)
     facts = MojoFacts.read(source, metadata, abi)
-    return NativeProgram(abi, facts, target).prepare(arguments)
+    call = NativeProgram(abi, facts, target).prepare(arguments)
+    call.compile()
+    return call

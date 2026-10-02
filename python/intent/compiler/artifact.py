@@ -41,7 +41,8 @@ class OptimizedIR:
 class GeneratedProgram:
     """Provider source, IR and metadata, with an optional process-local binding.
 
-    Native code and runtime handles are created by materialize(), not load().
+    load() restores the compiler contract only. materialize() binds a local
+    runtime; native compilation and loading follow that provider's lifecycle.
     """
 
     source: str
@@ -161,8 +162,9 @@ class GeneratedProgram:
         An explicit target chooses the local device or SDK. Programs generated
         with a local target may reuse that process-local binding; programs loaded
         from disk or generated from explicit compiler facts require a target.
-        Providers may defer native JIT or tuning until invocation. This does not
-        launch a kernel, and does not retarget the compiled physical program.
+        Providers may defer native compilation and loading until invocation.
+        A prepared call's compile() requests compilation without tuning or
+        execution. Materialization never launches or retargets the program.
         """
         from intent.targets.base import ResolvedTarget
         from .toolchain import CompilationStageError

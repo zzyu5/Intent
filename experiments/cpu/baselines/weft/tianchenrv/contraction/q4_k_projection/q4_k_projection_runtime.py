@@ -30,18 +30,16 @@ def serve(directory: Path) -> None:
         builds = [executor.submit(compile_artifact, directory / side,
                   cc=tuple(configuration["cc"]), cflags=tuple(configuration["cflags"]))
                   for side in ("generated", "source")]
-        for build in builds:
-            build.result()
+        generated_artifact, source_artifact = (build.result() for build in builds)
     os.sched_setaffinity(0, configuration["cpus"])
-    generated = NativeProgram(directory / "generated")
-    source = NativeProgram(directory / "source")
+    generated = NativeProgram(generated_artifact)
+    source = NativeProgram(source_artifact)
     try:
         arguments = inputs(4096, 4096)
         generated_call = generated.prepare(arguments)
         source_call = source.prepare(arguments)
         cache = bytearray(64 * 1024 * 1024)
-        evict = generated.library.intent_weft_evict
-        evict.argtypes, evict.restype = [ctypes.c_void_p, ctypes.c_int64], None
+        evict = generated.library.bind("intent_weft_evict", [ctypes.c_void_p, ctypes.c_int64], None)
         cache_pointer = ctypes.addressof(ctypes.c_char.from_buffer(cache))
 
         def prepare():

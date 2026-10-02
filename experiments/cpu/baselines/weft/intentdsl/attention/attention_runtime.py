@@ -20,11 +20,10 @@ def serve(directory: Path) -> None:
         builds = [executor.submit(compile_artifact, directory / side,
                   cc=tuple(configuration["cc"]), cflags=tuple(configuration["cflags"]))
                   for side in ("generated", "source")]
-        for build in builds:
-            build.result()
+        generated_artifact, source_artifact = (build.result() for build in builds)
     os.sched_setaffinity(0, configuration["cpus"])
-    generated = NativeProgram(directory / "generated")
-    source = NativeProgram(directory / "source")
+    generated = NativeProgram(generated_artifact)
+    source = NativeProgram(source_artifact)
     try:
         rng = random.Random(0)
         shape = (8, 128, 32)

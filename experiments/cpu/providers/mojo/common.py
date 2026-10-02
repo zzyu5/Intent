@@ -42,12 +42,22 @@ def _compile(context, definition, *, constexprs=None):
     artifact = intent.compile(definition, target=context.target, compiler=context.compiler,
                               tuning_config=context.tuning_config, options=context.compile_options, constexprs=constexprs)
     elapsed = time.monotonic() - started
-    libraries = artifact.runtime.compilation.libraries
-    reasons = sorted({library.cache_reason for library in libraries if library.cache_reason})
-    print(f"mojo: generated_materialization_s={elapsed:.6f}; "
-          f"native_cache_hits={sum(library.cache_hit for library in libraries)}/{len(libraries)}; "
-          f"cache_unavailable={reasons}", flush=True)
+    print(f"mojo: generated_materialization_s={elapsed:.6f}", flush=True)
     return artifact
+
+
+def _prepare_native(artifact, arguments):
+    call = artifact.prepare(*arguments)
+    report_stage("generated_native_compilation")
+    started = time.monotonic()
+    call.compile()
+    elapsed = time.monotonic() - started
+    binaries = artifact.runtime.compilation.artifacts
+    reasons = sorted({binary.cache_reason for binary in binaries if binary.cache_reason})
+    print(f"mojo: native_compilation_s={elapsed:.6f}; "
+          f"native_cache_hits={sum(binary.cache_hit for binary in binaries)}/{len(binaries)}; "
+          f"cache_unavailable={reasons}", flush=True)
+    return call
 
 
 def report_selection(observed):
@@ -61,7 +71,7 @@ def report_selection(observed):
 
 def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
     artifact = _compile(context, definition)
-    generated = artifact.prepare(*arguments)
+    generated = _prepare_native(artifact, arguments)
     report_stage("source_compilation")
     runtime = load_module(context.project_root / runtime_path, "intent_mojo_" + definition.__name__)
     source = runtime.prepare(context.target.resolve(), *arguments)
@@ -81,6 +91,7 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
 
 def prepare_host_comparison(context, definition, arguments, reference, tolerance, *, constexprs=None, note=""):
     artifact = _compile(context, definition, constexprs=constexprs)
+    _prepare_native(artifact, arguments)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
     def side(function, artifact=None):
@@ -106,6 +117,7 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
 
 def prepare_host_run_only(context, definition, arguments, *, constexprs=None, note):
     artifact = _compile(context, definition, constexprs=constexprs)
+    _prepare_native(artifact, arguments)
     state = {}
     interface = artifact.interface
     mutable = {parameter.position: argument

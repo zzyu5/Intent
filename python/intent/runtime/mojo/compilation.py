@@ -3,15 +3,11 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import base64
-import ctypes
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
-import subprocess
 from threading import Lock
-import time
 from uuid import uuid4
 
 from intent.compiler.cache import cache_root, file_identity, locked_cache_entry
@@ -19,19 +15,15 @@ from intent.compiler.toolchain import CompilationStageError
 from .toolchain import resolve_toolchain, runtime_dependencies
 from .contract import MojoCandidate, MojoFacts
 from ..native import NativeABI
+from ..native_artifact import (
+    NativeArtifact, NativeBuildResult, build_native_artifact,
+    run_native_command, write_source,
+)
 
 
-@dataclass
-class NativeLibrary:
-    directory: Path
-    library: ctypes.CDLL
-    cache_hit: bool
-    cache_reason: str | None
-
-
-@dataclass
+@dataclass(frozen=True)
 class NativeCompilation:
-    libraries: tuple[NativeLibrary, ...]
+    artifacts: tuple[NativeArtifact, ...]
     identity: tuple[object, ...]
 
 
@@ -39,8 +31,6 @@ _compilations: dict[tuple[object, ...], Future[NativeCompilation]] = {}
 _compilation_lock = Lock()
 _compilers = ThreadPoolExecutor(max_workers=2)
 _BUILD_OPTIONS = ("--emit", "shared-lib")
-_loaded_libraries: dict[tuple[object, ...], ctypes.CDLL] = {}
-_loading_lock = Lock()
 
 ELEMENT_TYPES = {
     "f16": "Float16", "bf16": "BFloat16", "f32": "Float32", "f64": "Float64",
@@ -106,34 +96,6 @@ def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
     return "".join(sections)
 
 
-def _invoke_compiler(command: list[str], directory: Path, stage: str,
-                     environment: dict[str, str]) -> None:
-    (directory / f"{stage}.command").write_text(shlex.join(command) + "\n", encoding="utf-8")
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(command, env=environment, capture_output=True, text=True, check=False)
-    except OSError as error:
-        (directory / f"{stage}.stdout").write_text("", encoding="utf-8")
-        (directory / f"{stage}.stderr").write_text(str(error) + "\n", encoding="utf-8")
-        (directory / f"{stage}.status").write_text("process not started\n", encoding="utf-8")
-        raise
-    finally:
-        (directory / f"{stage}.seconds").write_text(str(time.monotonic() - started) + "\n", encoding="utf-8")
-    (directory / f"{stage}.stdout").write_text(completed.stdout, encoding="utf-8")
-    (directory / f"{stage}.stderr").write_text(completed.stderr, encoding="utf-8")
-    (directory / f"{stage}.status").write_text(str(completed.returncode) + "\n", encoding="utf-8")
-    if completed.returncode:
-        raise RuntimeError(
-            f"compiler exited with code {completed.returncode}:\n{completed.stderr}{completed.stdout}"
-        )
-
-
-def _write_source(path: Path, text: str) -> None:
-    # Stable inputs retain their mtimes for the provider's own compilation cache.
-    if not path.exists() or path.read_text(encoding="utf-8") != text:
-        path.write_text(text, encoding="utf-8")
-
-
 def _compile_fp_environment(environment: dict[str, str]) -> tuple[Path, bytes]:
     executable = shutil.which("cc", path=environment.get("PATH"))
     if executable is None:
@@ -145,14 +107,16 @@ def _compile_fp_environment(environment: dict[str, str]) -> tuple[Path, bytes]:
     key = json.dumps((compiler, options, source))
     with locked_cache_entry("mojo-fp", key) as cache:
         source_path = cache.directory / "fp_environment.c"
-        _write_source(source_path, source)
+        write_source(source_path, source)
         attempt = cache.create_attempt()
         output = attempt / "fp_environment.o"
         # Resolve headers and the C toolchain on each materialization. The actual
         # object is a native link input, shared by all candidates in this group.
         try:
-            _invoke_compiler([executable, *options, str(source_path), "-o", str(output)],
-                             attempt, "fp_environment_compilation", environment)
+            run_native_command(
+                [executable, *options, str(source_path), "-o", str(output)],
+                attempt, "fp_environment_compilation", environment=environment,
+            )
             if file_identity(Path(executable)) != compiler:
                 raise RuntimeError("C compiler changed during compilation")
             payload = output.read_bytes()
@@ -207,114 +171,68 @@ def _link_inputs(path: Path) -> list[Path]:
     return words
 
 
-def _dependency(path: Path):
-    # Keep the lookup path as well as the resolved file identity: retargeting a
-    # symlink must invalidate a dependency even if its previous target remains.
-    return str(path.absolute()), file_identity(path)
+def _runtime_paths(library: Path, environment: dict[str, str]) -> tuple[Path, ...]:
+    return tuple(path.absolute() for path in runtime_dependencies(library, environment))
 
 
-def _unchanged(dependency) -> bool:
-    try:
-        return json.dumps(_dependency(Path(dependency[0]))) == json.dumps(dependency)
-    except FileNotFoundError:
-        return False
-
-
-def _load_library(path: Path, entry: str):
-    identity = file_identity(path)
-    # Dependency checks precede this lookup. Keep one process-lifetime handle
-    # per immutable artifact, not one dlopen reference per materialization.
-    with _loading_lock:
-        library = _loaded_libraries.get(identity)
-        owner = library is None
-        if owner:
-            library = ctypes.CDLL(str(path))
-        try:
-            getattr(library, entry)
-            getattr(library, entry + "_benchmark")
-        except BaseException:
-            if owner:
-                import _ctypes
-                _ctypes.dlclose(library._handle)
-            raise
-        if owner:
-            _loaded_libraries[identity] = library
-        return library
+def runtime_inputs_current(artifact: NativeArtifact, environment: dict[str, str]) -> bool:
+    recorded = json.loads((artifact.directory / "runtime.json").read_text(encoding="utf-8"))
+    return recorded == [str(path) for path in _runtime_paths(artifact.library, environment)]
 
 
 def _compile_unit(source: str, candidate: MojoCandidate, key: str, target,
-                  environment: dict[str, str], snapshot, fp_object: Path) -> NativeLibrary:
-    entry = candidate.entry
-    root = cache_root() / "mojo"
-    source_path = None
-    stage = "artifact_lookup"
+                  environment: dict[str, str], snapshot, fp_object: Path) -> NativeArtifact:
+    def build(directory: Path) -> NativeBuildResult:
+        # The stable source retains its mtime for Mojo's own compilation cache.
+        source_path = directory.parent.parent / "kernel.mojo"
+        write_source(source_path, source)
+        (directory / "artifact.json").write_text(
+            json.dumps(candidate.metadata(), indent=2) + "\n", encoding="utf-8")
+        (directory / "request.json").write_text(json.dumps({
+            "source": str(source_path), "fp_object": str(fp_object),
+            "cache_unavailable_reason": snapshot.reason,
+        }, indent=2) + "\n", encoding="utf-8")
+        library = directory / "kernel.so"
+        dependencies = directory / "link.d"
+        link_options = ["-Xlinker", str(fp_object)]
+        build_environment = environment
+        if snapshot.identity is not None:
+            link_options += ["-Xlinker", "--dependency-file=" + str(dependencies)]
+            temporary = directory / "temporary"
+            temporary.mkdir()
+            build_environment = {**environment, "TMPDIR": str(temporary)}
+        run_native_command(
+            [target.executable, "build", str(source_path), *_BUILD_OPTIONS,
+             "-o", str(library), *target.native_options, *link_options],
+            directory, "native_compilation", environment=build_environment,
+        )
+        snapshot.check_unchanged()
+        runtime_paths = (_runtime_paths(library, environment)
+                         if snapshot.identity is not None else ())
+        runtime_record = directory / "runtime.json"
+        runtime_record.write_text(json.dumps([str(path) for path in runtime_paths]) + "\n",
+                                  encoding="utf-8")
+        inputs = []
+        if snapshot.identity is not None:
+            inputs = [path for path in _link_inputs(dependencies)
+                      if path.resolve() != fp_object.resolve() and
+                      not path.resolve().is_relative_to(directory.parent.parent)]
+        return NativeBuildResult(library, (runtime_record, *inputs, *runtime_paths))
+
     try:
-        with locked_cache_entry("mojo", key) as cache:
-            root = cache.directory
-            source_path = cache.directory / "kernel.mojo"
-            previous = cache.ready_attempt() if snapshot.identity is not None else None
-            if previous is not None:
-                root = previous
-                manifest = json.loads((previous / "native.json").read_text(encoding="utf-8"))
-                library_path = previous / "kernel.so"
-                valid = all(_unchanged(dependency) for dependency in
-                            [manifest["library"], *manifest["link_inputs"], *manifest["runtime_inputs"]])
-                if valid:
-                    current = [_dependency(path) for path in runtime_dependencies(library_path, environment)]
-                    valid = json.dumps(current) == json.dumps(manifest["runtime_inputs"])
-                if valid:
-                    stage = "cached_native_loading"
-                    root = previous
-                    library = _load_library(previous / "kernel.so", entry)
-                    return NativeLibrary(previous, library, True, None)
-                cache.invalidate_ready()
-            root = cache.directory
-            _write_source(source_path, source)
-            root = cache.create_attempt()
-            (root / "artifact.json").write_text(json.dumps(candidate.metadata(), indent=2) + "\n", encoding="utf-8")
-            (root / "request.json").write_text(json.dumps({
-                "source": str(source_path), "fp_object": str(fp_object),
-                "cache_unavailable_reason": snapshot.reason,
-            }, indent=2) + "\n", encoding="utf-8")
-            library_path = root / "kernel.so"
-            dependencies = root / "link.d"
-            link_options = ["-Xlinker", str(fp_object)]
-            build_environment = environment
-            if snapshot.identity is not None:
-                link_options += ["-Xlinker", "--dependency-file=" + str(dependencies)]
-                # Compiler-created link objects belong to this attempt, not to
-                # the external dependency set. Keep their scratch namespace
-                # explicit even when the provider removes them before returning.
-                temporary = root / "temporary"
-                temporary.mkdir()
-                build_environment = {**environment, "TMPDIR": str(temporary)}
-            stage = "native_compilation"
-            _invoke_compiler(
-                [target.executable, "build", str(source_path), *_BUILD_OPTIONS, "-o", str(library_path),
-                 *target.native_options, *link_options], root, stage, build_environment,
-            )
-            snapshot.check_unchanged()
-            stage = "native_loading"
-            library = _load_library(library_path, entry)
-            if snapshot.identity is not None:
-                inputs = [_dependency(path) for path in _link_inputs(dependencies)
-                          if path.resolve() != fp_object.resolve() and
-                          not path.resolve().is_relative_to(cache.directory)]
-                (root / "native.json").write_text(json.dumps({
-                    "library": _dependency(library_path), "link_inputs": inputs,
-                    "runtime_inputs": [_dependency(path) for path in runtime_dependencies(library_path, environment)],
-                }, indent=2) + "\n", encoding="utf-8")
-                cache.publish(root)
-            return NativeLibrary(root, library, False, snapshot.reason)
-    except Exception as error:
+        return build_native_artifact(
+            "mojo", key, build, reusable=snapshot.identity is not None,
+            cache_reason=snapshot.reason,
+            validate_cached=lambda artifact: runtime_inputs_current(artifact, environment),
+        )
+    except CompilationStageError as error:
         raise CompilationStageError(
-            stage, f"Mojo {stage} failed for candidate {entry}:\n{error}\nNative compiler artifacts: {root}",
-            cache_directory=root, candidate=entry,
-            artifacts={"source": source_path} if source_path is not None else None,
+            error.stage, str(error), cache_directory=error.cache_directory,
+            candidate=candidate.entry, artifacts=error.artifacts,
         ) from error
 
 
-def compile_library(facts: MojoFacts, target, *, abi: NativeABI) -> NativeCompilation:
+def compile_portfolio(facts: MojoFacts, target, *, abi: NativeABI) -> NativeCompilation:
     environment = dict(os.environ)
     try:
         snapshot = resolve_toolchain(target.executable, facts.native_dependencies, environment)
@@ -348,9 +266,8 @@ def compile_library(facts: MojoFacts, target, *, abi: NativeABI) -> NativeCompil
         for unit, candidate, unit_key in units:
             futures.append(_compilers.submit(_compile_unit, unit, candidate, unit_key,
                                              target, environment, snapshot, fp_object))
-        libraries = tuple(future.result() for future in futures)
-        result = NativeCompilation(libraries, (key, tuple(
-            file_identity(library.directory / "kernel.so") for library in libraries)))
+        artifacts = tuple(future.result() for future in futures)
+        result = NativeCompilation(artifacts, (key, tuple(artifact.identity for artifact in artifacts)))
         snapshot.check_unchanged()
     except BaseException as error:
         for future in futures:
