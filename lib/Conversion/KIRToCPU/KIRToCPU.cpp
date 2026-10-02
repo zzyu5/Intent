@@ -5,6 +5,7 @@
 #include "Intent/Analysis/ProductSchema.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
@@ -299,7 +300,7 @@ private:
   }
 
   LogicalResult helper(Region &original, Region &target, TypeRange inputTypes,
-                       TypeRange destinationTypes) {
+                       TypeRange destinationTypes, bool scalarResults = false) {
     auto savedDimensions = dimensions;
     OpBuilder::InsertionGuard guard(builder);
     Block *body = new Block;
@@ -329,13 +330,19 @@ private:
     for (Operation &operation : original.front().without_terminator())
       if (failed(lowerOperation(&operation))) return failure();
     auto results = flattened(original.front().getTerminator()->getOperands());
-    if (results.size() != destinationTypes.size())
+    if (!scalarResults && results.size() != destinationTypes.size())
       return original.getParentOp()->emitError("CPU helper destination schema mismatch");
-    for (auto [value, slot] : llvm::zip(results, body->getArguments().drop_front(inputCount)))
-      copyToSlot(value, slot, original.getLoc());
+    if (!scalarResults)
+      for (auto [value, slot] : llvm::zip(results, body->getArguments().drop_front(inputCount)))
+        copyToSlot(value, slot, original.getLoc());
     for (Value allocation : llvm::reverse(allocations.back())) builder.create<memref::DeallocOp>(original.getLoc(), allocation);
     allocations.pop_back();
-    if (isa<cpu::ScanOp>(target.getParentOp())) builder.create<cpu::ScanYieldOp>(original.getLoc(), ValueRange{});
+    if (isa<cpu::SliceReduceOp>(target.getParentOp()))
+      builder.create<cpu::SliceReduceYieldOp>(original.getLoc(),
+          scalarResults ? ValueRange(results) : ValueRange{});
+    else if (isa<cpu::ScanOp>(target.getParentOp()))
+      builder.create<cpu::ScanYieldOp>(original.getLoc(),
+          scalarResults ? ValueRange(results) : ValueRange{});
     else builder.create<cpu::RegionYieldOp>(original.getLoc());
     dimensions = std::move(savedDimensions);
     return success();
@@ -875,7 +882,7 @@ private:
     SmallVector<Value> arguments;
     for (Value input : operation->getOperands())
       arguments.push_back(values.lookup(input));
-    if (!tensor || scalarized) {
+    if (!tensor) {
       auto result = arithmetic(operation, arguments, builder);
       if (failed(result)) return failure();
       values.map(operation->getResult(0), *result);
@@ -942,86 +949,49 @@ private:
       for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
       return success();
     }
-    Block &source = operation.getCombine().front();
-    Block *body = &target.getCombine().emplaceBlock();
-    for (BlockArgument argument : source.getArguments()) {
-      auto mapped = body->addArgument(argument.getType(), operation.getLoc());
-      values.map(argument, mapped);
-    }
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(body);
-      if (failed(lowerBlock(source))) return failure();
-      SmallVector<Value> yielded;
-      for (Value value : source.getTerminator()->getOperands()) yielded.push_back(values.lookup(value));
-      builder.create<cpu::ScanYieldOp>(operation.getLoc(), yielded);
-    }
+    if (failed(helper(operation.getCombine(), target.getCombine(),
+                      operation.getCombine().front().getArgumentTypes(), {}, true)))
+      return failure();
     for (auto [result, output] : llvm::zip(operation.getResults(), outputs)) values.map(result, output);
     return success();
   }
 
   LogicalResult reduce(ReduceOp operation) {
-    Block &combine = operation.getCombine().front();
-    for (Operation &nested : combine.without_terminator())
-      if (!isa<ConstantOp, BinaryOp, UnaryOp, CompareOp, SelectOp, MaskOp,
-               CastOp, BitcastOp, MakeRecordOp, MakeTupleOp, ExtractOp,
-               AssumeInBoundsOp>(nested))
-        return nested.emitError("CPU tensor reduction requires a pointwise combine; non-pointwise summary reduction is not implemented");
     auto sources = flattened(operation.getSources());
     auto identities = flattened(operation.getIdentities());
     auto captures = flattened(operation.getCaptures());
-    if (sources.size() != identities.size()) return operation.emitError("CPU reduction source and state leaves differ");
-    auto type = cast<MemRefType>(sources.front().getType());
-    for (Value value : sources)
-      if (cast<MemRefType>(value.getType()).getShape() != type.getShape())
-        return operation.emitError("CPU product reduction with differing free shapes is not implemented");
-    SmallVector<bool> reduced(type.getRank(), false);
-    for (Attribute axis : operation.getAxes()) reduced[cast<IntegerAttr>(axis).getInt()] = true;
-    SmallVector<AffineExpr> freeAxes;
-    SmallVector<utils::IteratorType> iterators;
-    for (unsigned axis = 0; axis < reduced.size(); ++axis) {
-      iterators.push_back(reduced[axis] ? utils::IteratorType::reduction : utils::IteratorType::parallel);
-      if (!reduced[axis]) freeAxes.push_back(builder.getAffineDimExpr(axis));
-    }
     Location loc = operation.getLoc();
     auto outputs = makeSlots(operation.getResultTypes(), loc);
-    if (outputs.size() != identities.size()) return failure();
-    for (auto [identity, output] : llvm::zip(identities, outputs)) copyToSlot(identity, output, loc);
-    SmallVector<Value> inputs(sources);
-    llvm::append_range(inputs, captures);
-    SmallVector<AffineMap> maps(sources.size(), builder.getMultiDimIdentityMap(type.getRank()));
-    for (Value capture : captures) {
-      SmallVector<AffineExpr> expressions;
-      if (auto memory = dyn_cast<MemRefType>(capture.getType())) {
-        if (memory.getRank() > static_cast<int64_t>(freeAxes.size())) return operation.emitError("CPU reduction capture is not free-axis aligned");
-        for (int64_t axis = 0; axis < memory.getRank(); ++axis)
-          expressions.push_back(memory.getDimSize(axis) == 1 ? builder.getAffineConstantExpr(0) : freeAxes[freeAxes.size() - memory.getRank() + axis]);
-      }
-      maps.push_back(AffineMap::get(type.getRank(), 0, expressions, builder.getContext()));
-    }
-    for (Value output : outputs) {
-      if (cast<MemRefType>(output.getType()).getRank() != static_cast<int64_t>(freeAxes.size()))
-        return operation.emitError("CPU reduction result does not retain the free axes");
-      maps.push_back(AffineMap::get(type.getRank(), 0, freeAxes, builder.getContext()));
-    }
-    LogicalResult status = success();
-    auto reduction = builder.create<linalg::GenericOp>(loc, inputs, outputs, maps, iterators,
-        [&](OpBuilder &nestedBuilder, Location, ValueRange scalars) {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(nestedBuilder.getInsertionBlock(), nestedBuilder.getInsertionPoint());
-      SmallVector<Value> arguments(scalars.drop_front(inputs.size()));
-      llvm::append_range(arguments, scalars.take_front(sources.size()));
-      llvm::append_range(arguments, scalars.slice(sources.size(), captures.size()));
-      bindScalars(combine.getArguments(), arguments);
-      scalarized = true;
-      for (Operation &nested : combine.without_terminator())
-        if (failed(lowerOperation(&nested))) { status = failure(); break; }
-      scalarized = false;
-      if (succeeded(status)) builder.create<linalg::YieldOp>(loc, flattened(combine.getTerminator()->getOperands()));
-    });
-    reduction->setAttr("intent_cpu.reduction_order",
+    if (outputs.size() != identities.size() || sources.size() != identities.size())
+      return operation.emitError("CPU reduction source, identity and output leaves differ");
+    SmallVector<int64_t> axes;
+    for (Attribute axis : operation.getAxes())
+      axes.push_back(cast<IntegerAttr>(axis).getInt());
+    auto reduction = builder.create<cpu::SliceReduceOp>(loc, sources, identities,
+        captures, outputs, axes,
         cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
-    if (failed(status)) return failure();
+    bool scalar = llvm::none_of(identities, [](Value value) {
+      return isa<MemRefType>(value.getType());
+    });
+    SmallVector<Type> arguments, states;
+    if (scalar) {
+      llvm::append_range(arguments, TypeRange(identities));
+      llvm::append_range(arguments, TypeRange(identities));
+    } else {
+      for (auto [identity, output] : llvm::zip(identities, outputs)) {
+        auto state = cpu::collectiveStateType(output.getType());
+        if (!isa<MemRefType>(identity.getType()) && state.getRank())
+          return operation.emitError("mixed scalar/slice reduction requires complete slice identities for shaped components");
+        states.push_back(state);
+      }
+      llvm::append_range(arguments, states);
+      for (Value source : sources)
+        arguments.push_back(cpu::collectiveMemberType(cast<MemRefType>(source.getType()), axes));
+    }
+    llvm::append_range(arguments, TypeRange(captures));
+    if (failed(helper(operation.getCombine(), reduction.getCombine(), arguments,
+                      states, scalar)))
+      return failure();
     bindSlots(operation.getResults(), outputs, loc);
     return success();
   }
@@ -1793,7 +1763,6 @@ private:
   llvm::DenseMap<int64_t, Value> dimensions;
   llvm::DenseMap<Value, Domain> domains;
   SmallVector<SmallVector<Value>> allocations;
-  bool scalarized = false;
 };
 
 }

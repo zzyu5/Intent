@@ -13,6 +13,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   BlockContractions.cpp
   NormalizeContractions.cpp
   NormalizeReductions.cpp
+  SliceCollectives.cpp
   ContractionSources.cpp
   BlockStructuredComputations.cpp
   RealizeRegions.cpp
@@ -42,6 +43,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRSCFDialect
   MLIRSCFUtils
   MLIRVectorDialect
+  MLIRValueBoundsOpInterface
   MLIRIR
   MLIRPass
   MLIRTransforms

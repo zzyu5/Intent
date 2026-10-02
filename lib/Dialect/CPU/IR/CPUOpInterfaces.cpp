@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/Visitors.h"
@@ -87,6 +88,22 @@ Block::BlockArgListType intent::cpu::detail::regionArguments(
 
 namespace {
 
+void regionEffects(RegionOpInterface program,
+                   SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  // Helper destination formals are separate scratch/state bindings, not aliases
+  // of their schema prototypes. Effects at this boundary name actual operands.
+  unsigned outputBegin =
+      program->getNumOperands() - program.getDestinations().size();
+  for (OpOperand &operand : program->getOpOperands()) {
+    if (!isa<MemRefType>(operand.get().getType()))
+      continue;
+    if (operand.getOperandNumber() >= outputBegin)
+      effects.emplace_back(MemoryEffects::Write::get(), &operand);
+    else
+      effects.emplace_back(MemoryEffects::Read::get(), &operand);
+  }
+}
+
 Type slotType(Type type) {
   if (auto memory = dyn_cast<MemRefType>(type))
     return MemRefType::get(memory.getShape(), memory.getElementType());
@@ -140,34 +157,11 @@ LogicalResult verifyRegionProgram(Operation *operation) {
       if (relation.argument.getType() != expected)
         return operation->emitOpError("region helper argument type disagrees with its source/state/output schema");
     }
-    bool invalid = false;
-    region.walk([&](Operation *nested) {
-      if (nested->getName().getDialectNamespace() == "intent") {
-        nested->emitOpError("CPU region helper cannot retain canonical operations");
-        invalid = true;
-      }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (auto &effect : instances) {
-          if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-          Value root = effect.getValue();
-          while (root) {
-            if (auto view = root.getDefiningOp<memref::SubViewOp>()) root = view.getSource();
-            else if (auto cast = root.getDefiningOp<memref::CastOp>()) root = cast.getSource();
-            else break;
-          }
-          auto argument = dyn_cast_or_null<BlockArgument>(root);
-          if (argument && argument.getOwner() == &region.front() &&
-              ((*schema)[argument.getArgNumber()].kind != RegionArgumentKind::Destinations ||
-               isa<MemoryEffects::Free>(effect.getEffect()))) {
-            nested->emitOpError("region helper inputs are read-only and destinations are caller-owned");
-            invalid = true;
-          }
-        }
-      }
+    unsigned destinations = llvm::count_if(*schema, [](const auto &argument) {
+      return argument.kind == RegionArgumentKind::Destinations;
     });
-    if (invalid) return failure();
+    if (failed(verifyCollectiveHelperEffects(operation, region, destinations)))
+      return failure();
   }
   return success();
 }
@@ -175,3 +169,13 @@ LogicalResult verifyRegionProgram(Operation *operation) {
 
 LogicalResult RegionFoldOp::verify() { return verifyRegionProgram(*this); }
 LogicalResult RegionScanOp::verify() { return verifyRegionProgram(*this); }
+
+void RegionFoldOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  regionEffects(cast<RegionOpInterface>(getOperation()), effects);
+}
+
+void RegionScanOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  regionEffects(cast<RegionOpInterface>(getOperation()), effects);
+}

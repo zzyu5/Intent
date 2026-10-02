@@ -47,6 +47,29 @@ def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
   let arguments = (ins AnyTypeOf<[AnyFloat, AnyInteger, Index]>:$value);
 }
 
+def IntentCPU_SliceReduceOp : IntentCPU_Op<"slice_reduce", [SingleBlock,
+    IsolatedFromAbove, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Product reduction over complete source slices with explicit combine";
+  let arguments = (ins Variadic<AnyMemRef>:$sources,
+      Variadic<AnyType>:$identities, Variadic<AnyType>:$captures,
+      Variadic<AnyMemRef>:$outputs, DenseI64ArrayAttr:$axes,
+      IntentCPU_ReductionOrderAttr:$order);
+  let regions = (region AnyRegion:$combine);
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    bool isDestinationPassing() {
+      return !getCombine().empty() && getCombine().front().getNumArguments() ==
+          3 * getSources().size() + getCaptures().size();
+    }
+  }];
+}
+
+def IntentCPU_SliceReduceYieldOp : IntentCPU_Op<"slice_reduce_yield", [Pure,
+    Terminator, HasParent<"SliceReduceOp">]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+}
+
 def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Ordered prefixes with typed scalar or destination-passing slice combines";
@@ -124,7 +147,8 @@ def IntentCPU_QuantizedDotOp : IntentCPU_Op<"quantized_dot"> {
 }
 
 class IntentCPU_RegionOp<string name> : IntentCPU_Op<name,
-    [RecursiveMemoryEffects, AttrSizedOperandSegments, IntentCPU_RegionOpInterface]> {
+    [IsolatedFromAbove, AttrSizedOperandSegments, IntentCPU_RegionOpInterface,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let hasVerifier = 1;
 }
 

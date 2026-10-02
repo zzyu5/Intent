@@ -53,7 +53,7 @@ mlir::LogicalResult exposeStructuredWorksets(mlir::func::FuncOp function,
     const ImplementationRegistry &implementations, llvm::ArrayRef<mlir::Value> leadingExtents = {});
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
-mlir::LogicalResult realizeSliceScans(mlir::func::FuncOp function);
+mlir::LogicalResult realizeSliceCollectives(mlir::func::FuncOp function);
 mlir::LogicalResult realizeHistograms(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
 mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);

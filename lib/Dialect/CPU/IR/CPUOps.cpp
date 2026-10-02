@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -140,68 +141,7 @@ LogicalResult ScanOp::verify() {
     auto yield = body.empty() ? ScanYieldOp() : dyn_cast<ScanYieldOp>(body.getTerminator());
     if (!yield || yield.getNumOperands() || !llvm::equal(body.getArgumentTypes(), arguments))
       return emitOpError("slice scan combine requires incoming states, members, captures and destination slots");
-    for (BlockArgument destination : body.getArguments().take_back(count)) {
-      bool written = false;
-      for (OpOperand &use : destination.getUses()) {
-        Operation *user = use.getOwner();
-        if (isa<memref::DimOp>(user)) continue;
-        if (user->getBlock() != &body)
-          return emitOpError("slice scan destinations require unconditional complete writes");
-        if (auto copy = dyn_cast<memref::CopyOp>(user)) {
-          if (copy.getTarget() != destination || copy.getSource() == destination)
-            return emitOpError("slice scan destinations cannot be read before initialization");
-        } else if (auto store = dyn_cast<memref::StoreOp>(user)) {
-          if (store.getMemref() != destination || cast<MemRefType>(destination.getType()).getRank() || !store.getIndices().empty())
-            return emitOpError("slice scan scalar destination stores require rank-zero slots");
-        } else if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
-          if (!llvm::is_contained(generic.getDpsInits(), destination) || generic.getNumReductionLoops() ||
-              !generic.getIndexingMapsArray()[use.getOperandNumber()].isPermutation() ||
-              generic.payloadUsesValueFromOperand(&use))
-            return emitOpError("slice scan destination computations must write every element without reading the slot");
-        } else return emitOpError("slice scan destination use does not prove a complete write");
-        written = true;
-      }
-      if (!written) return emitOpError("slice scan combine must initialize every destination");
-    }
-    bool invalid = false;
-    getCombine().walk([&](Operation *nested) {
-      if (invalid) return;
-      for (Value input : nested->getOperands())
-        if (!getCombine().isAncestor(input.getParentRegion())) {
-          nested->emitOpError("slice scan combine has an implicit capture: ") << input;
-          invalid = true;
-          return;
-        }
-      auto effects = getEffectsRecursively(nested);
-      if (!effects) {
-        nested->emitOpError("slice scan combine requires known effects");
-        invalid = true;
-        return;
-      }
-      for (auto &effect : *effects) {
-        if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-        Value root = effect.getValue();
-        while (root) {
-          if (auto view = root.getDefiningOp<memref::SubViewOp>()) root = view.getSource();
-          else if (auto cast = root.getDefiningOp<memref::CastOp>()) root = cast.getSource();
-          else break;
-        }
-        if (auto argument = dyn_cast_or_null<BlockArgument>(root)) {
-          invalid |= argument.getOwner() != &body || argument.getArgNumber() < arguments.size() - count ||
-              !isa<MemoryEffects::Write>(effect.getEffect());
-        } else {
-          Operation *owner = root ? root.getDefiningOp() : nullptr;
-          invalid |= !isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) ||
-              !getCombine().isAncestor(owner->getParentRegion());
-        }
-        if (invalid) {
-          nested->emitOpError("slice scan write/free must target its destinations or local scratch");
-          return;
-        }
-      }
-    });
-    if (invalid) return emitOpError("slice scan requires explicit read-only inputs and locally owned scratch");
-    return success();
+    return verifyCollectiveHelper(getOperation(), getCombine(), count);
   }
   SmallVector<Type> elements;
   for (auto [source, initial, output] : llvm::zip(getSources(), getInitials(), getOutputs())) {

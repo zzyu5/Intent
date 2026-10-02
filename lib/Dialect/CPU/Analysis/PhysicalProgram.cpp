@@ -107,7 +107,7 @@ bool PhysicalProgramAnalysis::mayReadAt(Value memory, Operation *from, Operation
 
 SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
   SmallVector<MemoryAccess> result;
-  scope->walk([&](Operation *operation) {
+  scope->walk<WalkOrder::PreOrder>([&](Operation *operation) {
     auto add = [&](Value memory, bool read, bool write) {
       if (isa<MemRefType>(memory.getType()))
         result.push_back({operation, memory, read, write});
@@ -119,6 +119,11 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
         add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
     } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
       for (Value input : reduce.getInputs()) add(input, true, false);
+    } else if (auto reduce = dyn_cast<SliceReduceOp>(operation)) {
+      for (Value input : reduce.getSources()) add(input, true, false);
+      for (Value input : reduce.getIdentities()) add(input, true, false);
+      for (Value input : reduce.getCaptures()) add(input, true, false);
+      for (Value output : reduce.getOutputs()) add(output, false, true);
     } else if (auto scan = dyn_cast<ScanOp>(operation)) {
       for (Value input : scan.getSources()) add(input, true, false);
       for (Value input : scan.getInitials()) add(input, true, false);
@@ -157,6 +162,8 @@ SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
     else if (auto load = dyn_cast<vector::LoadOp>(operation)) add(load.getBase(), true, false);
     else if (auto store = dyn_cast<memref::StoreOp>(operation)) add(store.getMemref(), false, true);
     else if (auto store = dyn_cast<vector::StoreOp>(operation)) add(store.getBase(), false, true);
+    return isa<SliceReduceOp, ScanOp, RegionOpInterface>(operation)
+        ? WalkResult::skip() : WalkResult::advance();
   });
   return result;
 }
@@ -182,6 +189,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
       else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
       else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
       else if (auto scan = dyn_cast<ScanOp>(user)) writes = llvm::is_contained(scan.getOutputs(), value);
+      else if (auto reduce = dyn_cast<SliceReduceOp>(user)) writes = llvm::is_contained(reduce.getOutputs(), value);
       else if (auto histogram = dyn_cast<HistogramOp>(user)) writes = histogram.getOutput() == value;
       else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
         multiple = true;
@@ -258,7 +266,7 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     }
   }
   function.walk([&](Operation *operation) {
-    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
+    if (realized && (isa<RegionFoldOp, RegionScanOp, ReduceOp, SliceReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation) || operation->getName().getDialectNamespace() == "linalg")) {
       operation->emitError("CPU structured operation has not been materialized for the provider");
       invalid = true;
     }

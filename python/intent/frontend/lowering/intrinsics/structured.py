@@ -104,13 +104,19 @@ def _prepare_reduction(lowerer: FunctionLowerer, name: str, node: ast.Call, boun
     components, schema = _source_components(lowerer, source, node)
     if not components or any(not isinstance(value.type, TensorType) for value in components):
         lowerer.error(node, f"I.{purpose} source components must be tensors")
-    rank = components[0].type.rank
-    axes = normalize_axes(lowerer, require_axes(lowerer, bound["axis"]), rank, node)
+    source_axes = require_axes(lowerer, bound["axis"])
+    axes = normalize_axes(lowerer, source_axes, components[0].type.rank, node)
     if scan:
         if len(axes) != 1:
             lowerer.error(node, "I.scan requires exactly one axis")
-    elif any(value.type.rank != rank for value in components):
-        lowerer.error(node, "I.reduce source components must have equal rank")
+    for component in components[1:]:
+        component_axes = normalize_axes(lowerer, source_axes, component.type.rank, node)
+        if component_axes != axes:
+            lowerer.error(node, f"I.{purpose} axes must identify the same positions in every source component; "
+                          "use non-negative axes when component ranks differ")
+        if any(not dims_compatible(components[0].type.shape[axis], component.type.shape[axis])
+               for axis in axes):
+            lowerer.error(node, f"I.{purpose} source components must share each reduction or scan extent")
     if not generic and schema.kind != "scalar":
         lowerer.error(node, f"I.{name} requires one tensor")
     if name in ("reduce.any", "reduce.all") and components[0].type.dtype != intent_bool:

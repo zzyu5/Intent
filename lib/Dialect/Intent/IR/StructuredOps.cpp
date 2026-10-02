@@ -162,6 +162,7 @@ LogicalResult verifyReduceOrScan(StructuredOpInterface structured, bool scan) {
   }
 
   SmallVector<Type> accumulatorTypes;
+  RankedTensorType firstSource;
   llvm::DenseSet<int64_t> uniqueAxes;
   for (int64_t axis : axes)
     if (axis < 0 || !uniqueAxes.insert(axis).second)
@@ -178,6 +179,14 @@ LogicalResult verifyReduceOrScan(StructuredOpInterface structured, bool scan) {
     for (int64_t axis : axes)
       if (axis >= source.getRank())
         return operation->emitOpError("reduce/scan axis is outside source rank");
+    if (firstSource) {
+      for (int64_t axis : axes)
+        if (!sameDimension(firstSource, axis, source, axis))
+          return operation->emitOpError(
+              "reduce/scan source components must share each member-axis extent");
+    } else {
+      firstSource = source;
+    }
     Type result = resultValue.getType();
     if (scan) {
       auto identityTensor = dyn_cast<RankedTensorType>(identity);
