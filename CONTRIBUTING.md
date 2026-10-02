@@ -745,7 +745,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |
 | 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
 | 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
-| 存储别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 查询 views、captures、uses 与 lexical end；`areDisjointStorage`、`preservesStorage`、`isStorageReadStable` 结合当前 effects、alias analysis 与显式 ABI 证明能否重放读取，不移动 allocation 或决定 packing |
+| 存储来源、别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `StorageAnalysis` 统一查询 `origins`、`aliases`、`lifetime`、`effects`、`disjoint` 与读取稳定性；消费标准 MLIR flow/effect 接口及显式 ABI，不移动 allocation 或决定 packing |
 | 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 委托共同 ExtentRelations 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸 |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
@@ -763,7 +763,47 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
-别名集合的 `complete=false` 表示仍有未知的内存值传播。验证器可以检查已知 uses 是否越过 lifetime end，但改变存储或重放读取的优化还必须证明其需要的完整性与 effect 条件。查询结果只服务当前图，移动、替换或删除相关 operations 后重算；不能把某次查询结果跨变换保存为另一份存储计划。
+`StorageAnalysis` 直接使用 MLIR 的 `BufferViewFlowAnalysis`、`BufferOriginAnalysis`、
+AliasAnalysis 和 dominance。标准 views、SCF、CFG 和 select 的来源由其原生模型解释；
+CPU Tasks 和 collective 在 [CPUOpInterfaces.cpp](lib/Dialect/CPU/IR/CPUOpInterfaces.cpp)
+及 [CollectiveHelpers.cpp](lib/Dialect/CPU/IR/CollectiveHelpers.cpp) 实现
+`BufferViewFlowOpInterface`，声明真实 source/capture 借用关系。
+Helper 的 summary/state/destination 类型原型不构成存储连边；已知 formal 可以是当前
+region 内的来源边界，但不因此成为 fresh allocation，也不保证不同 formal 互不 alias。
+`uniqueOrigin` 无法证明单一来源时返回空值，不能用两个空值相等推断共享存储。
+
+`effects` 保留产生 effect 的 operation、实际目标和完整性，遵循标准
+`MemoryEffectOpInterface` 与 recursive trait。Linalg 的 payload effects 也参与分析；
+collective 在实际 operands 边界描述 effects，内部 scratch 不冒充外部访问。
+原子操作同时保留目标读写与 ordering 屏障。新增 operation 应完善接口，避免在 fusion、
+任务分区和 provider 中分别增加访问枚举。`PhysicalProgramAnalysis` 保留 allocation
+预算与 verifier，写入来源同样从共同 effects 查询取得。
+`registerStorageInterfaces` 为 MLIR 20 的 `memref.prefetch` 补原生 effects 模型：
+目标只读，独立 cache resource 保留提示的存在性；cache 写意向不作为 buffer 内容写入。
+Storage 摘要只排除这个明确的 cache effect，不静默丢弃其它未知 effects。
+
+跨原生入口的同步 buffer 借用使用 [CPU `InvokeOp`](include/Intent/Dialect/CPU/IR/CPUOps.td)：
+callee、实际参数及逐参数读写是当前 IR 的一部分，调用通过显式 storage 返回结果，
+不保留或释放调用方的指针。SymbolUser 校验外部声明的完整签名；MemoryEffects 和
+BufferViewFlow 接口使普通 lifetime 与 effect 查询直接理解这个边界。未知 `func.call`
+仍不能被当成不逃逸的调用，声明上的 `cpu.external_runtime` 标记也不提供借用保证。
+Weft 从最终 kernel 接口通过 `taskCallAccesses` 形成调用，并由 typed task binding
+同时核对 callee、参数与 access；host serializer 只拼写调用。Mojo 使用同一操作的
+外部 C ABI 拼写，普通浮点环境管理调用保持自身的 effects 和返回约定。
+
+`unchangedBetween` 检查同 block 两个操作之间的开区间，用于读取 producer 完成后的
+buffer 内容；`readStable` 还检查 producer 与 consumer 的执行范围，用于移动或重放读取。
+两者都检查 dominance、lifetime 和可能 alias 的写入。`isReadOnly` 表示参数访问角色，
+不能替代存储稳定性证明。常量传播按可能 alias 的 writes/free 使旧事实失效，不能把
+不同 SSA 或不同来源名字当作不相交。
+
+来源或 alias 集合的 `complete=false` 保留未知转发、调用逃逸和地址身份观察。
+Heap lifetime 要求一个明确 lexical end 覆盖完整 alias 使用；移动、替换或删除相关
+operations 后重建分析。多个只读查询可复用同一 snapshot，不能跨实际 rewrite 缓存它。
+对应成熟机制见 MLIR 20 的 `Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h:17–111`；
+本地 Triton `lib/Dialect/Triton/Transforms/LoopInvariantCodeMotion.cpp:22–52` 同样从
+operation effects 证明读取移动。Intent CPU 还要证明显式 allocation/free 和 helper
+调用边界，实际循环与物化改写继续由各 CPU pass 决定。
 
 [IntegerSources.cpp](lib/Dialect/CPU/Transforms/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
 
@@ -798,8 +838,11 @@ Intent 的 Weft 路径继续使用 CPU tasks、普通 host 调用和原有同步
 
 修改 Weft host 的 task 派发、capture 装箱或跨模块连接时，进入
 [Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp)；修改 task 内部的原生操作转换时，
-进入相邻 `TaskLowering`。后者的只读分析和转换状态以单个 CPU function 为生命周期，
-不由 serializer 重建，也不跨程序保留。
+进入相邻 `TaskLowering`。转换状态属于单个 CPU function；存储分析在每个 task lowering
+开始时重建，因为此前的 task 可能已经移除。Task ABI 的读写与 encoded 格式查询共同
+存储事实；只有当前 task 内的 allocation 才能成为其局部 SSA，捕获的外层 allocation
+仍通过 view ABI 访问。Admit 快照复用需要证明整个 task 保持该存储，不仅检查只读角色。
+这些决定不由 serializer 重建，也不跨程序保留。
 
 ## Provider 与 runtime 扩展
 
