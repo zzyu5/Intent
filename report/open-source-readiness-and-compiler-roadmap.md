@@ -1,327 +1,787 @@
-# IntentDSL 开源可用性与编译器能力调研
+# IntentDSL 成熟编译器与产品化路线图
 
-调研日期：2026-09-30。范围：基于当前代码、既有运行证据和成熟参考实现，调查产品可用性、agent/MCP、跨执行模型与资源感知，提出后续计划。本轮不修改实现、规格、README 或实验结果，不启动新 benchmark。
+调研日期：2026-10-02。当前实现基线：main / 7769c7ec。本文在原报告上完整重写，结算旧工作包，吸收公共接口、算法重组与优化权限的自查结果。目标保持为：**在 Intent 承诺的语言、执行模型和平台范围内，达到 Triton/TileLang 同等级的编译器工程质量、使用体验、扩展能力和持续维护能力。**
 
-## 1. 判断：继续完善现有编译器，同时建立真实的公开使用入口
+本轮交付是调查与路线图，不修改编译器、正式规格、作者算法或实验 CSV。里程碑是多项相关任务和一系列提交共同完成的能力，不是一个 commit、一个 pass 或一个测试通过。
 
-**IntentDSL 已经有真实编译器和跨执行模型的共同价值，尚未成为外部开发者能顺畅安装、使用、诊断并扩展的成熟工具。当前最值得投入的不是继续增加 benchmark 覆盖数量，而是安装与调用闭环、合法写法的编译稳定性、共享分析的积累，以及目标能力判定和物理变换的可维护性。**
+## 1. 核心判断与本次纠正
 
-这不是“论文结果足够好，所以产品也好了”的结论。当前证据支持以下分层判断：
+**已有基础足以进入成熟产品建设，不需要再次推倒，也不需要不断重做统一接口。** Intent 已经有真实的 typed KIR、分 execution family 的 physical program、共享分析、provider lowering、JIT/runtime、独立安装包、IR 工具和 agent 工具。近期重构确实消除了多份参数表、ABI 推导、生成式 host wrapper 和不明确的变换边界。
 
-| 问题 | 当前结论 | 尚不能据此声称什么 |
-|---|---|---|
-| 是真实编译器吗？ | 是。已有 typed KIR、不同 execution family 的物理程序、改变 SSA/loop/access/storage 的变换、provider 编译与真实运行链路 | 合法程序已全面覆盖、任何写法都稳定高效 |
-| 只是统一前端吗？ | 不是。已有跨 GPU/CPU/DSA 的共用语义分析，GPU providers 共用 physical passes，Mojo/Weft 共用 CPU pipeline | 所有优化已经跨 family 共享，或新增后端成本很低 |
-| 真的是 JIT 吗？ | 是 Python 运行期编译与 provider JIT 的组合，Triton 路径确实 launch 生成的 kernel | `@intent.kernel` 已具有透明直接调用体验，或 `intent.compile()` 返回前完成全部 native JIT |
-| 已能被别人安装使用吗？ | 研究环境中能用；标准 Python 包、依赖交付、独立 MCP、普通使用教程尚不完整 | 当前 README 已足以让陌生用户在新环境成功使用 |
-| 跨代只变 Triton config 吗？ | 不是。资源已能影响 grid-stride traversal、部分数值实现和 contraction/access forms | 已建立精确 occupancy/cost model，或 H100/5090D 每次都应生成不同源码 |
-| 会退化成算法库吗？ | 所核查主路径没有 whole-operator 名称分派证据；局部 typed primitive/micro-kernel 是合理组成 | 所有复合 matcher 都足够通用，或 DSA 的分层已经清楚 |
+剩余工作可以收束为六组明确交付：可控且合同明确的优化；标准 MLIR 工具可持续处理的 IR；独立用户与框架使用闭环；DSA 和 CPU 剩余组合性问题；可解释的物理质量与资源决策；可重复分发和后端演进维护。它们可以并行，不要求一切后端、硬件、精度和框架模式同时完美后才成为产品。
 
-本报告基于 2026-09-30 的 `main` 工作树。开始时工作区干净；本轮只新增此报告。代码理解先使用已有 Codegraph，再补读具体文件；参考为本地 `../ref/triton`、`../ref/tilelang` 与下文链接的一手官方文档。**没有新安装、编译、设备运行或性能测量。** 历史 CSV 只用于解释已经发生的问题，不作为当前代码的新性能结论；本地参考源码也不假定与历史实验安装包逐行相同。
+前两次简要回答有两处需要修正：
 
-## 2. 应该承诺什么样的统一能力
+1. **不能把“作者没有显式写出该循环或状态”当作优化不合法的充分理由。** 成熟编译器会合并运算、重组循环、引入中间状态和改变存储。关键是当前语言/编译选项允许什么、变换保持什么、实现条件是否成立。
+2. **不能把“未验证所有平台或所有组合”说成“现有工具仍然不成熟到不能使用”。** 已完成的独立安装、调用、MCP、IR 续编译和有限框架接入应正式结算；新增支持面和当前实现缺陷分别安排。
 
-### 2.1 统一算法事实，不统一所有物理拓扑
+同样，乐观推进不等于用容差测试替代语义判断。合法优化积极保留，条件与收益策略适合时默认采用；需要额外数值自由的优化给出清楚的编译合同；实现错误修复；不因一次未命中或暂时缺少证明就删除整项能力。
 
-当前边界是成立的：作者定义算法、数值合同、逻辑状态和 kernel/host 编排；compiler 选择不改变这些语义的执行组织。KIR 不携带设备分支；GPU、CPU、DSA 可以产生不同物理程序。它们应复用关系、依赖、effect、identity、bounds 与局部计算语义，而不是共享一套换名字的 GPU thread/block 模型。依据：[编程模型](/home/kingdom/phdworks/intentdsl/doc/programming-model/README.md:20)、[kernel/host 边界](/home/kingdom/phdworks/intentdsl/doc/programming-model/kernel-and-host.md:15)、[编译器边界](/home/kingdom/phdworks/intentdsl/doc/compiler/README.md:20)。
+### 1.1 “达到 Triton 成熟度”的可操作含义
 
-```mermaid
-flowchart TD
-    A[作者算法与显式 host 编排] --> K[同一份 typed KIR]
-    K --> S[共同语义与关系分析]
-    S --> G[GPU physical program 与 shared passes]
-    S --> C[CPU task/block program 与 shared passes]
-    S --> D[DSA local-storage program]
-    G --> T[Triton / cuTile / TileLang]
-    C --> M[Mojo / Weft]
-    D --> B[BANG C]
-    T --> L[provider 编译与 runtime 形成可执行调用]
-    M --> L
-    B --> L
-```
+成熟度按下列结果判断，不以代码量、pass 数、目录层数或论文成绩替代：
 
-图表示实际主链路，不表示三条分支已经同样成熟。尤其 DSA 的 construction 与后续优化尚未像 GPU/CPU 那样分开，见第 6 节。
-
-相对于直接写多个编译器的 source，Intent 应提供三项可以独立检查的价值：
-
-1. **作者复用**：修改一份算法定义，多个后端保持同一逻辑合同，不再分别维护算法实现。
-2. **编译知识复用**：某项 coordinate/identity/dependence 证明只实现一次，由不同物理程序消费；后端内的 mapping、blocking、reuse 也能跨多个算法使用。
-3. **物理程序构造**：作者没有写的 program ownership、fragments、访问、存储和遍历由 compiler 形成，然后交给成熟下层编译器。
-
-第三项是 Intent 比普通 Triton source 更高层的责任，也是风险所在。Triton 作者本来就写 program id、tile、部分 traversal 和 host launch。官方 persistent matmul 示例明确由 host 读取 SM 数，并在 kernel 中写 persistent loop；Intent 自动形成这一类结构具有独立价值，但不能因此接管算法选择或隐藏的多 kernel 编排。[Triton 官方 persistent matmul](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html)
-
-### 2.2 高性能承诺应有边界，但不能用边界掩盖实现问题
-
-同一个算法未必适合所有执行模型。若作者写了严格顺序依赖，或把一个全局归约限定为单 kernel，compiler 不能靠自动更换算法、引入隐藏 launches 来保证最优性能。另一方面，语言允许的 reshape、helper、标量/张量表示、合法索引等写法差异，如果没有改变算法与数值合同，却让 ownership 丢失或产生大量重算，仍是我们的编译器问题。
-
-因此目标应是：**在已支持的算法与语义范围内，让多种合法表达可靠地落到高质量物理程序；明确暴露无法兑现的目标组合及其原因；逐步扩大这套能力的适用范围。** “任意算法、任意后端、自动达到专家最优”不是可验收的目标；“所有掉速都要求作者改写”同样不能接受。
-
-判断一种融合是否越权，先对照合同与成熟实现。局部 producer/consumer、multiply-reduce→contract、dot+add→accumulator 可以是合法编译变换；改变 ordered recurrence、跨数值 cast、重写 host kernel 数量不是同一回事。当前规格已明确这些界限：[允许与禁止的变换](/home/kingdom/phdworks/intentdsl/doc/compiler/passes-and-analyses.md:139)。
-
-## 3. 安装、JIT、PyTorch 与 README：真实能力和交付缺口
-
-### 3.1 当前安装仍面向仓库维护者
-
-根目录文件盘点未发现标准 Python 构建入口 `pyproject.toml/setup.py/setup.cfg`，也未发现根目录 `LICENSE/COPYING` 或 `.github` 发布配置。这是本仓库当前状态，不代表已经调查所有外部发布渠道。
-
-[README](/home/kingdom/phdworks/intentdsl/README.md:1) 提供环境要求、手工 CMake 和实验执行，但没有普通用户安装 Intent Python 包并调用一个算子的完整路径。[实验脚本](/home/kingdom/phdworks/intentdsl/experiments/run.sh:30) 默认引用 `/home/kingdom/.venvs/`，并在 [105 行附近](/home/kingdom/phdworks/intentdsl/experiments/run.sh:105) 注入仓库相关 `PYTHONPATH`。这些是可以继续用于内部实验的入口，不能承担公开安装合同。
-
-安装还缺两项容易被忽略的内容：
-
-- **Python MLIR bindings**：frontend 必经 [canonicalization](/home/kingdom/phdworks/intentdsl/python/intent/frontend/compilation/compiler.py:57)，实际导入 [`mlir.dialects`/`mlir.ir`](/home/kingdom/phdworks/intentdsl/python/intent/frontend/mlir/builder.py:381)。README 的 MLIR CMake package 要求和 `environment/*.txt` 没有给出这项 Python 依赖的安装闭环。静态上可确认“所列依赖不足以保证成功”，本轮未创建新环境复现。
-- **compiler 配套资源**：[CMake](/home/kingdom/phdworks/intentdsl/tools/intent-compile/CMakeLists.txt:8) 把 shared/provider profiles 放到可执行文件旁的 `profiles/`。只打包 `intent-compile` 不够，还要处理 Python 包、MLIR bindings、可执行文件依赖和这些资源。
-
-Triton 的标准构建入口与安装说明已经把普通 wheel 使用和源码开发分开，见 [参考 pyproject](/home/kingdom/phdworks/ref/triton/pyproject.toml:1)、[参考安装文档](/home/kingdom/phdworks/ref/triton/docs/getting-started/installation.rst:11) 和[官方安装入口](https://triton-lang.org/main/getting-started/installation.html)。我们应先建立同等完整的用户路径，再逐步改善分发便利性。
-
-**建议首条公开路径收敛为 Linux + NVIDIA + Triton。** 这是交付优先级建议，不删除其它后端。先让这一条从干净环境到真实算子调用完整成立；cuTile、Mojo/Weft、BANG C 的工具链安装分别提供明确入口和支持边界。不要发一个能 `pip install`、但运行仍必须依赖维护者私有目录的包。
-
-### 3.2 JIT 链路已存在，缺的是体验和清楚的阶段合同
-
-| 阶段 | 当前代码事实 |
+| 维度 | 最终应具备的能力 |
 |---|---|
-| 定义 | [`@intent.kernel`](/home/kingdom/phdworks/intentdsl/python/intent/api/definitions.py:53) 产生 definition，直接调用要求先 compile |
-| Intent 编译 | [`intent.compile`](/home/kingdom/phdworks/intentdsl/python/intent/compiler/pipeline.py:16) 进行 frontend、目标解析、C++ compiler 调用和 materialization；当前 `compiler` 必填 |
-| 编译缓存与诊断 | [`toolchain`](/home/kingdom/phdworks/intentdsl/python/intent/compiler/toolchain.py:49) 已提供编译产物复用、阶段错误与日志路径 |
-| 加载生成程序 | [`runtime/source.py`](/home/kingdom/phdworks/intentdsl/python/intent/runtime/source.py:23) 真正 compile/exec provider Python source，绑定 launch/run |
-| 底层 JIT 与 launch | Triton serializer 发出 [`@triton.autotune`/`@triton.jit`](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Serialization/Serializer.cpp:577)，并真正调用 [`_intent_kernel[grid]`](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Serialization/Serializer.cpp:837) |
-| 普通调用 | [`artifact.run`](/home/kingdom/phdworks/intentdsl/python/intent/runtime/artifact.py:74) 和 artifact callable 已存在，包含 Torch tensor/device 处理 |
+| 作者使用 | 合法算法在承诺支持的范围内可编译、调用、诊断；无需知道 compiler 内部命中什么图形 |
+| 编译正确性 | 数值、类型、坐标、effects、alias 和调用合同明确；各层消费相同事实 |
+| 优化质量 | 常见程序有高质量默认实现；性能问题可以定位并用通用变换改善 |
+| IR 工程 | 当前 IR 独立表达执行事实；标准解析、打印、验证、优化和续编译可组合 |
+| 扩展 | 新 primitive、优化规则和 provider 能在明确模块完成，不需在多层添加同一特例 |
+| 产品交付 | 可取得、安装、运行和诊断；文档、工具、依赖与实际能力一致 |
+| 持续维护 | 构建、原生产验收、产物和 SDK 升级有稳定流程；贡献者能复现并提交改动 |
 
-准确的公开说法是：Intent 在 Python 运行期把算法 definition 编译成 callable artifact，再由 provider 完成其 JIT 和执行。首次 `compile`、首次调用的 native JIT/tuning、缓存命中后的调用是不同成本，不能把论文热态算子时间当作首次使用延迟。
+不把 Triton 的社区人数、全部 GPU 历史支持或全部底层机器优化复制过来作为验收门槛。也不把“我们发射下层 DSL”当成无需做好上述工程的理由。
 
-下一步应先提供默认 compiler 定位、保留开发者显式 override、给出 compile-once 的普通 host wrapper。**不必为证明“我们是 JIT”另造一套 `@intent.jit` 编译路径。** 若以后需要透明惰性 specialization，它也应包装同一 definition→compile→artifact 路径。
+### 1.2 为什么不负责 lane layout，工作仍然不少
 
-### 3.3 接收 Torch tensor 不等于已完整融入 PyTorch
+Triton 的作者输入已经包含 program id、tile shape、访问和部分遍历；TileLang 作者通常还给出 buffers、tile operations 与循环组织。Intent 输入更接近逻辑算法，必须先把它变成完整 block/task/local-storage program。
 
-当前 `python/` 中未找到 `torch.library`、`register_fake/register_autograd`、`triton_op/wrap_triton` 或正式 `torch.compile` adapter。已有 eager tensor 互操作是真实能力，但不能据此承诺无 graph break、FakeTensor、autograd、export 或所有 CUDA Graph 生命周期都已支持。
+我们省去了下层大量指令、寄存器分配、lane layout 和 pipeline 实现，但增加了三项真实职责：
 
-应把公开能力拆为：eager callable → 明确 output/mutation schema 的框架 adapter → 所选 `torch.compile`/FakeTensor 组合 → 作者 backward 注册。跨 provider 可以研究 opaque `custom_op`；Triton 路径可以研究可被追踪的 `triton_op/wrap_triton`。二者能力不同，不能用一个包装器名字宣称所有目标都完成集成。官方接口的这一区别见 [PyTorch 教程](https://docs.pytorch.org/tutorials/recipes/torch_compile_user_defined_triton_kernel_tutorial.html) 与 [`torch.library`](https://docs.pytorch.org/docs/main/library.html)。
+- 从逻辑成员、坐标、依赖和 effects 建立跨执行模型的 ownership 与遍历；
+- 保持张量值、视图、物理 fragment、loop carry 和存储之间的一致关系；
+- 让同一语义证明在 GPU、CPU、DSA 的不同改写中复用。
 
-这部分的完成标准是用户能把已选的 Intent callable 放入实际模型调用，并知道哪些框架组合已经兑现；不是新增自动求导编译器，也不是只让 import 成功。
+这能解释复杂性，不能作为无限建设基础设施的借口。对应的 IR、pipeline、analysis 与 runtime 基础现在已经存在；下一步应完成具体缺口并交付使用能力。
 
-### 3.4 README 与教程应围绕第一次成功使用
+## 2. 调研方法、依据与覆盖范围
 
-[examples/README](/home/kingdom/phdworks/intentdsl/examples/README.md:3) 当前把运行指向实验组；[DSL examples](/home/kingdom/phdworks/intentdsl/doc/dsl/examples/README.md:1) 明确是理想化语义示例。两者都不能直接当作完整 quickstart。可以复用已有 [softmax 算法](/home/kingdom/phdworks/intentdsl/examples/kernels/normalization/softmax.py:23) 及其 [真实 provider 接入](/home/kingdom/phdworks/intentdsl/experiments/gpu/providers/triton/normalization.py:30)，避免另写一套相似算法。
+### 2.1 证据顺序
 
-Triton 第一篇教程把 kernel、输出分配、host wrapper、Torch 调用放在一起，参见 [本地源码](/home/kingdom/phdworks/ref/triton/python/tutorials/01-vector-add.py:29) 和 [官方教程](https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html)。应学习这种完整路径，而不是把 Triton 的 tile/grid surface 搬给 Intent 作者。
+1. 当前 Intent 代码与正式 doc；
+2. 本地 ref 的实际实现；
+3. 当前编译观察、上一轮明确记录的运行结果；
+4. 官方网络资料，用于补充背景和核对版本，不覆盖本地实现事实。
 
-建议 README 保留以下顺序：一句话定位与边界、一张工作流图、真实支持平台、安装、一个完整调用、同 source 换 target 的入口、MCP 接入、深入教程/论文链接。首页不堆所有 pass、所有实验表和全部后端环境说明。
+本地参考工作树在本次检查时干净：
 
-本轮已实际查看论文的 [fig1-v2](/home/kingdom/phdworks/intent-paper/paper/fig/fig1-v2.pdf) 与 [fig3](/home/kingdom/phdworks/intent-paper/paper/fig/fig3.pdf) 渲染：前者右侧 workflow 适合简化成首页图，后者适合深入解释 execution family，密度不适合首次使用入口。前者的可编辑源在 [`fig1-v2.svg`](/home/kingdom/phdworks/intent-paper/01-引言与整体定位/fig1-v2/svg/fig1-v2.svg)。后续制作 README 时复制必要资源进入本仓库，并按实际支持范围校正图中文字；不依赖相邻论文 checkout。
+- Triton：ef08c7f，2026-08-19；
+- TileLang：f354430，2026-08-19。
 
-教程先提供少量有递进关系的完整调用：普通 tensor/归约、作者显式多 kernel 编排、一个 structured algorithm。同一算法定义继续复用 `examples/kernels/`；host 教程不复制 registry、baseline 或 benchmark runner，也不把固定题集里的硬编码 submission 直接包装成通用 API。
+这是本地快照，不声称等于某个实验环境安装包或网站当前主分支。网络资料与本地快照不一致时，以对应版本的代码说明行为；不从一个教程的写法推导“整个编译器绝不会做某种优化”。
 
-## 4. Agent/MCP：从评测接入变成日常工具
+### 2.2 本次完成的全链路自查
 
-### 4.1 已有基础值得保留
-
-[`manual.py`](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:43) 从公开语义文档和 API 声明构建 corpus；[`api`](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:266) 返回精确声明、规则及来源，明确声明不等于后端/性能保证；[`read`](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:285) 提供稳定材料入口；[MCP server](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:324) 暴露只读 search/api/read。这比只向 agent 塞一大份 README 更有用。
-
-主要缺口在接入和反馈：server [强制要求 `--corpus`](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:316)，材料生成及 client 配置在 [实验 agent](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/agent.py:77) 中，还带 `context.compile` 的评测接口；environment 文件未给出 MCP 依赖安装。公共用户缺少独立安装、启动配置和清楚的起点。
-
-已有首次记录中的 `asin` 未提交，agent 自述找不到所需 MCP/API，见 [h100-low.csv](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/results/h100-low.csv:3)。这能证明该次使用没有形成有效工具路径，**不能仅凭自述断言 server 宕机或精确归因**；后续独立提交通过也不能回写首次成绩。
-
-### 4.2 后续应形成的使用闭环
-
-1. 安装后可直接启动公共 manual MCP，材料随产品可用；普通客户端不需要先运行实验 driver。
-2. 入口告诉 agent 怎样发现语言、查询 API、确认语义和查看完整公开教程。保持真实 API 声明、源码定位与文档的一致性。
-3. 在只读 manual 之外，提供用户主动启用的编译诊断能力：输入当前程序和 target，返回失败阶段、source location、相关 operation/type、目标限制和 artifact 路径。编译成功与运行正确分开报告。
-4. 正常产品开发允许生成、编译、读取诊断、修正；固定 agent 实验继续一次正式提交。两者不共用成绩口径，也不让评测协议限制真实工具体验。
-
-当前 [错误收集](/home/kingdom/phdworks/intentdsl/python/intent/tools/manual.py:84) 仅扫描部分 frontend lowering 字符串，不是完整 compiler 诊断知识库。应复用 [toolchain 已有阶段分类](/home/kingdom/phdworks/intentdsl/python/intent/compiler/toolchain.py:18)，而非再建一套与真实编译器脱节的问答系统。
-
-完整公开示例应放普通教程/examples，当前 manual MCP 继续只含通用语法、语义和必要最小片段。若将来希望 MCP 直接检索完整算法，应明确改变这项边界，并与固定评测材料隔离；本报告不把用户提到“示范例子”解释为已经授权改变现有手册合同。
-
-## 5. GPU 跨代与资源感知：已经有什么，还缺什么
-
-### 5.1 同一 Triton provider 并非只调整 config
-
-资源信息的实际路径是：[CUDA 设备查询](/home/kingdom/phdworks/intentdsl/python/intent/targets/gpu/device.py:36) → [GPUCapabilities](/home/kingdom/phdworks/intentdsl/tools/intent-compile/intent-compile.cpp:278) → [physical kernel typed attribute](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToGPU/KIRToGPU.cpp:5630) → shared passes → [provider legalization](/home/kingdom/phdworks/intentdsl/tools/intent-compile/intent-compile.cpp:300)。查询包含 SM 数、shared memory、register file、thread limit、compute capability 和 FP32/FP64 吞吐比。
-
-| 当前机制 | 代码中实际改变什么 | 应保留的限制说明 |
+| 范围 | 核查内容 | 本次依据 |
 |---|---|---|
-| Grid-stride/persistent traversal | [RefineProgramMapping](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RefineProgramMapping.cpp:218) 按 computeUnits 绑定 resident workers，创建 `scf::ForOp` 并把 grid 缩为 `min(tasks, workers)` | 只对符合条件的 mapping；目前一 worker/SM，不是精确 occupancy 模型 |
-| 允许证明的常数除法 | [EliminateCommonValues](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/EliminateCommonValues.cpp:238) 的部分 f32 路径要求 FP32/FP64 比值不高于 2，再构造 f64 cast/multiply/回转 | 受精确性条件约束，不是任意浮点重结合 |
-| Retained contraction traversal | [RealizeContractionBlocking](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp:2774) 根据最小结果 fragment 与 shared-memory 上限决定额外分块遍历 | 是结构预算启发式，不说明结果最终一定在 shared memory |
-| Native dot 或乘加归约 form | [Triton Legalize](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/Legalize.cpp:2414) 消费 extent、精度、staging footprint/capacity，形成真实 IR 分支 | 形式合法不等于代价判断始终最优 |
-| Descriptor form | [Triton Legalize](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/Legalize.cpp:853) 检查架构、access、alignment、容量并建立 typed descriptor/allocator | 当前覆盖 contraction 相关场景，不是所有 TMA 访问 |
+| DSL/数值 | reduce、scan、ordered loop、region summary、cast、FMA、近似/FTZ、alias | 正式规格与当前 matcher/realizer |
+| 前端与 KIR | 参数归属、typed graph、结构化与访问接口、规范化 | 当前 frontend、Intent IR 与公共分析 |
+| 编译调度 | KIR/shared/provider 阶段、标准 PM、错误阶段、续编译 | Compiler、Backend、intent-opt 与 Python pipeline |
+| GPU | 关系维护、mapping owner、局部 fold/CSE、online、参数与候选 | 当前 IR/Analysis/Transforms，含原生产源码编译观察 |
+| CPU | 共同 pipeline、实现需求、ABI、布局/alias 限制、Mojo/Weft | 当前 CPU IR/passes、provider 与 runtime |
+| DSA | construction 分支、matrix、shared passes、BANG 分层 | KIRToDSA、DSA transforms 与 BANG pipeline |
+| Provider | 原语映射、target-local facts、数值选项、source/runtime 连接 | Triton/cuTile/TileLang/Mojo/Weft/BANG 代码 |
+| 产品 | 包、依赖安装、CLI、JIT/cache、离线产物、PyTorch、MCP | 当前 Python/CMake/environment/examples |
+| 维护 | 贡献导航、分发材料、许可证、自动交付、SDK/ABI 演进 | 根文件、构建目录、ref 的分发与运行代码 |
+| 旧计划 | A1–A4、B1–B6、框架/教程/发布项 | 原报告各工作包与当前实现逐项对照 |
 
-因此 H100 和 5090D 可能形成不同的 Intent physical program；也可能形成相同的 Triton source，随后由 Triton 产生不同机器程序。**相同源码本身不是缺点；应判断这一差异是否必须由上层表达，以及下层是否已经能处理。**
+“完整自查”在这里指覆盖上述责任链，不把所有源码逐行读一遍或做全库形式化证明当作本轮完成条件。发现必须落到具体代码、后果和任务；没有发现问题的既有边界不因本次审查而重做。
 
-### 5.2 Triton 怎样承担跨代差异
+### 2.3 运行证据怎样使用
 
-[NVIDIA compiler pipeline](/home/kingdom/phdworks/ref/triton/third_party/nvidia/backend/compiler.py:273) 在共同 TTGIR 上进行 coalescing、thread locality、matmul acceleration，再按架构选择 pipeline、warp specialization、TMEM 等序列。[AccelerateMatmul](/home/kingdom/phdworks/ref/triton/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:42) 不仅看代号，还检查 operation/shape/dtype：Hopper、数据中心 Blackwell、SM120 consumer Blackwell 的 MMA 路径不同；SM120 不能被视为 SM100 功能的超集。
+- 上一轮已有：MLIR20 compiler/optimizer 与 wheel 构建；5090D 上四个原生产算子经 Triton/cuTile 共八项通过；Mojo 两项通过；无 SDK 环境的 shared IR 优化、续编译和导出；安装包的原 softmax + torch.compile 调用。
+- 上一轮 Weft、TileLang、BANG C 的部分新结果只有 source generation，和更早 registry 的设备结果分开。
+- 本次新增的是原 sparse MLA 的编译/IR 观察，以及原 TileLang RMSNorm 的当前编译复核；未启动 GPU benchmark，未产生新的数值或性能通过结论。
+- 历史 CSV 是已有覆盖和问题的定位入口，不是当前 HEAD 的全量新验收。既有通过不抹掉，也不把未重测写成已失败。
 
-[TargetFeatures](/home/kingdom/phdworks/ref/triton/include/triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h:34) 还明确体现 feature 的非单调性。TileLang 同样按 target、storage scope、dtype/shape 和 threads 选择局部 GEMM lowering，见 [gemm.cc](/home/kingdom/phdworks/ref/tilelang/src/cuda/op/gemm.cc:80)、[target_utils](/home/kingdom/phdworks/ref/tilelang/src/cuda/target_utils.cc:71)；布局、pipeline 和 tile-op lowering 位于其 [CUDA pipeline](/home/kingdom/phdworks/ref/tilelang/tilelang/cuda/pipeline.py:100)。
+## 3. 最近多轮到底完成了什么
 
-应把“资源是不是 pass”拆为四件事：
+### 3.1 旧 roadmap 逐项结算
 
-| 内容 | 合适的职责 |
+| 旧工作包 | 当前结算 | 剩余工作归属 |
+|---|---|---|
+| A1 标准安装与工具定位 | 基础完成：pyproject、包内 compiler/optimizer/profiles/runtime 依赖闭包；前端不再依赖 Python MLIR bindings | M3/M6：声明平台基线、重复构建、发布与安装诊断 |
+| A2 普通调用、README、工作流图 | 基础完成：公开 compile/run、原算法 quickstart、后端入口与 README | M3：补完整使用旅程及公共返回约定，不重写一遍首页 |
+| A3 独立 manual MCP | 基础完成：包内材料、独立入口和客户端配置；compiler MCP 也已有 | M3：实际 agent 发现/诊断旅程、文档 API 同步 |
+| A4/B3 阶段诊断与产物 | 主干完成：stage/location/log/source/IR、标准 PM、CLI/Python/MCP 同路 | M1/M5：优化采用/拒绝原因、编译/JIT/tuning 成本解释 |
+| B1 目标能力合同 | 已补集中 provider eligibility 与候选验证，不能重复沿用旧 major>=9 漏口结论 | M5：按当前实际消费者继续补 feature/资源解释 |
+| B2 写法与物理关系稳定性 | 部分完成：operation-owned schema、access/region 接口、关系维护与参数重构 | M2/M5：mapping 存活、fold/CSE、原程序的结构质量 |
+| B4 共享语义证明 | 有真实共享成果：contraction/product axes、整数关系、online combine 公共核心等 | M2/M4：只提取新的实际重复，不造万能 scheduler |
+| B5 DSA 分层 | 部分完成：已有 DSA shared passes、BANG 分阶段 lowering；旧“无 shared pipeline”已过时 | M4：消除剩余 whole-source matrix construction 分叉 |
+| B6 资源决策改进 | capabilities、预算、参数、候选和 provider 过滤已有 | M5：候选剔除理由、事实来源、结构浪费与成本 |
+| PyTorch adapter | GPU functional/fake 范围完成；原 softmax fullgraph 路径已运行 | M3：作者 backward 注册、公共调用语义、实际模型使用 |
+| 教程和贡献入口 | CONTRIBUTING 与基本 examples 已有 | M3/M6：补能力旅程、保持入口与实现同步 |
+| 公开分发/许可证 | 仍未闭合 | M6；许可证是维护者选择，不阻断其它任务 |
+
+对应实现：[pyproject](../pyproject.toml):20，[公共 pipeline](../python/intent/compiler/pipeline.py):18–108，[编译驱动](../lib/Compiler/Compiler.cpp):58–118，[开发导航](../CONTRIBUTING.md):18–45、155–214，[DSA shared pipeline](../lib/Dialect/DSA/Transforms/Passes.cpp):63–71。
+
+### 3.2 不应再次立项重做的基础
+
+- 公共参数合同与实际物理 ABI 已分开，且 source signature 与 native slots 同源。
+- GPU 参数声明、稳定引用、候选绑定与 host producer 依赖已经进入 typed IR。
+- 编译事实与本机 device/SDK binding 已分开；GeneratedProgram 与 CompiledArtifact 职责明确。
+- CLI、Python、compiler MCP 已调用同一编译入口；无需另造 agent compiler。
+- native library/cache handle 已有复用机制；无需再次用缓存局部优化充当宏观里程碑。
+- CPU/GPU 不同物理 IR 是合理分工，不能为了“统一”强行融合它们。
+- 普通 reduce、scan 和 matrix primitives 应继续利用 provider 原生能力，不重建下层 layout/通信算法。
+
+### 3.3 为什么会感觉在原地打转
+
+首先，确有一部分工作在偿还早期“多轮追加功能先跑通”留下的结构债务。参数表、候选、ABI、生成 host wrapper 和关系维护先后收口，修改量大，但外部用户不直接看见。
+
+其次，旧 roadmap 没有及时结算，已完成的安装/MCP/调用仍出现在“未来缺口”的叙事中；若每次都以尚未覆盖的更大集合评价成熟度，终点会不断移动。
+
+第三，阶段完成曾被表述成宏观里程碑，而产品结果没有与其一起收束。一个 typed interface 迁移可以是重要提交，但单独不足以代表“用户现在能完成一个新的完整任务”。
+
+第四，对语义保持和新优化的讨论有时走向两个极端：先凭性能推动特殊结构，后又因不是作者字面结构而过度否定。应改为固定的合法性、数值许可与收益判断。
+
+因此后续每组任务必须同时回答：已完成的能力是什么；删掉了哪条冗余路径；外部用户或下一位开发者现在能独立做什么；还剩哪一项明确工作。代码量记录实际工作规模，不能代替这些答案。
+
+## 4. 对照 Triton/TileLang：该学什么，不该照搬什么
+
+### 4.1 责任层的对照
+
+| 责任 | Triton/TileLang 的本地事实 | Intent 应承担的相应责任 |
+|---|---|---|
+| 作者输入 | Triton TTIR 对应 block 程序；TileLang 输入带 tile/buffer/loop 结构 | KIR 更高，需要先形成完整 GPU/CPU/DSA 程序 |
+| 局部正规化 | Triton op 自带 fold/canonicalizer；Combine 做真实图改写 | 等价的 shape/value 规则归 op；跨 ownership 的变化归完整 transformation |
+| 执行优化 | 共同 IR 上做 target-aware pipeline、warp specialization、存储改写 | 优化自己的 program mapping、blocking、reuse、materialization；不复制 lane/ISA |
+| 局部专家实现 | TileLang GEMM 经 target/layout/thread 条件展开局部实现 | typed primitive/microkernel 可以复用；外围程序由 compiler 组织 |
+| 编译选项 | 数值、优化选择、资源与 native compile 选项有具体消费者 | 给出同样清楚的类别与传播路径，不把所有选择都叫 tuning |
+| JIT/产物 | compiler facts、source/IR/native code、runtime handle 有阶段边界 | 继续复用已有 GeneratedProgram/materialize；补兼容诊断和维护合同 |
+| 分发 | 二进制、源码、构建基线和 CI 作为产品代码维护 | 建立我们承诺平台上的同等完整交付链 |
+
+参考：[Triton NVIDIA pipeline](../../ref/triton/third_party/nvidia/backend/compiler.py):273–369；[Triton shape ops](../../ref/triton/include/triton/Dialect/Triton/IR/TritonOps.td):469–531；[TileLang CUDA pipeline](../../ref/tilelang/tilelang/cuda/pipeline.py):68–163、166–249；[TileLang GEMM](../../ref/tilelang/src/op/gemm.cc):188 起。Intent 对应：[compiler 边界](../doc/compiler/README.md):35–48，[CPU implementation 合同](../doc/compiler/cpu-program-ir.md):34–62。
+
+### 4.2 成熟编译器确实会主动改变计算结构
+
+本地 Triton 的 Combine pass：
+
+- 对满足 rank、axis、broadcast 与 combine 条件的乘法归约，构造 IEEE precision DotOp：[Combine.cpp](../../ref/triton/lib/Dialect/Triton/Transforms/Combine.cpp):135–192。
+- 对只供 reduce/histogram 使用的一维 reshape，允许元素重排：同文件 196–215。
+- 在 zero accumulator、single-use 等条件下把 dot+add 合并：同文件 249–282。
+- 这些规则被加入普通 Combine pass：同文件 297–314。
+
+因此“作者没有写 dot / 新 accumulator，所以 compiler 不应生成”显然不是合理标准。Intent 已有相应数值合同的局部融合，也应积极做。
+
+TileLang 的 CUDA pipeline 自动形成 producer/consumer warp specialization、software pipeline、buffer allocation 与 storage rewrite：[pipeline.py](../../ref/tilelang/tilelang/cuda/pipeline.py):100–140、173–178、210–217。改变循环、缓冲和同步的具体结构本来就是 compiler 工作；是否改变作者可观察语义必须另查。
+
+### 4.3 选项不是保守的替代品，而是成熟控制面
+
+本地 Triton 的 CUDAOptions 把 enable_fp_fusion、enable_reflect_ftz、dot precision 等分开：[compiler.py](../../ref/triton/third_party/nvidia/backend/compiler.py):120–129。Intent 当前 Triton runtime 显式允许后端 FMA 融合、关闭普通 libdevice FTZ：[runtime/triton.py](../python/intent/runtime/triton.py):181–186；这已经说明默认合同可以主动允许合理优化，而不是逐操作 bitwise 保守。
+
+TileLang 的 PassConfigKey 包含：
+
+- Simplify 内部策略；
+- warp specialization 等优化选择；
+- TL_ENABLE_FAST_MATH 对应 native fast-math 编译；
+- reducer baseline 选择与计划解释。
+
+依据：[pass_config.py](../../ref/tilelang/tilelang/transform/pass_config.py):15–50、73–80、110–130。它们并非同一语义：关闭某项优化不等于更换数值合同，启用 fast math 也不等于任意错误均可接受。
+
+GCC 式思路可用于组织 Intent 的公开选项，但不照搬旗标数量。官方 GCC 文档也区分普通优化级别、浮点重结合及相关前提；这里只作背景对照，实际方案以本地 provider 实现及 Intent 合同为准。[官方优化选项说明](https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html)
+
+### 4.4 必须固定的判断顺序
+
+1. 是否保持调用、shape/dtype、索引成员、effects、必要顺序与别名关系？
+2. 改变的浮点求值方式，是否已经被该 operation 或选定数值模式允许？
+3. matcher 是否足以证明该规则的适用条件，而非只认一个像某算法的外形？
+4. 不采用此优化时，正常编译路径是否完整？
+5. 采用后是否改善完整算子的资源、编译或运行成本？
+
+前两项定义合法性，第三项负责实例化正确，第四项保证可组合，最后一项决定收益。正确性不要求每次编译形式化证明所有数学定律；维护者应给出明确规则、可执行条件、实现审查和原生产证据。
+
+## 5. Online 重组：保留能力，补齐合同与编译路径
+
+### 5.1 当前代码和实际触发
+
+默认 GPU shared pipeline 在 [Passes.cpp](../lib/Dialect/GPU/Transforms/Passes.cpp):262 调用 OnlineReductionsPass。
+
+[RealizeOnlineReduction.cpp](../lib/Dialect/GPU/Transforms/RealizeOnlineReduction.cpp):79–120 从顶层四字段 summary 图匹配；123–169 建立 chunk 参数和四个 carry；299–341 合成 max-rescale、mass 与 moment 合并。它不要求源程序已经使用 region_fold/combine。
+
+本次使用既有生产算法 token_sparse_mla_value_prefill，原源码位于 [mla.py](../examples/kernels/streaming/mla.py):249–294、403–411，入口由 [GPU registry](../experiments/gpu/registry.py):94 连接。先生成 target 无关 KIR，再指定现有 5090D 编译事实生成 shared IR，观察到了 before/after online group：
+
+- before：原来的四字段 summary；
+- after：新增 REDUCE_CHUNK_12_A0 与四 carry 的 scf.for；
+- 对应观察文件：/tmp/intentdsl-online-review-sparse-mla.log 与 /tmp/intentdsl-online-review-sparse-mla-shared.mlir。
+
+这些是当前生产源码的编译证据，不是新增测试算法，也不是设备数值验证。
+
+### 5.2 问题不在“合成了状态”，而在许可和适用条件
+
+实数下，用局部最大值归一化，再通过比例合并 summary，可以是合理的流式实现。若源 operation 或数值模式允许相应有限精度变化，compiler 完全可以实现这一优化。
+
+当前具体需要解决的是：
+
+- 原路径对 global maximum 归一化后的概率进行低精度 cast；
+- 新路径对 chunk maximum 归一化后的概率先 cast，再对局部 moment 重缩放；
+- 一般不能把 cast(exp(x-global_max)) 与 cast(exp(x-chunk_max)) 后缩放视为逐操作等价；
+- FMA 或普通 reduction 的重结合许可，并未自动说明这种跨操作、含低精度转换的重写允许什么。
+
+同时需要核对 NaN/Inf、空集合 identity、validity guarding、不同 dtype 与额外消费者，不只看“有 max、exp、sum、matmul”这几个节点。当前 matcher 与生成代码的依据见 [OnlineSummary.cpp](../lib/Dialect/GPU/Transforms/OnlineSummary.cpp):127–262 和 RealizeOnlineReduction 的概率 cast/contract、合并部分。
+
+**结论：不应整体删除 online 优化，也不能直接认定它在所有匹配输入上已经被当前数值合同覆盖。** 应形成默认合同可证明的适用域，以及显式声明额外数值自由后的适用域；实现错误在两种模式下都必须修复。
+
+### 5.3 对照作者显式 region 路径
+
+作者通过 region_fold/region_scan 给出的 summarize/combine 合同已经允许指定的连续分段与有限精度差异：[数值规格](../doc/dsl/types-numerics-and-effects.md):165–176。对应合法 lowering 应继续保留并优化。
+
+Triton attention 教程和 TileLang attention 示例中作者显式写 online recurrence，只能说明这些程序怎样表达算法，不能推出编译器永远不能从另一表达中得到它。应该从默认图重写、数值选项和具体合法性检查共同判断。
+
+### 5.4 关闭优化暴露出的真实实现缺口
+
+本次从同一生产程序的 before-online IR，用标准 intent-opt 执行其余 shared groups，跳过该 group：
+
+- 剩余 shared pipeline 可输出 /tmp/intentdsl-online-review-sparse-mla-without-online.mlir；
+- 从该产物继续 provider 编译时，解析第 193 行失败；
+- fragment extent 含 runtime Dimension 的 min/next_power_of_two 组合，违反当前 fragment 类型只允许常量/physical-parameter extent 的合同。
+
+对应构造入口是 [Traversal.cpp](../lib/Dialect/GPU/Transforms/Traversal.cpp):33–59；类型约束是 [GPUDialect.cpp](../lib/Dialect/GPU/IR/GPUDialect.cpp):710–725。这不是已经证明默认 pipeline 的所有程序都会失败，而是这个原生产输入的优化关闭路径存在实际缺口。
+
+因此新路线应同时完成：
+
+1. 合法的 online 路径；
+2. 原合同下保留 global max、再分块 exp/contract 的正常路径，优先复用现有 reduction/traversal；
+3. 开关关闭后的完整 pipeline 与可重读 IR；
+4. 不符合某种优化条件时的清楚原因。
+
+不把“写成 region_fold 才行”甩给作者，也不在 serializer 或异常处理里暗中选择另一算法。
+
+## 6. 当前结构与产品缺口清单
+
+优先级含义：P0 是已有正确性、可重放或公开交付的直接缺口；P1 是下一阶段的主要能力；P2 是依附相关任务清理或后续扩展。优先级不等同于“必须串行等它完成才能做其它工作”。
+
+| 编号 | 级别 | 当前事实与后果 | 收束目标 |
+|---|---|---|---|
+| F01 | P0 | Online 数值自由与 matcher 资格未闭合；已在原 sparse MLA 编译中触发 | M1：明确数值许可、保留优化、闭合正常路径 |
+| F02 | P0 | 变换能产出内存中可流转、文本却不可重读的 fragment type | M2，前置修复与 M1 联动 |
+| F03 | P1 | Pure Delinearize 承担隐藏的持久 mapping 事实，需要特殊保活 | M2：owner 表达持久事实，坐标计算正常 DCE/CSE |
+| F04 | P1 | 局部 folds、手写 CSE 与跨 use-def 关系修复耦合 | M2：局部规则进 op，完整关系变换保留 |
+| F05 | P1 | DSA whole-source matrix 与 structured/localMatMul 是两套入口合同 | M4：单一 construction/realization 主路径 |
+| F06 | P1 | 公共 schema 已统一，但返回约定、named alias 及部分 view 支持仍不一致 | M3/M4：行为合同和 family 能力收口 |
+| F07 | P1 | 资源过滤已有，精确事实、名义预算、偏好及下层拒绝缺统一解释 | M5：可追踪的合法性/收益决策 |
+| F08 | P0 公开发布 | 根许可证、可重复二进制生产和自动交付入口未闭合 | M6，与 M3 并行开始 |
+| F09 | P1 | 产物能保存恢复，但兼容范围及外部 SDK 改动的处理入口未形成完整产品合同 | M6 |
+| F10 | P1 | 框架/MCP 基础完成，但能力较分散，作者训练集成和完整使用旅程不足 | M3 |
+| F11 | P2 | 少量 canonical product schema 和可派生 buffer 字段仍重复 | 随 M4/M5 删除，不独立宣称里程碑 |
+| F12 | P2 扩展 | provider/hardware 概念已分开，GPU capability 实现仍主要 NVIDIA | 主产品稳定后完成第二 GPU vendor 的真实纵向路线 |
+| F13 | P1 | 原 TileLang RMSNorm 在当前 provider form-memory 阶段仍因非单位轴关系缺失而失败 | M2.7–2.8：修关系产生/维护与目标消费链，见 §11.1 |
+
+### 6.1 IR 可组合性：优先修 owner 和不变量，而不是继续加 repair
+
+DelinearizeOp 声明为 Pure：[GPUOps.td](../include/Intent/Dialect/GPU/IR/GPUOps.td):76–82。但 [EliminateCommonValues.cpp](../lib/Dialect/GPU/Transforms/EliminateCommonValues.cpp):187 与 [ValueRelations.cpp](../lib/Dialect/GPU/Transforms/ValueRelations.cpp):2056 特别排除其删除；其它变换按该 op 的位置、数量或附属属性读取 segment/mapping。
+
+具体消费者：[ContractionAnalysis.cpp](../lib/Dialect/GPU/Transforms/ContractionAnalysis.cpp):58–84；[RefineProgramMapping.cpp](../lib/Dialect/GPU/Transforms/RefineProgramMapping.cpp):156–168；[PointwiseAnalysis.cpp](../lib/Dialect/GPU/Transforms/PointwiseAnalysis.cpp):1182–1187。
+
+这说明持久执行事实还部分依赖“不应被删掉的纯计算节点”。应利用已有 program/segment/ownership owner 保存事实；Delinearize 只表示坐标求值。不能只是给它伪造 side effect，让所有 optimizer 都不敢动。
+
+GPU 的普通 shape/value operations 尚缺合适的局部 fold/canonicalizer，而 [EliminateCommonValues.cpp](../lib/Dialect/GPU/Transforms/EliminateCommonValues.cpp):170–208 自行维护 block-local CSE。对照 Triton 的 op-local canonicalization，可以迁移明确纯局部的等价规则。涉及 coordinate identity、owner、captures、accumulator 和 access 的成组改写仍归现有 transformation/worklist，不新建另一套全局修复系统。
+
+接入标准 CSE 前，先区分仅用于诊断的 origin 与有语义作用的 source-axis、owner、effect identity、numeric attributes。当前 OperationEquivalence 使用 exactValueMatch、忽略 location，但仍比较 attributes。不能为提高命中率统一忽略 origin/axisMap/owner 等字段；仅诊断信息的处理也须保留可用的 source 映射。同 shape 不等于同 value。
+
+F02 的处理也不能止于“打印后再读一遍”：应修产生非法类型的构造和 staging，再让类型构造、完整变换后置与文本入口消费同一个约束。无需为每个 helper 重复全 module 验证。
+
+### 6.2 DSA：已有进步，剩余两路线必须真正合并
+
+[KIRToDSA.cpp](../lib/Conversion/KIRToDSA/KIRToDSA.cpp):146–185 根据整份 source 中 contract 的位置和 structured operations 选择路线。
+
+- lowerMatrix 在 3578–3612 限定 direct full rank-two views、特定轴配对和共享 LHS；
+- 3615–3640 又限定单 output 和 pointwise epilogue；
+- structured localMatMul 在 675–742 另行处理 local shape、reduction slicing、projection 与 replay；
+- 两路分别形成 loops、local allocations、loads、matrix 与 stores。
+
+问题是合同和 realization 的重复，不是文件长。新任务应统一语义查询与当前 DSA program 的矩阵实现，再删除 whole-function shortcut；保留已经存在的 [DSA shared passes](../lib/Dialect/DSA/Transforms/Passes.cpp):63–66 和 BANG target-local realization。
+
+TileLang 的 [CUDA pipeline](../../ref/tilelang/tilelang/cuda/pipeline.py):91–142 与 [CPU pipeline](../../ref/tilelang/tilelang/cpu/pipeline.py):21–66 表明：共同 tile/operation 语义可以保留，不同 execution model 各自实现，不需要统一硬件拓扑。
+
+### 6.3 公共调用：schema 统一以后还要收口行为
+
+当前 .run()/prepared .result() 的实际约定：
+
+| 路径 | 返回内容 | 没有输出时 |
+|---|---|---|
+| GPU | Out，声明顺序 | None |
+| Mojo / Weft | Out + InOut，声明顺序 | 空 tuple |
+| BANG C | Out，声明顺序 | 空 tuple |
+
+依据：[native.py](../python/intent/runtime/native.py):215；[GPU interface](../python/intent/runtime/gpu/interface.py):67–70、272–273；[Mojo](../python/intent/runtime/mojo/program.py):150–157；[Weft](../python/intent/runtime/weft/program.py):226–236；[BANG C](../python/intent/runtime/bangc/program.py):138–141。区别已写在 CONTRIBUTING，但正式 public authoring 没有完整定义零/单/多输出及 InOut 回传。
+
+建议统一为：run/result 只返回 Out；零个返回 None，一个返回该值，多个按声明顺序返回 tuple；InOut 通过原对象观察。公开 launch/显式输出调用负责执行，返回 None；内部 provider 的 LaunchResult/compiled kernel 仍供 backend IR 收集和诊断使用，不随公开返回约定删除。**这是待确认的公开行为提案，不是本轮已修改的规格。** CPU join、GPU stream、MLU queue 继续各守执行语义。
+
+named alias group 同样需要一句完整合同。建议同组表示同一底层 allocation，允许不同 offset、shape 和不重叠子视图；不同组不推出 disjoint；noalias 维持既有 allocation 不重叠前置条件。若作者实际需要的不是这个含义，应在语言合同处一次解决，不能让各 runtime 自己解释。
+
+另外，CPU 当前 verifier 对 view layout、stride constraints、scalar carrier 有明确限制：[PhysicalProgram.cpp](../lib/Dialect/CPU/Analysis/PhysicalProgram.cpp):199–238。readonly/Out/InOut 的别名和布局支持要按实际实现资格处理；不把 provider 某个 microkernel 的限制自动提升为整个语言的限制。
+
+### 6.4 资源和硬件：强化已有机制，不重新实现下层编译器
+
+已有能力包括 shared fragment footprint、provider collective 预算、TileLang 明确 allocation lifetime 的容量分析：
+
+- [ConfigurationConstraints.cpp](../lib/Dialect/GPU/Transforms/ConfigurationConstraints.cpp):12–32；
+- [Triton Configurations.cpp](../lib/Target/Triton/Transforms/Configurations.cpp):436–466；
+- [TileLang Legalize.cpp](../lib/Target/TileLang/Transforms/Legalize.cpp):179–218。
+
+需要区分“准确证明非法”和“名义 payload 预算不看好”。例如 warps × 32 × 255 不是实际 register allocation；当前审查没有证明它已经错误剔除了某个生产候选，不能直接删除或宣称发现性能 bug。
+
+Triton 的真实 allocation analysis 处理 buffers、offsets、intervals 和 aliases：[Allocation.h](../../ref/triton/include/triton/Analysis/Allocation.h):70–129；这是更低层的职责。Intent 应解释自己的 footprint/lifetime，并利用下层实际反馈，不复制该 allocator。
+
+当前 NVIDIA 的多 CTA 限制已排除 SM12x：[Configuration.cpp](../lib/Target/Triton/IR/Configuration.cpp):13–27。下一硬件扩展再引入实际需要的 vendor/wave/feature facts，参考 [Triton AMD compiler](../../ref/triton/third_party/amd/backend/compiler.py):106–108、154–174、260–273。不为证明“泛用”而提前加入无人消费的硬件字段。
+
+### 6.5 可删除的重复，必须附着于真实任务
+
+- CPU/DSA 的 canonical tuple/record 叶类型、字段顺序和 offsets 可共享；各自的 storage、lazy materialization、slicing、copy 与 carries 不硬合并。入口：[KIRToCPU.cpp](../lib/Conversion/KIRToCPU/KIRToCPU.cpp):253–278；[KIRToDSA.cpp](../lib/Conversion/KIRToDSA/KIRToDSA.cpp):2895–2928。
+- 当前 BufferType 的 workspace 与 lifetime 由 scope 唯一确定：[GPUDialect.cpp](../lib/Dialect/GPU/IR/GPUDialect.cpp):745–768。核清消费者后可以派生查询替代重复字段。
+- initialization、owner、instance、visibility 有独立意义，不能因为“字段少更漂亮”一起删除。
+- serializer 从已经确定的 typed shapes/axes 拼写目标 API，不等于偷偷做算法决策。本轮没有新发现整算子 serializer 旁路，不以怀疑制造另一轮整理。
+
+## 7. 编译优化控制面的具体设计方向
+
+本节是下一阶段设计提案。正式 doc 的数值变化必须在提案确定后同步；不让 report 暗中覆盖现有规格。
+
+### 7.1 四类输入分开，不再混进 tuning_config
+
+| 类别 | 内容 | 作用 |
+|---|---|---|
+| 语言/数值许可 | source 已有 FMA/reduce/region 权利，及将来明确的额外重组权限 | 决定哪些变换合法 |
+| 可选优化策略 | 选择/关闭某个完整可省略优化 group | 决定是否采用合法优化，便于复现与排查 |
+| 目标能力 | dtype、primitive、grid、资源、架构 feature | 决定目标能否实现 |
+| 候选参数 | 已声明结构的 tile/grain/provider options | 在合法空间中选择性能 |
+
+tuning_config 继续提供有限候选数据，不放布尔算法规则、错误绕过或设备名分支。必要 construction、ABI legalization、验证不属于用户可以随意关闭的普通优化。
+
+### 7.2 推荐的默认与额外数值模式
+
+- 默认名称和说明应是“遵循 source 合同”。它本来就允许规定范围内的并行归约、FMA、局部 contraction 融合，不应叫“逐操作严格模式”。
+- 合同已覆盖、条件充分的优化保留为合法候选，并在收益策略适合时默认采用，不要求作者重复提示。
+- 对 normalized reduction 等额外重组，给出具体许可：允许改变的归一化参考、部分累加/舍入关系、适用 dtype，以及必须保持的特殊值、effects 和 ABI。
+- 不直接提供一个含义模糊的 fast_math=True，让所有 pass 自行扩大解释。
+- 显式 approximation/FTZ、dot 输入精度、外部格式和量化操作的独立舍入条款分别处理；不能由一个后端全局旗标悄悄改变。
+- 若证明某类 online 变换已经由现有合同覆盖，直接纳入默认；只有实际需要新增数值自由的范围才使用新模式。
+
+### 7.3 贯通路径
+
+公开 Python/CLI/compiler MCP
+→ 一份 compile request
+→ typed IR 中的有效数值/优化事实
+→ family/provider eligibility
+→ 实际 source/native 编译选项
+→ artifact metadata 和缓存依赖。
+
+现有入口：[pipeline.py](../python/intent/compiler/pipeline.py):18–54、130–152；[Compiler::Request](../include/Intent/Compiler/Compiler.h):36–46。扩展这些入口，不另造“优化编译器”或 agent 特殊通道。
+
+shared IR 续编译沿用产物已经绑定的许可；不能在加载时无声换一种数值模式。缓存必须区分实际影响生成/执行的选项；继续使用现有完整输入与文件依赖机制，不新增 hash/checksum 机制。
+
+### 7.4 优化开关的准入
+
+一个 group 可被关闭，须满足：
+
+1. 前后的程序都拥有完整语义和类型；
+2. 后续必需 passes 不依赖它附带修复本不属于它的不变量；
+3. 不执行该优化仍能得到合法 provider program；
+4. 开关改变能从诊断、IR 和产物信息中看到；
+5. 对应原生产程序可以通过现有编译与数值入口验证。
+
+这是编译器设计要求，不是额外的人为审批。M1/M2 要解决现有 online 关闭路径，而不是先公布一个实际无法工作的开关。
+
+### 7.5 诊断输出的最小内容
+
+复用 MLIR remarks 与现有阶段诊断，逐步让关键规则能说明：
+
+- 规则名称及 source location；
+- 已采用、未命中、缺数值许可、目标不支持或预算淘汰；
+- 依赖的 dtype/axes/alias/capability 事实；
+- 原因来自 Intent 还是下层 compiler；
+- 对应 IR/source 与日志位置。
+
+这些是观察结果，不是第二份 executable plan。完整日志继续留缓存目录，普通用户默认看到简洁结论。
+
+## 8. 后续设计与改动的共同标准
+
+1. **先复用当前 owner。** 参数、访问、结构化 regions、ABI 已有承载者；只有真实缺少执行事实才扩展 IR。
+2. **一个语义事实一个权威。** 类型、操作或 region 保存正式关系，analysis 读取当前 IR；缓存不承担语义。
+3. **模块边界跟职责走。** 公共证明、family rewrite、provider realization、runtime 相互清楚；不强求 CPU/GPU 同目录同形态。
+4. **正向构造与检查一致。** 不先造不合法 IR，指望后面某个优化顺带修复。
+5. **优化有前提但不为所有前提造新 hint。** 从 dtype、def-use、effects、坐标与已有 operation 合同直接取得的事实，compiler 自己使用。
+6. **标准能力优先。** 使用 MLIR 的 op interfaces、fold/pattern、PassManager、diagnostics；使用 provider 的 reduce/scan/layout/pipeline。
+7. **一个有效实现路径。** 迁移完成即删除同责旧路径；显式优化控制不等于保留两套编译器。
+8. **慢与错分开。** 正确但慢的实现可以是明确的基础 lowering；不能把另一算法或隐式 host 替代称作兼容 fallback，也不能仅因暂时慢就拒绝所有合法程序。
+9. **删除冗余随任务完成。** 不按文件长度拆模块，不按删除行数挑目标，不保留无人使用的“未来扩展层”。
+10. **公开能力有有限而真实的支持范围。** 范围内的缺陷要修；范围扩展单独推进；不随每轮调研扩大成熟度门槛。
+
+## 9. 六个成组里程碑
+
+下面每个里程碑都允许由多项任务、多次实现与若干连贯提交完成。实现、删除旧路径、用户入口和必要生产验证一起收束；不能只完成表中的一个节点就宣布整个里程碑完成。
+
+源码增删按整组实际工作统计，延续用户对实质改动规模的要求，可以累计多个提交达到 5,000+；不靠重排、无关注释、生成代码、文档或结果表凑数。任务自然形成的规模和能力结果同时报告。
+
+### 总览与依赖
+
+| 里程碑 | 用户或开发者得到的结果 | 主要依赖 |
+|---|---|---|
+| M1 优化合同与控制闭环 | 能积极使用、关闭和解释合法优化，online 的正常/放宽数值路径明确 | 现有编译链；与 M2 的类型修复共同推进 |
+| M2 可组合的 MLIR 与共享变换 | IR 能在标准工具中优化、保存、重读、续编译；不靠纯 op 保活 | 已完成的 typed 参数/访问/ABI，不重做 |
+| M3 统一调用与完整使用旅程 | 外部用户和 agent 能独立安装、编译、调用、集成、诊断 | 现有产品入口；公共行为选择一次收口 |
+| M4 跨执行模型单一路线 | DSA 去掉 whole-source matrix 分叉，CPU/DSA 共享正确层的知识 | M2 的改写原则；现有 DSA/CPU 骨架 |
+| M5 物理质量与资源解释 | 性能问题能沿结构和真实资源定位，优化可以复用 | M1/M2；可与 M4 的特定分析共享并行 |
+| M6 可持续分发与演进 | 可重复取得产品、升级 provider、接受外部贡献和持续验证 | 构建/许可证工作立即开始，最终汇集其它里程碑 |
+
+建议推进顺序：M1/M2 是近期编译器主线；M3 与 M6 的构建/分发准备同时推进。之后 M4 与 M5 并行，最后以 M6 的产品交付收束。不是等 M1–M5 全部结束才让别人使用。
+
+### M1：优化合同、控制和 online 路径成为一个完整能力
+
+**问题：** 当前正确优化与额外数值自由未形成统一控制面；online 关闭会暴露普通路径缺口。单独加一个 bool 开关或删除 pass 都没有完成目标。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M1.1 明确数值权限 | 对照 types-numerics、provider 选项与真实算子；形成少量明确条款 | 默认继续允许已有 FMA/reduce/contract 融合；额外 online 许可具体化 |
+| M1.2 闭合正常 lowering | Traversal、RealizeReductionBlocking、retained values、ContractionValues | 保留 global max 与原 cast 关系的分块实现；修已定位 fragment extent 问题 |
+| M1.3 收口 online 资格 | OnlineSummary 公共证明、GPU matcher/realizer、region 路径 | 普通图使用 typed 归一化关系与数值许可；已有 region/combine 的路径复用 combine 分析；dtype/特殊值、replay/effects 各有实际检查 |
+| M1.4 统一编译输入 | Python pipeline、Compiler::Request、CLI、compiler MCP | 一个调用参数模型贯通各入口，不把数值政策放进 tuning JSON |
+| M1.5 绑定产物与下层 | typed module/program facts、provider lowering/runtime、artifact/cache | 默认与额外模式可区分，实际 native options 与声明一致，续编译不变更许可 |
+| M1.6 提供合法的优化控制 | 注册的完整可选 group、默认 pipeline | 关闭 group 不损坏必要不变量，未知选项明确报错 |
+| M1.7 暴露采用原因 | 现有 MLIR diagnostics、toolchain、CLI/MCP | 区分缺权限、未匹配、目标限制和无收益，不在日志之外另造决策权威 |
+| M1.8 原生产收束 | sparse_mla_prefill 及确实受影响的既有归约/region/contraction case | 原输入/容差，生成、编译、数值、耗时分别记录；不新造边界矩阵 |
+
+**应删除的东西：** 散落的 policy 默认值、仅凭形状外观获得数值权限的隐式路径、为关闭优化临时补的 exception fallback。保留同一变换中的合法模式，不建立两份长期并存的整套 compiler。
+
+**完成标准：**
+
+- 同一个原生产程序有明确默认合同和优化资格；作者无需为了绕过 compiler 缺口改算法。
+- 已选择的优化可以关闭并得到可解析、可续编译、可运行的完整程序。
+- 选项在 API、IR、metadata、实际下层编译及缓存中一致。
+- 原生产数值比较通过；性能数据只反映实际完整算子，不将 JIT/tuning 混入。
+- online 能力保留并有明确适用域，不能以“保守”为由一删了之，也不能用 fast-math 名称覆盖实现错误。
+
+### M2：让 MLIR 本身成为可组合、可维护的编译接口
+
+**问题：** typed IR 已经有实际作用，但 fragment staging、mapping 生命周期和局部正规化仍存在自定义工具链假设。这是一组横向 IR 问题，应一起解决。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M2.1 统一 extent staging | GPU PhysicalExpr/FragmentType、Traversal、Deferred 参数 | 优先把 host-derived capacity 表达为已有 Deferred 符号，fragment type 消费合法 compile-time 表达式 |
+| M2.2 统一构造和验证 | GPU IR builders/mutation、GPUDialect verifier、完整 transformation 后置 | release 构造与文本解析遵守同一约束；不靠 Debug assert 才发现 |
+| M2.3 给 mapping 正确 owner | Program、program space/segments、Delinearize consumers | 先区分持久执行决定与派生坐标值，复用现有 owner |
+| M2.4 删除 keepalive 例外 | EliminateCommonValues、ValueRelations、ContractionAnalysis、RefineProgramMapping | 无用坐标计算可被标准 DCE 删除，后续不再靠扫描纯 op 找语义 |
+| M2.5 落实局部 folds | GPUOps 定义及相邻 canonicalization 实现 | identity projection、select、record extract、合法 transpose composition 等纯局部规则有唯一实现 |
+| M2.6 收口 CSE 职责 | 自定义 common-values 与标准 canonicalizer/CSE | 保留真正需要专门分析的变换，删与标准能力等价的重复逻辑 |
+| M2.7 修复并收口完整关系变换 | 当前 ValueRelations worklist、access/structured/ownership 查询 | 修复普通 reduce→broadcast/pointwise→store 的 source-axis 关系产生/维护，追到 RMSNorm derived 22 与 source 6 分歧的责任层；跨图修复不塞进 op fold |
+| M2.8 完成工具链消费 | intent-opt、generate_from_ir、三个 GPU provider 与公共工具 | 原 shared IR 保存、标准优化、重新读取、继续生成走同一链路；原 rms_norm_f32 的 TileLang form-memory 正常路径闭合 |
+
+**应删除的东西：** 纯 mapping op 保活白名单、同一局部规则的多处实现、没有独立语义的重复类型字段、用文本/旁表补回 owner 的逻辑。
+
+**完成标准：**
+
+- 已定位的 sparse MLA shared IR 重读问题在产生不合法类型的层解决。
+- 原 rms_norm_f32 无需改写作者算法即可完成 TileLang 生成与原生产运行；不在 scalarizer 中按相同 shape 猜测缺失轴关系。
+- 普通标准 canonicalize/CSE 不破坏后续所需 program facts。
+- 局部等价规则在 op/pattern 层可复用；跨结构改写仍有完整后置合同。
+- 至少通过原有归约、contraction、结构化 region、带 compiler-private resource 的实际编译路径；运行只选择真实受影响的原 production cases。
+- 不需要重新运行一整套论文实验，也不以新建 fixtures 替代真实程序。
+
+### M3：统一公共行为，完成用户、框架与 agent 使用旅程
+
+**问题：** 包和工具已经可用，但返回行为、别名约束和较完整使用方式仍分散在 provider 或开发文档中。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M3.1 明确公开返回合同 | authoring 提案、PublicInterface、GPU/native/BANG result | 零/单/多输出、Out/InOut、run/launch/result 语义一次定义 |
+| M3.2 统一 alias 声明检查 | PublicInterface、各 provider observer/binder | named group 与 noalias 分清；family 不支持 overlap 时给正确性质的错误 |
+| M3.3 把调用要求归实际能力 | CPU/DSA EntryRequirements、native observers、provider legality | 不以共同 binder 名称掩盖全局 contiguity/disjointness 限制；可以共享的检查只保一份 |
+| M3.4 完成框架作者流程 | 现有 torch adapter、softmax forward/backward 算法与公开示例 | 作者注册 backward 的完整实际用法；明确保存张量、fake/output schema 和调用目标 |
+| M3.5 组织产品教程 | 现有 examples/README、README 深入入口、CONTRIBUTING | compile/run、显式输出/prepared、同 source 换 target、离线产物、IR 优化形成少量完整旅程 |
+| M3.6 完成 agent 发现流程 | manual 与 compiler MCP、CLI API 声明 | 查询语义→编译→读取真实错误/IR→修正的日常流程独立可用 |
+| M3.7 解释首次使用成本 | 当前 toolchain/materialize/provider 边界 | Intent compile、native JIT、tuning、load、热调用分别说明，默认输出不淹没用户 |
+| M3.8 交付环境定位 | doctor、backends、environment 安装入口 | 说明缺的是包、compiler provider、SDK、设备还是语言能力，不要求维护者私有路径 |
+
+**应删除的东西：** 公共接口统一后残留的重复返回筛选、dtype/shape/alias 推导，以及教程中已经失效的实验输出路径。手写 baseline 的声明 helper 已迁到 experiments/cpu/baselines/mojo/source.py，仍有原实验消费者，不重复立项迁移或当作无用代码删除。不会借此复制一套算法或把 baseline 带入 manual。
+
+**完成标准：**
+
+- 新用户取得 Intent 后，按文档在声明环境完成现有算法调用，而不依赖 experiments driver。
+- 原有 forward/backward 能作为作者定义的训练操作集成，不自动发明 backward。
+- 同一算法换 target 时，参数和公开结果规则一致；执行同步仍遵循各目标实际模型。
+- 真实 MCP 客户端可发现公开 API、编译原程序并取得可行动诊断。
+- readonly manual 仍只提供通用语法、类型、接口、语义和最小片段；完整算法保留在普通教程。
+- 固定 agent 实验继续一次交付，不以产品交互流程回写历史成绩。
+
+### M4：跨执行模型的组合能力与单一路线
+
+**问题：** GPU/CPU shared 骨架已成立，DSA 剩余 whole-source matrix 分支及 CPU/DSA 的一部分 schema 重复影响真实扩展。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M4.1 列清共同语义与目标事实 | ContractionAxes、StructuredOpInterface、canonical product schema | 轴、字段路径、访问窗口、result mapping 共用；storage/task 独立 |
+| M4.2 统一 DSA 初始构造 | KIRToDSA 普通 structured/workset 路线 | 每个合法局部 operation 有初始完整表示，不按 whole-function 图形选择另一编译器 |
+| M4.3 统一矩阵 realization | lowerMatrix/localMatMul 与 DSA MatrixSupply | 一份 typed contract 资格和数据供应/结果映射接口 |
+| M4.4 迁移执行策略 | task traversal、tiling、local storage、协作与资源分析 | 在当前 DSA program 的完整变换中产生，不回读 KIR 重建 |
+| M4.5 删除旧分叉 | whole-source matrices classification、epilogue 白名单、重复 loops/alloc/load/store | 移植完成即删，不留“旧路径模式” |
+| M4.6 闭合 CPU 表达能力差异 | CPU view/stride/alias eligibility、Mojo/Weft 接口 | 可由当前 IR 表达的形式正常 lowering，只有真实 provider/hardware 缺能力才拒绝 |
+| M4.7 扩展一个真实局部能力 | 从原 registry 的现有 primitive/form 缺口选择 | 验证新增规则无需在 construction、serializer、runtime 多次重复算法判断 |
+| M4.8 设备闭环 | 原 MLU/CPU registry 及已有远端入口 | source→native compile→runtime→原数值比较；硬件不可用时明确未完成设备部分 |
+
+**应删除的东西：** DSA 两条矩阵 realization 的同责代码、CPU/DSA 纯 product schema 重复、已经被共同查询替代的局部白名单。不删除 DSA local-memory/DMA/engine 模型，也不强迫 Weft 经过 Mojo SIMD。
+
+**完成标准：**
+
+- plain matrix、matrix+epilogue 与结构化 region 中的 matrix 共用同一局部实现合同。
+- 后续变换只消费当前 DSA/CPU IR；原程序不需要为命中某个入口改写算法。
+- 共享知识至少有两个真实消费者，并说明各自不同的物理改写。
+- 原 MLU/CPU 受影响生产程序完成实际链路；生成成功单独报告，不提前把设备里程碑结案。
+
+### M5：物理质量、资源决策与优化解释
+
+**问题：** 已有能力和约束还缺可追踪的解释；部分写法敏感性仍可能来自 facts 丢失或早期结构固定。此里程碑不以单个算子刷新耗时为终点。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M5.1 给决策分类 | 当前 capability、resource、profile、candidate consumers | 硬非法、名义预算、偏好、未知、下层失败分别说明 |
+| M5.2 统一资源查询 | GPU Resources、storage/lifetime、CPU input supply | 当前 IR facts 在短生命周期 analysis 中复用，不跨改写保留失效结果 |
+| M5.3 修已观察结构问题 | 既有 producer projection、reduction/free-axis ownership、reshape/broadcast 关系 | 从实际失败/掉速程序选一条完整关系链，修共同机制 |
+| M5.4 提升候选质量 | 现有 correlated profiles 与 parameter domains | 保持有限候选和合法性；不靠放大笛卡尔积掩盖结构问题 |
+| M5.5 暴露下层事实 | provider 返回的 register/shared-memory 等已有信息 | 来源、阶段、测量身份明确；不反向猜成上层真值 |
+| M5.6 验证跨架构职责 | 原 5090D/H100 入口与同算法程序 | 解释 Intent 结构差异、provider config 差异及下层处理的差异 |
+| M5.7 清理确证冗余 | buffer scope 派生 workspace/lifetime 等 | 删除重复 carrier，保留独立 owner/instance/initialization 事实 |
+| M5.8 形成优化扩展范式 | 现有贡献指南、当前 IR query/rewrite/provider 边界 | 新优化有明确 facts、legality、rewrite、收益和实际复用，不写任务名规则 |
+
+**应删除的东西：** 同一事实的多套估计/解释、已被证明冗余的 repair 或字段、按样例身份分支。没有错误证据的预算启发式先解释再改，不因“不是精确 occupancy”就全部丢弃。
+
+**完成标准：**
+
+- 对选定原生产问题，能回答“当前结构为何慢、哪个事实丢失、规则为何适用、改了哪个 IR”。
+- 至少一个结构规则服务不同原有程序，至少一项共同分析被两个执行模型或两个 provider 的真实变换消费。
+- 完整算子性能有原 reference、输入、dtype、容差和比值；不把编译/JIT/tuning 当算子时间。
+- H100 与 5090D 产生相同 source 也可以是正确结果；不把“源码必须不同”作为资源感知验收。
+
+### M6：可重复分发、SDK 演进和长期维护成为产品的一部分
+
+**问题：** 本地 wheel 已有真实价值，但公开产品还需要可重复生产、明确支持合同以及接手和升级流程。它不要求先支持所有平台。
+
+| 任务 | 实现与主要位置 | 必须完成的收口 |
+|---|---|---|
+| M6.1 选择许可证和材料范围 | 根许可证、package/sdist/wheel 内容、third-party notices | 维护者决定许可证；实验 baselines 与产品材料分发边界明确 |
+| M6.2 固定二进制构建基线 | 现有 CMake/scikit-build/bundle runtime、构建自动化 | 选定 Linux 系统 ABI、Python 与工具链组合；不把本地包误标为任意系统通用 |
+| M6.3 自动生成可安装产物 | wheel、compiler/optimizer/profiles/manual data、notices | 构建可重复执行，安装离开 checkout 后不需手工库路径 |
+| M6.4 自动复用现有验收入口 | 构建、安装、doctor、离线 IR、现有 production registry | 不新造 test/fixture/矩阵；按变更范围调度既有入口 |
+| M6.5 定义产物兼容行为 | GeneratedProgram、target matching、provider SDK 绑定 | 能解释、能加载，或要求使用调用方保留的原 Intent definition/KIR 重编；不默默猜旧字段 |
+| M6.6 SDK/ABI 升级入口 | provider legality、source spelling、native ABI/runtime、environment | 一次真实升级有清楚修改层，不跨后端扩散 |
+| M6.7 外部贡献闭环 | CONTRIBUTING、构建/问题定位/提交说明、原 production 入口 | 开发者能在自己的环境修改一个实际局部能力并给出相关证据 |
+| M6.8 产品交付与维护节奏 | 选定支持域、实际获取方式、已有结果更新 | 每次交付说明已验证组合、已知缺口与解决入口；实际发布按维护者授权执行 |
+
+本地成熟参考：[Triton installation](../../ref/triton/docs/getting-started/installation.rst):11、27；[Triton wheels workflow](../../ref/triton/.github/workflows/wheels.yml):72；[TileLang dist workflow](../../ref/tilelang/.github/workflows/dist.yml):76–93。学习它们的可重复链路，不照搬其全部平台矩阵或缓存来源校验机制。
+
+**应删除的东西：** 产品路径中的维护者私有目录、过时安装说明、重复 SDK 检测、将“包能 import”冒充“后端可运行”的模糊状态。无需新增 CHANGELOG、版本号或迁移文档；修改用 Git 记录，支持说明放已有用户入口。
+
+**完成标准：**
+
+- 用户取得声明支持的产物后可以独立安装并运行原有完整程序。
+- 构建、依赖定位、原生产验收和产物获取可以再次执行。
+- 一个 provider 的实际 API/ABI 变化能在所属层完成适配，并通过原程序验证。
+- 旧产物不兼容时说明是否有调用方保留的原 Intent definition/KIR 可供重编，不承诺仅凭旧生成产物恢复原算法；不维护无边界的 schema 猜测兼容层。
+- 编译器的使用、调试、优化控制和贡献已形成稳定产品流程。
+
+## 10. 后端与 ABI 改变时怎样跟进
+
+统一接口的目标是让变化局部化，并让影响范围可以判断，不是让未来所有版本自动兼容。
+
+| 变化类型 | 应修改的层 | 应保持的边界 |
+|---|---|---|
+| 用户算法新增输入、shape/dtype/外部布局改变 | 作者声明/host wrapper 与现有 frontend/public interface | compiler 不猜新算法；同一声明仍供所有后端消费 |
+| 物理参数重排、增加 workspace/stride/extent | family/provider lowering、typed argument binding 或 native slots | 公共参数不跟着物理位置变化；runtime 读取当前 ABI |
+| descriptor、allocator、launcher API 改变 | 对应 provider legality、source/runtime adapter | 不修改无关 family 的算法和公共合同 |
+| native 标量或结构体 carrier 改变 | NativeABI query、provider signature/runtime marshal | 源码签名与调用参数仍同源；缺少必要表示时再扩展 |
+| SDK 只改变内部 LLVM/机器 ABI | 外部 provider 自己的 compiler/runtime，Intent 核对实际使用接口 | 不复制下层内部 ABI；必要时在适配层跟进 |
+| 新 GPU vendor 或真实执行模型变化 | target facts、family/provider-specific lowering | 不以配置名称冒充已实现的新硬件/执行模型 |
+| 保存产物的 schema 不能被当前实现解释 | 产物加载诊断和原 Intent definition/KIR 重编路径 | 不猜字段、不给缺失语义塞默认值；重编输入需由调用方保留 |
+
+当前共同 ABI 已显著改善维护成本：[NativeABI.cpp](../lib/Serialization/NativeABI.cpp):33–64；[GPU ProgramInterface](../include/Intent/Dialect/GPU/Analysis/ProgramInterface.h):14–26；[GeneratedProgram](../python/intent/compiler/artifact.py):62–78、108–155。
+
+GeneratedProgram.save 当前只保存 provider source、最终 IR 和 metadata，不保存原 Intent Python definition 或原始 KIR（同文件 98–101）。因此这里的“重编”明确要求调用方仍持有原 definition/KIR；program.source 是生成的后端源码，不能当作原算法输入。仅有旧 GeneratedProgram 时，不承诺恢复原算法或跨硬件 retarget；本路线不为此另造一个隐含归档格式。
+
+成熟参考也保留具体产物边界：[Triton CompiledKernel](../../ref/triton/python/triton/compiler/compiler.py):407–488 从 metadata 恢复具体 target 并在加载设备时检查资源；[TileLang kernel](../../ref/tilelang/tilelang/jit/kernel.py):151 起的恢复和 737–762 的共享库导出均受实际 backend/runtime 条件约束。
+
+因此 M6 的验收是：对一个真实升级，知道该改哪里、能解释哪些产物需重编、能使用原程序验证升级。不是承诺所有旧 MLIR、所有 SDK 组合永远互通。
+
+### 10.1 第二 GPU vendor 的后续纵向任务
+
+在当前产品主线稳定后，按真实设备条件推进：
+
+1. 从现有 NVIDIA-only capability consumers 抽出实际 architecture family/wave width/feature facts；
+2. 同一 Triton provider 接另一 hardware target，保留 NVIDIA-local descriptor 等判断；
+3. 使用已有原算法和对应设备环境贯通 compile→native→run→原数值比较；
+4. 证明共享 KIR/分析与 GPU program 的价值，实际消除硬编码 32/SM 的错误假设；
+5. 不复制 Triton AMD/NVIDIA 下层的布局、MMA 或寄存器分配。
+
+这是新的支持能力里程碑，不把尚未做完的多 vendor 覆盖作为当前 Linux/NVIDIA 产品永远不能交付的理由。
+
+## 11. 未完成事项承接表
+
+这张表明确承接此前留下的工作，避免下一轮再次只选一个容易的局部点。状态在实施时依据实际代码和原运行入口更新。
+
+| 事项 | 当前证据/状态 | 归属与下一动作 |
+|---|---|---|
+| named alias group 含义 | doc 未明确；CPU/MLU 同 allocation 检查，GPU 未检查 | M3.1–3.2：确定一条公共合同并统一；不把历史差异永久化 |
+| 公共返回约定 | Out/InOut、None/tuple 存在当前差异 | M3.1：按明确零/单/多输出合同收口 |
+| online 重组适用性 | 本次原 sparse MLA 编译已真实触发，lowp cast/rescale 需合同判定 | M1：保留优化并建立数值资格与可关闭的完整路径 |
+| 关闭 online 后 shared IR 不能重读 | 本次原生产输入编译已复现 | M2.1–2.2，作为 M1 正常路径的前置修复 |
+| GPU mapping Pure op 保活 | 静态代码确认隐藏存活依赖 | M2.3–2.4：归实际 owner，删除例外 |
+| TileLang 普通 RMSNorm 关系失败 | 本次重新编译原 rms_norm_f32，仍在 form-memory 失败，见下文 | M2.7–2.8：追到产生错误/缺失轴关系的变换，不在 serializer 猜补 |
+| GPU workspace host 依赖 | IR/runtime 主干已改，上一轮无新的完整设备覆盖 | 在 M2/M3 中使用确实保留 workspace 的既有 production case 补必要运行 |
+| Weft host view descriptors | 上一轮已修 base/offset，matvec source 可生成；不等于新增 native 运行通过 | M4/M6：用原 Weft 环境与 case 完成 native/runtime 验收 |
+| BANG C/MLU 更新后的链路 | 早期有设备结果，最近 ABI 变更的新增证据主要是 source generation | M4：当前代码在可用 MLU 上跑原受影响 case，先核真实设备/SDK |
+| TileLang 其它历史失败 | 既有 CSV 有多个 stage 的失败，不能假定已全部修复，也不能假定全部仍存在 | 按共同原因和原 case 收口，M2/M5/M6，不另造平行矩阵 |
+| CPU FP8 numerical_failed | 既有 mojo-x86.csv 保留该结果，未放宽容差 | M4/M5：按原输入和容差查清数值合同/实现，不被重构成绩覆盖 |
+| CPU run_only 项 | 部分原条目缺同合同 reference 或已有算法差异 | 保留真实性质；不自动升级为 pass，不通过改容差或参考算法制造成绩 |
+| 优化资格/未采用原因 | 现有阶段/IR 诊断已可用，统一解释层未完成 | M1.7/M5 |
+| 作者 backward 框架注册 | 独立 backward kernel 与 forward/backward 示例存在，正式框架旅程还需完成 | M3.4；不等同于新增自动求导编译器 |
+| 根许可证/可重复分发 | 源码包和 wheel 基础完成，维护者许可证及分发入口未闭合 | M6.1–6.4，并行推进 |
+| 新 SDK/ABI 维护合同 | 当前各 adapter 边界清楚，升级旅程未形成完整产品规范 | M6.5–6.6 |
+
+### 11.1 本次补核的 TileLang RMSNorm
+
+为避免把历史错误直接当作当前缺陷，本次通过现有公开 CLI 编译 [rms_norm_f32](../examples/kernels/normalization/rms_norm.py):28–43。该算法正是 [TileLang production adapter](../experiments/gpu/providers/tilelang/normalization.py):35–54 使用的定义；未修改算法、输入合同或容差，未运行设备。
+
+结果仍为 provider_pipeline 失败：
+
+~~~
+'intent_gpu.store' op
+TileLang scalarization cannot recover a missing non-unit physical axis
+TileLang transformation failed: intent-tilelang-form-memory
+~~~
+
+source/target 的相应 axis map 分别涉及 derived source 22 与原 source 6。完整当前 diagnostic 在 /tmp/intentdsl-roadmap-tilelang-rms.json；编译目录为 ~/.cache/intentdsl/roadmap-review/compiler/9df31b11d4884faab437a207b1837318/。
+
+这是一个普通归约加 pointwise 输出的当前编译问题。后续要找到关系在哪个变换中丢失或没有被正确表达，不能要求作者改写 RMSNorm，也不能由终端 scalarizer 仅凭相同 shape 猜等价。它同时让 M2 的“IR 真正有作用”具备具体的生产验收对象。
+
+## 12. 验证与交付方式
+
+### 12.1 每组任务采用相同的完成逻辑
+
+1. 依据原生产程序、当前 IR 和 ref 代码确认问题，不先写抽象框架。
+2. 在正确层实现；相关旧路径、重复 authority 和临时兼容代码一并删除。
+3. 构建必要 compiler/provider；用原输入观察有关 IR、source 和诊断。
+4. 运行真正受影响的既有生产入口，保留原算法、规模、dtype 和容差。
+5. 同一机器的性能计时避开相互干扰；准备与编译可以合理并发。
+6. 更新原实验组既有结果，简明记录实际成功层次和剩余项。
+7. 提交一组连贯改动，直到整个里程碑的用户/开发者结果成立。
+
+不新增测试目录、pytest、fixtures、独立边界/数值/压力/组合矩阵；不编写临时脚本绕过这一约束。自动化复用已有构建、公开示例、CLI/MCP 和 production registry。若未来另行扩大验证体系，应单独决定，不能在本 roadmap 中偷偷加入。
+
+### 12.2 验证量与变化范围匹配
+
+| 改动 | 合理的必要验证 |
 |---|---|
-| 设备容量、primitive/dtype/cluster 支持 | target facts，不是 pass |
-| 当前 fragment、lifetime、access 的需求估计 | analysis，可在 IR 改写后重算 |
-| 决定 mapping、blocking、form 或候选集合 | policy，具有明确合法性和收益前提 |
-| 真正修改 loop、SSA、type、access、storage | pass/coherent transformation group |
+| 公共 ABI、返回/alias 合同 | 对受影响 family 选择已有输入/输出/可变参数 case，检查实际 native 调用 |
+| IR owner、type staging、局部 canonicalization | 已有 production 的 shared 保存、标准优化、重读与续编译，必要原运行 |
+| 数值模式或 online | 原生产输入下的前后结构与既定容差；明确当前模式改变的数值关系 |
+| provider API/SDK 升级 | 已有 provider registry 的相关原程序，按实际依赖验证 JIT/launch |
+| 二进制/安装 | 选定平台的真实 wheel 安装与原公开调用，离开 checkout |
+| 完整产品交付 | 已承诺支持范围对应的现有 registry 性能运行；不扩大矩阵 |
 
-新架构特性只有在 Intent 必须形成不同 provider-source 结构时，才需要 Intent 的 pass 或 target-local extension。已由 Triton 完成的 MMA 指令选择、lane layout、TMA lowering、register allocation、pipeline scheduling 不重新实现。也不建立“一代 GPU 一个 dialect/pass”的系列。当前 [target 边界](/home/kingdom/phdworks/intentdsl/doc/compiler/README.md:35) 已支持这种组织。
+不是每次内部修改都全量重跑；也不把少数用例通过扩大成所有模式通过。原数值失败、run_only、SDK 不可用和性能差距分开处理。
 
-### 5.3 当前最具体的能力缺口
+### 12.3 里程碑交付应报告什么
 
-**第一，feature 判定不够精确。** [device.py](/home/kingdom/phdworks/intentdsl/python/intent/targets/gpu/device.py:36) 当前查询 CUDA，`matrix_units=major>=7` 粒度较粗，不能从 Triton 自身支持 AMD 推导 Intent 已支持 AMD。更具体地，[Triton legalization](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/Legalize.cpp:4318) 以 major≥9 放行多 CTA，而 [Triton TargetFeatures](/home/kingdom/phdworks/ref/triton/include/triton/Dialect/TritonNvidiaGPU/IR/TargetFeatures.h:36) 排除 SM12x cluster ops。默认 [profiles](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/TuningProfiles.json:1) 的 ctas 都是 1，因此这是自定义候选或未来扩展可触及的静态 legality 漏口，不是本轮运行失败。
+- 用户现在能完成的完整任务或开发者能够复用的实际能力；
+- 解决的横向问题、删除的旧路径及责任边界；
+- 该组提交列表和实际代码增删，文档/CSV/生成产物不冒充实现规模；
+- 生成、原生编译、运行、数值、性能分别有哪些证据；
+- 仍未完成的具体任务及下一位置；
+- 不自动 push，不自动对外发布，不新增版本号或 CHANGELOG。
 
-应为已有 consumers 补齐准确 feature predicates，并集中表达 provider/hardware 约束；不要为一个漏口创建无实际使用者的庞大 capability framework。
+普通节点完成只报告节点完成。一次失败调查、一个新类型、一个 matcher 命中、几百行移动或几十次运行，都不单独定义为宏观里程碑。
 
-**第二，资源模型只是粗结构预算。** [归约 blocking](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp:71) 比较 fragment words 与 register file；[配置物化](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/MaterializeConfigTuples.cpp:809) 逐 fragment 限预算，并承认逻辑 SSA liveness 不能代替下层布局与寄存器调度。加上前述一 worker/SM，目前不应宣传精确 occupancy 优化。改进应优先解决真实结构浪费，最终资源数据从下层编译结果解释，不复制其 allocator。
+## 13. 建议立即开始的执行批次
 
-**第三，经验候选与能力建模混在宣传上容易误读。** [LocalOptions](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/Legalize.cpp:4274) 为 recurrent contraction 选择 Hopper/Blackwell profiles，具体候选在 [JSON](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Transforms/TuningProfiles.json:20)。这属于目标相关经验数据，合理但有限；不能替代 SM100/SM120 独立的 legality，也不能算作已经完成泛用成本模型。
+### 第一批：M1/M2 编译闭环与 M3/M6 产品任务并行
 
-## 6. 跨模型复用、leaf 与代码结构
+编译器线程：
 
-### 6.1 已经成立的复用，不应被抹掉
+1. 修复 boundedTraversalChunk 产生非法 fragment extent 的 staging；
+2. 收口 online 数值资格和正常路径，随后提供实际可用的优化控制；
+3. 处理 mapping owner/Delinearize 保活及对应普通正规化；
+4. 解决原 TileLang RMSNorm 的完整轴关系链。
 
-| 复用范围 | 共同机制及实际消费者 | 说明 |
+产品线程：
+
+1. 把公共返回与 alias 合同提案一次明确；
+2. 完成作者 backward、prepared/offline/IR 工具的用户旅程；
+3. 选定二进制构建基线，准备现有入口的自动交付；
+4. 维护者决定许可证和外部分发材料范围，其余工作继续进行。
+
+不等待上述全做完才提交；按依赖形成可审查、可验证的连贯提交，最终以完整里程碑条件收束。
+
+### 第二批：M4/M5 组合能力和默认程序质量
+
+- DSA 矩阵两路线合并是主要横向架构任务；
+- CPU/DSA 共同 product/axis/访问知识随之收口；
+- 资源决策和优化 remarks 接入实际消费者；
+- 从既有程序选择已经暴露的结构问题，改一套可复用机制，而不是继续逐题微调。
+
+### 第三批：M6 产品维护基线与后续扩展
+
+- 汇集已完成用户/API、compiler、provider、安装和原运行证据；
+- 固化实际支持的交付组合及升级处理方式；
+- 用外部开发者的真实扩展任务验证模块化；
+- 然后按需求推进第二 GPU vendor、更多 provider 的分发/框架支持与新的优化能力。
+
+六组任务完成后的目标是**可持续使用、扩展和维护的成熟产品基线**。这与 Triton/TileLang 的工程成熟度对齐，同时保留 Intent 跨执行模型、较高层算法表达的独立价值。后续新增硬件或算子不应再反复推倒 pipeline、ABI、owner 和调用接口。
+
+## 14. 需要明确的设计选择与本轮边界
+
+以下只有真正改变公开合同的部分需要明确，普通模块划分、验证方式和实现细节不逐项请用户审批：
+
+| 选择 | 本报告建议 | 实施影响 |
 |---|---|---|
-| GPU / CPU / DSA | [CanonicalKernel::indexRelation](/home/kingdom/phdworks/intentdsl/lib/Analysis/CanonicalKernel.cpp:235)；[GPU](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToGPU/KIRToGPU.cpp:5476)、[CPU](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToCPU/KIRToCPU.cpp:565)、[DSA](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:830) 消费 | 共享 index terms、维度 identity 与 coordinate provenance；各自形成 fragment/access、memref loops 或 local-memory access |
-| GPU / CPU / DSA | [UniformValueAnalysis](/home/kingdom/phdworks/intentdsl/lib/Analysis/UniformValues.cpp:195)；[GPU](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeRegionFold.cpp:1773)、[CPU](/home/kingdom/phdworks/intentdsl/lib/Dialect/CPU/Analysis/RegionPredicates.cpp:326)、[DSA](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:2440) 接入 | 共享常量语义求值；CPU 需要额外 effect/alias 与 memory 解释，适配器不同是合理的 |
-| GPU / CPU / DSA | [partitionCoordinatePredicate](/home/kingdom/phdworks/intentdsl/lib/Analysis/RegionSemantics.cpp:7)；[GPU](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeRegionFold.cpp:1745)、[CPU](/home/kingdom/phdworks/intentdsl/lib/Dialect/CPU/Transforms/RealizeRegions.cpp:232)、[DSA](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:2448) 调用 | 相同区间规则导出 fully-valid/possible 区间，配合 identity 证明分别缩短 traversal 或跳过无贡献分段 |
-| GPU providers | [shared transformation groups](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/Passes.cpp:206)，之后才分叉目标 legalization | ownership、blocking、region/reduction/contraction、access、buffer、mapping 不是每个 provider 各写一次 |
-| Mojo / Weft | [共同 CPU 入口](/home/kingdom/phdworks/intentdsl/tools/intent-compile/intent-compile.cpp:234) 与 [CPU passes](/home/kingdom/phdworks/intentdsl/lib/Dialect/CPU/Transforms/Passes.cpp:161) | 共用 task/block、storage/input reuse、grouping、blocking 和任务划分；差别通过目标 implementation registry 注入 |
+| 数值优化策略 | 默认遵循现有 source 合同；额外 normalized/online 重组提供明确许可，优化开关与许可分开 | 统一 request/IR/provider/cache；正式数值规格随已确认设计更新 |
+| run/result 返回 | 只返回 Out；零 None、单值、多 tuple；InOut 通过原对象观察 | 统一四类 runtime 的公开行为和调用文档 |
+| named alias group | 同组共享 allocation，不要求访问重叠；不同组不推断 disjoint | 各 runtime 统一检查，避免隐含优化假设 |
+| 开源许可证与分发边界 | 由维护者选择；第三方 notices 与实验基线另清范围 | 影响公开发布，不阻断其它实现 |
 
-前三项是**共同分析、语义求值与证明规则**，不是三个完全相同的跨后端 rewrite pass。这个区别不会削弱价值：同一个作者坐标 predicate 的尾段只贡献 identity，可以在 GPU 上减少 fragment traversal，在 CPU 上减少 loop 区间，在 DSA 上避免相应 local-memory 搬运与计算；可迁移的是证明，执行变换应适合各自模型。
+这些提案作为下一轮具体实施的输入；本次不擅改 doc，也不把尚未确认项包装成已实现合同。
 
-CPU 的复用也不是旁表记录：[ReusePreparedInputs](/home/kingdom/phdworks/intentdsl/lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp:383) 检查当前 supplies 的等价关系，真正改写 uses、去掉重复 producer/allocation，并调整 storage lifetime。这里能证明机制与共用代码路径存在，不能未经运行宣称所有 Mojo/Weft 算子都受益。
+本次已经完成：当前代码全链路分工审查；本地 Triton/TileLang 具体机制对照；旧工作包结算；online 默认/跳过路径和 TileLang 原 RMSNorm 的编译观察；分组任务、依赖、删除路径、验证与产品完成标准的重写。没有修改实现、运行设备或刷新性能结果。
 
-### 6.2 Leaf/micro-kernel 的存在不等于算法库化
+## 附录 A：本轮可复查的编译观察
 
-CPU [Implementation 接口](/home/kingdom/phdworks/intentdsl/include/Intent/Dialect/CPU/Transforms/Implementation.h:44) 有 applicable、legal、parameters、formTile/expand 和 input requirements；[registry 选择](/home/kingdom/phdworks/intentdsl/lib/Dialect/CPU/Transforms/Implementation.cpp:31) 消费当前 operation/capability；[Mojo 实现](/home/kingdom/phdworks/intentdsl/lib/Target/Mojo/Transforms/Implementations.cpp:166) 依 contraction、dtype、资源选择局部实现。外层 CPU passes 仍负责分块、供数和复用。
+临时目录仅用于复查本次调查，不成为新产品接口或实验数据权威。持久复现入口是原作者源码、现有 CLI、指定 target facts 与标准 pass 工具。
 
-GPU 的 [Triton serializer](/home/kingdom/phdworks/intentdsl/lib/Target/Triton/Serialization/Serializer.cpp:1237) 消费已经形成的 contract/reduce/scan，映射到 `tl.dot/dot_scaled/reduce/associative_scan`；[TileLang bufferization](/home/kingdom/phdworks/intentdsl/lib/Target/TileLang/Transforms/Bufferize.cpp:1855) 形成局部 GemmOp。这些是明确 typed 计算块的实现，不是按 attention 等整个算子身份替换程序。
+### A.1 Online 触发
 
-成熟目标也如此：[TileLang GEMM](/home/kingdom/phdworks/ref/tilelang/src/op/gemm.cc:188) 接收 target/layout/thread bounds，把局部实现 body 嵌入当前 IR；[LowerTileOp](/home/kingdom/phdworks/ref/tilelang/src/transform/lower_tile_op.cc:1134) 通过资源/布局回调继续展开。差异在于 TileLang 作者已经写下较多物理组织，Intent 作者没有写，所以 Intent 不能把缺失的外层组织甩给 leaf 猜。
+源：examples/kernels/streaming/mla.py 的 token_sparse_mla_value_prefill。先用现有 intent compile --stage kir 生成 KIR，再用 intent-compile --target=cutile --stop-after-shared 和标准 IR 打印选项观察 intent-gpu-co-realize-online-reductions 前后。
 
-判断库化风险时应看四个问题：
+本次指定目标事实：
 
-- 匹配依据是局部 operation 的完整语义，还是整个 kernel 的名字/任务身份？
-- 局部实现是否由当前 operands、relations、dtype 和能力合法实例化？
-- 外层控制、访问、state、kernel 数量仍由当前程序决定吗？
-- 同一 leaf 能否作为其它算法的局部组成，还是接管了完整算法？
+~~~
+compute-units=170
+shared-memory-per-unit=102400
+max-dynamic-shared-memory-per-block=101376
+registers-per-unit=65536
+max-threads-per-block=1024
+compute-capability-major=12
+compute-capability-minor=0
+single-to-double-precision-perf-ratio=64
+matrix-units=true
+dynamic-vector-width=false
+~~~
 
-不应以“用了专家代码”“存在 shape 约束”或“最初只优化一个例子”直接否定编译器性质。相反，如果每个新任务都要在 construction、matcher、serializer 三处增加平行特例，即使没有调用任何外部库，仍然是严重的可扩展性问题。
+这些是指定的编译输入，不表示本轮检测了当前设备状态。输入产物：~/.cache/intentdsl/compiler/e039dccf5d414c298d19d57987a86e56/input.mlir。
 
-### 6.3 当前结构债务是具体的
+IR 日志 /tmp/intentdsl-online-review-sparse-mla.log：296 行原 record；372 行 after 起点；374–375 行 chunk 参数；566 行四 carry loop。
 
-**DSA 的阶段边界最弱。** [CLI](/home/kingdom/phdworks/intentdsl/tools/intent-compile/intent-compile.cpp:222) 直接走 KIRToDSA→BANG C legalization→serialization；[construction 结束](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:4144) 后主要做 verify，没有 GPU/CPU 那样的 current-program transformation pipeline。
+### A.2 跳过 online 的剩余 shared pipeline
 
-更具体地，[KIRToDSA](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:3866) 在 construction 内依 shape、local bytes、tasks 等选择四计算核协作；[3905 行附近](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:3905) 写入 `bangc.layout="matrix_filter_interleaved64"`；[3947 行附近](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:3947) 写入 `bangc.implementation="matmul_local_f32_accumulator"`。同一阶段还建立 double buffer/pipeline/synchronization。这不是按名字选算法，但已混合 family construction、资源策略和 BANG C realization。新 DSA 硬件不能指望只换配置就获得泛化。
+输入为标准 IR tree dump 中该 group 的 before 快照。使用现有 intent-opt，运行：
 
-后续应按职责把 cooperation、storage/pipeline、目标 implementation selection 迁到相应 current DSA IR 变换，保留完整初始程序并逐阶段验证；不是按文件长度拆目录。当前 [compiler 规格入口](/home/kingdom/phdworks/intentdsl/doc/compiler/README.md:9) 也主要列 GPU/CPU，缺少 DSA 对等章节。相关设计需先明确并由用户确认，再完善正式规格，本轮不擅自补写。
+~~~
+builtin.module(
+  intent-gpu-realize-region-folds,
+  intent-gpu-realize-region-scans,
+  intent-gpu-realize-reductions,
+  intent-gpu-realize-contractions,
+  intent-gpu-compose-realized-accesses,
+  intent-gpu-schedule-private-stores,
+  intent-gpu-vectorize-buffer-loops,
+  intent-gpu-promote-buffer-values,
+  intent-gpu-refine-program-mapping,
+  intent-gpu-simplify-range-predicates,
+  intent-gpu-eliminate-common-values,
+  intent-gpu-materialize-configurations,
+  intent-gpu-fuse-independent-traversals
+)
+~~~
 
-**GPU 关系维护耦合较重。** [Passes.cpp](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/Passes.cpp:52) 多次串联 align/refresh；[RealizePointwiseBlocking](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp:4301) 内部又串联多轮 aggregate/access/pointwise/contract relation 修复。重复调用是维护压力的证据，尚不是“这些调用可直接删除”的证明。应追踪每项 rewrite 改坏/失效了哪些 facts，把维护归入有清楚 postcondition 的变换或 mutation API，再去掉确证冗余。
+输出 /tmp/intentdsl-online-review-sparse-mla-without-online.mlir 后，以相同 target facts 和 --input-stage=shared 继续生成 cuTile。解析失败位置 193:69；日志 /tmp/intentdsl-online-review-sparse-mla-provider.log。没有修改 pipeline 实现、作者源码或数值数据。
 
-**复合代数知识存在分叉。** [canonical OnlineSummary matcher](/home/kingdom/phdworks/intentdsl/lib/Analysis/OnlineSummary.cpp:96) 被 [DSA](/home/kingdom/phdworks/intentdsl/lib/Conversion/KIRToDSA/KIRToDSA.cpp:2595) 使用；[GPU OnlineSummary](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/OnlineSummary.cpp:201) 另行识别物理图。适配不同 dialect 合理，但同一套 validity/max/mass/moment 关系各自维护，容易使合法性修复只落在一边。应优先共享代数关系与合法性分析，保留各自 physical rewrite；不新造“万能 attention plan”。
+### A.3 TileLang RMSNorm 当前编译
 
-**这条乘法归约规范化尚未成为跨 family 共用路径。** [multiply-reduction normalization](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp:6134) 由 [GPU group](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/Passes.cpp:29) 调用；这不排除 CPU 自身规范化存在其它等价机会。它是复用候选，但不能机械搬到 immutable KIR 上。先共享 typed algebra/coordinate 分析，再由不同 family 改写 current IR；若要增加 KIR 前规范化阶段，应单独明确语义与 authority。
-
-## 7. “换一种写法就变弱”：已有证据怎样归因
-
-### 7.1 历史中确有编译器自身造成的大幅差距
-
-下表来自已有 [h100-low.csv](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/results/h100-low.csv:1)，是同一批首次记录与 development 记录的摘录，不是当前代码重测，也不把 development 算成首次生成成功。
-
-| 程序 | 原记录 / development 时间（ms） | 记录与 source 支持的归因 |
-|---|---|---|
-| fused_mv_sigmoid_sub | 0.186352 / 0.013616 | [同一原提交复测](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/results/h100-low.csv:51)；记录指向 scalar producer projection/row ownership 修复 |
-| normalize_pairwise_distance | 3.531768 / 0.009664 | [同一原提交复测](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/results/h100-low.csv:154)；记录指向先保留完整 reduction fibers 再 blocking |
-| exp_mean | 0.064968 / 0.027136 | [独立新提交](/home/kingdom/phdworks/intentdsl/experiments/agent_tritonbench/results/h100-low.csv:40)；从一个 kernel 改成显式 exp、mean 两个 kernels，不能归为单纯等价语法规范化 |
-
-本轮读过前两项原 submission：前者是 matmul→reshape→sigmoid→逐行写出；后者先计算整域距离/归一化 tensor，再在 `I.parallel` 中索引写出。它们暴露的是 compiler 必须正确保持 producer/free-axis/reduction ownership 的问题。原提交文件路径可由 CSV 的 `intent_program` 字段定位，未复制到新 corpus。
-
-本轮也读过 `exp_mean` 两份程序：首次完整 exp+reduce 在一个 kernel；后续由 host 分配中间 tensor 并调用两个 kernel。因此即使外部数学结果相同，host-visible 程序组织已经改变。该差距不能用来要求 compiler 自动拆 kernel，也不能用“作者改写后快了”掩盖其它明确的 lowering 问题。
-
-这些历史观察支持认真治理性能断崖，但不证明这些问题仍在当前代码，也不证明所有 agent 掉速来自同一个 matcher。本轮没有新的“同编译器、同输入、两种等价写法”配对运行。
-
-### 7.2 当前实现为什么仍可能对表达形态敏感
-
-正面机制已经存在：[`I.dot/matvec/vecmat/matmul`](/home/kingdom/phdworks/intentdsl/python/intent/frontend/lowering/intrinsics/matrix.py:15) 归一到共同 `emit_contract`，不是每个 surface 名称都建独立 backend 路径；[GPU structured normalization](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp:6396) 也已经处理部分乘法归约与 contraction 关系。
-
-但 online-summary 优化仍有明显窄边界：[matcher](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/OnlineSummary.cpp:201) 要求恰好四字段、特定 validity/max/mass/moment 关系；[后续匹配](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/OnlineSummary.cpp:253) 依赖特定 select、exp/exp2、subtract 和 cast/contract 连线；[普通 online reduction](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeOnlineReduction.cpp:74) 还要求入口 block 的形态。[miss 时](/home/kingdom/phdworks/intentdsl/lib/Dialect/GPU/Transforms/RealizeOnlineReduction.cpp:360) 跳过该优化。它使用真实 typed graph，不是按 kernel 名称，但字段扩展、不同 select 组织或嵌套位置可能使优化资格变化。
-
-窄 matcher 本身并非错误。Triton 的 [Combine.cpp](/home/kingdom/phdworks/ref/triton/lib/Dialect/Triton/Transforms/Combine.cpp:135) 同样用 rank、reduction axis、broadcast 和尺寸条件识别 mul+sum→dot；[dot+add](/home/kingdom/phdworks/ref/triton/lib/Dialect/Triton/Transforms/Combine.cpp:249) 也要求零初值和 single use。但 Intent 把更多物理选择从作者移给 compiler，因此需要更强的规范化与可解释性，不能用 Triton 也有 matcher 为所有性能断崖免责。
-
-建议把后续处理分成三类：
-
-| 差别 | 处理责任 |
-|---|---|
-| 同语义的 helper、坐标映射、reshape/broadcast、纯表达式组织 | 尽量保留共同 facts、规范化到等价局部结构；未优化时给出具体原因 |
-| 额外 cast、accumulator 精度、NaN/identity、ordered control/effects 不同 | 先核对语义，不强制统一执行结果或匹配资格 |
-| kernel 数量、中间 ABI、分段算法或 host 编排不同 | 作者算法选择；compiler 可解释代价，但不默认自动更换 |
-
-“优化沉淀”不应只是新增一个命中特定图的分支。每次修复应回答：丢失的事实是什么、可共享的规则是什么、哪些 current-IR users 需要同步改写、哪部分确实目标专属。第一轮就从现有 agent/production 中已经暴露的关系问题着手，不另造一套抽象等价测试矩阵。
-
-## 8. 推进计划：两条工作线，按可交付结果收束
-
-建议产品可用性与编译器稳定性并行。产品线不等待所有后端重构完成；编译器线也不以 README 上线代替能力进展。下面是工作包与依赖顺序，不是新增审批流程；具体实现仍需用户后续授权。
-
-### 第一批：让别人真正用起来，同时修正最明确的能力合同
-
-| 工作包 | 要交付的实际变化 | 依赖与完成标准 |
-|---|---|---|
-| A1 安装闭环 | 标准 Python packaging；MLIR bindings、compiler、profiles 的安装与定位；Triton 路线依赖脚本；保留显式开发 override | 新环境按文档安装，离开 checkout 后能 import、compile、调用已有生产算子；不依赖私人路径或实验 driver |
-| A2 公共调用与 README | compile-once 的普通 Torch wrapper；说明首次 compile/调用/tuning/cache；一个完整 quickstart；简化论文 workflow 图；准确支持范围 | A1 的真实路径跑通后写入 README；复用现有算法和容差，不提供无法运行的展示代码 |
-| A3 独立 MCP | 包内公共 corpus 与依赖；独立启动和客户端配置；清楚的发现/API/语义入口 | 普通 agent 客户端能实际连接并查询公共接口，无需 `ProgramContext` 或实验材料生成器 |
-| B1 目标能力合同 | 修正现有 capability consumers 的明确漏口，优先多 CTA/SM12x；分清 legality 与 profile；暴露已有 device facts | 有足够信息时提前拒绝不支持组合；使用现有受影响生产入口验证；不凭默认候选没触发而保留错误判定 |
-
-**第一批的主交付应是 A1+A2+A3，而不是继续全量刷算子。** B1 可独立并行，范围限定为已经定位的目标合同；不顺带启动大规模资源模型重写。README 首屏选择 Triton 路线，不代表其它后端的既有运行证据被取消。
-
-### 第二批：让写法和优化决定更可靠、更容易解释
-
-**B2：从当前 current-IR 关系维护入手治理性能断崖。**
-
-- 从现有程序中选择已有的 producer projection、reduction/free-axis ownership、reshape/broadcast 相关问题链；先核对 source 数值/effect/host 合同。
-- 追踪 normalization→ownership→blocking→structured realization 的真实 IR，找出失去 facts 或过早固定物理结构的位置。
-- 修改正确层的分析与 rewrite，让合法表达复用同一机制；把必要关系维护收回 coherent transformation，不在 serializer 再补猜测。
-- 在既有 production/agent 开发入口上跑必要的原容差与完整算子计时，原位更新既有开发结果。历史首次结果不改，不创建平行结果表。
-
-完成标准不是“增加了几个 pass”，而是受影响的原程序无需改算法，物理结构问题消除；其它已存在且适用的程序能复用该规则。若只修了一个 shape，应如实说明已验证范围。
-
-**A4/B3：把现有诊断与编译产物变成用户能理解的接口。**
-
-复用已有错误阶段、source location、physical IR、generated source、cache directory；增加必要的优化资格/未采用原因与所用目标事实。例如“因何不能用 descriptor”“某 reduction 的 free axis 为何不能打包”“为何选择当前 traversal”。说明依据来自哪层，避免把性能猜测当事实。下层编译结果中的 registers/shared memory 可用于解释；冷编译、tuning、热态 kernel 时间分别呈现。
-
-这些能力可以先作为普通 CLI/Python 诊断，再由独立 MCP 工具调用；不在只读 manual 中混入动态编译动作。不另建一套脱离当前 IR 的 plan authority。
-
-### 第三批：把可迁移优化知识沉淀好，补齐较弱的 execution family
-
-| 工作包 | 具体范围 | 完成标准 |
-|---|---|---|
-| B4 共享语义证明 | 在现有 `lib/Analysis` 上逐项共享 coordinate/identity/代数合法性；优先 online-summary 重复关系及数学规范化的共同部分 | 至少两个真实消费者使用同一规则；各 family 仍改写自己的完整 current IR；不以包装同名函数冒充复用 |
-| B5 DSA 分层 | 先明确初始 DSA executable program；把 cooperation、storage/pipeline 与 BANG implementation/layout 选择分开 | 可在阶段边界看到完整程序及验证；目标细节不再由 KIR construction 直接猜；保留单一路径，用已有 MLU registry 核查 |
-| B6 资源决策改进 | 对已观察的结构瓶颈改进 footprint/lifetime/reuse 估计；准确 feature predicates；有限合法候选 | 能解释相同 KIR 在 H100/5090D 的上层异同，以及哪些差异由 Triton 完成；不要求源代码必须不同，不重建下层 allocator |
-
-B4 应按真实重复逐项提取，不建立一个大而全的跨模型 scheduler。B5 涉及尚未完整沉淀的 DSA 设计，实施前需要用户确认职责变化及规格补充。B6 以已有资源消费者和生产瓶颈为驱动，避免先堆“architecture pass”再寻找用途。
-
-### 第四批：扩大产品集成与外部贡献能力
-
-完成 A1 的基础后可与第二、三批并行推进，具体按用户使用需求排序：
-
-- **PyTorch adapter**：先选定 eager、`torch.compile`/FakeTensor、mutation/output schema 的具体支持范围；用已有算法 callable 接入。Backward 由作者定义或注册，不默认自动发明。
-- **更多后端安装与分发**：cuTile、CPU 与 MLU 分别提供依赖获取、安装、定位、错误诊断；从可重复源码安装走向普通用户二进制交付。不把所有后端放进一个必须全部安装的巨型环境。
-- **少量完整教程与贡献入口**：讲清如何新增一个算法、一个已有 primitive 的目标实现、一个具合法性前提的变换。以真实代码边界指导贡献，不要求每位作者阅读所有内部 IR。
-- **公开发布条件**：根许可证和已有 baseline/第三方材料的分发边界需要明确；许可证选择由维护者决定。本轮不替用户选许可证或发布，也不新增版本号、CHANGELOG 或迁移指南。
-
-### 8.1 如何判断我们是在成长，而不是继续堆样例
-
-后续每个连贯改动用以下实际问题收束，不建立额外报告或独立测试体系：
-
-1. 外部用户能否从安装到调用成功，还是仍需要维护者提供私有环境？
-2. 新的合法程序是否主要复用已有语义/分析/family passes，还是又要在多层加同一个任务的特例？
-3. 一个优化的合法性规则是否被真正共享，目标专属部分是否范围清楚？
-4. 性能差距能否定位到当前物理结构、provider 能力或测量合同，而非笼统归因“后端太弱”？
-5. 交付是否分别说明生成成功、编译成功、运行正确与性能观察，而不是混成一个“支持”？
-
-验证继续使用既有生产 registry、既定输入与容差、对应实验组的既有结果输出；不新增独立数值/边界/压力测试矩阵，不为了产品化重新跑整套论文实验。同一改动完成必要检查后继续交付，不用验证次数代替实现进展。
-
-## 9. 本轮结论的限制与下一步起点
-
-本轮已完成代码/规格/参考对照、安装与 MCP 入口盘点、历史个例核查和两张论文图的渲染查看；没有声称新环境安装成功，也没有声称当前 compiler 在新的表达或设备组合上通过运行。
-
-最有价值的下一步是启动第一批产品交付，并在编译器线上完成 B1、进入 B2。当前证据不支持推倒整个架构，也不支持直接宣布已经达到 Triton 的成熟度。我们已经拥有可继续积累的算法语义、共享证明与物理编译骨架；接下来要让这些能力不再依赖维护者的机器、特定写法和对内部流程的熟悉程度。
+现有 CLI compile 命令使用 examples/kernels/normalization/rms_norm.py:rms_norm_f32、--target tilelang、相同指定 GPU facts、当前 intent-compile，输出 JSON。未 materialize、launch 或测量。当前错误、源码位置和缓存入口见 §11.1。
