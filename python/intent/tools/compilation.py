@@ -407,20 +407,21 @@ def doctor(target: str | None = None, *, target_options: dict | None = None, com
     result["toolchain"] = description["toolchain"]
 
     def inspect_provider():
-        if target not in information["providers"]:
+        provider = information["providers"].get(target)
+        if provider is None or not provider["available"]:
+            available = [name for name, entry in information["providers"].items() if entry["available"]]
             raise NotImplementedError(
                 f"The selected Intent compiler does not contain {target!r}; "
-                f"built providers: {', '.join(information['providers'])}"
+                f"built providers: {', '.join(available)}"
             )
-        return target
+        return {"name": target, **provider}
 
     if information is not None:
         check("compiled provider", "compiler_provider", inspect_provider)
-    executable = information["executable"] if information is not None else None
-    if executable is not None and target != "bangc":
+    provider = information["providers"].get(target) if information is not None else None
+    if provider is not None and provider["available"]:
         def profiles():
-            names = ("shared", target) if target in {"triton", "cutile"} else (target,)
-            paths = [Path(executable).parent / "profiles" / f"{name}.json" for name in names]
+            paths = [Path(path) for path in provider["profiles"]]
             for path in paths:
                 if not path.is_file():
                     raise FileNotFoundError(f"Compiler profile is missing: {path}")

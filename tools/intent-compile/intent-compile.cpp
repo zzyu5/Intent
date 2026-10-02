@@ -1,10 +1,12 @@
 #include "Intent/Compiler/Compiler.h"
+#include "Intent/Compiler/Backend.h"
 #include "Intent/Compiler/Registration.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/Timing.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -89,8 +91,42 @@ int main(int argc, char **argv) {
       llvm::cl::desc("Print compiled providers, stages, outputs and failure categories"));
   llvm::cl::ParseCommandLineOptions(argc, argv, "Intent compiler\n");
 
+  llvm::SmallString<256> profileDirectory(
+      llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
+  llvm::sys::path::remove_filename(profileDirectory);
+  llvm::sys::path::append(profileDirectory, "profiles");
+  const llvm::SmallVector<llvm::cl::Option *> gpuOptions{
+      &computeUnits, &sharedMemoryPerUnit, &maxDynamicSharedMemoryPerBlock,
+      &registersPerUnit, &maxThreadsPerBlock, &computeCapabilityMajor,
+      &computeCapabilityMinor, &singleToDoublePrecisionPerfRatio,
+      &matrixUnits, &dynamicVectorWidth};
+  const llvm::SmallVector<llvm::cl::Option *> cpuOptions{
+      &cpuVectorBits, &cpuWorkers, &cpuMatrixI8I32, &cpuPrivateBytes};
+  const llvm::SmallVector<llvm::cl::Option *> dsaOptions{
+      &dsaArchitecture, &dsaTile, &dsaTileM, &dsaTileN, &dsaTileK,
+      &dsaRegionTile, &dsaShapes, &dsaStrides, &dsaTasks, &dsaLocalBytes};
+  auto rejectOptions = [&](llvm::ArrayRef<llvm::cl::Option *> options,
+                           llvm::StringRef reason) {
+    for (llvm::cl::Option *option : options)
+      if (option->getNumOccurrences()) {
+        llvm::errs() << reason << ": "
+                     << (option->ArgStr.empty() ? "<input Intent KIR>" : "--" + option->ArgStr.str())
+                     << "\n";
+        return true;
+      }
+    return false;
+  };
   if (compilerInfo) {
-    llvm::outs() << llvm::json::Value(intent::compiler::information()) << "\n";
+    if (rejectOptions(gpuOptions, "--compiler-info does not compile a program") ||
+        rejectOptions(cpuOptions, "--compiler-info does not compile a program") ||
+        rejectOptions(dsaOptions, "--compiler-info does not compile a program") ||
+        rejectOptions({&inputFilename, &target, &inputStage, &irOutputFilename,
+                       &sourceOutputFilename, &metadataOutputFilename,
+                       &tuningConfigFilename, &numerics, &onlineReduction,
+                       &optimizationRemarks, &stopAfterKIR, &stopAfterShared},
+                      "--compiler-info does not compile a program"))
+      return exitCode(Failure::Invocation);
+    llvm::outs() << llvm::json::Value(intent::compiler::information(profileDirectory)) << "\n";
     return 0;
   }
   if (stopAfterKIR && stopAfterShared) {
@@ -112,6 +148,9 @@ int main(int argc, char **argv) {
     llvm::errs() << "--input-stage must be kir or shared\n";
     return exitCode(Failure::Invocation);
   }
+  if (request.inputStage == intent::compiler::InputStage::Shared &&
+      rejectOptions({&tuningConfigFilename}, "shared input already contains resolved tuning profiles"))
+    return exitCode(Failure::Invocation);
   if (!target.empty()) {
     request.provider = intent::compiler::parseProvider(target);
     if (!request.provider) {
@@ -125,6 +164,29 @@ int main(int argc, char **argv) {
     llvm::errs() << "--target is required unless --stop-after-kir is selected\n";
     return exitCode(Failure::Invocation);
   }
+  if (request.stopAfter == intent::compiler::Stage::Kernel) {
+    if (rejectOptions({&target, &tuningConfigFilename},
+                      "KIR output does not select a physical target or tuning profile") ||
+        rejectOptions(gpuOptions, "KIR output does not consume GPU resources") ||
+        rejectOptions(cpuOptions, "KIR output does not consume CPU resources") ||
+        rejectOptions(dsaOptions, "KIR output does not consume DSA bindings"))
+      return exitCode(Failure::Invocation);
+  } else {
+    const auto family = intent::compiler::backend(*request.provider).family();
+    if ((family != intent::compiler::Family::GPU &&
+         rejectOptions(gpuOptions, "selected provider does not consume GPU resources")) ||
+        (family != intent::compiler::Family::CPU &&
+         rejectOptions(cpuOptions, "selected provider does not consume CPU resources")) ||
+        (family != intent::compiler::Family::DSA &&
+         rejectOptions(dsaOptions, "selected provider does not consume DSA bindings")) ||
+        (family == intent::compiler::Family::DSA &&
+         rejectOptions({&tuningConfigFilename}, "DSA takes explicit bindings, not a tuning profile")))
+      return exitCode(Failure::Invocation);
+  }
+  if (request.stopAfter != intent::compiler::Stage::Provider &&
+      rejectOptions({&sourceOutputFilename, &metadataOutputFilename},
+                    "selected stage only emits IR"))
+    return exitCode(Failure::Invocation);
   if (irOutputFilename.empty() ||
       (request.stopAfter == intent::compiler::Stage::Provider && sourceOutputFilename.empty())) {
     llvm::errs() << "--ir-output is required; provider compilation also requires --source-output\n";
@@ -137,12 +199,7 @@ int main(int argc, char **argv) {
   request.dsa = {dsaArchitecture, dsaTile, dsaTileM, dsaTileN, dsaTileK,
       dsaRegionTile, dsaTasks, dsaLocalBytes, dsaShapes, dsaStrides};
   request.tuningConfig = tuningConfigFilename;
-  {
-    llvm::SmallString<256> directory(llvm::sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main)));
-    llvm::sys::path::remove_filename(directory);
-    llvm::sys::path::append(directory, "profiles");
-    request.profileDirectory = std::string(directory);
-  }
+  request.profileDirectory = std::string(profileDirectory);
 
   mlir::DialectRegistry registry;
   intent::compiler::registerDialects(registry);

@@ -13,7 +13,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "llvm/Support/JSON.h"
 
 using namespace mlir;
 
@@ -50,33 +49,6 @@ public:
   }
 };
 
-FailureOr<DictionaryAttr> parseBindings(ModuleOp module, StringRef text,
-                                       bool shapes) {
-  auto parsed = llvm::json::parse(text);
-  if (!parsed) {
-    module.emitError() << "invalid DSA " << (shapes ? "shapes" : "strides")
-                       << ": " << llvm::toString(parsed.takeError());
-    return failure();
-  }
-  auto object = parsed->getAsObject();
-  if (!object) return module.emitError("DSA bindings must be a JSON object"), failure();
-  Builder builder(module.getContext());
-  NamedAttrList bindings;
-  for (auto &[name, value] : *object) {
-    auto entries = value.getAsArray();
-    if (!entries) return module.emitError("DSA parameter binding must be an integer array"), failure();
-    SmallVector<int64_t> integers;
-    for (auto &entry : *entries) {
-      auto integer = entry.getAsInteger();
-      if (!integer || (shapes && *integer < -1))
-        return module.emitError("invalid DSA bound dimension/stride"), failure();
-      integers.push_back(*integer);
-    }
-    bindings.append(name.str(), builder.getDenseI64ArrayAttr(integers));
-  }
-  return bindings.getDictionary(module.getContext());
-}
-
 class ConstructDSAPass : public impl::ConstructDSABase<ConstructDSAPass> {
 public:
   using Base::Base;
@@ -85,8 +57,8 @@ public:
     auto configuration = dsa::ConfigurationAttr::getChecked(
         [&]() { return module.emitError(); }, module.getContext(), tile.getValue(), tileM.getValue(),
         tileN.getValue(), tileK.getValue(), regionTile.getValue(), tasks.getValue(), localBytes.getValue());
-    auto shapeBindings = parseBindings(module, shapes, true);
-    auto strideBindings = parseBindings(module, strides, false);
+    auto shapeBindings = parseDSAParameterBindings(module, shapes, true);
+    auto strideBindings = parseDSAParameterBindings(module, strides, false);
     if (!configuration || failed(shapeBindings) || failed(strideBindings) ||
         failed(lowerCanonicalKIRToDSA(module, configuration, *shapeBindings, *strideBindings)))
       signalPassFailure();

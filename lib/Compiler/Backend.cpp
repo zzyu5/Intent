@@ -34,6 +34,22 @@ Family Backend::family() const {
   return std::visit([](const auto &model) { return model.family; }, model);
 }
 
+SmallVector<std::string> Backend::profilePaths(StringRef directory) const {
+  SmallVector<std::string> result;
+  if (!available)
+    return result;
+  if (std::holds_alternative<GPUBackend>(model)) {
+    // The shared preparation pass resolves the complete GPU profile namespace.
+    for (const auto &source : gpuProfileSources(directory))
+      result.push_back(source.filename);
+  } else if (const auto *cpu = std::get_if<CPUBackend>(&model)) {
+    llvm::SmallString<256> path(directory);
+    llvm::sys::path::append(path, cpu->profileFilename);
+    result.push_back(std::string(path));
+  }
+  return result;
+}
+
 void Backend::buildConstruction(OpPassManager &manager, const Request &request) const {
   std::visit([&](const auto &model) { model.buildConstruction(manager, request); }, model);
 }

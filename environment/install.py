@@ -137,7 +137,7 @@ def main() -> None:
         run(python, "-c", "import sys; from intent.compiler.toolchain import compiler_info; "
             "facts = compiler_info(); "
             "print(facts); "
-            "'weft' in facts['providers'] or "
+            "facts['providers']['weft']['available'] or "
             "sys.exit('The installed Intent compiler was built without Weft support')", env=env)
         print("Weft is available for source generation. Supply your actual vector_bits/workers to intent doctor/compile;")
         print("native RISC-V execution additionally requires an explicit deployment and matching external toolchain.")

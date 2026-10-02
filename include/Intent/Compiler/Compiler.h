@@ -68,7 +68,7 @@ llvm::StringRef providerName(Provider provider);
 llvm::StringRef stageName(Stage stage);
 llvm::StringRef failureStage(Failure failure);
 bool isProviderAvailable(Provider provider);
-llvm::json::Object information();
+llvm::json::Object information(llvm::StringRef profileDirectory);
 Result compile(mlir::OwningOpRef<mlir::ModuleOp> module, const Request &request);
 
 } // namespace intent::compiler

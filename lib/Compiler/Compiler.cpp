@@ -40,13 +40,26 @@ StringRef failureStage(Failure code) {
   for (const auto &failure : failures) if (failure.code == code) return failure.name;
   llvm_unreachable("not a compiler failure");
 }
-llvm::json::Object information() {
-  llvm::json::Array available;
-  for (const Backend &adapter : backends()) if (adapter.available) available.push_back(adapter.name);
+llvm::json::Object information(StringRef profileDirectory) {
+  llvm::json::Object providers;
+  for (const Backend &adapter : backends()) {
+    StringRef family;
+    switch (adapter.family()) {
+    case Family::GPU: family = "gpu"; break;
+    case Family::CPU: family = "cpu"; break;
+    case Family::DSA: family = "dsa"; break;
+    }
+    llvm::json::Array profiles;
+    for (const std::string &path : adapter.profilePaths(profileDirectory))
+      profiles.push_back(path);
+    providers[adapter.name] = llvm::json::Object{
+        {"family", family}, {"available", adapter.available},
+        {"profiles", std::move(profiles)}};
+  }
   llvm::json::Object failureStages;
   for (const auto &failure : failures)
     failureStages[std::to_string(static_cast<int>(failure.code))] = failure.name;
-  return llvm::json::Object{{"providers", std::move(available)},
+  return llvm::json::Object{{"providers", std::move(providers)},
           {"input_stages", llvm::json::Array{"kir", "shared"}},
           {"stages", llvm::json::Array{stageName(Stage::Kernel), stageName(Stage::Shared), stageName(Stage::Provider)}},
           {"outputs", llvm::json::Object{{"kir", llvm::json::Array{"ir"}},
@@ -65,6 +78,12 @@ Result compile(OwningOpRef<ModuleOp> module, const Request &request) {
   result.stage = sharedInput ? Stage::Shared : Stage::Kernel;
   if (!result.module) {
     result.failure = sharedInput ? Failure::SharedPipeline : Failure::KernelIR;
+    return result;
+  }
+  if (request.stopAfter == Stage::Kernel &&
+      (request.provider || !request.tuningConfig.empty())) {
+    result.module->emitError("KIR output does not select a physical target or tuning profile");
+    result.failure = Failure::Invocation;
     return result;
   }
   auto existing = (*result.module)->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr);

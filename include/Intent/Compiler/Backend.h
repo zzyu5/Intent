@@ -56,6 +56,7 @@ struct Backend {
   mlir::LogicalResult (*serialize)(mlir::ModuleOp, std::string &source, std::string &metadata);
 
   Family family() const;
+  llvm::SmallVector<std::string> profilePaths(llvm::StringRef directory) const;
   void buildConstruction(mlir::OpPassManager &, const Request &) const;
   void buildShared(mlir::OpPassManager &, const Request &) const;
   mlir::LogicalResult verifySharedInput(mlir::ModuleOp, const Request &) const;
@@ -64,6 +65,8 @@ struct Backend {
 llvm::ArrayRef<Backend> backends();
 const Backend &backend(Provider provider);
 llvm::SmallVector<gpu::TuningProfileSource> gpuProfileSources(llvm::StringRef directory);
+mlir::FailureOr<mlir::DictionaryAttr> parseDSAParameterBindings(
+    mlir::ModuleOp module, llvm::StringRef text, bool shapes);
 
 } // namespace intent::compiler
 #endif
