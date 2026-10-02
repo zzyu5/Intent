@@ -441,8 +441,8 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
     projection = builder.create<BroadcastOp>(location, target, value);
   Operation *definition = value.getDefiningOp();
   if (!projection &&
-      isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
-          definition)) {
+      (queryElementwiseShapeSource(definition) ||
+       isa_and_nonnull<BinaryOp, CompareOp, SelectOp>(definition))) {
     IRMapping mapping;
     for (Value operand : definition->getOperands()) {
       Type element = operand.getType();
@@ -1007,22 +1007,8 @@ FailureOr<Value> materializeReplayedValue(
     }
 
     if (auto contract = dyn_cast<ContractOp>(producer)) {
-      SmallVector<std::pair<unsigned, unsigned>> freeAxes;
-      auto lhsType = cast<FragmentType>(contract.getLhs().getType());
-      auto rhsType = cast<FragmentType>(contract.getRhs().getType());
-      for (unsigned inputAxis = 0; inputAxis < lhsType.getShape().size();
-           ++inputAxis)
-        if (!llvm::is_contained(contract.getLhsReductionAxes(),
-                               static_cast<int64_t>(inputAxis)))
-          freeAxes.emplace_back(0, inputAxis);
-      for (unsigned inputAxis = 0; inputAxis < rhsType.getShape().size();
-           ++inputAxis)
-        if (!llvm::is_contained(contract.getRhsReductionAxes(),
-                               static_cast<int64_t>(inputAxis)) &&
-            !llvm::is_contained(contract.getRhsBatchAxes(),
-                               static_cast<int64_t>(inputAxis)))
-          freeAxes.emplace_back(1, inputAxis);
-      if (axis >= freeAxes.size())
+      auto axes = queryContractionAxes(contract);
+      if (!axes || axis >= axes->results.size())
         return failure();
       // One SSA value can have different matrix roles at the two input uses.
       SmallVector<Value> operands{contract.getLhs(), contract.getRhs(),
@@ -1046,13 +1032,14 @@ FailureOr<Value> materializeReplayedValue(
         operands[operand] = *replayed;
         return success();
       };
-      auto [operand, inputAxis] = freeAxes[axis];
+      const auto &resultAxis = axes->results[axis];
+      unsigned operand = resultAxis.operand == ContractionOperand::Lhs ? 0 : 1;
+      unsigned inputAxis = resultAxis.axis;
       if (failed(replayAxis(operand, inputAxis)) || failed(replayAxis(2, axis)))
         return failure();
       if (operand == 0)
-        for (auto [batch, lhsAxis] : llvm::enumerate(contract.getLhsBatchAxes()))
-          if (lhsAxis == static_cast<int64_t>(inputAxis) &&
-              failed(replayAxis(1, contract.getRhsBatchAxes()[batch])))
+        for (const auto &batch : axes->batch)
+          if (batch.lhs == inputAxis && failed(replayAxis(1, batch.rhs)))
             return failure();
       IRMapping cloneMapping(mapping);
       Operation *clone = builder.clone(*producer, cloneMapping);

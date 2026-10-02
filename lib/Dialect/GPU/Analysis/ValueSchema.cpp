@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Interfaces/StructuredOpInterface.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -23,6 +24,41 @@
 using namespace mlir;
 
 namespace intent::gpu {
+
+Value queryElementwiseShapeSource(Operation *operation) {
+  if (isa_and_nonnull<UnaryOp, CastOp, BitcastOp>(operation))
+    return operation->getOperand(0);
+  return {};
+}
+
+SmallVector<StructuredSchemaGroup>
+queryStructuredSchemaGroups(Operation *operation) {
+  if (!isa<RegionFoldOp, RegionScanOp>(operation)) return {};
+  auto structured = cast<StructuredOpInterface>(operation);
+  auto fold = dyn_cast<RegionFoldOp>(operation);
+  auto scan = dyn_cast<RegionScanOp>(operation);
+  auto identities = fold ? fold.getIdentities() : scan.getIdentities();
+  SmallVector<StructuredSchemaGroup> groups;
+  for (unsigned index = 0; index < identities.size(); ++index) {
+    StructuredSchemaGroup group{
+        &structured.getSummarizeRegion()->front().getTerminator()->getOpOperand(index),
+        identities.getBeginOperandIndex() + index,
+        {structured.getCombineLhs()[index], structured.getCombineRhs()[index]}, {},
+        {&structured.getCombine().front().getTerminator()->getOpOperand(index)}};
+    if (fold) group.results.push_back(fold.getResult(index));
+    else group.arguments.push_back(structured.getApplySummaries()[index]);
+    groups.push_back(std::move(group));
+  }
+  if (scan) {
+    auto initial = scan.getInitialStates();
+    for (unsigned index = 0; index < initial.size(); ++index)
+      groups.push_back({&structured.getApplyRegion()->front().getTerminator()->getOpOperand(index),
+          initial.getBeginOperandIndex() + index,
+          {structured.getApplyStates()[index], structured.getEmitStates()[index]},
+          {scan.getFinalStates()[index]}, {}});
+  }
+  return groups;
+}
 
 FailureOr<func::FuncOp> getPhysicalKernel(ModuleOp module) {
   SmallVector<func::FuncOp> kernels;

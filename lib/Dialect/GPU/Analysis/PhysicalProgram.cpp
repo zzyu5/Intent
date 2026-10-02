@@ -3913,40 +3913,21 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   }
 
   if (auto contract = value.getDefiningOp<ContractOp>()) {
-    llvm::SmallDenseSet<int64_t> lhsReduced(
-        contract.getLhsReductionAxes().begin(),
-        contract.getLhsReductionAxes().end());
-    llvm::SmallDenseSet<int64_t> rhsReduced(
-        contract.getRhsReductionAxes().begin(),
-        contract.getRhsReductionAxes().end());
-    llvm::SmallDenseSet<int64_t> rhsBatched(
-        contract.getRhsBatchAxes().begin(), contract.getRhsBatchAxes().end());
-    SmallVector<std::pair<Value, unsigned>> resultSources;
-    auto lhs = dyn_cast<FragmentType>(contract.getLhs().getType());
-    auto rhs = dyn_cast<FragmentType>(contract.getRhs().getType());
-    if (lhs && rhs) {
-      for (unsigned axis = 0; axis < lhs.getShape().size(); ++axis)
-        if (!lhsReduced.contains(axis))
-          resultSources.emplace_back(contract.getLhs(), axis);
-      for (unsigned axis = 0; axis < rhs.getShape().size(); ++axis)
-        if (!rhsReduced.contains(axis) && !rhsBatched.contains(axis))
-          resultSources.emplace_back(contract.getRhs(), axis);
-      if (fragmentAxis < resultSources.size()) {
-        Value sourceValue = resultSources[fragmentAxis].first;
-        unsigned sourceAxis = resultSources[fragmentAxis].second;
-        auto source = cast<FragmentType>(sourceValue.getType());
-        PhysicalAxisRealizationFact input =
-            axisRealization(sourceValue, sourceAxis);
-        if (input.hasExtentAuthority() &&
-            source.getShape()[sourceAxis] == extent) {
-          result.state = PhysicalFactState::Exact;
-          result.physicalized = input.physicalized;
-          result.constructionScalarSeed = input.constructionScalarSeed;
-          result.roots = input.roots;
-          result.extentAuthority =
-              PhysicalAxisRealizationFact::ExtentAuthority::Structural;
-          return result;
-        }
+    auto axes = queryContractionAxes(contract);
+    if (axes && fragmentAxis < axes->results.size()) {
+      const auto &axis = axes->results[fragmentAxis];
+      Value sourceValue = axis.operand == ContractionOperand::Lhs
+                              ? Value(contract.getLhs()) : Value(contract.getRhs());
+      auto source = cast<FragmentType>(sourceValue.getType());
+      PhysicalAxisRealizationFact input = axisRealization(sourceValue, axis.axis);
+      if (input.hasExtentAuthority() && source.getShape()[axis.axis] == extent) {
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = input.physicalized;
+        result.constructionScalarSeed = input.constructionScalarSeed;
+        result.roots = input.roots;
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+        return result;
       }
     }
   }

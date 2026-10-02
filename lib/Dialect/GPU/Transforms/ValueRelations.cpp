@@ -136,7 +136,8 @@ private:
       push(operation, ReductionIdentity);
       push(operation, ReductionYield);
     }
-    if (isa<MakeRecordOp, ExtractOp, scf::IfOp, scf::ForOp, RegionFoldOp>(operation))
+    if (isa<MakeRecordOp, ExtractOp, scf::IfOp, scf::ForOp,
+            RegionFoldOp, RegionScanOp>(operation))
       push(operation, Aggregate);
     if (auto access = dyn_cast<AccessOpInterface>(operation)) {
       AccessKind kind = access.getAccessKind();
@@ -551,7 +552,8 @@ enum class StructuredBoundary { Parent, Child, Result };
 
 void appendStructuredRelations(StructuredOpInterface operation, Value value,
                                SmallVectorImpl<Value> &worklist,
-                               AxisSelector selects, StructuredBoundary boundary) {
+                               AxisSelector selects, StructuredBoundary boundary,
+                               OpOperand *use = nullptr) {
   using K = StructuredRelationKind;
   auto relations = operation.getValueRelations();
   auto crossesSelectedAxis = [&](const StructuredValueRelation &relation) {
@@ -565,38 +567,55 @@ void appendStructuredRelations(StructuredOpInterface operation, Value value,
     if (related != value && !llvm::is_contained(worklist, related))
       worklist.push_back(related);
   };
+  bool regionOperation = operation.getStructuredKind() == StructuredOpKind::RegionFold ||
+                         operation.getStructuredKind() == StructuredOpKind::RegionScan;
+  if (regionOperation) {
+    for (const StructuredSchemaGroup &group : queryStructuredSchemaGroups(operation)) {
+      bool connected = boundary == StructuredBoundary::Child
+          ? use == group.producer || llvm::is_contained(group.yields, use)
+          : boundary == StructuredBoundary::Parent
+              ? llvm::is_contained(group.arguments, value)
+              : llvm::is_contained(group.results, value);
+      if (!connected) continue;
+      // A seed may initialize several independent components or have other
+      // numeric users. Only the component's operand slot is projected during
+      // aggregate closure; never use the seed SSA value to join their schemas.
+      append(group.producer->get());
+      for (BlockArgument argument : group.arguments) append(argument);
+      for (Value result : group.results) append(result);
+      for (OpOperand *yield : group.yields) append(yield->get());
+    }
+  }
   if (boundary == StructuredBoundary::Child) {
+    if (Region *emit = operation.getEmitRegion();
+        emit && use && use->getOwner() == emit->front().getTerminator()) {
+      bool memberAxis = llvm::any_of(operation.getEmitSources(), [&](Value source) {
+        return llvm::any_of(operation.getIterationAxes(), [&](int64_t axis) {
+          return selectsSegmentAxis(source.getType(), axis, selects);
+        });
+      });
+      // Emit yields are positional; identical SSA values at two yield slots do
+      // not merge their outputs. The segmented member extent stays local to the
+      // helper and must not replace the full output's member extent.
+      if (!memberAxis)
+        append(operation.getEmittedResults()[use->getOperandNumber()]);
+    }
     for (const auto &relation : relations)
       if (relation.from == value &&
-          (relation.kind == K::Capture || (relation.kind == K::SameSchema || relation.kind == K::Accumulator) ||
+          (relation.kind == K::Capture ||
+           (!regionOperation && (relation.kind == K::SameSchema || relation.kind == K::Accumulator)) ||
            (relation.kind == K::SourceSlice && !crossesSelectedAxis(relation))))
         append(relation.to);
     return;
   }
   if (boundary == StructuredBoundary::Parent) {
-    if (operation.getStructuredKind() != StructuredOpKind::RegionFold &&
-        operation.getStructuredKind() != StructuredOpKind::RegionScan)
-      return;
+    if (!regionOperation) return;
     for (const auto &relation : relations) {
       if (relation.to != value ||
-          (relation.kind != K::Capture && relation.kind != K::SameSchema &&
+          (relation.kind != K::Capture &&
            (relation.kind != K::SourceSlice || crossesSelectedAxis(relation))))
         continue;
       append(relation.from);
-      if (relation.kind != K::SameSchema) continue;
-      // Locate the formal slot, not the identity SSA value: multiple
-      // components may intentionally use the same identity constant.
-      auto appendPairedResult = [&](ValueRange arguments, ValueRange results) {
-        for (auto [argument, result] : llvm::zip_equal(arguments, results))
-          if (argument == value) append(result);
-      };
-      if (operation.getStructuredKind() == StructuredOpKind::RegionFold) {
-        appendPairedResult(operation.getCombineLhs(), operation->getResults());
-        appendPairedResult(operation.getCombineRhs(), operation->getResults());
-      } else {
-        appendPairedResult(operation.getApplyStates(), operation.getFinalStates());
-        appendPairedResult(operation.getEmitStates(), operation.getFinalStates());
-      }
     }
     return;
   }
@@ -608,23 +627,13 @@ void appendStructuredRelations(StructuredOpInterface operation, Value value,
     } else if (relation.kind == K::Emission) {
       append(relation.from);
     } else if (relation.kind == K::SameSchema || relation.kind == K::Accumulator) {
+      if (regionOperation) continue;
       append(relation.from);
-      if (operation.getStructuredKind() == StructuredOpKind::Reduce ||
-          operation.getStructuredKind() == StructuredOpKind::RegionFold) {
+      if (operation.getStructuredKind() == StructuredOpKind::Reduce) {
         unsigned component = cast<OpResult>(value).getResultNumber();
         append(operation.getCombineLhs()[component]);
         append(operation.getCombineRhs()[component]);
         append(operation.getCombineYields()[component]);
-        if (operation.getSummarizeRegion())
-          append(operation.getSummarizeYields()[component]);
-      } else {
-        auto states = operation.getFinalStates();
-        auto found = llvm::find(states, value);
-        if (found != states.end()) {
-          unsigned component = std::distance(states.begin(), found);
-          append(operation.getApplyStates()[component]);
-          append(operation.getEmitStates()[component]);
-        }
       }
     }
   }
@@ -1012,9 +1021,8 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
     }
     if (!target)
       return WalkResult::advance();
-    if (isa<UnaryOp, CastOp, BitcastOp>(operation) &&
-        operation->getNumOperands() == 1) {
-      auto source = dyn_cast<FragmentType>(operation->getOperand(0).getType());
+    if (Value value = queryElementwiseShapeSource(operation)) {
+      auto source = dyn_cast<FragmentType>(value.getType());
       if (source) {
         changes.setType(operation->getResult(0), FragmentType::get(
             kernel.getContext(), target.getElementType(), source.getShape(),
@@ -1505,21 +1513,13 @@ WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) 
     }
     return WalkResult::advance();
   }
-  if (auto fold = dyn_cast<RegionFoldOp>(operation)) {
-    if (!llvm::hasSingleElement(fold.getSummarize()) ||
-        !llvm::hasSingleElement(fold.getCombine()))
-      return WalkResult::interrupt();
-    auto summarizeYield =
-        dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
-    if (!summarizeYield ||
-        summarizeYield.getValues().size() != fold.getIdentities().size())
-      return WalkResult::interrupt();
-    auto structured = cast<StructuredOpInterface>(fold.getOperation());
+  if (isa<RegionFoldOp, RegionScanOp>(operation)) {
+    auto structured = cast<StructuredOpInterface>(operation);
     if (failed(verifyStructuredArity(structured))) return WalkResult::interrupt();
-    OpBuilder builder(fold);
-      builder.setListener(&changes);
-    for (unsigned index = 0; index < fold.getIdentities().size(); ++index) {
-      Type target = summarizeYield.getValues()[index].getType();
+    OpBuilder builder(operation);
+    builder.setListener(&changes);
+    for (const StructuredSchemaGroup &group : queryStructuredSchemaGroups(operation)) {
+      Type target = group.producer->get().getType();
       SmallVector<std::pair<int64_t, PhysicalExprAttr>> dimensions;
       std::function<LogicalResult(Type)> collectDimensions =
           [&](Type type) -> LogicalResult {
@@ -1549,24 +1549,42 @@ WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) 
         return success();
       };
       if (failed(collectDimensions(target))) {
-        fold.emitOpError(
-            "region-fold summary has conflicting physical dimension extents")
-            << "; summary_index=" << index << "; summary=" << target;
+        operation->emitOpError(
+            "structured component has conflicting physical dimension extents")
+            << "; seed_operand=" << group.seedOperand << "; schema=" << target;
         return WalkResult::interrupt();
       }
-      for (auto [dimension, extent] : dimensions)
-        retargetDimensionExtent(fold.getResult(index), dimension, extent, changes.typeChanged());
+      for (auto [dimension, extent] : dimensions) {
+        for (Value result : group.results)
+          retargetDimensionExtent(result, dimension, extent, changes.typeChanged());
+        for (BlockArgument argument : group.arguments)
+          retargetDimensionExtent(argument, dimension, extent, changes.typeChanged());
+      }
       FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, fold.getLoc(), fold.getIdentities()[index], target, changes.typeChanged());
+          builder, operation->getLoc(), operation->getOperand(group.seedOperand),
+          target, changes.typeChanged());
       if (failed(projected)) {
-        fold.emitOpError(
-            "region-fold identity cannot adopt its summary relation");
+        operation->emitOpError(
+            "structured seed cannot adopt its producer schema")
+            << "; seed_operand=" << group.seedOperand;
         return WalkResult::interrupt();
       }
-      fold.getIdentitiesMutable().slice(index, 1).assign(*projected);
-      changes.setType(fold.getResult(index), target);
-      changes.setType(structured.getCombineLhs()[index], target);
-      changes.setType(structured.getCombineRhs()[index], target);
+      operation->setOperand(group.seedOperand, *projected);
+      for (Value result : group.results) changes.setType(result, target);
+      for (BlockArgument argument : group.arguments) changes.setType(argument, target);
+      for (OpOperand *yield : group.yields) {
+        OpBuilder yieldBuilder(yield->getOwner());
+        yieldBuilder.setListener(&changes);
+        auto projectedYield = projectPhysicalValueToSchema(
+            yieldBuilder, yield->getOwner()->getLoc(), yield->get(), target,
+            changes.typeChanged());
+        if (failed(projectedYield)) {
+          operation->emitOpError("structured combine cannot adopt its producer schema")
+              << "; seed_operand=" << group.seedOperand;
+          return WalkResult::interrupt();
+        }
+        yield->set(*projectedYield);
+      }
     }
     return WalkResult::advance();
   }
@@ -1725,6 +1743,9 @@ static void retargetExtent(Value root, AxisSelector selects,
       worklist.append(record.getFields().begin(), record.getFields().end());
     if (auto extract = value.getDefiningOp<ExtractOp>())
       worklist.push_back(extract.getRecord());
+    if (Operation *producer = value.getDefiningOp())
+      if (Value source = queryElementwiseShapeSource(producer))
+        worklist.push_back(source);
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       if (auto structured = dyn_cast<StructuredOpInterface>(argument.getOwner()->getParentOp()))
         appendStructuredRelations(structured, argument, worklist, selects, StructuredBoundary::Parent);
@@ -1773,7 +1794,8 @@ static void retargetExtent(Value root, AxisSelector selects,
       }
     if (auto structured = dyn_cast_or_null<StructuredOpInterface>(value.getDefiningOp()))
       appendStructuredRelations(structured, value, worklist, selects, StructuredBoundary::Result);
-    for (Operation *user : value.getUsers()) {
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
       if (auto buffer = dyn_cast<BufferOp>(user);
           buffer && buffer.getInitialValue() == value && previousFragment) {
         auto storage = buffer.getResult().getType();
@@ -1874,9 +1896,7 @@ static void retargetExtent(Value root, AxisSelector selects,
       }
       if (isa<RegionFoldOp, RegionScanOp>(user)) {
         appendStructuredRelations(cast<StructuredOpInterface>(user), value, worklist,
-                                  selects, StructuredBoundary::Child);
-        for (Value result : user->getResults())
-          worklist.push_back(result);
+                                  selects, StructuredBoundary::Child, &use);
         continue;
       }
       if (auto loop = dyn_cast<scf::ForOp>(user))
@@ -1916,6 +1936,10 @@ static void retargetExtent(Value root, AxisSelector selects,
             if (value == yielded)
               worklist.push_back(branch.getResult(index));
       }
+      if (isa<YieldOp>(user))
+        if (auto structured = dyn_cast<StructuredOpInterface>(user->getParentOp()))
+          appendStructuredRelations(structured, value, worklist, selects,
+                                    StructuredBoundary::Child, &use);
       if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
               ContractOp, ScaledContractOp, SparseContractOp, ReduceOp,
               ScanOp, RandomBitsOp,

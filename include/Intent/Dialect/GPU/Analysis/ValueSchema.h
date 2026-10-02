@@ -7,6 +7,21 @@
 
 namespace intent::gpu {
 
+// Current-IR schema edges, independent of element values and numeric casts.
+mlir::Value queryElementwiseShapeSource(mlir::Operation *operation);
+
+// One positional summary/state component. Seeds are kept as operand slots:
+// different components may intentionally start from the same SSA constant.
+struct StructuredSchemaGroup {
+  mlir::OpOperand *producer;
+  unsigned seedOperand;
+  llvm::SmallVector<mlir::BlockArgument> arguments;
+  llvm::SmallVector<mlir::Value> results;
+  llvm::SmallVector<mlir::OpOperand *> yields;
+};
+llvm::SmallVector<StructuredSchemaGroup>
+queryStructuredSchemaGroups(mlir::Operation *operation);
+
 // These queries inspect current IR and return facts/types without changing it.
 bool isShapeBound(PhysicalExprAttr bound);
 mlir::Type scalarCallbackType(mlir::Type type);
