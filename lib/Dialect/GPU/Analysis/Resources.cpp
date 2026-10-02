@@ -82,11 +82,48 @@ std::optional<int64_t> minimumFragmentRegisterFootprint(
 
 RequirementEvaluation evaluateConfigurationRequirement(
     ConfigurationRequirementAttr requirement,
-    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf) {
+    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf,
+    llvm::function_ref<std::optional<int64_t>(ParameterRefAttr)>
+        resolveActivation) {
+  using Status = RequirementStatus;
+  using Predicate = ConfigurationRequirementPredicate;
+  if (auto reference = requirement.getActivation()) {
+    auto activation =
+        resolveActivation ? resolveActivation(reference) : std::nullopt;
+    if (!activation)
+      return {Status::Unknown, std::nullopt, std::nullopt};
+    if (*activation == 0)
+      return {Status::Inactive, std::nullopt, std::nullopt};
+    if (*activation != 1)
+      return {Status::Invalid, std::nullopt, std::nullopt};
+  }
   auto usage = evaluatePhysicalExpression(requirement.getUsage(), resolveLeaf);
-  auto limit = evaluatePhysicalExpression(requirement.getLimit(), resolveLeaf);
-  if ((usage && *usage <= 0) || (limit && *limit < 0))
-    return {FootprintBound::Invalid, usage, limit};
+  auto limit = requirement.getLimit()
+                   ? evaluatePhysicalExpression(requirement.getLimit(),
+                                                resolveLeaf)
+                   : std::nullopt;
+  auto predicate = requirement.getPredicate();
+  if ((usage && *usage <= 0) || (limit && *limit < 0) ||
+      ((predicate == Predicate::MultipleOf || predicate == Predicate::Equal) &&
+       limit && *limit == 0))
+    return {Status::Invalid, usage, limit};
+  if (predicate == Predicate::Positive)
+    return {usage ? Status::Satisfied : Status::Unknown, usage, limit};
+  if (predicate == Predicate::PowerOfTwo)
+    return {!usage ? Status::Unknown
+                   : llvm::isPowerOf2_64(*usage) ? Status::Satisfied
+                                               : Status::Violated,
+            usage, limit};
+  if (predicate == Predicate::MultipleOf)
+    return {!usage || !limit ? Status::Unknown
+                            : *usage % *limit == 0 ? Status::Satisfied
+                                                  : Status::Violated,
+            usage, limit};
+  if (predicate == Predicate::Equal)
+    return {!usage || !limit ? Status::Unknown
+                            : *usage == *limit ? Status::Satisfied
+                                              : Status::Violated,
+            usage, limit};
   if (!usage && limit) {
     // Preserve a finite upper-budget decision for positive products whose exact
     // count exceeds i64. Missing leaves and unproved arithmetic remain unknown.
@@ -94,34 +131,49 @@ RequirementEvaluation evaluateConfigurationRequirement(
     std::function<std::optional<__int128>(PhysicalExprAttr)> bounded =
         [&](PhysicalExprAttr expression) -> std::optional<__int128> {
       if (auto exact = evaluatePhysicalExpression(expression, resolveLeaf))
-        return *exact < 0 ? std::nullopt
-                         : std::optional<__int128>(std::min(cap, static_cast<__int128>(*exact)));
+        return *exact < 0
+                   ? std::nullopt
+                   : std::optional<__int128>(
+                         std::min(cap, static_cast<__int128>(*exact)));
       auto kind = expression.getKind();
       if (kind != PhysicalExprKind::Add && kind != PhysicalExprKind::Multiply)
         return std::nullopt;
       auto operands = expression.getOperands();
       auto left = bounded(cast<PhysicalExprAttr>(operands[0]));
       auto right = bounded(cast<PhysicalExprAttr>(operands[1]));
-      if (!left || !right) return std::nullopt;
-      return std::min(cap, kind == PhysicalExprKind::Add ? *left + *right : *left * *right);
+      if (!left || !right)
+        return std::nullopt;
+      return std::min(cap, kind == PhysicalExprKind::Add ? *left + *right
+                                                       : *left * *right);
     };
     if (auto count = bounded(requirement.getUsage()); count && *count > *limit)
-      return {FootprintBound::Exceeds, usage, limit};
+      return {Status::Violated, usage, limit};
   }
   if (!usage || !limit)
-    return {FootprintBound::Unknown, usage, limit};
-  return {*usage <= *limit ? FootprintBound::Within : FootprintBound::Exceeds,
+    return {Status::Unknown, usage, limit};
+  return {*usage <= *limit ? Status::Satisfied : Status::Violated,
           usage, limit};
 }
 
 RequirementEvaluation evaluateConfigurationRequirement(
     ConfigurationRequirementAttr requirement, DictionaryAttr bindings) {
-  return evaluateConfigurationRequirement(requirement,
+  return evaluateConfigurationRequirement(
+      requirement,
       [&](PhysicalExprAttr leaf) -> std::optional<int64_t> {
         if (leaf.getKind() != PhysicalExprKind::Parameter || !bindings)
           return std::nullopt;
-        auto value = bindings.getAs<IntegerAttr>(leaf.getParameterReference().getName());
+        auto value =
+            bindings.getAs<IntegerAttr>(leaf.getParameterReference().getName());
         return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+      },
+      [&](ParameterRefAttr reference) -> std::optional<int64_t> {
+        auto value = bindings ? bindings.getAs<IntegerAttr>(reference.getName())
+                              : IntegerAttr();
+        // Configuration rows store every declaration, including i1 choices,
+        // as i64 bindings. Do not sign-extend an SSA i1 true into -1 here.
+        return value && value.getType().isSignlessInteger(64)
+                   ? std::optional<int64_t>(value.getInt())
+                   : std::nullopt;
       });
 }
 

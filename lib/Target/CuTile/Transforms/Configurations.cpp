@@ -3,11 +3,63 @@
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 namespace intent::cutile {
+namespace {
+
+FailureOr<SmallVector<gpu::ConfigurationRequirementAttr>>
+collectConfigurationRequirements(func::FuncOp kernel) {
+  auto parameters = gpu::ParameterSpace::read(kernel);
+  if (failed(parameters))
+    return failure();
+  SmallVector<ValueRange> reductionSources;
+  kernel.walk([&](ReduceOp reduce) {
+    reductionSources.push_back(reduce.getSources());
+  });
+  auto requirements = gpu::collectReductionRequirements(
+      kernel, reductionSources,
+      gpu::ReductionRequirementScope::InvocationDependent);
+  auto resident = parameters->find(gpu::ParameterRole::ResidentWorkers);
+  auto ctas = parameters->find(gpu::ParameterRole::ProviderCTAs);
+  auto occupancy = parameters->find(gpu::ParameterRole::ProviderOccupancy);
+  if (resident && ctas && occupancy) {
+    auto capabilities =
+        kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
+    if (!capabilities || capabilities.getComputeUnits() <= 0)
+      return kernel.emitError("cuTile resident binding requires a positive compute-unit count"),
+             failure();
+    Builder builder(kernel.getContext());
+    auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
+                          Attribute symbol, ArrayRef<Attribute> operands) {
+      return gpu::PhysicalExprAttr::get(kernel.getContext(), kind, value,
+                                       symbol, builder.getArrayAttr(operands));
+    };
+    auto parameter = [&](gpu::ParameterAttr declaration) {
+      return expression(gpu::PhysicalExprKind::Parameter, 0,
+                        declaration.getReference(), {});
+    };
+    auto computeUnits = expression(gpu::PhysicalExprKind::Constant,
+        capabilities.getComputeUnits(), builder.getStringAttr(""), {});
+    auto clusters = expression(gpu::PhysicalExprKind::FloorDiv, 0,
+        builder.getStringAttr(""), {computeUnits, parameter(ctas)});
+    auto capacity = expression(gpu::PhysicalExprKind::Multiply, 0,
+        builder.getStringAttr(""), {clusters, parameter(occupancy)});
+    requirements.push_back(gpu::ConfigurationRequirementAttr::get(
+        kernel.getContext(), gpu::ConfigurationRequirementKind::Legality,
+        gpu::ConfigurationRequirementMetric::ResidentWorkers,
+        gpu::ConfigurationRequirementPredicate::Equal, parameter(resident),
+        capacity, gpu::ParameterRefAttr(),
+        builder.getStringAttr("cuTile resident workers must match the CTA and occupancy binding")));
+  }
+  return requirements;
+}
+
+} // namespace
+
 const gpu::TuningProfileSchema &tuningProfileSchema() {
   static const StringRef columns[] = {"value"};
   static const gpu::TuningProfileSchema schema{"cutile", columns};
@@ -185,14 +237,36 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   }
   if (encoded.empty())
     return kernel.emitError("cuTile legalization produced no provider config");
-  return gpu::writeConfigurations(kernel, encoded, gpu::ConfigurationStage::Complete);
+  auto requirements = collectConfigurationRequirements(kernel);
+  if (failed(requirements))
+    return failure();
+  auto accepted = gpu::filterConfigurationRequirements(kernel, encoded, *requirements);
+  if (failed(accepted))
+    return failure();
+  return gpu::writeConfigurations(kernel, *accepted,
+                                 gpu::ConfigurationStage::Complete, *requirements);
+}
+
+LogicalResult finalizeConfigurationRequirements(func::FuncOp kernel) {
+  auto parameters = gpu::ParameterSpace::read(kernel);
+  if (failed(parameters))
+    return failure();
+  auto rows = parameters->configurations(gpu::ConfigurationStage::Complete);
+  auto requirements = collectConfigurationRequirements(kernel);
+  if (failed(rows) || failed(requirements))
+    return failure();
+  auto accepted = gpu::filterConfigurationRequirements(kernel, *rows, *requirements);
+  if (failed(accepted))
+    return failure();
+  return gpu::writeConfigurations(kernel, *accepted,
+                                 gpu::ConfigurationStage::Complete, *requirements);
 }
 
 LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
-  auto space = gpu::ParameterSpace::read(kernel);
-  if (failed(space))
+  auto requirements = collectConfigurationRequirements(kernel);
+  if (failed(requirements))
     return failure();
-  return success(succeeded(space->configurations(gpu::ConfigurationStage::Complete)));
+  return gpu::verifyConfigurationRequirements(kernel, *requirements);
 }
 
 } // namespace intent::cutile

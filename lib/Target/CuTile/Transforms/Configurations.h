@@ -25,6 +25,7 @@ mlir::FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
     llvm::StringRef family, llvm::StringRef name, gpu::ParameterRole role,
     bool (*isLegal)(int64_t));
 mlir::LogicalResult materializeClosedConfigs(mlir::func::FuncOp kernel);
+mlir::LogicalResult finalizeConfigurationRequirements(mlir::func::FuncOp kernel);
 mlir::LogicalResult verifyClosedConfigs(mlir::func::FuncOp kernel);
 } // namespace intent::cutile
 #endif

@@ -222,17 +222,30 @@ def IntentGPU_ConfigurationRequirementKind : IntentGPU_I32Enum<
 def IntentGPU_ConfigurationRequirementMetric : IntentGPU_I32Enum<
     "ConfigurationRequirementMetric", "Units of a structural candidate requirement", [
       I32EnumAttrCase<"FragmentElements", 0, "fragment_elements">,
-      I32EnumAttrCase<"FragmentRegisterWords", 1, "fragment_register_words">
+      I32EnumAttrCase<"FragmentRegisterWords", 1, "fragment_register_words">,
+      I32EnumAttrCase<"FragmentBytes", 2, "fragment_bytes">,
+      I32EnumAttrCase<"ResidentWorkers", 3, "resident_workers">
+    ]>;
+
+def IntentGPU_ConfigurationRequirementPredicate : IntentGPU_I32Enum<
+    "ConfigurationRequirementPredicate", "A finite candidate quantity test", [
+      I32EnumAttrCase<"LessEqual", 0, "less_equal">,
+      I32EnumAttrCase<"Positive", 1, "positive">,
+      I32EnumAttrCase<"PowerOfTwo", 2, "power_of_two">,
+      I32EnumAttrCase<"MultipleOf", 3, "multiple_of">,
+      I32EnumAttrCase<"Equal", 4, "equal">
     ]>;
 
 def IntentGPU_ConfigurationRequirementAttr : AttrDef<IntentGPU_Dialect, "ConfigurationRequirement"> {
   let mnemonic = "configuration_requirement";
-  let summary = "An explicit usage <= limit condition on candidate bindings";
+  let summary = "An explicit predicate on candidate quantities with an optional boolean activation";
   let parameters = (ins
     EnumParameter<IntentGPU_ConfigurationRequirementKind>:$kind,
     EnumParameter<IntentGPU_ConfigurationRequirementMetric>:$metric,
+    EnumParameter<IntentGPU_ConfigurationRequirementPredicate>:$predicate,
     "::intent::gpu::PhysicalExprAttr":$usage,
-    "::intent::gpu::PhysicalExprAttr":$limit,
+    OptionalParameter<"::intent::gpu::PhysicalExprAttr">:$limit,
+    OptionalParameter<"::intent::gpu::ParameterRefAttr">:$activation,
     "::mlir::StringAttr":$message
   );
   let assemblyFormat = "`<` struct(params) `>`";

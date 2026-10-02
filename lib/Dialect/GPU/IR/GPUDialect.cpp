@@ -542,13 +542,32 @@ LogicalResult TuningProfilesAttr::verify(
 LogicalResult ConfigurationRequirementAttr::verify(
     function_ref<InFlightDiagnostic()> emitError,
     ConfigurationRequirementKind kind, ConfigurationRequirementMetric metric,
-    PhysicalExprAttr usage, PhysicalExprAttr limit, StringAttr message) {
+    ConfigurationRequirementPredicate predicate, PhysicalExprAttr usage,
+    PhysicalExprAttr limit, ParameterRefAttr activation, StringAttr message) {
   if ((kind != ConfigurationRequirementKind::Legality &&
        kind != ConfigurationRequirementKind::NominalBudget) ||
       (metric != ConfigurationRequirementMetric::FragmentElements &&
-       metric != ConfigurationRequirementMetric::FragmentRegisterWords) ||
-      !usage || !limit || !message || message.empty())
-    return emitError() << "configuration requirement needs a kind, metric, expressions and diagnostic message";
+       metric != ConfigurationRequirementMetric::FragmentRegisterWords &&
+       metric != ConfigurationRequirementMetric::FragmentBytes &&
+       metric != ConfigurationRequirementMetric::ResidentWorkers) ||
+      !symbolizeConfigurationRequirementPredicate(
+          static_cast<uint32_t>(predicate)) ||
+      !usage || !message || message.empty())
+    return emitError()
+           << "configuration requirement needs a kind, metric, predicate, "
+              "quantity and diagnostic message";
+  const bool binary = predicate == ConfigurationRequirementPredicate::LessEqual ||
+                      predicate == ConfigurationRequirementPredicate::MultipleOf ||
+                      predicate == ConfigurationRequirementPredicate::Equal;
+  if (binary != static_cast<bool>(limit))
+    return emitError()
+           << "only less-equal, multiple-of and equal requirements take a limit";
+  if (kind == ConfigurationRequirementKind::NominalBudget &&
+      predicate != ConfigurationRequirementPredicate::LessEqual)
+    return emitError() << "nominal budgets require a less-equal quantity test";
+  if (activation &&
+      failed(ParameterRefAttr::verify(emitError, activation.getName())))
+    return failure();
   bool valid = true;
   AttrTypeWalker walker;
   walker.addWalk([&](PhysicalExprAttr expression) {
@@ -562,7 +581,7 @@ LogicalResult ConfigurationRequirementAttr::verify(
     }
   });
   walker.walk(usage);
-  walker.walk(limit);
+  if (limit) walker.walk(limit);
   return success(valid);
 }
 
@@ -589,9 +608,11 @@ LogicalResult ConfigurationSetAttr::verify(
     auto requirement = mlir::dyn_cast<ConfigurationRequirementAttr>(attribute);
     if (!requirement || !unique.insert(attribute).second)
       return emitError() << "configuration requirements must be distinct typed constraints";
-    if (failed(ConfigurationRequirementAttr::verify(emitError,
-          requirement.getKind(), requirement.getMetric(), requirement.getUsage(),
-          requirement.getLimit(), requirement.getMessage())))
+    if (failed(ConfigurationRequirementAttr::verify(
+            emitError, requirement.getKind(), requirement.getMetric(),
+            requirement.getPredicate(), requirement.getUsage(),
+            requirement.getLimit(), requirement.getActivation(),
+            requirement.getMessage())))
       return failure();
   }
   return success();

@@ -1,4 +1,5 @@
 #include "Legalization.h"
+#include "ConfigurationRequirements.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"

@@ -27,15 +27,18 @@ std::optional<int64_t> minimumFragmentRegisterFootprint(
 // A structural estimate, not a machine-register allocation or occupancy model.
 // The provider still owns layout reuse, scheduling, spills and final legality.
 enum class FootprintBound { Unknown, Within, Exceeds, Invalid };
+enum class RequirementStatus { Unknown, Satisfied, Violated, Invalid, Inactive };
 struct RequirementEvaluation {
-  FootprintBound bound;
+  RequirementStatus status;
   std::optional<int64_t> usage;
   std::optional<int64_t> limit;
 };
 
 RequirementEvaluation evaluateConfigurationRequirement(
     ConfigurationRequirementAttr requirement,
-    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf);
+    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf,
+    llvm::function_ref<std::optional<int64_t>(ParameterRefAttr)>
+        resolveActivation = {});
 RequirementEvaluation evaluateConfigurationRequirement(
     ConfigurationRequirementAttr requirement, mlir::DictionaryAttr bindings);
 // Unknown includes expressions the checked evaluator cannot establish (missing

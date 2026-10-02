@@ -1,3 +1,5 @@
+from contextvars import copy_context
+
 from ..artifact import CompiledArtifact
 from ..gpu.expressions import evaluate_shape
 from ..gpu.program import LaunchResult, materialize_gpu_program
@@ -96,6 +98,9 @@ class TritonProgram:
         self._config_rows = {id(config): row for config, row in
                              zip(configs, self.configurations.rows, strict=True)}
         kernel = namespace[facts.kernel]
+        # Native JIT invocation also covers the autotuner's one-config and
+        # cached-winner paths, which do not call early_config_prune.
+        kernel.add_pre_run_hook(self._validate_native_configuration)
         if self.descriptors:
             kernel = triton.heuristics({entry.name: self._descriptor_hook(entry)
                                         for entry in self.descriptors})(kernel)
@@ -151,40 +156,29 @@ class TritonProgram:
                 and all(tensor.stride(axis) * tensor.element_size() % alignment == 0
                         for axis in entry.aligned_stride_axes))
 
-    @staticmethod
-    def _block_legal(entry, values, stages) -> bool:
-        from math import prod
-
-        shape = evaluate_shape(entry.block_shape, values)
-        if any(extent <= 0 or (entry.require_power_of_two_block_shape and extent & (extent - 1))
-               for extent in shape):
-            return False
-        elements = prod(shape)
-        size = values[entry.base].element_size()
-        return (elements <= entry.maximum_block_elements
-                and shape[-1] * size >= entry.minimum_contiguous_bytes
-                and (stages <= 1 or elements * size % entry.pipeline_block_alignment == 0))
-
-    def _prune(self, configs, named_args, **kwargs):
-        invocation_values = self._context({**named_args, **kwargs})
-        retained = []
-        for config in configs:
-            values = {**invocation_values, **self._config_rows[id(config)]}
-            choice = self.facts.descriptor_choice
-            if choice is not None and values[choice.config]:
-                if not values[choice.eligibility] or not all(
-                    self._block_legal(entry, values, config.num_stages) for entry in self.descriptors
-                ):
-                    continue
-            if self.configurations.within_resources(values):
-                retained.append(config)
+    def _eligible_rows(self, values, rows=None):
+        retained = self.configurations.candidates(values, rows=rows)
+        choice = self.facts.descriptor_choice
+        if choice is not None and not values[choice.eligibility]:
+            retained = tuple(row for row in retained if not row[choice.config])
         if not retained:
-            self.configurations.candidates(invocation_values)
             raise CompilationStageError(
                 "provider_eligibility",
-                "No Triton configuration satisfies the declared descriptor alignment and block-shape requirements",
+                "No Triton configuration satisfies the declared descriptor view alignment, shape and stride requirements",
             )
         return retained
+
+    def _prune(self, configs, named_args, **kwargs):
+        values = self._context({**named_args, **kwargs})
+        rows = tuple(self._config_rows[id(config)] for config in configs)
+        retained = self._eligible_rows(values, rows)
+        return [config for config, row in zip(configs, rows, strict=True) if row in retained]
+
+    def _validate_native_configuration(self, *arguments, **keywords):
+        named = dict(zip(self.facts.kernel_arguments, arguments, strict=True))
+        named.update(keywords)
+        row = self._trial_configuration(named)
+        self._eligible_rows(self._context(named), (row,))
 
     def launch(self, invocation) -> LaunchResult:
         import triton
@@ -210,15 +204,21 @@ class TritonProgram:
         def grid(config):
             return evaluate_shape(self.interface.grid, {**values, **config})
 
+        def execute():
+            if self.facts.allocator:
+                triton.set_allocator(_descriptor_allocator)
+            with self.hooks:
+                return self.kernel[grid](*arguments, **coverage,
+                                         enable_fp_fusion=True, enable_reflect_ftz=False)
+
         def invoke():
             previous = self.hooks.observe_trial
             self.hooks.observe_trial = trial
             try:
-                if self.facts.allocator:
-                    triton.set_allocator(_descriptor_allocator)
-                with self.hooks:
-                    return self.kernel[grid](*arguments, **coverage,
-                                             enable_fp_fusion=True, enable_reflect_ftz=False)
+                # Triton's public allocator setter binds a ContextVar. Keep the
+                # descriptor's allocator local to this invocation, including
+                # its native JIT/tuning, without replacing the caller's binding.
+                return copy_context().run(execute) if self.facts.allocator else execute()
             except CompilationStageError:
                 raise
             except Exception as error:
@@ -230,12 +230,9 @@ class TritonProgram:
                 self.hooks.observe_trial = previous
 
         compiled = invoke()
-        # Triton's disk winner cache reconstructs Config objects. The selected
-        # binding, not Python object identity, must match the declared IR rows.
+        # The native pre-run hook has checked this complete binding before
+        # execution, including winners reconstructed by Triton's disk cache.
         config = self._trial_configuration(self.kernel.best_config.all_kwargs())
-        if config not in self.configurations.rows:
-            raise CompilationStageError("provider_configuration",
-                                        "Triton selected a configuration absent from the generated program")
         history = recorder.snapshot()
         recorder.record(config, "selected", "provider_invocation")
         details = observation("triton", self.target, invocation, config, _native_resources(compiled),
@@ -244,7 +241,11 @@ class TritonProgram:
         return LaunchResult(invoke, compiled, details)
 
     def tuning_configurations(self, invocation):
-        return self.configurations.enumerate(invocation.values, self.configurations.rows)
+        values = dict(invocation.values)
+        choice = self.facts.descriptor_choice
+        if choice is not None:
+            values[choice.eligibility] = all(self._eligible(entry, values) for entry in self.descriptors)
+        return self.configurations.enumerate(values, self._eligible_rows(values))
 
 def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
     asm = getattr(compiled_kernel, "asm", None)

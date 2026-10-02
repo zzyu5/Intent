@@ -1,30 +1,15 @@
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
 #include "Configurations.h"
 #include "ConfigurationFacts.h"
+#include "ConfigurationRequirements.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
-#include "Intent/Target/Triton/IR/Configuration.h"
-#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
-#include "Intent/Dialect/GPU/IR/GPUOps.h"
-#include "Intent/Dialect/GPU/IR/GPUTypes.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/Passes.h"
-#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Resources.h"
-#include "Intent/Target/Triton/IR/TritonOps.h"
+#include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/StringSet.h"
-
-#include <algorithm>
-#include <functional>
-#include <limits>
+#include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 namespace intent::triton {
@@ -130,197 +115,6 @@ std::optional<int64_t> descriptorElementBytes(Type type) {
   return bitWidth / 8;
 }
 
-bool fragmentHasValidExtents(gpu::FragmentType fragment, DictionaryAttr config) {
-  return llvm::all_of(fragment.getShape(), [&](Attribute attribute) {
-    auto extent = evaluateCompileTimeExpression(cast<gpu::PhysicalExprAttr>(attribute), config);
-    return !extent || *extent > 0;
-  });
-}
-
-SmallVector<gpu::FragmentType> collectiveFragments(func::FuncOp kernel) {
-  SmallVector<gpu::FragmentType> fragments;
-  kernel.walk([&](Operation *operation) {
-    auto collect = [&](Value value) {
-      if (auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
-          fragment && !llvm::is_contained(fragments, fragment))
-        fragments.push_back(fragment);
-    };
-    if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp>(operation)) {
-      for (Value result : operation->getResults())
-        collect(result);
-      return;
-    }
-    auto store = dyn_cast<gpu::StoreOp>(operation);
-    bool workspaceStore = store && isa<gpu::BufferType>(store.getResource().getType());
-    if (store)
-      if (auto argument = dyn_cast<BlockArgument>(store.getResource());
-          argument && argument.getOwner() == &kernel.front()) {
-        auto binding = gpu::getArgumentBinding(argument);
-        workspaceStore |= binding && binding.getKind() == gpu::ArgumentKind::Workspace;
-      }
-    if (!isa<gpu::ReduceOp, gpu::ScanOp, ReduceOp, ScanOp>(operation) &&
-        !workspaceStore)
-      return;
-    if (workspaceStore)
-      collect(store.getValue());
-    else
-      for (Value operand : operation->getOperands())
-        collect(operand);
-  });
-  return fragments;
-}
-
-FailureOr<SmallVector<gpu::ConfigurationRequirementAttr>>
-collectTritonRequirements(func::FuncOp kernel,
-                         const gpu::FragmentResourceAnalysis &resources) {
-  Builder attributes(kernel.getContext());
-  gpu::ParameterAttr warpParameter;
-  auto parameters = gpu::ParameterSpace::read(kernel);
-  if (failed(parameters)) return failure();
-  for (gpu::ParameterAttr schema : parameters->extentDeclarations())
-    if (schema.getRole() ==
-        gpu::ParameterRole::ProviderWarps)
-      warpParameter = schema;
-  SmallVector<ValueRange> reductionSources;
-  kernel.walk([&](Operation *operation) {
-    if (auto reduce = dyn_cast<gpu::ReduceOp>(operation))
-      reductionSources.push_back(reduce.getSources());
-    else if (auto reduce = dyn_cast<ReduceOp>(operation))
-      reductionSources.push_back(reduce.getSources());
-  });
-  auto requirements = gpu::collectReductionRequirements(kernel, reductionSources,
-      gpu::ReductionRequirementScope::AllCandidates);
-  auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
-                        ArrayRef<Attribute> operands) {
-    return gpu::PhysicalExprAttr::get(kernel.getContext(), kind, value,
-        attributes.getStringAttr(""), attributes.getArrayAttr(operands));
-  };
-  auto constant = [&](int64_t value) {
-    return expression(gpu::PhysicalExprKind::Constant, value, {});
-  };
-  auto append = [&](gpu::ConfigurationRequirementKind kind,
-                    gpu::ConfigurationRequirementMetric metric,
-                    gpu::PhysicalExprAttr usage, gpu::PhysicalExprAttr limit,
-                    StringRef message) {
-    auto requirement = gpu::ConfigurationRequirementAttr::get(kernel.getContext(),
-        kind, metric, usage, limit, attributes.getStringAttr(message));
-    if (!llvm::is_contained(requirements, requirement)) requirements.push_back(requirement);
-  };
-  for (gpu::FragmentType fragment : resources.valueTypes()) {
-    auto elements = gpu::fragmentElementCount(fragment);
-    if (!isTritonFragmentExtent(elements))
-      return kernel.emitError("Triton tensor bounds require constexpr fragment extents"), failure();
-    append(gpu::ConfigurationRequirementKind::Legality,
-        gpu::ConfigurationRequirementMetric::FragmentElements,
-        elements, constant(maxTritonTensorElements),
-        "Triton block tensor exceeds the maximum element count");
-  }
-  auto capabilities =
-      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  if (capabilities && capabilities.getRegistersPerUnit() > 0) {
-    if (warpParameter && warpParameter.getCandidates().size() > 1) {
-      auto warps = gpu::PhysicalExprAttr::get(
-          kernel.getContext(),
-          gpu::PhysicalExprKind::Parameter, 0,
-          warpParameter.getReference(), attributes.getArrayAttr({}));
-      int64_t maximumWarps =
-          *llvm::max_element(warpParameter.getCandidates().asArrayRef());
-      auto belowMaximum = expression(gpu::PhysicalExprKind::Subtract, 0,
-                                     {warps, constant(maximumWarps)});
-      auto nominalBudget = expression(gpu::PhysicalExprKind::Multiply, 0,
-                                      {warps, constant(32 * 255)});
-      // This is the existing per-fragment policy, not a proof of register
-      // allocation. The widest supplied option may spill.
-      auto budget = expression(gpu::PhysicalExprKind::Select, 0,
-                               {belowMaximum, nominalBudget,
-                                constant(std::numeric_limits<int64_t>::max())});
-      for (gpu::FragmentType fragment : collectiveFragments(kernel)) {
-        auto footprint = gpu::fragmentRegisterFootprint(fragment);
-        append(gpu::ConfigurationRequirementKind::NominalBudget,
-            gpu::ConfigurationRequirementMetric::FragmentRegisterWords,
-            footprint, budget,
-            "Triton collective fragment exceeds the nominal per-thread register budget");
-      }
-    }
-  }
-  return requirements;
-}
-
-LogicalResult finalizeConfigurationRequirements(func::FuncOp kernel) {
-  auto space = gpu::ParameterSpace::read(kernel);
-  if (failed(space)) return failure();
-  auto rows = space->configurations(gpu::ConfigurationStage::Complete);
-  const gpu::FragmentResourceAnalysis resources(kernel);
-  auto requirements = collectTritonRequirements(kernel, resources);
-  if (failed(rows) || failed(requirements)) return failure();
-  auto accepted = gpu::filterConfigurationRequirements(kernel, *rows, *requirements);
-  if (failed(accepted)) return failure();
-  return gpu::writeConfigurations(kernel, *accepted, gpu::ConfigurationStage::Complete, *requirements);
-}
-
-bool descriptorFragmentFits(gpu::FragmentType fragment,
-                            DictionaryAttr config, int64_t stages,
-                            int64_t pipelineBlockAlignment,
-                            const llvm::StringMap<SmallVector<int64_t>>
-                                &parameterDomains,
-                            const llvm::StringSet<> &coverageParameters) {
-  std::optional<int64_t> elementBytes =
-      descriptorElementBytes(fragment.getElementType());
-  if (!elementBytes)
-    return false;
-  __int128 elements = 1;
-  __int128 concreteElements = 1;
-  bool concrete = true;
-  int64_t minimumLastExtent = std::numeric_limits<int64_t>::max();
-  bool runtimeGuardsLastExtent = false;
-  bool runtimeGuardsElementCount = false;
-  for (auto [axis, extent] : llvm::enumerate(fragment.getShape())) {
-    auto expression = cast<gpu::PhysicalExprAttr>(extent);
-    SmallVector<int64_t> values;
-    if (std::optional<int64_t> value =
-            evaluateCompileTimeExpression(expression, config)) {
-      values.push_back(*value);
-      concreteElements *= *value;
-    } else if (expression.getKind() ==
-               gpu::PhysicalExprKind::Parameter) {
-      auto domain = parameterDomains.find(expression.getParameterReference().getName().getValue());
-      if (domain == parameterDomains.end())
-        return false;
-      concrete = false;
-      values.append(domain->second.begin(), domain->second.end());
-      if (axis + 1 == fragment.getShape().size())
-        runtimeGuardsLastExtent =
-            coverageParameters.contains(expression.getParameterReference().getName().getValue());
-      runtimeGuardsElementCount |=
-          coverageParameters.contains(expression.getParameterReference().getName().getValue());
-    } else {
-      return false;
-    }
-    int64_t maximum = 0;
-    int64_t minimum = std::numeric_limits<int64_t>::max();
-    for (int64_t value : values) {
-      if (value <= 0 || !llvm::isPowerOf2_64(value))
-        return false;
-      maximum = std::max(maximum, value);
-      minimum = std::min(minimum, value);
-    }
-    elements *= maximum;
-    if (axis + 1 == fragment.getShape().size())
-      minimumLastExtent = minimum;
-    if (elements > maxTritonTensorElements && !runtimeGuardsElementCount)
-      return false;
-  }
-  // Triton's canPipelineTMALoad requires each shared stage to begin at a
-  // 128-byte boundary. Small legal descriptor tiles can otherwise produce a
-  // misaligned second buffer in a multistage pipeline.
-  if (stages > 1 && concrete &&
-      (concreteElements * *elementBytes) % pipelineBlockAlignment != 0)
-    return false;
-  return minimumLastExtent != std::numeric_limits<int64_t>::max() &&
-         (runtimeGuardsLastExtent ||
-          minimumLastExtent * *elementBytes >= 16);
-}
-
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
                                       TensorDescriptorChoiceOp descriptorChoice,
                                       ArrayRef<TritonLocalOptions> localOptions) {
@@ -332,14 +126,6 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
   auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared))
     return failure();
-  llvm::StringMap<SmallVector<int64_t>> parameterDomains;
-  llvm::StringSet<> coverageParameters;
-  for (gpu::ParameterAttr domain : space->extentDeclarations()) {
-    parameterDomains[domain.getName().getValue()] =
-        SmallVector<int64_t>(domain.getCandidates().asArrayRef());
-    if (domain.isDeferred())
-      coverageParameters.insert(domain.getName().getValue());
-  }
   auto warps = space->find(gpu::ParameterRole::ProviderWarps);
   auto stages = space->find(gpu::ParameterRole::ProviderStages);
   auto ctas = space->find(gpu::ParameterRole::ProviderCTAs);
@@ -363,65 +149,9 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
     }
   }
 
-  const gpu::FragmentResourceAnalysis resources(kernel);
-  SmallVector<gpu::PhysicalExprAttr> rangeExtents;
-  struct DescriptorConstraint {
-    gpu::FragmentType fragment;
-    uint64_t alignment;
-  };
-  SmallVector<DescriptorConstraint> descriptors;
-  bool validRanges = true;
-  kernel.walk([&](Operation *operation) {
-    if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
-      auto fragment = dyn_cast<gpu::FragmentType>(range.getResult().getType());
-      if (!fragment || fragment.getShape().size() != 1)
-        validRanges = false;
-      else {
-        auto extent = cast<gpu::PhysicalExprAttr>(fragment.getShape()[0]);
-        if (!llvm::is_contained(rangeExtents, extent))
-          rangeExtents.push_back(extent);
-      }
-    }
-    auto descriptorConstraint = [&](Value descriptor, gpu::FragmentType fragment) {
-      descriptors.push_back({fragment, descriptor.getDefiningOp<TensorDescriptorOp>()
-                                          .getPipelineBlockAlignment()});
-    };
-    if (auto load = dyn_cast<DescriptorLoadOp>(operation))
-      descriptorConstraint(load.getDescriptor(), load.getResult().getType());
-    else if (auto store = dyn_cast<DescriptorStoreOp>(operation))
-      descriptorConstraint(store.getDescriptor(), store.getValue().getType());
-  });
-  if (!validRanges)
-    return kernel.emitError("Triton ranges require one-dimensional fragments");
-  SmallVector<DictionaryAttr> accepted;
-  for (DictionaryAttr config : configs) {
-    int64_t configWarps = config.getAs<IntegerAttr>(schema->warps).getInt();
-    int64_t configStages = config.getAs<IntegerAttr>(schema->stages).getInt();
-    int64_t configCTAs = config.getAs<IntegerAttr>(schema->ctas).getInt();
-    if (configWarps <= 0 || configStages <= 0 || configCTAs <= 0)
-      return kernel.emitError("Triton provider parameter domains are incomplete");
-    if (llvm::any_of(rangeExtents, [&](gpu::PhysicalExprAttr expression) {
-          auto extent = evaluateCompileTimeExpression(expression, config);
-          return extent && (*extent <= 0 || !llvm::isPowerOf2_64(*extent));
-        }) || llvm::any_of(resources.valueTypes(), [&](gpu::FragmentType fragment) {
-          return !fragmentHasValidExtents(fragment, config);
-        }))
-      continue;
-    bool descriptorConfig = descriptorChoice &&
-        config.getAs<IntegerAttr>(descriptorChoice.getConfigParameter().getName()).getInt() != 0;
-    if (descriptorConfig && llvm::any_of(descriptors, [&](const auto &constraint) {
-          return !descriptorFragmentFits(constraint.fragment, config, configStages,
-              constraint.alignment, parameterDomains, coverageParameters);
-        }))
-      continue;
-    accepted.push_back(config);
-  }
-  if (accepted.empty())
-    return kernel.emitError(
-        "all Triton parameter candidates violate typed range, fragment or descriptor legality");
-  auto requirements = collectTritonRequirements(kernel, resources);
+  auto requirements = collectConfigurationRequirements(kernel);
   if (failed(requirements)) return failure();
-  auto filtered = gpu::filterConfigurationRequirements(kernel, accepted, *requirements);
+  auto filtered = gpu::filterConfigurationRequirements(kernel, configs, *requirements);
   if (failed(filtered)) return failure();
   return gpu::writeConfigurations(kernel, *filtered, gpu::ConfigurationStage::Complete, *requirements);
 }

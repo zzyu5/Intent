@@ -26,6 +26,5 @@ mlir::FailureOr<llvm::SmallVector<TritonLocalOptions>> declareProviderOptions(
 mlir::LogicalResult materializeLegalConfigs(
     mlir::func::FuncOp kernel, TensorDescriptorChoiceOp descriptorChoice,
     llvm::ArrayRef<TritonLocalOptions> localOptions);
-mlir::LogicalResult finalizeConfigurationRequirements(mlir::func::FuncOp kernel);
 } // namespace intent::triton
 #endif

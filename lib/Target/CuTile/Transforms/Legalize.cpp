@@ -15,7 +15,6 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Transforms/Resources.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -689,19 +688,7 @@ LogicalResult finalizeProgram(ModuleOp module) {
     for (auto [argument, shape] : *bounds)
       kernel->setArgAttr(argument.getArgNumber(), arrayIndexTileBoundsAttr, shape);
   }
-  SmallVector<ValueRange> reductionSources;
-  kernel->walk([&](ReduceOp reduce) {
-    reductionSources.push_back(reduce.getSources());
-  });
-  auto requirements = gpu::collectReductionRequirements(*kernel, reductionSources,
-      gpu::ReductionRequirementScope::InvocationDependent);
-  auto parameters = gpu::ParameterSpace::read(*kernel);
-  if (failed(parameters)) return failure();
-  auto configurations = parameters->configurations(gpu::ConfigurationStage::Complete);
-  if (failed(configurations)) return failure();
-  auto accepted = gpu::filterConfigurationRequirements(*kernel, *configurations, requirements);
-  if (failed(accepted) || failed(gpu::writeConfigurations(*kernel, *accepted,
-          gpu::ConfigurationStage::Complete, requirements)))
+  if (failed(finalizeConfigurationRequirements(*kernel)))
     return failure();
   if (failed(verifyCuTileProgram(module)))
     return failure();

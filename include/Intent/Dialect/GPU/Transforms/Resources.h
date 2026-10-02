@@ -18,6 +18,12 @@ mlir::FailureOr<llvm::SmallVector<mlir::DictionaryAttr>> filterConfigurationRequ
     mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::DictionaryAttr> rows,
     llvm::ArrayRef<ConfigurationRequirementAttr> requirements);
 
+// Verify the final current-IR condition set and rows without changing either.
+// Conditions have set semantics; candidate row order remains significant.
+mlir::LogicalResult verifyConfigurationRequirements(
+    mlir::func::FuncOp kernel,
+    llvm::ArrayRef<ConfigurationRequirementAttr> expected);
+
 } // namespace intent::gpu
 
 #endif

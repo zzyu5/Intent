@@ -143,7 +143,7 @@ class GPUInterface:
         self.overlaps = tuple(overlaps)
         require_references(self.grid, self)
         for requirement in self.configuration_space.requirements:
-            require_references((requirement.usage, requirement.limit), self)
+            require_references(requirement.expressions, self)
         self._binders = build_invocation_binders(
             self.public, observe_view=self._observe_view, allocate_output=self._allocate_output)
         self._abstract_binders = build_invocation_binders(

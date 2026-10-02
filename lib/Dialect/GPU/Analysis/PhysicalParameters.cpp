@@ -109,9 +109,19 @@ LogicalResult ParameterSpace::verifyRequirements(
       return kernel->emitError("configuration requirement cannot be null");
     if (failed(ConfigurationRequirementAttr::verify(
             [&] { return kernel->emitError("invalid configuration requirement: "); },
-            requirement.getKind(), requirement.getMetric(), requirement.getUsage(),
-            requirement.getLimit(), requirement.getMessage())))
+            requirement.getKind(), requirement.getMetric(),
+            requirement.getPredicate(), requirement.getUsage(),
+            requirement.getLimit(), requirement.getActivation(),
+            requirement.getMessage())))
       return failure();
+    if (ParameterRefAttr activation = requirement.getActivation()) {
+      auto parameter = lookup(activation);
+      if (!parameter || !parameter.getValueType().isSignlessInteger(1) ||
+          parameter.getPhase() != ConfigurationBindingPhase::Provider)
+        return kernel->emitError(
+                   "configuration activation requires a declared provider boolean: ")
+               << activation;
+    }
     walker.walk(requirement);
     if (!valid) return failure();
   }

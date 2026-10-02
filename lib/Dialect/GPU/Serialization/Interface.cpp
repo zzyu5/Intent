@@ -123,6 +123,7 @@ FailureOr<llvm::json::Object> serializeInterface(
     PhysicalParameterBinding binding = queryParameterBinding(declaration);
     llvm::json::Object entry{
         {"name", declaration.getName().getValue()},
+        {"value_type", scalarABIName(declaration.getValueType())},
         {"role", static_cast<uint32_t>(declaration.getRole())},
         {"category", static_cast<uint32_t>(declaration.getCategory())},
         {"element_bits", declaration.getElementBitWidth()},
@@ -184,8 +185,14 @@ FailureOr<llvm::json::Object> serializeInterface(
     requirements.push_back(llvm::json::Object{
         {"kind", stringifyConfigurationRequirementKind(requirement.getKind())},
         {"metric", stringifyConfigurationRequirementMetric(requirement.getMetric())},
+        {"predicate", stringifyConfigurationRequirementPredicate(requirement.getPredicate())},
         {"usage", serializeExpression(requirement.getUsage())},
-        {"limit", serializeExpression(requirement.getLimit())},
+        {"limit", requirement.getLimit()
+                      ? serializeExpression(requirement.getLimit())
+                      : llvm::json::Value(nullptr)},
+        {"activation", requirement.getActivation()
+                           ? llvm::json::Value(requirement.getActivation().getName().getValue())
+                           : llvm::json::Value(nullptr)},
         {"message", requirement.getMessage().getValue()}});
   auto configs = configurations(*configurationSpace);
   if (failed(configs))

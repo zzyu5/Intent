@@ -21,10 +21,6 @@ class Descriptor:
     require_positive_strides: bool
     alignment: int
     maximum_shape_extent: int
-    minimum_contiguous_bytes: int
-    require_power_of_two_block_shape: bool
-    maximum_block_elements: int
-    pipeline_block_alignment: int
     padding: str
     aligned_stride_axes: tuple[int, ...]
     unit_stride_axes: tuple[int, ...]
@@ -42,8 +38,7 @@ class Descriptor:
             if len(values) != rank:
                 raise ValueError("descriptor shape and stride recipes must match its rank")
             require_references(values, interface)
-        flags = tuple(entry[field] for field in ("require_positive_shape", "require_positive_strides",
-                                                 "require_power_of_two_block_shape"))
+        flags = tuple(entry[field] for field in ("require_positive_shape", "require_positive_strides"))
         if any(type(flag) is not bool for flag in flags):
             raise TypeError("descriptor requirements must be boolean")
         axes = []
@@ -55,9 +50,6 @@ class Descriptor:
         return cls(name_field(entry["name"], "descriptor name"), entry["base"], rank, *expressions,
                    flags[0], flags[1], integer_field(entry["alignment"], "descriptor alignment", minimum=1),
                    integer_field(entry["maximum_shape_extent"], "maximum descriptor extent", minimum=1),
-                   integer_field(entry["minimum_contiguous_bytes"], "minimum descriptor bytes", minimum=1),
-                   flags[2], integer_field(entry["maximum_block_elements"], "maximum descriptor block", minimum=1),
-                   integer_field(entry["pipeline_block_alignment"], "descriptor pipeline alignment", minimum=1),
                    name_field(entry["padding"], "descriptor padding"), *axes)
 
 

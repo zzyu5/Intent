@@ -1338,10 +1338,6 @@ private:
           {"require_positive_strides", operation.getRequirePositiveStrides()},
           {"alignment", operation.getAlignment()},
           {"maximum_shape_extent", operation.getMaximumShapeExtent()},
-          {"minimum_contiguous_bytes", operation.getMinimumContiguousBytes()},
-          {"require_power_of_two_block_shape", operation.getRequirePowerOfTwoBlockShape()},
-          {"maximum_block_elements", operation.getMaximumBlockElements()},
-          {"pipeline_block_alignment", operation.getPipelineBlockAlignment()},
           {"padding", operation.getPadding()}};
       auto encodeValues = [&](StringRef field, ValueRange values) -> LogicalResult {
         llvm::json::Array expressions;

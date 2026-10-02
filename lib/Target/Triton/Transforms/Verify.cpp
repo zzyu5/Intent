@@ -1,4 +1,5 @@
 #include "Legalization.h"
+#include "ConfigurationRequirements.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
@@ -74,9 +75,7 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
   }
 
   auto schema = ConfigurationSchema::read(kernel);
-  auto configurations = gpu::ParameterSpace::read(kernel);
-  if (failed(schema) || failed(configurations) ||
-      failed(configurations->configurations(gpu::ConfigurationStage::Complete)))
+  if (failed(schema) || failed(verifyConfigurationRequirements(kernel)))
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
