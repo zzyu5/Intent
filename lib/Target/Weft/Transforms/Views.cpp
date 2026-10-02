@@ -1,4 +1,5 @@
 #include "Views.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -24,84 +25,6 @@ bool same(OpFoldResult actual, Value metadata, int64_t fixed) {
   if (auto value = dyn_cast<Value>(actual); value && value == metadata) return true;
   auto integer = constant(actual);
   return integer && !ShapedType::isDynamic(fixed) && *integer == fixed;
-}
-
-// An extent is either a known integer, one scalar SSA value, or one dimension
-// of one current descriptor. A dynamic type marker is never an identity.
-struct SizeIdentity {
-  std::optional<int64_t> fixed;
-  Value value;
-  std::optional<unsigned> axis;
-
-  bool operator==(const SizeIdentity &other) const {
-    return fixed == other.fixed && value == other.value && axis == other.axis;
-  }
-};
-
-SizeIdentity sizeIdentity(OpFoldResult size);
-
-SizeIdentity dimensionIdentity(Value memory, unsigned axis) {
-  auto type = cast<MemRefType>(memory.getType());
-  if (!type.isDynamicDim(axis)) return {type.getDimSize(axis), {}, {}};
-  if (auto cast = memory.getDefiningOp<memref::CastOp>())
-    return dimensionIdentity(cast.getSource(), axis);
-  if (auto subview = memory.getDefiningOp<memref::SubViewOp>()) {
-    unsigned retained = 0;
-    for (unsigned original = 0; original < subview.getSourceType().getRank(); ++original)
-      if (!subview.getDroppedDims().test(original) && retained++ == axis)
-        return sizeIdentity(subview.getMixedSizes()[original]);
-  }
-  if (auto allocation = memory.getDefiningOp<memref::AllocOp>())
-    return sizeIdentity(allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]);
-  if (auto allocation = memory.getDefiningOp<memref::AllocaOp>())
-    return sizeIdentity(allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]);
-  if (auto view = memory.getDefiningOp<memref::ReinterpretCastOp>())
-    return sizeIdentity(view.getMixedSizes()[axis]);
-  if (auto expand = memory.getDefiningOp<memref::ExpandShapeOp>()) {
-    for (auto [source, group] : llvm::enumerate(expand.getReassociationIndices())) {
-      if (!llvm::is_contained(group, axis)) continue;
-      if (llvm::count_if(group, [&](int64_t result) { return type.getDimSize(result) != 1; }) == 1)
-        return dimensionIdentity(expand.getSrc(), source);
-      break;
-    }
-  }
-  if (auto collapse = memory.getDefiningOp<memref::CollapseShapeOp>()) {
-    auto groups = collapse.getReassociationIndices();
-    std::optional<unsigned> active;
-    bool unitProjection = true;
-    for (int64_t source : groups[axis]) {
-      if (collapse.getSrcType().getDimSize(source) == 1) continue;
-      if (active) { unitProjection = false; break; }
-      active = source;
-    }
-    if (unitProjection)
-      return active ? dimensionIdentity(collapse.getSrc(), *active) : SizeIdentity{1, {}, {}};
-  }
-  if (auto argument = dyn_cast<BlockArgument>(memory))
-    if (auto task = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp());
-        task && argument.getArgNumber())
-      return dimensionIdentity(task.getCaptures()[argument.getArgNumber() - 1], axis);
-  return {{}, memory, axis};
-}
-
-SizeIdentity sizeIdentity(OpFoldResult size) {
-  if (auto fixed = constant(size)) return {fixed, {}, {}};
-  Value value = cast<Value>(size);
-  if (auto dimension = value.getDefiningOp<memref::DimOp>())
-    if (auto axis = dimension.getConstantIndex())
-      return dimensionIdentity(dimension.getSource(), *axis);
-  if (auto metadata = value.getDefiningOp<memref::ExtractStridedMetadataOp>())
-    for (auto [axis, extent] : llvm::enumerate(metadata.getSizes()))
-      if (value == extent) return dimensionIdentity(metadata.getSource(), axis);
-  if (auto argument = dyn_cast<BlockArgument>(value))
-    if (auto task = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp());
-        task && argument.getArgNumber())
-      return sizeIdentity(task.getCaptures()[argument.getArgNumber() - 1]);
-  return {{}, value, {}};
-}
-
-bool sameSize(OpFoldResult actual, memref::ExtractStridedMetadataOp metadata, unsigned axis) {
-  return sizeIdentity(actual) == dimensionIdentity(metadata.getSource(), axis);
 }
 
 bool isViewDefinition(Operation *operation) {
@@ -200,7 +123,8 @@ FailureOr<AxisView> queryAxisView(Value value) {
       std::optional<unsigned> match;
       for (unsigned source = 0; source < static_cast<unsigned>(sourceType.getRank()); ++source) {
         if (used[source] || sourceType.getDimSize(source) == 1 ||
-            !sameSize(sizes[axis], metadata, source) ||
+            !cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(sizes[axis]),
+                                  ValueBoundsConstraintSet::Variable(metadata.getSource(), source)) ||
             !same(strides[axis], metadata.getStrides()[source], sourceStrides[source])) continue;
         if (match) return reject();
         match = source;

@@ -12,7 +12,7 @@ add_mlir_library(MLIRIntentCompiler
   ${dialect_libs}
   MLIRIntentKIRToGPU MLIRIntentKIRToCPU MLIRIntentKIRToDSA
   MLIRIntentDSATransforms MLIRIntentBangC
-  MLIRIntentCPUTransforms MLIRIntentMojoTransforms MLIRIntentMojoSerialization
+  MLIRIntentCPUAnalysis MLIRIntentCPUTransforms MLIRIntentMojoTransforms MLIRIntentMojoSerialization
   MLIRIntentGPUTransforms
   MLIRIntentTritonTransforms MLIRIntentTritonSerialization
   MLIRIntentCuTileTransforms MLIRIntentCuTileSerialization

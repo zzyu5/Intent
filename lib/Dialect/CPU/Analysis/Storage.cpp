@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Analysis/AliasAnalysis.h"
@@ -15,18 +16,7 @@ namespace intent::cpu {
 std::optional<int64_t> constantDimensionUpperBound(Value memory, unsigned axis) {
   auto type = dyn_cast<MemRefType>(memory.getType());
   if (!type || axis >= static_cast<unsigned>(type.getRank())) return std::nullopt;
-  auto stop = [](Value value, std::optional<int64_t> dimension, ValueBoundsConstraintSet &) {
-    if (dimension) return false;
-    // Descriptor dimensions and constants are exact size facts. MLIR's affine
-    // models for arbitrary index arithmetic do not prove absence of wrapping;
-    // leave those scalar leaves unconstrained instead of shrinking from them.
-    return !isa_and_nonnull<arith::ConstantOp, memref::DimOp, memref::RankOp>(value.getDefiningOp());
-  };
-  auto bound = ValueBoundsConstraintSet::computeConstantBound(
-      presburger::BoundType::UB, ValueBoundsConstraintSet::Variable(memory, axis), stop,
-      /*closedUB=*/true);
-  if (failed(bound) || *bound < 0) return std::nullopt;
-  return *bound;
+  return constantExtentUpperBound(ValueBoundsConstraintSet::Variable(memory, axis));
 }
 
 bool isStorageAliasOperation(Operation *operation) {

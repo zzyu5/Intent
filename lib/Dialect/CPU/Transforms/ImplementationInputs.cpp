@@ -1,4 +1,5 @@
 #include "ImplementationInputs.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
@@ -16,19 +17,6 @@ namespace {
 bool sameRepresentation(const InputRequirement &first, const InputRequirement &second) {
   return first.elementType == second.elementType && first.panelAxis == second.panelAxis &&
       first.panelSize == second.panelSize && first.alignment == second.alignment && first.reuse == second.reuse;
-}
-
-std::optional<OpFoldResult> dimension(Value source, unsigned axis, Builder &builder) {
-  auto type = cast<MemRefType>(source.getType());
-  if (!type.isDynamicDim(axis)) return builder.getIndexAttr(type.getDimSize(axis));
-  if (auto view = source.getDefiningOp<memref::SubViewOp>()) {
-    auto dropped = view.getDroppedDims();
-    unsigned resultAxis = 0;
-    for (auto [sourceAxis, size] : llvm::enumerate(view.getMixedSizes()))
-      if (!dropped.test(sourceAxis) && resultAxis++ == axis) return size;
-  }
-  if (auto cast = source.getDefiningOp<memref::CastOp>()) return dimension(cast.getSource(), axis, builder);
-  return std::nullopt;
 }
 
 memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
@@ -122,12 +110,10 @@ std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequiremen
   if (!view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
       llvm::any_of(view.getMixedStrides(), [](OpFoldResult stride) { return getConstantIntValue(stride) != 1; }))
     return std::nullopt;
-  Builder builder(source.getContext());
   auto full = [&](unsigned axis) {
-    auto extent = dimension(view.getSource(), axis, builder);
-    auto size = view.getMixedSizes()[axis];
-    return extent && getConstantIntValue(view.getMixedOffsets()[axis]) == 0 &&
-        (*extent == size || (getConstantIntValue(*extent) && getConstantIntValue(*extent) == getConstantIntValue(size)));
+    return getConstantIntValue(view.getMixedOffsets()[axis]) == 0 &&
+        haveEqualExtents(ValueBoundsConstraintSet::Variable(view.getSource(), axis),
+                         ValueBoundsConstraintSet::Variable(view.getMixedSizes()[axis]));
   };
   unsigned axis;
   if (full(1)) axis = 0;

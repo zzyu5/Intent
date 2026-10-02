@@ -1,4 +1,6 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/CPU/IR/ShapeRelations.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -33,27 +35,15 @@ struct CanonicalViewDimension : OpRewritePattern<memref::DimOp> {
     auto argument = dyn_cast<BlockArgument>(operation.getSource());
     auto axis = operation.getConstantIndex();
     if (!argument || !axis) return failure();
-    auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp());
-    if (!function || argument.getOwner() != &function.front()) return failure();
-    auto interface = intent::getPublicInterface(function);
-    if (!interface) return failure();
-    auto view = intent::getPublicView(interface, argument.getArgNumber());
-    if (!view || *axis < 0 || *axis >= intent::publicViewDimensions(view).size()) return failure();
-    int64_t identity = intent::publicViewDimensions(view)[*axis];
-    if (!identity) return failure();
-    // CPU invocation binds every occurrence of a nonzero dimension identity
-    // to the same extent; retain one entry view as its SSA representative.
-    for (auto [number, field] : llvm::enumerate(interface.getArguments())) {
-      auto candidate = intent::getPublicView(interface, number);
-      if (!candidate) continue;
-      for (auto [dimension, value] : llvm::enumerate(intent::publicViewDimensions(candidate).asArrayRef())) {
-        if (value != identity) continue;
-        if (number == argument.getArgNumber() && dimension == static_cast<size_t>(*axis)) return failure();
-        rewriter.replaceOpWithNewOp<memref::DimOp>(operation, function.getArgument(number), dimension);
-        return success();
-      }
+    auto dimension = queryPublicDimension(argument, *axis);
+    if (!dimension) return failure();
+    if (dimension->constant) {
+      rewriter.replaceOpWithNewOp<arith::ConstantIndexOp>(operation, *dimension->constant);
+      return success();
     }
-    return failure();
+    if (dimension->argument == argument && dimension->axis == *axis) return failure();
+    rewriter.replaceOpWithNewOp<memref::DimOp>(operation, dimension->argument, dimension->axis);
+    return success();
   }
 };
 

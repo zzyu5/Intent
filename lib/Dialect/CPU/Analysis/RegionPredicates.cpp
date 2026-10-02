@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -20,17 +21,8 @@ bool fullSubview(memref::SubViewOp view) {
   for (unsigned axis = 0; axis < type.getRank(); ++axis) {
     if (getConstantIntValue(view.getMixedOffsets()[axis]) != 0 ||
         getConstantIntValue(view.getMixedStrides()[axis]) != 1) return false;
-    OpFoldResult size = view.getMixedSizes()[axis];
-    if (!type.isDynamicDim(axis)) {
-      if (getConstantIntValue(size) != type.getDimSize(axis)) return false;
-      continue;
-    }
-    auto extent = dyn_cast<Value>(size);
-    if (!extent) return false;
-    if (auto allocation = view.getSource().getDefiningOp<memref::AllocOp>())
-      if (extent == allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]) continue;
-    auto dimension = extent.getDefiningOp<memref::DimOp>();
-    if (!dimension || dimension.getSource() != view.getSource() || dimension.getConstantIndex() != axis)
+    if (!haveEqualExtents(ValueBoundsConstraintSet::Variable(view.getMixedSizes()[axis]),
+                         ValueBoundsConstraintSet::Variable(view.getSource(), axis)))
       return false;
   }
   return true;

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Utilities.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -15,8 +16,8 @@ namespace intent::cpu {
 namespace {
 
 bool sameExtent(Value first, Value second) {
-  auto constant = getConstantIntValue(first);
-  return first == second || (constant && constant == getConstantIntValue(second));
+  return haveEqualExtents(ValueBoundsConstraintSet::Variable(first),
+                          ValueBoundsConstraintSet::Variable(second));
 }
 
 bool workset(scf::ParallelOp loop) {
@@ -143,29 +144,10 @@ bool fuse(scf::ParallelOp first, scf::ParallelOp second, ArrayRef<Operation *> b
   return true;
 }
 
-std::optional<OpFoldResult> dimension(Value memory, unsigned axis) {
-  auto type = cast<MemRefType>(memory.getType());
-  if (!type.isDynamicDim(axis))
-    return IntegerAttr::get(IndexType::get(memory.getContext()), type.getDimSize(axis));
-  if (auto allocation = memory.getDefiningOp<memref::AllocOp>()) {
-    unsigned number = 0;
-    for (unsigned i = 0; i < axis; ++i) number += type.isDynamicDim(i);
-    return allocation.getDynamicSizes()[number];
-  }
-  if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimension(cast.getSource(), axis);
-  if (auto view = memory.getDefiningOp<memref::SubViewOp>()) {
-    auto dropped = view.getDroppedDims();
-    unsigned result = 0;
-    for (unsigned source = 0; source < dropped.size(); ++source)
-      if (!dropped[source] && result++ == axis) return view.getMixedSizes()[source];
-  }
-  return std::nullopt;
-}
-
 void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
   auto type = allocation.getType();
   if (!type.getRank() || !type.getLayout().isIdentity()) return;
-  auto size = dimension(allocation, 0);
+  auto size = queryExtentValue(allocation, 0);
   if (!size) return;
   if (auto value = dyn_cast<Value>(*size)) {
     if (!sameExtent(value, loop.getUpperBound()[0])) return;
@@ -182,8 +164,10 @@ void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
     for (Operation *user : memory.getUsers()) {
       if (auto dim = dyn_cast<memref::DimOp>(user)) {
         auto axis = getConstantIntValue(dim.getIndex());
-        auto value = axis ? dimension(memory, *axis) : std::nullopt;
+        auto value = axis ? queryExtentValue(memory, *axis) : std::nullopt;
         if (!value) return;
+        if (auto size = dyn_cast<Value>(*value))
+          if (!dominance.dominates(size, dim)) return;
         dimensions.emplace_back(dim, *value);
         continue;
       }

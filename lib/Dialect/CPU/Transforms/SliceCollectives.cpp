@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Utilities.h"
@@ -8,7 +9,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/ADT/STLExtras.h"
 #include <functional>
 
@@ -84,25 +84,15 @@ FailureOr<SmallVector<Value>> instantiateHelper(OpBuilder &builder, Region &regi
   return results;
 }
 
-bool sameExtent(Value lhs, Value rhs, int64_t axis) {
-  if (lhs == rhs) return true;
-  auto left = cast<MemRefType>(lhs.getType());
-  auto right = cast<MemRefType>(rhs.getType());
-  if (!left.isDynamicDim(axis) && !right.isDynamicDim(axis))
-    return left.getDimSize(axis) == right.getDimSize(axis);
-  auto equal = ValueBoundsConstraintSet::areEqual(
-      ValueBoundsConstraintSet::Variable(lhs, axis),
-      ValueBoundsConstraintSet::Variable(rhs, axis));
-  return succeeded(equal) && *equal;
-}
-
 bool commonScalarDomain(SliceReduceOp operation) {
   Value first = operation.getSources().front();
   auto type = cast<MemRefType>(first.getType());
   for (Value source : operation.getSources().drop_front()) {
     if (cast<MemRefType>(source.getType()).getRank() != type.getRank()) return false;
     for (int64_t axis = 0; axis < type.getRank(); ++axis)
-      if (!llvm::is_contained(operation.getAxes(), axis) && !sameExtent(first, source, axis))
+      if (!llvm::is_contained(operation.getAxes(), axis) &&
+          !haveEqualExtents(ValueBoundsConstraintSet::Variable(first, axis),
+                            ValueBoundsConstraintSet::Variable(source, axis)))
         return false;
   }
   return true;

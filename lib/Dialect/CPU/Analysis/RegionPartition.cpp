@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/RegionPartition.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -41,16 +42,8 @@ public:
   bool fullSubviewAxis(memref::SubViewOp view, unsigned axis) {
     if (getConstantIntValue(view.getMixedOffsets()[axis]) != 0 ||
         getConstantIntValue(view.getMixedStrides()[axis]) != 1) return false;
-    OpFoldResult size = view.getMixedSizes()[axis];
-    auto type = view.getSourceType();
-    if (!type.isDynamicDim(axis)) return getConstantIntValue(size) == type.getDimSize(axis);
-    if (auto allocation = view.getSource().getDefiningOp<memref::AllocOp>())
-      if (auto value = dyn_cast<Value>(size))
-        if (value == allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]) return true;
-    if (auto value = dyn_cast<Value>(size))
-      if (auto dimension = value.getDefiningOp<memref::DimOp>())
-        return dimension.getSource() == view.getSource() && dimension.getConstantIndex() == axis;
-    return false;
+    return haveEqualExtents(ValueBoundsConstraintSet::Variable(view.getMixedSizes()[axis]),
+                            ValueBoundsConstraintSet::Variable(view.getSource(), axis));
   }
 
   void inspect(Operation *operation) {

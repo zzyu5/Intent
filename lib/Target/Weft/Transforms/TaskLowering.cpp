@@ -5,6 +5,7 @@
 #include "Quantization.h"
 #include "Reductions.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
@@ -57,7 +58,8 @@ public:
   Impl(func::FuncOp function, ModuleOp output,
                const llvm::DenseMap<Value, intent::QuantFormat> &formats,
                const cpu::ImplementationRegistry &implementations)
-      : analysis(function), relations(function), output(output), b(output.getContext()),
+      : sourceFunction(function), analysis(function), relations(function),
+        output(output), b(output.getContext()),
         formats(formats), implementations(implementations) {
     auto interface = getPublicInterface(function);
     for (auto [argument, schema] : llvm::zip(function.getArguments(), interface.getArguments())) {
@@ -115,7 +117,7 @@ public:
         SmallVector<int64_t> dimensions;
         for (auto [axis, extent] : llvm::enumerate(memory.getShape())) {
           if (ShapedType::isDynamic(extent)) {
-            auto symbol = dimensionSymbol(capture, axis);
+            auto symbol = shapeSymbol(ValueBoundsConstraintSet::Variable(capture, axis));
             if (!symbol) return tasks.emitError("captured view extent has no external shape binding");
             dimensions.push_back(-*symbol);
           } else dimensions.push_back(extent);
@@ -222,9 +224,9 @@ private:
     SmallVector<int64_t> dimensions;
     for (auto [axis, extent] : llvm::enumerate(type.getShape())) {
       if (ShapedType::isDynamic(extent)) {
-        auto symbol = dimensionSymbol(memory, axis);
-        if (!symbol) return emitError(memory.getLoc(), "private value extent has no explicit shape binding"), failure();
-        dimensions.push_back(-*symbol);
+        auto dimension = dimensionExtent(memory, axis);
+        if (!dimension) return emitError(memory.getLoc(), "private value extent has no explicit shape binding"), failure();
+        dimensions.push_back(*dimension);
       } else dimensions.push_back(extent);
     }
     Type element = scalar ? scalar : type.getElementType();
@@ -259,55 +261,60 @@ private:
     return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(localRoot(memory).getDefiningOp());
   }
 
-  std::optional<int64_t> extentSymbol(Value extent) {
-    if (auto cast = extent.getDefiningOp<arith::IndexCastOp>(); cast &&
-        (cast.getIn().getType().isInteger(64) || cast.getOut().getType().isInteger(64)))
-      return extentSymbol(cast.getIn());
-    if (auto maximum = extent.getDefiningOp<arith::MaxSIOp>()) {
-      // A memref extent is nonnegative; max(extent, 0) is the same bound.
-      if (matchPattern(maximum.getLhs(), m_Zero())) return extentSymbol(maximum.getRhs());
-      if (matchPattern(maximum.getRhs(), m_Zero())) return extentSymbol(maximum.getLhs());
-    }
-    if (auto argument = dyn_cast<BlockArgument>(extent)) {
-      auto tasks = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp());
-      if (tasks && argument.getArgNumber())
-        return extentSymbol(tasks.getCaptures()[argument.getArgNumber() - 1]);
-      return std::nullopt;
-    }
-    auto dimension = extent.getDefiningOp<memref::DimOp>();
-    if (!dimension || !dimension.getConstantIndex()) return std::nullopt;
-    return dimensionSymbol(dimension.getSource(), *dimension.getConstantIndex());
+  std::optional<int64_t> nativeExtent(const cpu::ExtentExpression &extent) {
+    AffineExpr expression = extent.expression.getResult(0);
+    if (auto constant = dyn_cast<AffineConstantExpr>(expression))
+      return constant.getValue() >= 0
+          ? std::optional<int64_t>(constant.getValue()) : std::nullopt;
+
+    // Weft shape entries are constants or references to the actual public shape
+    // arguments. Proving an affine expression is not permission to invent a
+    // new runtime symbol for it.
+    unsigned position;
+    if (auto dimension = dyn_cast<AffineDimExpr>(expression))
+      position = dimension.getPosition();
+    else if (auto symbol = dyn_cast<AffineSymbolExpr>(expression))
+      position = extent.expression.getNumDims() + symbol.getPosition();
+    else return std::nullopt;
+    auto [value, axis] = extent.operands[position];
+    auto argument = dyn_cast<BlockArgument>(value);
+    auto function = argument
+        ? dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp()) : func::FuncOp{};
+    if (function != sourceFunction || !axis) return std::nullopt;
+    auto publicView = getPublicView(getPublicInterface(function), argument.getArgNumber());
+    if (!publicView) return std::nullopt;
+    auto symbol = extentIds.find(publicViewDimensions(publicView)[*axis]);
+    return symbol == extentIds.end()
+        ? std::nullopt : std::optional<int64_t>(-symbol->second);
   }
 
-  std::optional<int64_t> dimensionSymbol(Value memory, unsigned axis) {
-    if (auto cast = memory.getDefiningOp<memref::CastOp>()) return dimensionSymbol(cast.getSource(), axis);
-    if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp())) {
-      auto projection = queryAxisView(memory);
-      if (failed(projection) || !projection->sourceAxes[axis]) return std::nullopt;
-      return dimensionSymbol(projection->source, *projection->sourceAxes[axis]);
-    }
-    if (auto argument = dyn_cast<BlockArgument>(memory)) {
-      if (auto tasks = dyn_cast<cpu::TasksOp>(argument.getOwner()->getParentOp()))
-        return dimensionSymbol(tasks.getCaptures()[argument.getArgNumber() - 1], axis);
-      if (isa<func::FuncOp>(argument.getOwner()->getParentOp()) &&
-          cast<MemRefType>(memory.getType()).isDynamicDim(axis)) {
-        auto interface = getPublicInterface(cast<func::FuncOp>(argument.getOwner()->getParentOp()));
-        auto dimension = publicViewDimensions(getPublicView(interface, argument.getArgNumber()))[axis];
-        return extentIds.at(dimension);
-      }
-    }
-    if (auto subview = memory.getDefiningOp<memref::SubViewOp>()) {
-      unsigned projected = 0;
-      for (unsigned original = 0; original < subview.getSourceType().getRank(); ++original)
-        if (!subview.getDroppedDims().test(original) && projected++ == axis) {
-          auto size = dyn_cast<Value>(subview.getMixedSizes()[original]);
-          return size ? extentSymbol(size) : std::nullopt;
-        }
-    }
-    if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(memory.getDefiningOp())) {
-      auto type = cast<MemRefType>(memory.getType());
-      if (type.isDynamicDim(axis))
-        return extentSymbol(memory.getDefiningOp()->getOperand(type.getDynamicDimIndex(axis)));
+  std::optional<int64_t> nativeExtent(OpFoldResult extent) {
+    auto expression = cpu::queryExtent(extent);
+    return succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  }
+
+  std::optional<int64_t> dimensionExtent(Value memory, unsigned axis) {
+    auto expression = cpu::queryExtent(ValueBoundsConstraintSet::Variable(memory, axis));
+    return succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  }
+
+  std::optional<int64_t>
+  shapeSymbol(const ValueBoundsConstraintSet::Variable &extent) {
+    if (auto expression = cpu::queryExtent(extent); succeeded(expression))
+      if (auto native = nativeExtent(*expression); native && *native < 0)
+        return -*native;
+    // A dynamic host descriptor still needs an actual shape parameter even
+    // when equality analysis proves its extent constant. Select only among the
+    // existing public bindings; never synthesize a symbol for an expression.
+    auto interface = getPublicInterface(sourceFunction);
+    for (BlockArgument argument : sourceFunction.getArguments()) {
+      auto memory = dyn_cast<MemRefType>(argument.getType());
+      if (!memory) continue;
+      auto ids = publicViewDimensions(getPublicView(interface, argument.getArgNumber()));
+      for (unsigned axis = 0; axis < static_cast<unsigned>(memory.getRank()); ++axis)
+        if (memory.isDynamicDim(axis) && cpu::haveEqualExtents(
+                extent, ValueBoundsConstraintSet::Variable(argument, axis)))
+          return extentIds.at(ids[axis]);
     }
     return std::nullopt;
   }
@@ -384,8 +391,7 @@ private:
     for (unsigned axis = 0; axis < baseShape.size(); ++axis) {
       if (dropped.test(axis)) continue;
       auto size = nativeSizes[axis];
-      bool full = baseShape[axis] >= 0 ? sameBound(size, b.getIndexAttr(baseShape[axis]))
-          : isa<Value>(size) && extentSymbol(cast<Value>(size)) == -baseShape[axis];
+      bool full = nativeExtent(size) == baseShape[axis];
       projectionOnly &= sameBound(nativeOffsets[axis], b.getIndexAttr(0)) && full;
     }
     if (projectionOnly) {
@@ -409,24 +415,24 @@ private:
       return selected;
     }
     append(nativeOffsets, offsets);
-    append(nativeSizes, extents);
+    for (OpFoldResult size : nativeSizes) {
+      auto extent = nativeExtent(size);
+      if (!extent) return operation.emitError("dynamic Weft subview extent has no shape binding"), failure();
+      dimensions.push_back(*extent);
+      if (*extent >= 0) extents.push_back(*extent);
+      else {
+        extents.push_back(-1);
+        dynamic.push_back(values.lookup(cast<Value>(size)));
+      }
+    }
     auto format = formats.find(analysis.storageRoot(memory));
     if (format != formats.end()) {
       int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
       if (offsets.back() != 0 || extents.back() != bytes)
         return operation.emitError("encoded view projection must retain its complete record bytes"), failure();
-      extents.back() = 256;
+      extents.back() = dimensions.back() = 256;
     }
     auto ids = axes((*base).getType());
-    for (auto [axis, extent] : llvm::enumerate(extents)) {
-      if (extent >= 0) dimensions.push_back(extent);
-      else {
-        auto size = dyn_cast<Value>(nativeSizes[axis]);
-        auto symbol = size ? extentSymbol(size) : std::nullopt;
-        if (!symbol) return operation.emitError("dynamic Weft subview extent has no shape binding"), failure();
-        dimensions.push_back(-*symbol);
-      }
-    }
     Value selected = b.create<wk::SubviewOp>(operation.getLoc(),
         wk::SliceType::get(b.getContext(), encoding(memory), array(dimensions), array(ids)),
         *base, dynamic, array(offsets), array(extents));
@@ -1445,6 +1451,7 @@ private:
     return success();
   }
 
+  func::FuncOp sourceFunction;
   cpu::PhysicalProgramAnalysis analysis;
   cpu::AxisRelations relations;
   ModuleOp output;
