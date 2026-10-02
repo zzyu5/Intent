@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentKIRToGPU
   KIRToGPU.cpp
+  ConstructionSchema.cpp
 
   LINK_LIBS PUBLIC
   MLIRArithDialect

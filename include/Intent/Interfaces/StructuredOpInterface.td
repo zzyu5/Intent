@@ -52,6 +52,11 @@ def Intent_StructuredOpInterface : OpInterface<"StructuredOpInterface"> {
     ::mlir::ValueRange getSummarizeYields();
     ::mlir::ValueRange getApplyYields();
     ::mlir::ValueRange getEmitYields();
+    // Input-to-formal relations are available as soon as this region's block
+    // signature is built. They never inspect another region or any terminator.
+    ::llvm::SmallVector<::intent::StructuredValueRelation>
+    getRegionArgumentRelations(::mlir::Region &region);
+    // Whole-operation relations additionally require all regions and yields.
     ::llvm::SmallVector<::intent::StructuredValueRelation> getValueRelations();
   }];
 }

@@ -112,7 +112,8 @@ ValueRange StructuredOpInterface::getSummarizeYields() { return yields(getSummar
 ValueRange StructuredOpInterface::getApplyYields() { return yields(getApplyRegion()); }
 ValueRange StructuredOpInterface::getEmitYields() { return yields(getEmitRegion()); }
 
-SmallVector<StructuredValueRelation> StructuredOpInterface::getValueRelations() {
+SmallVector<StructuredValueRelation>
+StructuredOpInterface::getRegionArgumentRelations(Region &region) {
   SmallVector<StructuredValueRelation> relations;
   using K = StructuredRelationKind;
   auto connect = [&](ValueRange from, ValueRange to, K kind,
@@ -123,11 +124,40 @@ SmallVector<StructuredValueRelation> StructuredOpInterface::getValueRelations() 
   auto axes = getIterationAxes();
   auto kind = getStructuredKind();
   auto identities = getIdentities();
-  connect(identities, getCombineLhs(), K::SameSchema);
-  connect(identities, getCombineRhs(), K::SameSchema);
+  if (&region == &getCombine()) {
+    connect(identities, getCombineLhs(), K::SameSchema);
+    connect(identities, getCombineRhs(), K::SameSchema);
+    if (kind == StructuredOpKind::Reduce || kind == StructuredOpKind::Scan)
+      connect(getCaptures(), getCombineCaptures(), K::Capture);
+  } else if (&region == getSummarizeRegion()) {
+    connect(getSources(), getSummarizeSources(), K::SourceSlice, axes);
+    connect(getCaptures(), getSummarizeCaptures(), K::Capture);
+  } else if (&region == getApplyRegion()) {
+    connect(identities, getApplySummaries(), K::SameSchema);
+    connect(getInitialStates(), getApplyStates(), K::SameSchema);
+  } else if (&region == getEmitRegion()) {
+    connect(getSources(), getEmitSources(), K::SourceSlice, axes);
+    connect(getInitialStates(), getEmitStates(), K::SameSchema);
+    connect(getCaptures(), getEmitCaptures(), K::Capture);
+  }
+  return relations;
+}
+
+SmallVector<StructuredValueRelation> StructuredOpInterface::getValueRelations() {
+  SmallVector<StructuredValueRelation> relations;
+  for (Region &region : getOperation()->getRegions())
+    llvm::append_range(relations, getRegionArgumentRelations(region));
+  using K = StructuredRelationKind;
+  auto connect = [&](ValueRange from, ValueRange to, K kind,
+                     ArrayRef<int64_t> axes = {}) {
+    for (auto [source, target] : llvm::zip_equal(from, to))
+      relations.push_back({source, target, kind, {axes.begin(), axes.end()}});
+  };
+  auto axes = getIterationAxes();
+  auto kind = getStructuredKind();
+  auto identities = getIdentities();
   connect(getCombineYields(), identities, K::SameSchema);
   if (kind == StructuredOpKind::Reduce || kind == StructuredOpKind::Scan) {
-    connect(getCaptures(), getCombineCaptures(), K::Capture);
     connect(getSources(), getOperation()->getResults(),
             kind == StructuredOpKind::Reduce ? K::Reduction : K::Prefix, axes);
     // KIR identities may be scalar/slice schemas, while GPU identities have
@@ -135,20 +165,13 @@ SmallVector<StructuredValueRelation> StructuredOpInterface::getValueRelations() 
     connect(identities, getOperation()->getResults(), K::Accumulator);
     return relations;
   }
-  connect(getSources(), getSummarizeSources(), K::SourceSlice, axes);
-  connect(getCaptures(), getSummarizeCaptures(), K::Capture);
   connect(getSummarizeYields(), identities, K::SameSchema);
   if (kind == StructuredOpKind::RegionFold) {
     connect(identities, getOperation()->getResults(), K::SameSchema);
     return relations;
   }
-  connect(identities, getApplySummaries(), K::SameSchema);
-  connect(getInitialStates(), getApplyStates(), K::SameSchema);
-  connect(getInitialStates(), getEmitStates(), K::SameSchema);
   connect(getApplyYields(), getFinalStates(), K::SameSchema);
   connect(getInitialStates(), getFinalStates(), K::SameSchema);
-  connect(getSources(), getEmitSources(), K::SourceSlice, axes);
-  connect(getCaptures(), getEmitCaptures(), K::Capture);
   connect(getEmitYields(), getEmittedResults(), K::Emission);
   return relations;
 }

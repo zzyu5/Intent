@@ -2765,7 +2765,8 @@ SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
     bool fold = structured.getStructuredKind() == StructuredOpKind::RegionFold;
     bool scan = structured.getStructuredKind() == StructuredOpKind::RegionScan;
     if (!fold && !scan) return sources;
-    for (const auto &relation : structured.getValueRelations()) {
+    for (const auto &relation :
+         structured.getRegionArgumentRelations(*block->getParent())) {
       if (relation.to != argument) continue;
       if (block->getParent() == structured.getSummarizeRegion() &&
           (relation.kind == StructuredRelationKind::SourceSlice ||
@@ -3528,20 +3529,20 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
       }
     }
     auto isSegmentSource = [&](uint64_t sourceCount, uint64_t axis,
-                               Block &region) {
-      return argument.getOwner() == &region &&
+                               Region &region) {
+      return argument.getOwner()->getParent() == &region &&
              argument.getArgNumber() < sourceCount && fragmentAxis == axis;
     };
     bool segmentSource = false;
     if (auto fold = dyn_cast_or_null<RegionFoldOp>(owner))
       segmentSource = isSegmentSource(fold.getSources().size(), fold.getAxis(),
-                                      fold.getSummarize().front());
+                                      fold.getSummarize());
     else if (auto scan = dyn_cast_or_null<RegionScanOp>(owner))
       segmentSource =
           isSegmentSource(scan.getSources().size(), scan.getAxis(),
-                          scan.getSummarize().front()) ||
+                          scan.getSummarize()) ||
           isSegmentSource(scan.getSources().size(), scan.getAxis(),
-                          scan.getEmit().front());
+                          scan.getEmit());
     if (segmentSource) {
       // RegionFoldOp/RegionScanOp verification binds this exact block argument
       // axis to the operation's segment parameter.  The slice extent is a

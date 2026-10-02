@@ -72,18 +72,17 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
   access = [&](Operation *op, RankedTensorType result, const AxisRequirements &requested) -> bool {
     auto relation = analysis.indexRelation(op);
     if (failed(relation)) return false;
-    auto axes = accessAxes(*relation);
-    if (axes.rank != requested.size()) return false;
+    if (relation->resultDimensionIdentities.size() != requested.size()) return false;
     auto local = dyn_cast<RankedTensorType>(relation->source.getType());
     AxisRequirements sourceAxes(local ? local.getRank() : 0, false);
-    for (auto [position, term] : llvm::enumerate(relation->terms)) {
-      if (term.kind == 0 && local) sourceAxes[*term.sourceAxis] = requested[axes.terms[position]];
+    for (const auto &term : relation->terms) {
+      if (term.kind == 0 && local) sourceAxes[*term.sourceAxis] = requested[term.resultAxes.front()];
       if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
         Value indices = term.operands.front();
         auto type = cast<RankedTensorType>(indices.getType());
         AxisRequirements indexAxes(type.getRank(), false);
         for (unsigned axis = 0; axis < type.getRank(); ++axis) {
-          unsigned mapped = *axes.advancedStart + axes.advancedRank - type.getRank() + axis;
+          unsigned mapped = term.indexAxes[axis];
           if (!singletonAxis(type, axis) && requested[mapped]) {
             if (!equalAxisExtent(type, axis, result, mapped)) return false;
             indexAxes[axis] = true;

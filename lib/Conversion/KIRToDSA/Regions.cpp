@@ -58,15 +58,16 @@ FailureOr<int64_t> Construction::partitionQueryAxis(Block &block, RegionFoldOp f
       if (failed(fact)) { independent = false; return; }
       if (auto store = dyn_cast<ViewStoreOp>(op)) {
         auto outputIds = ids(store.getValue());
-        auto axes = accessAxes(*fact);
-        if (ArrayRef<int64_t>(fact->resultDimensionIdentities) != outputIds || axes.rank != outputIds.size()) {
+        if (ArrayRef<int64_t>(fact->resultDimensionIdentities) != outputIds) {
           independent = false;
           return;
         }
         unsigned ownedAxes = 0;
-        for (auto [i, term] : llvm::enumerate(fact->terms)) {
-          int64_t outputAxis = axes.terms[i];
-          if (outputAxis < 0 || outputIds[outputAxis] != query) continue;
+        for (const auto &term : fact->terms) {
+          unsigned queryAxes = llvm::count_if(term.resultAxes, [&](unsigned axis) {
+            return outputIds[axis] == query;
+          });
+          if (!queryAxes) continue;
           bool interval = false;
           if (term.kind == 4 && term.operands.size() == 1) {
             Operation *domain = term.operands.front().getDefiningOp();
@@ -76,7 +77,7 @@ FailureOr<int64_t> Construction::partitionQueryAxis(Block &block, RegionFoldOp f
             }
           }
           independent &= term.sourceAxis.has_value() && (term.kind == 0 || interval);
-          ++ownedAxes;
+          ownedAxes += queryAxes;
         }
         independent &= ownedAxes == 1;
       } else if (auto sourceType = dyn_cast<RankedTensorType>(fact->source.getType())) {

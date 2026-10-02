@@ -458,32 +458,27 @@ private:
     return nested.create<memref::LoadOp>(loc, input, indices);
   }
 
-  FailureOr<unsigned> advancedIndexRank(Operation *operation, const IndexRelationFact &fact) {
-    unsigned advancedRank = 0;
+  LogicalResult verifyIndexTerms(Operation *operation, const IndexRelationFact &fact) {
     for (const auto &term : fact.terms) {
-      if (term.kind == 3 && term.operands.size() == 1) {
-        if (auto type = dyn_cast<MemRefType>(values.lookup(term.operands[0]).getType()))
-          advancedRank = std::max<unsigned>(advancedRank, type.getRank());
-      } else if (term.kind == 4) {
+      if (term.kind == 3 && term.operands.size() == 1) continue;
+      if (term.kind == 4) {
         if (term.operands.size() != 1 || !domains.count(term.operands[0]))
-          return operation->emitError("CPU indexed access requires a realized domain"), failure();
+          return operation->emitError("CPU indexed access requires a realized domain");
       } else if (term.kind != 0 && term.kind != 1 && term.kind != 2) {
-        return operation->emitError("CPU indexed access does not implement this coordinate term"), failure();
+        return operation->emitError("CPU indexed access does not implement this coordinate term");
       }
     }
-    return advancedRank;
+    return success();
   }
 
-  SmallVector<Value> indexedCoordinates(const IndexRelationFact &fact, unsigned advancedRank,
+  SmallVector<Value> indexedCoordinates(const IndexRelationFact &fact,
                                        Value source, ValueRange members, OpBuilder &nested, Location loc) {
     SmallVector<Value> coordinates;
-    unsigned axis = 0;
-    std::optional<unsigned> advancedBegin;
     for (const auto &term : fact.terms) {
-      if (term.kind == 1) { ++axis; continue; }
+      if (term.kind == 1) continue;
       Value coordinate;
       if (term.kind == 0 || term.kind == 4) {
-        coordinate = members[axis++];
+        coordinate = members[term.resultAxes.front()];
         if (term.kind == 4) {
           Domain domain = domains.lookup(term.operands[0]);
           coordinate = nested.createOrFold<arith::AddIOp>(loc, domain.begin,
@@ -497,8 +492,12 @@ private:
       } else {
         coordinate = values.lookup(term.operands[0]);
         if (auto type = dyn_cast<MemRefType>(coordinate.getType())) {
-          if (!advancedBegin) { advancedBegin = axis; axis += advancedRank; }
-          coordinate = elementAt(coordinate, members.slice(*advancedBegin, advancedRank), nested, loc);
+          SmallVector<Value> indices;
+          for (int64_t axis = 0; axis < type.getRank(); ++axis)
+            indices.push_back(type.getDimSize(axis) == 1
+                ? Value(nested.create<arith::ConstantIndexOp>(loc, 0))
+                : members[term.indexAxes[axis]]);
+          coordinate = nested.create<memref::LoadOp>(loc, coordinate, indices);
         }
         if (!coordinate.getType().isIndex()) {
           auto logical = cast<IntegerType>(getElementTypeOrSelf(term.operands[0].getType()));
@@ -515,8 +514,7 @@ private:
   LogicalResult indexedWrite(Operation *operation) {
     auto fact = analysis.indexRelation(operation);
     if (failed(fact)) return failure();
-    auto rank = advancedIndexRank(operation, *fact);
-    if (failed(rank)) return failure();
+    if (failed(verifyIndexTerms(operation, *fact))) return failure();
     auto access = cast<IndexedAccessOpInterface>(operation);
     Value input = values.lookup(access.getStoredValue()), destination = values.lookup(fact->source);
     Location loc = operation->getLoc();
@@ -526,7 +524,7 @@ private:
         sizes.push_back(builder.create<memref::DimOp>(loc, input, axis));
     std::function<void(unsigned)> traverse = [&](unsigned axis) {
       if (axis == sizes.size()) {
-        auto coordinates = indexedCoordinates(*fact, *rank, destination, members, builder, loc);
+        auto coordinates = indexedCoordinates(*fact, destination, members, builder, loc);
         Value value = elementAt(input, members, builder, loc);
         builder.create<memref::StoreOp>(loc, value, destination, coordinates);
         return;
@@ -546,11 +544,10 @@ private:
     auto access = cast<IndexedAccessOpInterface>(operation);
     Type resultType = operation->getResult(0).getType();
     auto tensor = dyn_cast<RankedTensorType>(resultType);
-    auto rank = advancedIndexRank(operation, fact);
-    if (failed(rank)) return failure();
+    if (failed(verifyIndexTerms(operation, fact))) return failure();
     auto read = [&](OpBuilder &nested, Location loc, ValueRange members) -> Value {
       auto load = [&]() -> Value {
-        auto coordinates = indexedCoordinates(fact, *rank, source, members, nested, loc);
+        auto coordinates = indexedCoordinates(fact, source, members, nested, loc);
         return nested.create<memref::LoadOp>(loc, source, coordinates);
       };
       if (alwaysValid(operation)) return load();
@@ -586,8 +583,7 @@ private:
     auto access = cast<IndexedAccessOpInterface>(operation);
     auto fact = analysis.indexRelation(operation);
     if (failed(fact)) return failure();
-    auto rank = advancedIndexRank(operation, *fact);
-    if (failed(rank)) return failure();
+    if (failed(verifyIndexTerms(operation, *fact))) return failure();
     Location loc = operation->getLoc();
     Value target = values.lookup(fact->source);
     Type element = cast<MemRefType>(target.getType()).getElementType();
@@ -619,7 +615,7 @@ private:
         members.pop_back();
         return;
       }
-      auto coordinates = indexedCoordinates(*fact, *rank, target, members, builder, loc);
+      auto coordinates = indexedCoordinates(*fact, target, members, builder, loc);
       SmallVector<Value> results;
       if (isa<AtomicLoadOp>(operation)) {
         results.push_back(builder.create<cpu::AtomicLoadOp>(loc, element, target, coordinates, ordering));
@@ -647,8 +643,7 @@ private:
   LogicalResult scatterReduce(ScatterReduceOp operation) {
     auto fact = analysis.indexRelation(operation);
     if (failed(fact)) return failure();
-    auto rank = advancedIndexRank(operation, *fact);
-    if (failed(rank)) return failure();
+    if (failed(verifyIndexTerms(operation, *fact))) return failure();
     Location loc = operation.getLoc();
     Value target = values.lookup(fact->source);
     Value input = values.lookup(operation.getValue());
@@ -667,7 +662,7 @@ private:
         return status;
       }
       Value value = elementAt(input, members, builder, loc);
-      auto coordinates = indexedCoordinates(*fact, *rank, target, members, builder, loc);
+      auto coordinates = indexedCoordinates(*fact, target, members, builder, loc);
       auto update = builder.create<memref::GenericAtomicRMWOp>(loc, target, coordinates);
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(&update.getRegion().front());
@@ -696,20 +691,18 @@ private:
     SmallVector<OpFoldResult> offsets, sizes, strides;
     SmallVector<int64_t> resultShape;
     SmallVector<AffineExpr> projection;
-    unsigned outputAxis = 0;
     bool inserted = false;
     for (const IndexTermFact &term : fact->terms) {
       OpFoldResult stride = builder.getIndexAttr(1);
       if (term.kind == 1) {
         inserted = true;
-        ++outputAxis;
         continue;
       } else if (term.kind == 0) {
         unsigned axis = *term.sourceAxis;
         offsets.push_back(builder.getIndexAttr(0));
         sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(builder.create<memref::DimOp>(operation->getLoc(), source, axis).getResult()) : builder.getIndexAttr(type.getDimSize(axis)));
         resultShape.push_back(type.getDimSize(axis));
-        projection.push_back(builder.getAffineDimExpr(outputAxis++));
+        projection.push_back(builder.getAffineDimExpr(term.resultAxes.front()));
       } else if (term.kind == 3 && term.operands.size() == 1) {
         auto coordinate = indexValue(values.lookup(term.operands[0]), term.operands[0].getType(), operation->getLoc());
         if (failed(coordinate)) return failure();
@@ -726,7 +719,7 @@ private:
         Domain domain = domains.lookup(term.operands[0]);
         offsets.push_back(domain.begin);
         stride = domain.step;
-        projection.push_back(builder.getAffineDimExpr(outputAxis++));
+        projection.push_back(builder.getAffineDimExpr(term.resultAxes.front()));
         llvm::APInt extent;
         if (matchPattern(domain.extent, m_ConstantInt(&extent))) {
           sizes.push_back(builder.getIndexAttr(extent.getSExtValue()));

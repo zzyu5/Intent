@@ -31,11 +31,6 @@ struct Domain { Value begin, end, step; int64_t dimension; std::optional<int64_t
 // An axis keeps its source extent even when only one execution slice is local.
 struct LocalAxis { Value extent, begin, count; int64_t capacity; };
 using LocalShape = SmallVector<LocalAxis, 2>;
-struct AccessAxes {
-  unsigned rank = 0, advancedRank = 0;
-  std::optional<unsigned> advancedStart;
-  SmallVector<int64_t> terms;
-};
 using AxisRequirements = SmallVector<bool, 4>;
 struct WorksetTiling {
   DenseMap<Value, AxisRequirements> requirements;
@@ -112,7 +107,6 @@ private:
 
   // Access.cpp: source index relations and external memory accesses.
   FailureOr<AffineIndices> affineIndex(Value original);
-  AccessAxes accessAxes(const IndexRelationFact &relation);
   LogicalResult tensorAccess(Operation *op);
   Value stride(Location loc, Value view, int64_t axis);
 

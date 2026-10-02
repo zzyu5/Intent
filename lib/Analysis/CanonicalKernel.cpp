@@ -1,4 +1,5 @@
 #include "Intent/Analysis/CanonicalKernel.h"
+#include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
@@ -7,6 +8,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -176,7 +178,7 @@ CoordinateProvenance CanonicalKernelAnalysis::blockArgumentProvenance(
     return result;
   }
   if (auto structured = dyn_cast<StructuredOpInterface>(owner))
-    for (const auto &relation : structured.getValueRelations())
+    for (const auto &relation : structured.getRegionArgumentRelations(*argument.getOwner()->getParent()))
       if (relation.to == argument &&
           (relation.kind == StructuredRelationKind::Capture ||
            relation.kind == StructuredRelationKind::SourceSlice))
@@ -251,6 +253,11 @@ CanonicalKernelAnalysis::indexRelation(Operation *operation) {
       relation.getResultDimensions().asArrayRef().begin(),
       relation.getResultDimensions().asArrayRef().end());
   unsigned sourceAxis = 0;
+  Type resourceType = result.source.getType();
+  if (auto view = dyn_cast<ViewType>(resourceType)) resourceType = view.getTensor();
+  if (auto buffer = dyn_cast<BufferType>(resourceType)) resourceType = buffer.getTensor();
+  auto sourceTensor = dyn_cast<RankedTensorType>(resourceType);
+  DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
   for (Attribute attribute : terms) {
     auto term = dyn_cast<IndexTermAttr>(attribute);
     if (!term)
@@ -282,9 +289,323 @@ CanonicalKernelAnalysis::indexRelation(Operation *operation) {
           {absoluteCoordinateSource(fact.operands.front()), 0});
     else if (fact.kind == 3 && !fact.operands.empty())
       fact.coordinate = coordinateProvenance(fact.operands.front());
+    if (fact.kind == 2 && sourceTensor && fact.sourceAxis &&
+        !sourceTensor.isDynamicDim(*fact.sourceAxis)) {
+      int64_t extent = sourceTensor.getDimSize(*fact.sourceAxis);
+      int64_t index = *fact.staticValues.front();
+      fact.inBounds = -extent <= index && index < extent;
+    } else if (fact.kind == 3 && fact.sourceAxis) {
+      for (Operation *user : fact.operands.front().getUsers())
+        if (auto assumption = dyn_cast<AssumeInBoundsOp>(user))
+          if (assumption.getView() == result.source &&
+              assumption.getIndex() == fact.operands.front() &&
+              assumption.getAxis() == *fact.sourceAxis &&
+              dominance.properlyDominates(assumption.getOperation(), operation))
+            fact.inBounds = true;
+    }
     result.terms.push_back(std::move(fact));
   }
+  unsigned basicRank = llvm::count_if(result.terms, [](const IndexTermFact &term) {
+    return term.kind == 0 || term.kind == 1 || term.kind == 4 || term.kind == 5;
+  });
+  if (basicRank > result.resultDimensionIdentities.size())
+    return failure();
+  result.advancedRank = result.resultDimensionIdentities.size() - basicRank;
+  unsigned resultAxis = 0;
+  for (IndexTermFact &term : result.terms) {
+    if (term.kind == 0 || term.kind == 1 || term.kind == 4 || term.kind == 5) {
+      term.resultAxes.push_back(resultAxis++);
+      continue;
+    }
+    if (term.kind != 3 || term.operands.empty())
+      continue;
+    auto tensor = dyn_cast<RankedTensorType>(term.operands.front().getType());
+    if (!tensor)
+      continue;
+    if (tensor.getRank() > result.advancedRank)
+      return failure();
+    if (!result.advancedStart) {
+      result.advancedStart = resultAxis;
+      resultAxis += result.advancedRank;
+    }
+    for (unsigned axis = 0; axis < result.advancedRank; ++axis)
+      term.resultAxes.push_back(*result.advancedStart + axis);
+    for (unsigned axis = 0; axis < tensor.getRank(); ++axis)
+      term.indexAxes.push_back(*result.advancedStart + result.advancedRank -
+                               tensor.getRank() + axis);
+  }
+  if (resultAxis != result.resultDimensionIdentities.size())
+    return failure();
   return result;
+}
+
+FailureOr<SmallVector<TensorOperandProjection, 3>>
+CanonicalKernelAnalysis::operandProjections(OpResult result) const {
+  auto target = dyn_cast<RankedTensorType>(result.getType());
+  if (!target)
+    return failure();
+  Operation *operation = result.getOwner();
+  SmallVector<TensorOperandProjection, 3> projections;
+  auto append = [&](unsigned operand) -> TensorOperandProjection & {
+    auto source = cast<RankedTensorType>(operation->getOperand(operand).getType());
+    projections.push_back({operand, {}});
+    projections.back().resultAxes.resize(source.getRank());
+    return projections.back();
+  };
+  if (auto transpose = dyn_cast<TransposeOp>(operation)) {
+    auto &projection = append(0);
+    for (auto [axis, attribute] : llvm::enumerate(transpose.getPermutation()))
+      projection.resultAxes[cast<IntegerAttr>(attribute).getInt()] = axis;
+    return projections;
+  }
+  if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation)) {
+    auto integers = [&](StringRef name, unsigned member) {
+      SmallVector<int64_t> values;
+      for (Attribute value : operation->getAttrOfType<ArrayAttr>(name))
+        values.push_back(cast<IntegerAttr>(cast<ArrayAttr>(value)[member]).getInt());
+      return values;
+    };
+    unsigned rhsOperand = isa<ContractOp>(operation) ? 1 : 2;
+    auto lhs = cast<RankedTensorType>(operation->getOperand(0).getType());
+    auto rhs = cast<RankedTensorType>(operation->getOperand(rhsOperand).getType());
+    auto axes = ContractionAxes::get(lhs.getRank(), rhs.getRank(),
+        integers("reduce", 0), integers("reduce", 1),
+        integers("batch", 0), integers("batch", 1));
+    if (!axes)
+      return failure();
+    append(0).resultAxes.assign(axes->lhsResultAxes.begin(), axes->lhsResultAxes.end());
+    append(rhsOperand).resultAxes.assign(axes->rhsResultAxes.begin(), axes->rhsResultAxes.end());
+    return projections;
+  }
+  if (auto structured = dyn_cast<StructuredOpInterface>(operation)) {
+    if (structured.getStructuredKind() != StructuredOpKind::Reduce &&
+        structured.getStructuredKind() != StructuredOpKind::Scan)
+      return failure();
+    if (result.getResultNumber() >= structured.getSources().size())
+      return failure();
+    unsigned operand = result.getResultNumber();
+    if (!isa<RankedTensorType>(operation->getOperand(operand).getType()))
+      return failure();
+    auto &projection = append(operand);
+    auto reduced = structured.getIterationAxes();
+    unsigned next = 0;
+    for (unsigned axis = 0; axis < projection.resultAxes.size(); ++axis)
+      if (structured.getStructuredKind() == StructuredOpKind::Scan ||
+          !llvm::is_contained(reduced, axis))
+        projection.resultAxes[axis] = next++;
+    return projections;
+  }
+  if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
+    auto source = dyn_cast<RankedTensorType>(reshape.getInputs().front().getType());
+    if (!source)
+      return failure();
+    auto &projection = append(0);
+    // Only explicit dimension identity and occurrence transport coordinates.
+    // A regrouped row-major axis has its own result identity; equal extents
+    // alone do not identify a coordinate source.
+    auto sourceIDs = dimensionIDs(source), targetIDs = dimensionIDs(target);
+    if (!sourceIDs || !targetIDs)
+      return failure();
+    unsigned sourceBegin = 0, targetBegin = 0;
+    unsigned sourceEnd = source.getRank(), targetEnd = target.getRank();
+    while (sourceBegin < sourceEnd && targetBegin < targetEnd) {
+      if (sourceIDs[sourceBegin] == targetIDs[targetBegin]) {
+        projection.resultAxes[sourceBegin++] = targetBegin++;
+      } else if (source.getDimSize(sourceBegin) == 1) {
+        ++sourceBegin;
+      } else if (target.getDimSize(targetBegin) == 1) {
+        ++targetBegin;
+      } else {
+        break;
+      }
+    }
+    while (sourceBegin < sourceEnd && targetBegin < targetEnd) {
+      if (sourceIDs[sourceEnd - 1] == targetIDs[targetEnd - 1]) {
+        projection.resultAxes[--sourceEnd] = --targetEnd;
+      } else if (source.getDimSize(sourceEnd - 1) == 1) {
+        --sourceEnd;
+      } else if (target.getDimSize(targetEnd - 1) == 1) {
+        --targetEnd;
+      } else {
+        break;
+      }
+    }
+    return projections;
+  }
+  if (!isa<BroadcastOp, UnaryOp, CastOp, BitcastOp, BinaryOp, CompareOp,
+           SelectOp, MaskOp, JoinOp>(operation))
+    return failure();
+  unsigned count = isa<BroadcastOp>(operation) ? 1 : operation->getNumOperands();
+  for (unsigned operand = 0; operand < count; ++operand) {
+    auto source = dyn_cast<RankedTensorType>(operation->getOperand(operand).getType());
+    if (!source)
+      continue;
+    if (source.getRank() > target.getRank())
+      return failure();
+    auto &projection = append(operand);
+    for (unsigned axis = 0; axis < source.getRank(); ++axis)
+      projection.resultAxes[axis] = isa<JoinOp>(operation)
+          ? axis : target.getRank() - source.getRank() + axis;
+  }
+  return projections;
+}
+
+CoordinateProvenance CanonicalKernelAnalysis::axisProvenance(Value value,
+                                                            unsigned axis) {
+  auto key = std::make_pair(value, axis);
+  if (auto found = axisCache.find(key); found != axisCache.end())
+    return found->second;
+  if (axisActive.lookup(key))
+    return {};
+  axisActive[key] = true;
+  auto result = computeAxisProvenance(value, axis);
+  axisActive.erase(key);
+  axisCache.try_emplace(key, result);
+  return result;
+}
+
+CoordinateProvenance
+CanonicalKernelAnalysis::computeAxisProvenance(Value value, unsigned axis) {
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensor || axis >= tensor.getRank())
+    return {};
+  auto ownAxis = [&]() {
+    auto result = knownWithoutCoordinates();
+    result.origins.push_back({value, axis});
+    return result;
+  };
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Operation *owner = argument.getOwner()->getParentOp();
+    if (auto loop = dyn_cast<ForOp>(owner)) {
+      auto carries = loop.getRegionIterArgs();
+      auto found = llvm::find(carries, argument);
+      if (found != carries.end())
+        return axisProvenance(loop.getInitArgs()[found - carries.begin()], axis);
+    }
+    if (auto loop = dyn_cast<WhileOp>(owner))
+      return axisProvenance(loop.getInitArgs()[argument.getArgNumber()], axis);
+    if (auto structured = dyn_cast<StructuredOpInterface>(owner))
+      for (const auto &relation : structured.getRegionArgumentRelations(*argument.getOwner()->getParent()))
+        if (relation.to == argument &&
+            (relation.kind == StructuredRelationKind::Capture ||
+             relation.kind == StructuredRelationKind::SourceSlice)) {
+          auto source = dyn_cast<RankedTensorType>(relation.from.getType());
+          if (source && source.getRank() == tensor.getRank())
+            return axisProvenance(relation.from, axis);
+        }
+    return ownAxis();
+  }
+  auto result = cast<OpResult>(value);
+  Operation *operation = result.getOwner();
+  if (auto indices = dyn_cast<IndicesOp>(operation)) {
+    auto provenance = knownWithoutCoordinates();
+    Value source = indices.getSource();
+    if (isa<RankedTensorType>(source.getType()))
+      return axisProvenance(source, axis);
+    provenance.origins.push_back({absoluteCoordinateSource(source), axis});
+    return provenance;
+  }
+  if (isa<IndexedAccessOpInterface>(operation)) {
+    auto relation = indexRelation(operation);
+    if (failed(relation))
+      return {};
+    auto provenance = knownWithoutCoordinates();
+    for (const IndexTermFact &term : relation->terms) {
+      if (!llvm::is_contained(term.resultAxes, axis))
+        continue;
+      if (term.kind == 3) {
+        for (auto [indexAxis, resultAxis] : llvm::enumerate(term.indexAxes))
+          if (resultAxis == axis)
+            appendOrigins(provenance,
+                          axisProvenance(term.operands.front(), indexAxis));
+      } else if (term.kind == 4) {
+        provenance.origins.push_back({absoluteCoordinateSource(term.operands.front()), 0});
+      } else if ((term.kind == 0 || term.kind == 5) && term.sourceAxis) {
+        if (isa<RankedTensorType>(relation->source.getType()))
+          appendOrigins(provenance, axisProvenance(relation->source, *term.sourceAxis));
+        else
+          provenance.origins.push_back({relation->source, *term.sourceAxis});
+      }
+    }
+    return provenance.origins.empty() ? ownAxis() : provenance;
+  }
+  auto projections = operandProjections(result);
+  if (failed(projections))
+    return ownAxis();
+  auto provenance = knownWithoutCoordinates();
+  for (const auto &projection : *projections) {
+    Value source = operation->getOperand(projection.operandNumber);
+    auto sourceType = cast<RankedTensorType>(source.getType());
+    for (auto [sourceAxis, resultAxis] : llvm::enumerate(projection.resultAxes)) {
+      if (resultAxis != axis)
+        continue;
+      // Logical unit expansion introduces a coordinate, not a forwarding edge.
+      if (sourceType.getDimSize(sourceAxis) == 1 && tensor.getDimSize(axis) != 1)
+        continue;
+      appendOrigins(provenance, axisProvenance(source, sourceAxis));
+    }
+  }
+  return provenance.origins.empty() ? ownAxis() : provenance;
+}
+
+TensorExtentFact CanonicalKernelAnalysis::tensorExtent(Value value,
+                                                      unsigned axis) {
+  Type type = value.getType();
+  if (auto view = dyn_cast<ViewType>(type)) type = view.getTensor();
+  if (auto buffer = dyn_cast<BufferType>(type)) type = buffer.getTensor();
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor || axis >= tensor.getRank())
+    return {};
+  if (!tensor.isDynamicDim(axis))
+    return {tensor.getDimSize(axis), {}};
+  Operation *operation = value.getDefiningOp();
+  if (!operation)
+    return {};
+  if (auto indices = dyn_cast<IndicesOp>(operation)) {
+    Value source = indices.getSource();
+    if (isa<DomainType, RegionType>(source.getType()))
+      return {std::nullopt, {}, source};
+    return tensorExtent(source, axis);
+  }
+  if (isa<IndexedAccessOpInterface>(operation)) {
+    auto access = indexRelation(operation);
+    if (failed(access)) return {};
+    for (const IndexTermFact &term : access->terms) {
+      if (!llvm::is_contained(term.resultAxes, axis)) continue;
+      if (term.kind == 4)
+        return {std::nullopt, {}, term.operands.front()};
+      if (term.kind == 0 && term.sourceAxis)
+        return tensorExtent(access->source, *term.sourceAxis);
+      if (term.kind == 3)
+        for (auto [indexAxis, mapped] : llvm::enumerate(term.indexAxes))
+          if (mapped == axis &&
+              cast<RankedTensorType>(term.operands.front().getType()).getDimSize(indexAxis) != 1)
+            return tensorExtent(term.operands.front(), indexAxis);
+    }
+    return {};
+  }
+  ShapeRelationAttr shape;
+  if (auto reshape = dyn_cast<ReshapeOp>(operation)) shape = reshape.getShape();
+  else if (auto broadcast = dyn_cast<BroadcastOp>(operation)) shape = broadcast.getShape();
+  else if (auto full = dyn_cast<FullOp>(operation)) shape = full.getShape();
+  if (shape) {
+    auto extent = cast<ShapeExprAttr>(shape.getAxes()[axis]);
+    if (extent.getKind() == 0)
+      return {extent.getPayload(), {}};
+    if (extent.getKind() == 1)
+      return {std::nullopt, operation->getOperand(extent.getPayload())};
+    return {};
+  }
+  auto projections = operandProjections(cast<OpResult>(value));
+  if (succeeded(projections))
+    for (const auto &projection : *projections)
+      for (auto [sourceAxis, resultAxis] : llvm::enumerate(projection.resultAxes))
+        if (resultAxis == axis) {
+          Value source = operation->getOperand(projection.operandNumber);
+          if (cast<RankedTensorType>(source.getType()).getDimSize(sourceAxis) != 1)
+            return tensorExtent(source, sourceAxis);
+        }
+  return {};
 }
 
 FailureOr<SmallVector<LogicalWorksetFact, 4>>

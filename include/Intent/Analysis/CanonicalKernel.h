@@ -33,6 +33,14 @@ struct IndexTermFact {
   llvm::SmallVector<mlir::Value, 3> operands;
   llvm::SmallVector<std::optional<int64_t>, 3> staticValues;
   CoordinateProvenance coordinate;
+  // Logical result axes contributed by this term. All tensor indices share
+  // the advanced-index block; scalar indices contribute no logical axis.
+  llvm::SmallVector<unsigned, 4> resultAxes;
+  // Each axis of a tensor index maps into the shared advanced-index block.
+  llvm::SmallVector<unsigned, 4> indexAxes;
+  // Static indexing or a dominating explicit assume_in_bounds proves this
+  // coordinate lies within the logical resource axis.
+  bool inBounds = false;
 };
 
 struct IndexRelationFact {
@@ -40,6 +48,25 @@ struct IndexRelationFact {
   unsigned sourceRank = 0;
   llvm::SmallVector<int64_t, 4> resultDimensionIdentities;
   llvm::SmallVector<IndexTermFact, 4> terms;
+  unsigned advancedRank = 0;
+  std::optional<unsigned> advancedStart;
+};
+
+/// One operand's logical axes projected into an operation result. An absent
+/// result position denotes an eliminated axis. This is a coordinate relation,
+/// not a proof that values are equal or that an operation can be replayed.
+struct TensorOperandProjection {
+  unsigned operandNumber = 0;
+  llvm::SmallVector<std::optional<unsigned>, 4> resultAxes;
+};
+
+/// An extent explicitly supplied by the defining shape relation or tensor type.
+/// Unknown extents have neither member; no other equal-sized value is searched.
+struct TensorExtentFact {
+  std::optional<int64_t> constant;
+  mlir::Value value;
+  // A domain/subregion extent, without synthesizing a DimOp in immutable KIR.
+  mlir::Value domain;
 };
 
 enum class CanonicalFactState { Exact, Unknown, Ambiguous };
@@ -89,6 +116,10 @@ public:
   mlir::LogicalResult verify();
 
   CoordinateProvenance coordinateProvenance(mlir::Value value);
+  CoordinateProvenance axisProvenance(mlir::Value value, unsigned axis);
+  mlir::FailureOr<llvm::SmallVector<TensorOperandProjection, 3>>
+  operandProjections(mlir::OpResult result) const;
+  TensorExtentFact tensorExtent(mlir::Value value, unsigned axis);
   mlir::FailureOr<IndexRelationFact>
   indexRelation(mlir::Operation *operation);
   mlir::FailureOr<llvm::SmallVector<LogicalWorksetFact, 4>>
@@ -100,10 +131,13 @@ private:
   CoordinateProvenance computeCoordinateProvenance(mlir::Value value);
   CoordinateProvenance blockArgumentProvenance(mlir::BlockArgument argument);
   CoordinateProvenance resultProvenance(mlir::OpResult result);
+  CoordinateProvenance computeAxisProvenance(mlir::Value value, unsigned axis);
 
   mlir::ModuleOp module;
   llvm::DenseMap<mlir::Value, CoordinateProvenance> coordinateCache;
   llvm::DenseMap<mlir::Value, bool> coordinateActive;
+  llvm::DenseMap<std::pair<mlir::Value, unsigned>, CoordinateProvenance> axisCache;
+  llvm::DenseMap<std::pair<mlir::Value, unsigned>, bool> axisActive;
 };
 
 } // namespace intent
