@@ -958,9 +958,36 @@ stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()`
 `prepared.compile()` 编译本次绑定下具备资格的 native 候选并返回 `None`，不调优、
 不执行 kernel，也不建立 prepared replay。GPU 将逐候选编译结果记入 observation；
 个别候选编译失败可保留为失败记录，全部失败则报告 native compilation 错误。
-后续 `launch()` 仍执行原候选选择与调用路径。Mojo、Weft 和 BANG C 已在
-materialization 编译其 native portfolio 或固定入口，此方法不重复编译。
+后续 `launch()` 仍执行原候选选择与调用路径。Mojo 与 BANG C 的 materialization
+只绑定程序；`prepare` 绑定实参，`compile` 编译 portfolio 或固定入口，首次调用
+才加载库、绑定 symbols 并建立实际执行资源。Weft 的系统编译由显式 AOT 步骤完成，
+prepared `compile` 验证已有原生产物，加载同样延迟到调用。编译本身不创建 CNRT queue，
+也不运行 RVV 设备指令探测；参数分配和绑定仍遵守实际设备要求。
 编译成功不代表数值正确或性能达标，`result()` 此时也只返回已绑定的输出容器。
+
+Mojo、Weft 和 BANG C 复用 [native_artifact.py](python/intent/runtime/native_artifact.py)
+的 `NativeArtifact`、`build_native_artifact`、`run_native_command` 与
+`LoadedNativeLibrary`。Provider driver 只交付真实编译命令、文件与依赖；公共层复用
+已有 cache entry/attempt 机制，编译完整后发布不可变产物，失败保留输入和日志。
+`NativeArtifact` 不持有动态库或设备句柄；只有 loader 才加载库并按已声明 ABI 绑定
+symbols。同一二进制的 process image 可以共享，每个 runtime 有独立使用权；
+关闭一个 runtime 不卸载其它 runtime 的库，也不改写正在使用的二进制文件。
+
+SDK dependency closure 由实际 driver 声明。Mojo 保留工具链检查、linker inputs
+与实际动态库解析路径核对；CNCC 和任意 Weft C 编译命令尚未提供完整闭包，
+因此每次新编译请求真实调用 compiler，同一程序正常复用自己的已编译产物。
+不把有限几个 SDK 文件的 stat 冒充完整缓存身份，也不把磁盘产物读回冒充观察到 cache hit。
+
+Weft 的 [WeftArtifact](python/intent/runtime/weft/compilation.py) 在一次流程中携带
+已解析的 source、公共合同、native task facts 与目标 profile，贯通 export、system
+compile 和 `NativeProgram`。`save/read` 是跨进程或跨机器的目录边界；系统编译返回
+携带本机 `NativeArtifact` 的对象，不再覆盖导出目录中的 `kernel.so`。源码目录可以
+搬到目标机器重新编译，已加载的本机产物始终留在独立 attempt 中。
+
+职责对照：本地 Triton `python/triton/compiler/compiler.py:407–438` 先保存编译产物和
+metadata，`:452–488` 再创建实际 runtime handles 并检查设备资源。Intent 的共同
+native owner 负责文件和库生命周期，CNRT queue、RVV/VLEN 资格和各 provider 的
+tuner 仍由相邻 runtime 负责，不把这些执行模型差异塞进公共 loader。
 
 Triton 的 [program.py](python/intent/runtime/triton/program.py) 对各 eligible config
 调用底层 JIT function 的 `warmup`，保留本次参数、coverage、grid 与 native options；
@@ -1148,7 +1175,14 @@ Intent lowering、provider native compilation、首次 tuning/load 与热 launch
 
 作者位置沿 [SourceUnit.location](python/intent/frontend/source/unit.py)、[KIR 序列化](python/intent/frontend/mlir/serialization.py) 和 [compiler IR 输出](tools/intent-compile/intent-compile.cpp) 保存在标准 MLIR location 中。缓存的 `input.mlir`、`kernel.mlir` 与 operation 诊断使用这条位置链；新增 rewrite 创建或克隆 operation 时保留相应 source location，不用旁表替代。编译日志位于同一 `cache_directory` 的 `compiler.log`。
 
-Mojo 的 [native compilation](python/intent/runtime/mojo/compilation.py) 失败会指出具体 candidate、native 阶段和保留目录，目录中包含 bindings、命令、编译器 stdout/stderr 和阶段耗时，`request.json` 指向实际 source 与 FP object。`NativeLibrary.directory/cache_hit/cache_reason` 提供本次加载的产物及复用状态；既有 CPU runner 在准备阶段记录物化耗时和命中数量，二者不计为算子执行时间。Weft 的 [Canonical IR serializer](lib/Target/Weft/Serialization/Serializer.cpp) 同样保留标准 location，使下层编译诊断可以追到作者源码。
+各 native driver 通过共同 command runner 保留命令、编译器 stdout/stderr、状态与阶段耗时。
+Mojo 的 [native compilation](python/intent/runtime/mojo/compilation.py) 另外保留具体
+candidate bindings，`request.json` 指向实际 source 与 FP object。
+`NativeArtifact.directory/cache_hit/cache_reason` 提供本次产物及复用状态；既有 CPU
+runner 在准备阶段记录编译耗时和命中数量，编译、加载与调优不计为算子执行时间。
+Weft 的 [Canonical IR serializer](lib/Target/Weft/Serialization/Serializer.cpp) 保留标准
+location，使下层编译诊断可以追到作者源码。库加载失败保留 `native_loading` 与实际
+native 目录，不被调用入口覆盖成只有顶层 Intent cache 的错误。
 
 ### 查看完整 transformation group 的 IR 与编译时间
 
