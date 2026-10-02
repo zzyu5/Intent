@@ -1,4 +1,5 @@
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
+#include "Intent/Conversion/ScalarLowering.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Analysis/ProductSchema.h"
@@ -27,38 +28,6 @@ namespace {
 struct Domain {
   Value begin, end, step, extent;
 };
-
-Type integerStorageType(Type type) {
-  if (auto integer = dyn_cast<IntegerType>(type))
-    return IntegerType::get(type.getContext(), integer.getWidth());
-  if (auto memory = dyn_cast<MemRefType>(type))
-    return MemRefType::get(memory.getShape(), integerStorageType(memory.getElementType()), memory.getLayout(), memory.getMemorySpace());
-  if (auto function = dyn_cast<FunctionType>(type)) {
-    SmallVector<Type> inputs, outputs;
-    for (Type input : function.getInputs()) inputs.push_back(integerStorageType(input));
-    for (Type output : function.getResults()) outputs.push_back(integerStorageType(output));
-    return FunctionType::get(type.getContext(), inputs, outputs);
-  }
-  if (auto vector = dyn_cast<VectorType>(type))
-    return VectorType::get(vector.getShape(), integerStorageType(vector.getElementType()), vector.getScalableDims());
-  return type;
-}
-
-void realizeIntegerStorage(ModuleOp module) {
-  module.walk([&](Operation *operation) {
-    for (Value result : operation->getResults()) result.setType(integerStorageType(result.getType()));
-    for (Region &region : operation->getRegions())
-      for (Block &block : region)
-        for (BlockArgument argument : block.getArguments()) argument.setType(integerStorageType(argument.getType()));
-    SmallVector<NamedAttribute> attributes(operation->getAttrs());
-    for (NamedAttribute attribute : attributes) {
-      if (auto type = dyn_cast<TypeAttr>(attribute.getValue()))
-        operation->setAttr(attribute.getName(), TypeAttr::get(integerStorageType(type.getValue())));
-      else if (auto integer = dyn_cast<IntegerAttr>(attribute.getValue()))
-        operation->setAttr(attribute.getName(), IntegerAttr::get(integerStorageType(integer.getType()), integer.getValue()));
-    }
-  });
-}
 
 class Construction {
 public:
@@ -874,56 +843,6 @@ private:
         Value result = builder.create<arith::SelectOp>(loc, large, limit, quotient);
         return binary.getFlushToZero() ? flushF32(result) : result;
       }
-      bool fp = isa<FloatType>(a.getType());
-      auto logical = dyn_cast<IntegerType>(getElementTypeOrSelf(binary.getOperand(0).getType()));
-      bool unsignedInteger = logical && logical.isUnsigned();
-      switch (binary.getOperatorKind()) {
-      case BinaryOperator::Add:
-        return fp ? Value(builder.create<arith::AddFOp>(loc, a, b)) : Value(builder.create<arith::AddIOp>(loc, a, b));
-      case BinaryOperator::Subtract:
-        return fp ? Value(builder.create<arith::SubFOp>(loc, a, b)) : Value(builder.create<arith::SubIOp>(loc, a, b));
-      case BinaryOperator::Multiply:
-        return fp ? Value(builder.create<arith::MulFOp>(loc, a, b)) : Value(builder.create<arith::MulIOp>(loc, a, b));
-      case BinaryOperator::TrueDivide:
-        if (fp) return Value(builder.create<arith::DivFOp>(loc, a, b));
-        break;
-      case BinaryOperator::FloorDivide:
-        if (!fp) return unsignedInteger ? Value(builder.create<arith::DivUIOp>(loc, a, b))
-            : Value(builder.create<arith::FloorDivSIOp>(loc, a, b));
-        break;
-      case BinaryOperator::Remainder:
-        if (!fp) {
-          if (unsignedInteger) return Value(builder.create<arith::RemUIOp>(loc, a, b));
-          Value quotient = builder.create<arith::FloorDivSIOp>(loc, a, b);
-          Value product = builder.create<arith::MulIOp>(loc, quotient, b);
-          return Value(builder.create<arith::SubIOp>(loc, a, product));
-        }
-        break;
-      case BinaryOperator::MaximumNum:
-        if (fp) return Value(builder.create<arith::MaxNumFOp>(loc, a, b));
-        break;
-      case BinaryOperator::MinimumNum:
-        if (fp) return Value(builder.create<arith::MinNumFOp>(loc, a, b));
-        break;
-      case BinaryOperator::Power:
-        if (fp) return Value(builder.create<math::PowFOp>(loc, a, b));
-        break;
-      case BinaryOperator::Maximum:
-        return fp ? Value(builder.create<arith::MaximumFOp>(loc, a, b)) : unsignedInteger
-            ? Value(builder.create<arith::MaxUIOp>(loc, a, b)) : Value(builder.create<arith::MaxSIOp>(loc, a, b));
-      case BinaryOperator::Minimum:
-        return fp ? Value(builder.create<arith::MinimumFOp>(loc, a, b)) : unsignedInteger
-            ? Value(builder.create<arith::MinUIOp>(loc, a, b)) : Value(builder.create<arith::MinSIOp>(loc, a, b));
-      case BinaryOperator::LogicalAnd:
-      case BinaryOperator::BitwiseAnd: return Value(builder.create<arith::AndIOp>(loc, a, b));
-      case BinaryOperator::LogicalOr:
-      case BinaryOperator::BitwiseOr: return Value(builder.create<arith::OrIOp>(loc, a, b));
-      case BinaryOperator::BitwiseXor: return Value(builder.create<arith::XOrIOp>(loc, a, b));
-      case BinaryOperator::LeftShift: return Value(builder.create<arith::ShLIOp>(loc, a, b));
-      case BinaryOperator::RightShift: return unsignedInteger ? Value(builder.create<arith::ShRUIOp>(loc, a, b))
-          : Value(builder.create<arith::ShRSIOp>(loc, a, b));
-      default: break;
-      }
     } else if (auto unary = dyn_cast<UnaryOp>(operation)) {
       if (unary.getApproximate() || unary.getFlushToZero()) {
         auto kind = unary.getOperatorKind();
@@ -936,94 +855,18 @@ private:
                                                   : Value(builder.create<math::TanhOp>(loc, input));
         return unary.getFlushToZero() ? flushF32(result) : result;
       }
-      switch (unary.getOperatorKind()) {
-      case UnaryOperator::Rsqrt: return Value(builder.create<math::RsqrtOp>(loc, arguments[0]));
-      case UnaryOperator::Sqrt: return Value(builder.create<math::SqrtOp>(loc, arguments[0]));
-      case UnaryOperator::Exp: return Value(builder.create<math::ExpOp>(loc, arguments[0]));
-      case UnaryOperator::Exp2: return Value(builder.create<math::Exp2Op>(loc, arguments[0]));
-      case UnaryOperator::Log: return Value(builder.create<math::LogOp>(loc, arguments[0]));
-      case UnaryOperator::Sin: return Value(builder.create<math::SinOp>(loc, arguments[0]));
-      case UnaryOperator::Cos: return Value(builder.create<math::CosOp>(loc, arguments[0]));
-      case UnaryOperator::Floor: return Value(builder.create<math::FloorOp>(loc, arguments[0]));
-      case UnaryOperator::Erf: return Value(builder.create<math::ErfOp>(loc, arguments[0]));
-      case UnaryOperator::Tanh: return Value(builder.create<math::TanhOp>(loc, arguments[0]));
-      case UnaryOperator::Abs:
-        if (isa<FloatType>(arguments[0].getType())) return Value(builder.create<math::AbsFOp>(loc, arguments[0]));
-        if (auto type = dyn_cast<IntegerType>(getElementTypeOrSelf(unary.getOperand().getType())); type && type.isUnsigned()) return arguments[0];
-        return Value(builder.create<math::AbsIOp>(loc, arguments[0]));
-      case UnaryOperator::Sigmoid: {
+      if (unary.getOperatorKind() == UnaryOperator::Sigmoid) {
         Value one = builder.create<arith::ConstantOp>(loc, builder.getFloatAttr(arguments[0].getType(), 1.0));
         Value negative = builder.create<arith::NegFOp>(loc, arguments[0]);
         Value denominator = builder.create<arith::AddFOp>(loc, one, builder.create<math::ExpOp>(loc, negative));
         return Value(builder.create<arith::DivFOp>(loc, one, denominator));
       }
-      case UnaryOperator::Negate:
-        if (isa<FloatType>(arguments[0].getType())) return Value(builder.create<arith::NegFOp>(loc, arguments[0]));
-        return Value(builder.create<arith::SubIOp>(loc,
-            builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(arguments[0].getType(), 0)), arguments[0]));
-      case UnaryOperator::Not: return Value(builder.create<arith::XOrIOp>(loc, arguments[0],
-          builder.create<arith::ConstantOp>(loc, builder.getBoolAttr(true))));
-      default: break;
-      }
-    } else if (auto compare = dyn_cast<CompareOp>(operation)) {
-      static const arith::CmpFPredicate floating[] = {arith::CmpFPredicate::OEQ, arith::CmpFPredicate::UNE,
-          arith::CmpFPredicate::OLT, arith::CmpFPredicate::OLE, arith::CmpFPredicate::OGT, arith::CmpFPredicate::OGE};
-      static const arith::CmpIPredicate integer[] = {arith::CmpIPredicate::eq, arith::CmpIPredicate::ne,
-          arith::CmpIPredicate::slt, arith::CmpIPredicate::sle, arith::CmpIPredicate::sgt, arith::CmpIPredicate::sge};
-      static const arith::CmpIPredicate unsignedPredicates[] = {arith::CmpIPredicate::eq, arith::CmpIPredicate::ne,
-          arith::CmpIPredicate::ult, arith::CmpIPredicate::ule, arith::CmpIPredicate::ugt, arith::CmpIPredicate::uge};
-      auto type = dyn_cast<IntegerType>(getElementTypeOrSelf(compare.getOperand(0).getType()));
-      unsigned predicate = static_cast<unsigned>(compare.getPredicate());
-      return isa<FloatType>(arguments[0].getType())
-          ? Value(builder.create<arith::CmpFOp>(loc, floating[predicate], arguments[0], arguments[1]))
-          : Value(builder.create<arith::CmpIOp>(loc, type && type.isUnsigned() ? unsignedPredicates[predicate] : integer[predicate], arguments[0], arguments[1]));
-    } else if (isa<SelectOp>(operation)) {
-      return Value(builder.create<arith::SelectOp>(loc, arguments[0], arguments[1], arguments[2]));
-    } else if (isa<MaskOp>(operation)) {
-      return Value(builder.create<arith::SelectOp>(loc, arguments[1], arguments[0], arguments[2]));
-    } else if (isa<BitcastOp>(operation)) {
-      return Value(builder.create<arith::BitcastOp>(loc, getElementTypeOrSelf(operation->getResult(0).getType()), arguments[0]));
     } else if (auto cast = dyn_cast<CastOp>(operation)) {
-      Type type = getElementTypeOrSelf(cast.getType());
-      Type input = getElementTypeOrSelf(cast.getOperand().getType());
-      if (isa<LogicalIndexType>(input)) input = builder.getIndexType();
-      auto inputInteger = dyn_cast<IntegerType>(input), outputInteger = dyn_cast<IntegerType>(type);
-      bool unsignedInput = inputInteger && inputInteger.isUnsigned();
-      bool unsignedOutput = outputInteger && outputInteger.isUnsigned();
-      if (input == type) return arguments[0];
-      if (cast.getRounding() && *cast.getRounding() != 0)
-        return cast.emitError("CPU non-default-rounding cast is not implemented"), failure();
-      if (type.isInteger(1)) return cast.emitError("CPU numeric-to-bool cast is not implemented"), failure();
-      if (input.isIndex() && outputInteger) return unsignedOutput
-          ? Value(builder.create<arith::IndexCastUIOp>(loc, type, arguments[0])) : Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if (inputInteger && type.isIndex()) return unsignedInput
-          ? Value(builder.create<arith::IndexCastUIOp>(loc, type, arguments[0])) : Value(builder.create<arith::IndexCastOp>(loc, type, arguments[0]));
-      if ((input.isIndex() || inputInteger) && isa<FloatType>(type)) {
-        Value value = input.isIndex() ? Value(builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), arguments[0])) : arguments[0];
-        if (input.isInteger(1) || unsignedInput) return Value(builder.create<arith::UIToFPOp>(loc, type, value));
-        return Value(builder.create<arith::SIToFPOp>(loc, type, value));
-      }
-      if (isa<FloatType>(input) && isa<FloatType>(type)) {
-        if (input.getIntOrFloatBitWidth() < type.getIntOrFloatBitWidth())
-          return Value(builder.create<arith::ExtFOp>(loc, type, arguments[0]));
-        if (input.getIntOrFloatBitWidth() > type.getIntOrFloatBitWidth())
-          return Value(builder.create<arith::TruncFOp>(loc, type, arguments[0]));
-        Value widened = builder.create<arith::ExtFOp>(loc, builder.getF32Type(), arguments[0]);
-        return Value(builder.create<arith::TruncFOp>(loc, type, widened));
-      }
-      if (isa<FloatType>(input) && outputInteger && !type.isInteger(1))
-        return unsignedOutput ? Value(builder.create<arith::FPToUIOp>(loc, type, arguments[0]))
-            : Value(builder.create<arith::FPToSIOp>(loc, type, arguments[0]));
-      if (inputInteger && outputInteger) {
-        if (input.getIntOrFloatBitWidth() == type.getIntOrFloatBitWidth()) return arguments[0];
-        if (input.getIntOrFloatBitWidth() > type.getIntOrFloatBitWidth())
-          return Value(builder.create<arith::TruncIOp>(loc, type, arguments[0]));
-        if (input.isInteger(1) || unsignedInput) return Value(builder.create<arith::ExtUIOp>(loc, type, arguments[0]));
-        return Value(builder.create<arith::ExtSIOp>(loc, type, arguments[0]));
-      }
+      if (getElementTypeOrSelf(cast.getType()).isInteger(1) &&
+          !getElementTypeOrSelf(cast.getInput().getType()).isInteger(1))
+        return cast.emitError("CPU numeric-to-bool cast is not implemented"), failure();
     }
-    operation->emitError("CPU construction does not implement this arithmetic operation");
-    return failure();
+    return intent::lowerScalarOperation(operation, arguments, builder);
   }
 
   LogicalResult pointwise(Operation *operation) {

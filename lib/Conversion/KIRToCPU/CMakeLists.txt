@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentKIRToCPU
 
   LINK_LIBS PUBLIC
   MLIRIntentAnalysis
+  MLIRIntentScalarLowering
   MLIRIntentDialect
   MLIRIntentCPUDialect
   MLIRArithDialect

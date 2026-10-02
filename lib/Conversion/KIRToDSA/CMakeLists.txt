@@ -9,6 +9,6 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   Regions.cpp
   Worksets.cpp
 
-  LINK_LIBS PUBLIC MLIRIntentAnalysis MLIRIntentDialect MLIRIntentDSADialect
+  LINK_LIBS PUBLIC MLIRIntentAnalysis MLIRIntentScalarLowering MLIRIntentDialect MLIRIntentDSADialect
     MLIRArithDialect MLIRFuncDialect MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect
     MLIRIR MLIRSupport)

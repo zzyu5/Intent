@@ -1,6 +1,7 @@
 #ifndef INTENT_ANALYSIS_UNIFORMVALUES_H
 #define INTENT_ANALYSIS_UNIFORMVALUES_H
 
+#include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
@@ -39,6 +40,14 @@ bool equalUniformConstants(mlir::Attribute lhs, mlir::Attribute rhs);
 mlir::Attribute uniformZero(mlir::Type type);
 std::optional<bool> uniformBoolean(mlir::Attribute value);
 UniformExpression describeScalarValue(mlir::Value value);
+UniformExpression describeUniformUnary(mlir::Type elementType,
+    UnaryOperator kind, mlir::Value input, bool approximate, bool flushToZero);
+UniformExpression describeUniformBinary(mlir::Type elementType,
+    BinaryOperator kind, mlir::Value lhs, mlir::Value rhs,
+    bool approximate, bool flushToZero);
+UniformExpression describeUniformCompare(mlir::Type elementType,
+    mlir::Type operandElementType, ComparePredicate predicate,
+    mlir::Value lhs, mlir::Value rhs);
 UniformExpression describeCanonicalUniformValue(mlir::Value value);
 UniformExpression describeStructuredReduction(mlir::OpResult result,
                                               mlir::Type elementType,

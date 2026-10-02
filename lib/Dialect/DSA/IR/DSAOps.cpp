@@ -533,6 +533,11 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
       interface.getArguments().size() != function.getNumArguments())
     return function.emitError("DSA kernel requires a complete interface and configuration");
   for (auto [argument, attribute] : llvm::zip(function.getArguments(), interface.getArguments())) {
+    auto storageType = [&](Type logical) -> Type {
+      if (auto integer = dyn_cast<IntegerType>(logical))
+        return IntegerType::get(function.getContext(), integer.getWidth());
+      return logical;
+    };
     Type logical = cast<intent::PublicParameterAttr>(attribute).getType();
     if (auto view = dyn_cast<intent::ViewType>(logical)) {
       auto tensor = intent::publicViewTensor(view);
@@ -541,14 +546,14 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
           !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
         return function.emitError("DSA view has unsupported numeric storage");
       auto physical = dyn_cast<MemRefType>(argument.getType());
-      if (!physical || physical.getElementType() != element || physical.getShape() != tensor.getShape() ||
+      if (!physical || physical.getElementType() != storageType(element) || physical.getShape() != tensor.getShape() ||
           physical.getMemorySpaceAsInt() != 0)
         return function.emitError("DSA view disagrees with its physical entry ABI");
     } else {
       if (!logical.isF32() && !logical.isIndex() && !logical.isInteger(64) &&
           !logical.isInteger(32) && !logical.isInteger(1))
         return function.emitError("DSA scalar has unsupported native ABI type");
-      if (logical != argument.getType())
+      if (storageType(logical) != argument.getType())
         return function.emitError("DSA scalar disagrees with its physical entry ABI");
     }
   }

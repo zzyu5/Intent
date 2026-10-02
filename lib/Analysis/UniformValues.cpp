@@ -1,4 +1,5 @@
 #include "Intent/Analysis/UniformValues.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -284,6 +285,66 @@ Attribute UniformValueAnalysis::fold(const UniformExpression &expression, const 
   return arithmetic(expression, values);
 }
 
+UniformExpression describeUniformUnary(Type type, UnaryOperator kind,
+    Value input, bool approximate, bool flushToZero) {
+  UniformExpression result;
+  result.type = type;
+  result.operands = {input};
+  if (approximate || flushToZero) return result;
+  using K = UniformKind;
+  switch (kind) {
+  case UnaryOperator::Negate: result.kind = K::Negate; break;
+  case UnaryOperator::Not: result.kind = K::Not; break;
+  case UnaryOperator::Exp: case UnaryOperator::Exp2: result.kind = K::Exp; break;
+  default: break;
+  }
+  return result;
+}
+
+UniformExpression describeUniformBinary(Type type, BinaryOperator kind,
+    Value lhs, Value rhs, bool approximate, bool flushToZero) {
+  UniformExpression result;
+  result.type = type;
+  result.operands = {lhs, rhs};
+  if (approximate || flushToZero) return result;
+  using K = UniformKind;
+  switch (kind) {
+  case BinaryOperator::Add: result.kind = K::Add; break;
+  case BinaryOperator::Subtract: result.kind = K::Subtract; break;
+  case BinaryOperator::Multiply: result.kind = K::Multiply; break;
+  case BinaryOperator::LogicalAnd: case BinaryOperator::BitwiseAnd: result.kind = K::And; break;
+  case BinaryOperator::LogicalOr: case BinaryOperator::BitwiseOr: result.kind = K::Or; break;
+  case BinaryOperator::BitwiseXor: result.kind = K::Xor; break;
+  case BinaryOperator::Maximum: result.kind = K::Maximum; break;
+  case BinaryOperator::Minimum: result.kind = K::Minimum; break;
+  case BinaryOperator::MaximumNum: result.kind = K::MaximumNum; break;
+  case BinaryOperator::MinimumNum: result.kind = K::MinimumNum; break;
+  default: break;
+  }
+  return result;
+}
+
+UniformExpression describeUniformCompare(Type type, Type operandType,
+    ComparePredicate predicate, Value lhs, Value rhs) {
+  UniformExpression result;
+  result.type = type;
+  result.operands = {lhs, rhs};
+  result.kind = UniformKind::Compare;
+  result.unsignedInput = isUnsigned(operandType);
+  switch (predicate) {
+  case ComparePredicate::Eq: result.predicate = UniformPredicate::Equal; break;
+  case ComparePredicate::Ne:
+    result.predicate = UniformPredicate::NotEqual;
+    result.unorderedTrue = true;
+    break;
+  case ComparePredicate::Lt: result.predicate = UniformPredicate::Less; break;
+  case ComparePredicate::Le: result.predicate = UniformPredicate::LessEqual; break;
+  case ComparePredicate::Gt: result.predicate = UniformPredicate::Greater; break;
+  case ComparePredicate::Ge: result.predicate = UniformPredicate::GreaterEqual; break;
+  }
+  return result;
+}
+
 UniformExpression describeCanonicalUniformValue(Value value) {
   UniformExpression result = describeScalarValue(value);
   if (auto tensor = dyn_cast<RankedTensorType>(value.getType()))
@@ -311,31 +372,21 @@ UniformExpression describeCanonicalUniformValue(Value value) {
   else if (auto extract = dyn_cast<ExtractOp>(op)) {
     result.kind = K::Extract; result.result = extract.getField();
   } else if (isa<SelectOp>(op)) result.kind = K::Select;
+  else if (auto mask = dyn_cast<MaskOp>(op)) {
+    result.kind = K::Select;
+    result.operands = {mask.getPredicate(), mask.getValue(), mask.getFill()};
+  }
   else if (isa<CastOp>(op)) result.kind = K::Cast;
   else if (isa<BitcastOp>(op)) result.kind = K::Bitcast;
   else if (auto unary = dyn_cast<UnaryOp>(op)) {
-    if (unary.getApproximate() || unary.getFlushToZero()) return result;
-    switch (unary.getOperatorKind()) {
-    case UnaryOperator::Negate: result.kind = K::Negate; break;
-    case UnaryOperator::Not: result.kind = K::Not; break;
-    case UnaryOperator::Exp: case UnaryOperator::Exp2: result.kind = K::Exp; break;
-    default: break;
-    }
+    return describeUniformUnary(result.type, unary.getOperatorKind(), unary.getInput(),
+                                 unary.getApproximate(), unary.getFlushToZero());
   } else if (auto binary = dyn_cast<BinaryOp>(op)) {
-    if (binary.getApproximate() || binary.getFlushToZero()) return result;
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add: result.kind = K::Add; break;
-    case BinaryOperator::Subtract: result.kind = K::Subtract; break;
-    case BinaryOperator::Multiply: result.kind = K::Multiply; break;
-    case BinaryOperator::LogicalAnd: case BinaryOperator::BitwiseAnd: result.kind = K::And; break;
-    case BinaryOperator::LogicalOr: case BinaryOperator::BitwiseOr: result.kind = K::Or; break;
-    case BinaryOperator::BitwiseXor: result.kind = K::Xor; break;
-    case BinaryOperator::Maximum: result.kind = K::Maximum; break;
-    case BinaryOperator::Minimum: result.kind = K::Minimum; break;
-    case BinaryOperator::MaximumNum: result.kind = K::MaximumNum; break;
-    case BinaryOperator::MinimumNum: result.kind = K::MinimumNum; break;
-    default: break;
-    }
+    return describeUniformBinary(result.type, binary.getOperatorKind(), binary.getLhs(), binary.getRhs(),
+                                  binary.getApproximate(), binary.getFlushToZero());
+  } else if (auto compare = dyn_cast<CompareOp>(op)) {
+    return describeUniformCompare(result.type, getElementTypeOrSelf(compare.getLhs().getType()),
+                                   compare.getPredicate(), compare.getLhs(), compare.getRhs());
   } else if (isa<ReduceOp>(op))
     return describeStructuredReduction(cast<OpResult>(value), result.type);
   return result;

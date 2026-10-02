@@ -21,8 +21,12 @@ std::string ctype(Type type) {
   if (type.isF32()) return "float";
   if (type.isF64()) return "double";
   if (type.isInteger(1)) return "bool";
-  if (type.isInteger(32)) return "int32_t";
-  return "int64_t";
+  if (type.isIndex()) return "int64_t";
+  return "int" + std::to_string(cast<IntegerType>(type).getWidth()) + "_t";
+}
+std::string unsignedType(Type type) {
+  unsigned width = type.isIndex() ? 64 : cast<IntegerType>(type).getWidth();
+  return "uint" + std::to_string(std::max(8u, width)) + "_t";
 }
 class Serializer {
 public:
@@ -89,6 +93,9 @@ public:
 private:
   void line(const std::string &text, unsigned depth) { out.indent(depth * 2) << text << "\n"; }
   std::string name(Value value) { return names.lookup(value); }
+  std::string unsignedValue(Value value) {
+    return "static_cast<" + unsignedType(value.getType()) + ">(" + name(value) + ")";
+  }
   std::string bind(Value value) {
     std::string result = "v" + std::to_string(next++); names[value] = result; return result;
   }
@@ -513,15 +520,24 @@ private:
     } else if (auto constant = dyn_cast<arith::ConstantOp>(op)) {
       if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) expression = floatLiteral(floating);
       else expression = std::to_string(cast<IntegerAttr>(constant.getValue()).getInt());
-    } else if (isa<arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::ExtSIOp, arith::ExtUIOp,
-                   arith::TruncIOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp>(op)) {
+    } else if (isa<arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::IndexCastUIOp,
+                   arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+                   arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp>(op)) {
       Type from = op->getOperand(0).getType(), to = op->getResult(0).getType();
       std::string value = name(op->getOperand(0));
+      if (isa<arith::ExtUIOp, arith::UIToFPOp, arith::IndexCastUIOp>(op))
+        value = unsignedValue(op->getOperand(0));
       if (from.isBF16()) value = "intent_bf16_to_float(" + value + ")";
+      if (isa<arith::FPToUIOp>(op)) value = "static_cast<" + unsignedType(to) + ">(" + value + ")";
       expression = to.isBF16() ? "intent_number_to_bf16(" + value + ")" : "static_cast<" + ctype(to) + ">(" + value + ")";
     }
     else if (auto select = dyn_cast<arith::SelectOp>(op)) expression = name(select.getCondition()) + " ? " + name(select.getTrueValue()) + " : " + name(select.getFalseValue());
     else if (isa<arith::NegFOp>(op)) expression = "-" + name(op->getOperand(0));
+    else if (isa<math::AbsIOp>(op)) {
+      Value input = op->getOperand(0);
+      expression = "(" + name(input) + " < 0 ? static_cast<" + ctype(input.getType()) +
+          ">(" + unsignedType(input.getType()) + "(0) - " + unsignedValue(input) + ") : " + name(input) + ")";
+    }
     else if (op->getName().getDialectNamespace() == "math" && op->getNumOperands() == 1) {
       std::string callee;
       if (isa<math::ExpOp>(op)) callee = "expf";
@@ -542,13 +558,15 @@ private:
       if (isa<arith::AddIOp, arith::AddFOp>(op)) symbol = "+";
       if (isa<arith::SubIOp, arith::SubFOp>(op)) symbol = "-";
       if (isa<arith::MulIOp, arith::MulFOp>(op)) symbol = "*";
-      if (isa<arith::DivSIOp, arith::DivFOp>(op)) symbol = "/";
-      if (isa<arith::RemSIOp>(op)) symbol = "%";
+      if (isa<arith::DivSIOp, arith::DivUIOp, arith::DivFOp>(op)) symbol = "/";
+      if (isa<arith::RemSIOp, arith::RemUIOp>(op)) symbol = "%";
       if (isa<arith::AndIOp>(op)) symbol = "&";
       if (isa<arith::OrIOp>(op)) symbol = "|";
       if (isa<arith::XOrIOp>(op)) symbol = "^";
       if (isa<arith::ShLIOp>(op)) symbol = "<<";
-      if (isa<arith::ShRSIOp>(op)) symbol = ">>";
+      if (isa<arith::ShRSIOp, arith::ShRUIOp>(op)) symbol = ">>";
+      bool unsignedOperands = isa<arith::DivUIOp, arith::RemUIOp, arith::ShRUIOp,
+                                  arith::MinUIOp, arith::MaxUIOp>(op);
       if (auto cmp = dyn_cast<arith::CmpIOp>(op)) {
         switch (cmp.getPredicate()) {
         case arith::CmpIPredicate::eq: symbol = "=="; break;
@@ -557,8 +575,15 @@ private:
         case arith::CmpIPredicate::sle: symbol = "<="; break;
         case arith::CmpIPredicate::sgt: symbol = ">"; break;
         case arith::CmpIPredicate::sge: symbol = ">="; break;
-        default: return op->emitError("BANG C integer comparison predicate is not bound");
+        case arith::CmpIPredicate::ult: symbol = "<"; unsignedOperands = true; break;
+        case arith::CmpIPredicate::ule: symbol = "<="; unsignedOperands = true; break;
+        case arith::CmpIPredicate::ugt: symbol = ">"; unsignedOperands = true; break;
+        case arith::CmpIPredicate::uge: symbol = ">="; unsignedOperands = true; break;
         }
+      }
+      if (unsignedOperands) {
+        lhs = unsignedValue(op->getOperand(0));
+        rhs = unsignedValue(op->getOperand(1));
       }
       if (auto cmp = dyn_cast<arith::CmpFOp>(op)) {
         switch (cmp.getPredicate()) {
@@ -572,8 +597,8 @@ private:
         }
       }
       if (!symbol.empty()) expression = lhs + " " + symbol + " " + rhs;
-      else if (isa<arith::MinSIOp>(op)) expression = "(" + lhs + " < " + rhs + " ? " + lhs + " : " + rhs + ")";
-      else if (isa<arith::MaxSIOp>(op)) expression = "(" + lhs + " > " + rhs + " ? " + lhs + " : " + rhs + ")";
+      else if (isa<arith::MinSIOp, arith::MinUIOp>(op)) expression = "(" + lhs + " < " + rhs + " ? " + lhs + " : " + rhs + ")";
+      else if (isa<arith::MaxSIOp, arith::MaxUIOp>(op)) expression = "(" + lhs + " > " + rhs + " ? " + lhs + " : " + rhs + ")";
       else if (isa<arith::FloorDivSIOp>(op)) expression = "(" + lhs + " / " + rhs + " - (" + lhs + " % " + rhs + " != 0 && ((" + lhs + " < 0) != (" + rhs + " < 0))))";
       else if (isa<arith::CeilDivSIOp>(op)) expression = "(" + lhs + " / " + rhs + " + (" + lhs + " % " + rhs + " != 0 && ((" + lhs + " < 0) == (" + rhs + " < 0))))";
       else if (isa<arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp>(op)) {
@@ -584,9 +609,13 @@ private:
       }
       if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ShLIOp>(op)) {
         Type type = op->getResult(0).getType();
-        std::string unsignedType = type.isInteger(32) ? "uint32_t" : "uint64_t";
-        expression = "static_cast<" + ctype(type) + ">(static_cast<" + unsignedType + ">(" + lhs + ") " + symbol + " static_cast<" + unsignedType + ">(" + rhs + "))";
+        // Arithmetic below 32 bits must not be promoted back to signed int
+        // before multiplication or left shift. The final cast retains low bits.
+        std::string carrier = type.isInteger(64) || type.isIndex() ? "uint64_t" : "uint32_t";
+        expression = "static_cast<" + ctype(type) + ">(static_cast<" + carrier + ">(" + lhs + ") " + symbol + " static_cast<" + carrier + ">(" + rhs + "))";
       }
+      if (unsignedOperands && !isa<arith::CmpIOp>(op))
+        expression = "static_cast<" + ctype(op->getResult(0).getType()) + ">(" + expression + ")";
     }
     if (expression.empty() || op->getNumResults() != 1) return op->emitError("operation has no BANG C spelling");
     line(ctype(op->getResult(0).getType()) + " " + bind(op->getResult(0)) + " = " + expression + ";", depth);

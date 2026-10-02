@@ -406,18 +406,33 @@ LogicalResult Construction::tensorOperation(Operation *op) {
     return buffer && buffer.getShape() == cast<MemRefType>(output.getType()).getShape();
   });
   bool floating = isa<FloatType>(type.getElementType());
+  auto unsignedElement = [](Type type) {
+    auto integer = dyn_cast<IntegerType>(getElementTypeOrSelf(type));
+    return integer && integer.isUnsigned();
+  };
+  auto nativeCast = [&](CastOp cast) {
+    Type source = getElementTypeOrSelf(cast.getInput().getType());
+    Type target = type.getElementType();
+    // The DSA tile cast has no signedness operand. Equal-width integer casts
+    // preserve bits; other unsigned numeric conversions use scalar primitives.
+    return (!unsignedElement(source) && !unsignedElement(target)) ||
+        (isa<IntegerType>(source) && isa<IntegerType>(target) &&
+         source.getIntOrFloatBitWidth() == target.getIntOrFloatBitWidth());
+  };
   if (auto binary = dyn_cast<BinaryOp>(op); binary && matching && floating)
     b.create<dsa::BinaryOp>(loc, inputs[0], inputs[1], output, binary.getOperatorKindAttr(), binary.getApproximateAttr(), binary.getFlushToZeroAttr(), Value());
   else if (auto unary = dyn_cast<UnaryOp>(op); unary && matching && floating)
     b.create<dsa::UnaryOp>(loc, inputs[0], output, unary.getOperatorKindAttr(), unary.getApproximateAttr(), unary.getFlushToZeroAttr(), Value());
-  else if (auto cast = dyn_cast<CastOp>(op); cast && matching) {
-    if (cast.getRounding()) return cast.emitError("DSA explicit rounding is not implemented");
+  else if (auto cast = dyn_cast<CastOp>(op); cast && matching && nativeCast(cast)) {
+    if (cast.getRounding() && *cast.getRounding() != 0)
+      return cast.emitError("DSA explicit rounding is not implemented");
     b.create<dsa::CastOp>(loc, inputs[0], output);
   } else if (isa<SelectOp>(op) && matching)
     b.create<dsa::SelectOp>(loc, inputs[0], inputs[1], inputs[2], output, Value{});
   else if (isa<MaskOp>(op) && matching)
     b.create<dsa::SelectOp>(loc, inputs[1], inputs[0], inputs[2], output, Value{});
   else if (auto compare = dyn_cast<CompareOp>(op); compare && matching &&
+      !unsignedElement(compare.getLhs().getType()) &&
       mlir::cast<MemRefType>(inputs.front().getType()).getElementType().isInteger(64))
     b.create<dsa::CompareOp>(loc, inputs[0], inputs[1], output, compare.getPredicateAttr(), Value());
   else if (failed(eachElement(loc, *shape, [&](ValueRange coordinates) {

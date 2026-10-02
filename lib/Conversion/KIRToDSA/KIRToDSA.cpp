@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Conversion/ScalarLowering.h"
 
 using namespace mlir;
 namespace intent {
@@ -14,6 +15,7 @@ LogicalResult lowerCanonicalKIRToDSA(ModuleOp module, dsa::ConfigurationAttr con
   kir_to_dsa::Construction construction(module, *physical, configuration, shapes, strides);
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (failed(construction.lower(function))) return failure();
+  realizeIntegerStorage(*physical);
   if (failed(dsa::verifyProgram(*physical))) return failure();
   module.getBodyRegion().takeBody(physical->getBodyRegion());
   module->setAttrs((*physical)->getAttrs());
