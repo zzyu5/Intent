@@ -123,6 +123,11 @@ class NativeCall(ObservedCall):
     trial_storage: tuple[memoryview, ...]
     winner: int | None = None
 
+    def compile(self) -> None:
+        """Weft's AOT portfolio is already compiled and loaded by materialization."""
+        if self.program.library is None:
+            raise CompilationStageError("provider_native_compilation", "native artifact is closed")
+
     def inspect_configurations(self):
         return self.program.inspect_configurations()
 

@@ -6,7 +6,7 @@ from ..artifact import CompiledArtifact
 from ..gpu.expressions import evaluate_shape
 from ..gpu.program import LaunchResult, materialize_gpu_program
 from ..tuning import TuningState
-from ..diagnostics import CacheObservation, CandidateRecorder, bindings, observation, resource, unavailable_resources
+from ..diagnostics import CacheObservation, CandidateObservation, CandidateRecorder, bindings, observation, resource, unavailable_resources
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -182,9 +182,7 @@ class TritonProgram:
         row = self._trial_configuration(named)
         self._eligible_rows(self._context(named), (row,))
 
-    def launch(self, invocation) -> LaunchResult:
-        import triton
-
+    def _arguments(self, invocation):
         values = dict(invocation.values)
         packed = self.facts.metadata_argument
         if packed is not None:
@@ -197,6 +195,69 @@ class TritonProgram:
             values[choice.eligibility] = all(self._eligible(entry, values) for entry in self.descriptors)
         arguments = tuple(self.interface.native_value(name, values) for name in self.facts.kernel_arguments)
         coverage = {name: values[name] for name in self.configurations.coverage_names}
+        return values, arguments, coverage
+
+    def compile(self, invocation):
+        import triton
+        from triton.compiler.errors import CompileTimeAssertionFailure
+        from triton.runtime.errors import OutOfResources, PTXASError
+
+        values, arguments, coverage = self._arguments(invocation)
+        records = []
+        last_error = None
+
+        def details(stage):
+            return observation("triton", self.target, invocation.description, None,
+                unavailable_resources("triton", "Compilation did not select or load an execution winner"),
+                records, stage=stage,
+                caches=(CacheObservation("native_compilation", "sdk", None, "Triton JIT warmup",
+                                         "native_compilation", "The SDK does not expose this cache decision"),))
+
+        try:
+            rows = tuple(self._trial_configuration(config.all_kwargs()) for config in self.kernel.configs)
+            eligible = self._eligible_rows(values, rows)
+            for config, row in zip(self.kernel.configs, rows, strict=True):
+                if row not in eligible:
+                    continue
+                configuration = bindings(self.configurations.bound_configuration(invocation.values, row))
+
+                def warmup():
+                    if self.facts.allocator:
+                        triton.set_allocator(_descriptor_allocator)
+                    return self.kernel.fn.warmup(
+                        *arguments, grid=evaluate_shape(self.interface.grid, {**values, **row}),
+                        **coverage, **config.all_kwargs(), enable_fp_fusion=True, enable_reflect_ftz=False)
+
+                try:
+                    copy_context().run(warmup) if self.facts.allocator else warmup()
+                except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as error:
+                    # Match the SDK autotuner's candidate rejection boundary.
+                    records.append(CandidateObservation(configuration, "failed", "provider_native_compilation",
+                                                        type(error).__name__, str(error)))
+                    last_error = error
+                    continue
+                except Exception as error:
+                    records.append(CandidateObservation(configuration, "failed", "provider_native_compilation",
+                                                        type(error).__name__, str(error)))
+                    raise
+                records.append(CandidateObservation(configuration, "compiled", "provider_native_compilation"))
+            if not any(record.status == "compiled" for record in records):
+                raise CompilationStageError("provider_native_compilation",
+                    f"No Triton candidate compiled. Configuration: {dict(records[-1].configuration)}\n{last_error}",
+                    observation=details("failed")) from last_error
+        except CompilationStageError as error:
+            if error.observation is None:
+                error.observation = details("failed")
+            raise
+        except Exception as error:
+            raise CompilationStageError("provider_native_compilation", str(error),
+                                        observation=details("failed")) from error
+        return details("compiled")
+
+    def launch(self, invocation) -> LaunchResult:
+        import triton
+
+        values, arguments, coverage = self._arguments(invocation)
         recorder = CandidateRecorder()
 
         def trial(arguments, error):

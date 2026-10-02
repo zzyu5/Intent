@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 from ..artifact import CompiledArtifact
@@ -71,22 +70,22 @@ def _search(*arguments, **keywords):
 
 
 class CuTileProgram:
-    def __init__(self, interface, namespace: dict, facts, target: dict) -> None:
+    def __init__(self, interface, namespace: dict, facts, target: dict, *, source: str) -> None:
+        from .compilation import CuTileCompilation
+
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
         self.target = bindings(target)
-        self.kernel = namespace[facts.kernel]
-        self.narrow_kernel = None if facts.narrow_kernel is None else namespace[facts.narrow_kernel]
-        self.native_kernels = {name: namespace[name] for name in (facts.kernel, facts.narrow_kernel)
-                               if name is not None}
+        self.compilation = CuTileCompilation(source, {
+            name: namespace[name] for name in (facts.kernel, facts.narrow_kernel) if name is not None})
+        self.kernel = self.compilation.kernel(facts.kernel)
+        self.narrow_kernel = None if facts.narrow_kernel is None else self.compilation.kernel(facts.narrow_kernel)
         self.tile_bounds = facts.index_tile_bounds
         self.search = _search
-        self.trial_state = TuningState
         self.observe_tuning = None
         self.tuning_options: dict = {}
         self._winners: dict = {}
-        self._compiling = False
 
     def _array_values(self, values: dict) -> None:
         for entry in self.facts.array_views:
@@ -114,6 +113,53 @@ class CuTileProgram:
                 tuple(values[entry.eligible] for entry in self.facts.array_views),
                 tuple(values[entry.name] for entry in self.interface.overlaps))
 
+    def _configurations(self, values):
+        return tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
+
+    def _kernel(self, invocation, values):
+        if self.tile_bounds is not None:
+            bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
+            if can_use_i32_array_indices(invocation.views, bounds):
+                return self.narrow_kernel
+        return self.kernel
+
+    def compile(self, invocation):
+        import cuda.tile as ct
+
+        values = dict(invocation.values)
+        self._array_values(values)
+        records = ()
+
+        def details(stage):
+            return observation("cutile", self.target, invocation.description, None, _native_resources(),
+                               records, stage=stage)
+
+        try:
+            configurations = self._configurations(values)
+            kernel = self._kernel(invocation, values)
+            failures = self.compilation.compile(tuple(
+                (kernel.replace_hints(**self._hints(config)), self._arguments(values, config))
+                for config in configurations))
+            records = tuple(CandidateObservation(
+                bindings(self.configurations.bound_configuration(invocation.values, vars(config))),
+                "compiled" if error is None else "failed", "provider_native_compilation",
+                None if error is None else error[0], None if error is None else error[1])
+                for config, error in zip(configurations, failures, strict=True))
+            if all(error is not None for error in failures):
+                kind, message = failures[0]
+                cause = ct.TileError(f"{kind}: {message}")
+                raise CompilationStageError("provider_native_compilation",
+                    f"No cuTile candidate compiled. Configuration: {vars(configurations[0])}\n{cause}",
+                    observation=details("failed")) from cause
+        except CompilationStageError as error:
+            if error.observation is None:
+                error.observation = details("failed")
+            raise
+        except Exception as error:
+            raise CompilationStageError("provider_native_compilation", str(error),
+                                        observation=details("failed")) from error
+        return details("compiled")
+
     def launch(self, invocation) -> LaunchResult:
         import torch
         import cuda.tile as ct
@@ -126,18 +172,14 @@ class CuTileProgram:
         candidates = ()
         if cached is None:
             try:
-                configurations = tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
+                configurations = self._configurations(values)
             except CompilationStageError as error:
                 error.observation = observation("cutile", self.target, invocation.description, None, _native_resources(),
                                                 stage="failed", history_unavailable="Candidate binding failed before native tuning")
                 raise
-            kernel = self.kernel
-            if self.tile_bounds is not None:
-                bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
-                if can_use_i32_array_indices(invocation.views, bounds):
-                    kernel = self.narrow_kernel
-            state = self.trial_state(invocation.public_views,
-                                     tuple(view.writable for view in self.interface.public_views))
+            kernel = self._kernel(invocation, values)
+            state = TuningState(invocation.public_views,
+                                tuple(view.writable for view in self.interface.public_views))
             trial_values = dict(values)
             trial_values.update((view.id, trial) for view, trial in
                                 zip(self.interface.public_views, state.views, strict=True))
@@ -152,13 +194,12 @@ class CuTileProgram:
                 details = observation("cutile", self.target, invocation.description, None, _native_resources(),
                     stage="failed", history_unavailable=
                     "cuTile did not return a TuningResult; its exception is preserved, but no complete candidate history is available")
-                stage = "provider_native_compilation" if self._compiling else "provider_tuning"
-                raise CompilationStageError(stage, str(error), observation=details) from error
+                raise CompilationStageError("provider_tuning", str(error), observation=details) from error
             if self.observe_tuning is not None:
                 self.observe_tuning(configurations, result)
             config = result.best.config
             selected = kernel.replace_hints(**self._hints(config)) if hints else kernel
-            candidates = () if self._compiling else tuple(
+            candidates = tuple(
                 [CandidateObservation(bindings(self.configurations.bound_configuration(invocation.values, vars(item.config))),
                                       "trial_completed", "provider_tuning",
                                       elapsed_ms=item.mean_us * 1e-3)
@@ -168,8 +209,7 @@ class CuTileProgram:
                                       error if isinstance(error, str) else error.__name__, message)
                  for config, error, message in result.failures])
             cached = config, selected
-            if not self._compiling:
-                self._winners[key] = cached
+            self._winners[key] = cached
         config, selected = cached
         grid = self._grid(values, config)
         arguments = self._arguments(values, config)
@@ -184,7 +224,7 @@ class CuTileProgram:
                 raise CompilationStageError("provider_invocation", str(error), observation=details) from error
 
         invoke()
-        details = None if self._compiling else observation(
+        details = observation(
             "cutile", self.target, invocation.description,
             bindings(self.configurations.bound_configuration(invocation.values, vars(config))), _native_resources(), candidates,
             caches=(CacheObservation("tuning", "runtime_instance", reused, "CuTileProgram._winners", "selection"),
@@ -192,7 +232,7 @@ class CuTileProgram:
                                      "native_dispatch",
                                      "The dispatcher does not report native compilation cache hits")),
             history_unavailable="The existing tuning winner was reused; no candidates were retried in this invocation" if reused else None)
-        return LaunchResult(None if self._compiling else invoke, selected, details)
+        return LaunchResult(invoke, selected, details)
 
     def tuning_configurations(self, invocation):
         return self.configurations.enumerate(invocation.values,
@@ -200,19 +240,6 @@ class CuTileProgram:
 
     def inspect_configurations(self, invocation):
         return self.configurations.inspect(invocation.values)
-
-    @contextmanager
-    def compilation_only(self, search, trial_state):
-        """Use a native compilation driver without recording its placeholders as tuning winners."""
-        previous = self.search, self.trial_state, self.observe_tuning, self._compiling
-        self.search, self.trial_state, self.observe_tuning = search, trial_state, None
-        self._compiling = True
-        try:
-            yield
-        finally:
-            self.search, self.trial_state, self.observe_tuning, self._compiling = previous
-            self._winners.clear()
-
 
 def _native_resources():
     return unavailable_resources("cuda.tile.CompilationResult",
@@ -227,7 +254,7 @@ def materialize_cutile_artifact(
     contract,
 ) -> CompiledArtifact:
     return materialize_gpu_program(
-        provider_name="cutile", provider_type=CuTileProgram, contract=contract,
+        provider_name="cutile", provider_type=lambda *args: CuTileProgram(*args, source=source), contract=contract,
         source=source,
         module_text=module_text,
         entry_name=entry_name,

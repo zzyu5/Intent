@@ -62,6 +62,9 @@ class NativeCall(ObservedCall):
     description: tuple
     winner: int | None = None
 
+    def compile(self) -> None:
+        """The Mojo portfolio is already compiled and loaded by materialization."""
+
     def inspect_configurations(self):
         return self.program.inspect_configurations()
 

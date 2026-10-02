@@ -12,9 +12,7 @@ import math
 import torch
 
 import intent
-from intent.targets import CuTileTarget
 from experiments._common.support import benchmark
-from experiments._common.support import prepare_kernel_call
 
 from .model import Context
 from .model import PreparedComparison
@@ -22,7 +20,6 @@ from .model import PreparedLaunch
 from .model import TensorTree
 from .model import Tolerance
 from .model import IntegerTolerance, SimilarityTolerance, NumericalTolerance
-from intent.runtime.cutile.compilation import CuTileCompilation
 
 
 class PipelineStageError(RuntimeError):
@@ -181,26 +178,27 @@ def compile_single(
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
-    if isinstance(context.target, CuTileTarget):
-        compilation = CuTileCompilation()
-        with compilation.cache():
-            report_stage("generated_native_compilation")
-            try:
-                with cpu_preparation(), compilation.compilation_only((artifact,)):
-                    artifact.run(*arguments)
-            except Exception as error:
-                raise PipelineStageError("generated_native_compilation", str(error)) from error
-            result = initial_launch(lambda: artifact.run(*arguments), side="generated")
-    else:
-        result = initial_launch(lambda: artifact.run(*arguments), side="generated")
     report_stage("generated_launcher_preparation")
     try:
-        launch_outputs = () if result is None else result
-        launch = prepare_kernel_call(artifact, arguments, launch_outputs)
+        call = artifact.prepare(*arguments)
+    except Exception as error:
+        raise PipelineStageError("generated_launcher_preparation", str(error)) from error
+    report_stage("generated_native_compilation")
+    try:
+        with cpu_preparation():
+            call.compile()
+    except intent.CompilationStageError as error:
+        raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
+    initial_launch(call.launch, side="generated")
+    report_stage("generated_launcher_preparation")
+    try:
+        # Preserve the existing second preparation launch, now on the same
+        # bound call whose candidates were compiled and initially tuned.
+        call.launch()
     except Exception as error:
         raise PipelineStageError("generated_launcher_preparation", str(error)) from error
     report_stage("adapter_preparation")
-    return artifact, PreparedLaunch(launch=launch, outputs=lambda: result)
+    return artifact, PreparedLaunch(launch=call.launch, outputs=call.result)
 
 
 def functional_launch(function) -> PreparedLaunch:

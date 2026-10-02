@@ -49,7 +49,7 @@ class NativeResource:
 
 @dataclass(frozen=True, slots=True)
 class CandidateObservation:
-    """A provider trial; elapsed_ms is existing tuning data, not an operator benchmark."""
+    """A provider compilation or trial; elapsed_ms is existing tuning data only."""
 
     configuration: tuple[tuple[str, object], ...] | None
     status: str
@@ -118,11 +118,11 @@ class InvocationArgument:
 
 @dataclass(frozen=True, slots=True)
 class NativeObservation:
-    """Latest actual native invocation; missing SDK facts stay explicitly unknown.
+    """Latest native compilation or invocation; missing SDK facts stay unknown.
 
     Arguments describe this invocation, not a promise that every scalar belongs
     to the provider's specialization key. Candidate bindings and native resource
-    fields describe the selected compiled program. This is not an occupancy
+    fields describe the selected compiled program, if one was selected. This is not an occupancy
     estimate, a correctness result, or an Intent optimization decision.
     """
 

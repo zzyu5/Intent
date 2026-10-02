@@ -26,6 +26,14 @@ class PreparedCall(Protocol):
     result() returns output containers; it does not perform synchronization.
     """
 
+    def compile(self) -> None:
+        """Compile eligible native candidates without tuning or executing this call.
+
+        Providers already compiled during materialization require no further work.
+        Compilation does not select a winner or certify native execution.
+        """
+        ...
+
     def launch(self) -> None:
         """Execute with the bound arguments and the provider's synchronization semantics."""
         ...
@@ -140,7 +148,8 @@ class CompiledArtifact:
     def prepare(self, *arguments: Any, outputs: tuple | None = None) -> PreparedCall:
         """Bind arguments and allocate invocation-owned outputs/workspace without executing.
 
-        The returned call's launch performs any first-use JIT/tuning and execution.
+        The returned call's compile() can perform native JIT without execution;
+        launch performs remaining first-use JIT/tuning and execution.
         GPU calls use the provider's current stream; CPU calls complete their join;
         BANG C calls synchronize their queue. result() only returns output containers.
         Explicit outputs replace declared Out buffers, in declaration order.

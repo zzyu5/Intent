@@ -21,6 +21,11 @@ class NativeCall(ObservedCall):
     outputs: tuple[DeviceBuffer | DeviceView, ...]
     description: tuple
 
+    def compile(self) -> None:
+        """The fixed BANG C entry is already compiled and loaded by materialization."""
+        if not self.program.queue.value:
+            raise CompilationStageError("provider_native_compilation", "BANG C program is closed")
+
     def inspect_configurations(self):
         """BANG C has a fixed generated entry, not a runtime tuning portfolio."""
         return ()

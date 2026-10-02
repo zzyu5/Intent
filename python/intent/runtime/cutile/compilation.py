@@ -1,163 +1,159 @@
+"""Program-owned cuTile compilation, shared by preparation and SDK dispatch."""
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, replace
 import linecache
 import multiprocessing
-from types import SimpleNamespace
+from threading import RLock
 
 
-def _initialize_compiler(sources):
-    global _compile_namespaces
-    _compile_namespaces = {}
-    for module_name, filename, source in sources:
-        linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
-        namespace = {"__name__": module_name}
-        exec(compile(source, filename, "exec", dont_inherit=True), namespace)
-        _compile_namespaces[module_name] = namespace
+def _initialize_compiler(module_name, filename, source):
+    global _compile_namespace
+    linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
+    _compile_namespace = {"__name__": module_name}
+    exec(compile(source, filename, "exec", dont_inherit=True), _compile_namespace)
 
 
-def _compile_configuration(module_name, function_name, parameters, static_arrays,
-                           symbol, options, architecture, timeout):
+def _compile_configuration(function_name, parameters, convention, symbol, options,
+                           architecture, context_config):
     import cuda.tile as ct
+    from cuda.tile._cext import TileContext
     from cuda.tile._compile import compile_tile
     from cuda.tile.compilation import CallingConvention, KernelSignature
 
-    kernel = _compile_namespaces[module_name][function_name]
-    convention = (CallingConvention.cutile_python_v2() if static_arrays
-                  else CallingConvention.cutile_python_v1())
-    signature = KernelSignature(parameters, convention, symbol)
+    kernel = _compile_namespace[function_name]
+    signature = KernelSignature(parameters, CallingConvention.from_code(convention), symbol)
     try:
-        with ct.compiler_timeout(timeout):
-            compiled = compile_tile(kernel._annotated_function, (signature,),
-                                    architecture, options)
+        compiled = compile_tile(kernel._annotated_function, (signature,), architecture,
+                                options, TileContext(config=context_config))
     except ct.TileError as error:
-        return None, f"{type(error).__name__}: {error}"
+        return None, (type(error).__name__, str(error))
     return (compiled.cubin, compiled.kernel_signatures[0].symbol, None, []), None
 
 
+@dataclass(frozen=True)
+class _Compilation:
+    key: tuple
+    result: object
+    error: tuple[str, str] | None
+
+
 class CuTileCompilation:
-    """Prepare generated kernels without running their tuning candidates."""
+    """Own the exact native results passed to this program's SDK dispatchers.
 
-    def __init__(self):
-        self.compiled = []
-        self.failures = []
-        self.reuses = 0
+    The SDK has no dispatcher preloading API. Its kernel subclass callback is
+    used for both ordinary JIT and explicit compilation; global SDK functions,
+    autotuning and launch remain untouched. No tensors enter this result cache.
+    """
 
-    @contextmanager
-    def cache(self):
+    def __init__(self, source: str, kernels: dict[str, object]):
         import cuda.tile as ct
-        from cuda.tile._compile import format_sm_arch, get_sm_arch
 
-        original_compile = ct.kernel._compile
-        self.compiled.clear()
+        self._source = source
+        self._kernels = kernels
+        self._compiled: list[_Compilation] = []
+        self._variants = []
+        self._lock = RLock()
+        owner = self
 
-        def compile_kernel(kernel, signature, context, compute_capability=None):
-            # Native constraints are unhashable. Ignore only the prepared symbol;
-            # the launch dispatcher's otherwise identical signature is unnamed.
-            architecture = (get_sm_arch() if compute_capability is None
-                            else format_sm_arch(*compute_capability))
-            key = (kernel._pyfunc, kernel._compiler_options,
-                   signature.with_symbol(None), architecture, context)
-            for previous, result, error in self.compiled:
-                if key == previous:
-                    self.reuses += 1
-                    if error is not None:
-                        raise error
+        class ProgramKernel(ct.kernel):
+            def _compile(self, signature, context, compute_capability=None):
+                compute_capability = owner._capability(compute_capability)
+                key = owner._key(self, signature, context, compute_capability)
+                with owner._lock:
+                    cached = owner._lookup(key)
+                    if cached is not None:
+                        if cached.error is not None:
+                            kind, message = cached.error
+                            raise ct.TileError(f"{kind}: {message}")
+                        return cached.result
+                    try:
+                        result = super()._compile(signature, context, compute_capability)
+                    except ct.TileError as error:
+                        owner._compiled.append(_Compilation(key, None, (type(error).__name__, str(error))))
+                        raise
+                    owner._compiled.append(_Compilation(key, result, None))
                     return result
-            try:
-                result = original_compile(kernel, signature, context, compute_capability)
-            except ct.TileError as error:
-                self.compiled.append((key, None, error))
-                raise
-            self.compiled.append((key, result, None))
-            return result
 
-        ct.kernel._compile = compile_kernel
-        try:
-            yield
-        finally:
-            ct.kernel._compile = original_compile
+            def replace_hints(self, **hints):
+                return owner._variant(self._intent_entry, replace(self._compiler_options, **hints))
 
-    @contextmanager
-    def compilation_only(self, artifacts):
-        import cuda.tile as ct
-        from cuda.tile._compile import get_sm_arch
-        from cuda.tile.compilation import CallingConvention, KernelSignature
+        self._kernel_type = ProgramKernel
+
+    def _variant(self, name, options):
+        with self._lock:
+            for previous_name, previous_options, kernel in self._variants:
+                if previous_name == name and previous_options == options:
+                    return kernel
+            kernel = self._kernel_type(self._kernels[name]._pyfunc, **asdict(options))
+            kernel._intent_entry = name
+            self._variants.append((name, options, kernel))
+            return kernel
+
+    def kernel(self, name):
+        return self._variant(name, self._kernels[name]._compiler_options)
+
+    @staticmethod
+    def _capability(compute_capability):
+        if compute_capability is not None:
+            return compute_capability
+        import torch
+        from cuda.tile._cext import get_compute_capability
+
+        return get_compute_capability(torch.cuda.current_device())
+
+    @staticmethod
+    def _key(kernel, signature, context, compute_capability=None):
+        from cuda.tile._compile import format_sm_arch
+
+        architecture = format_sm_arch(*CuTileCompilation._capability(compute_capability))
+        # Dispatcher-selected symbols do not change the native signature.
+        return (kernel._intent_entry, kernel._compiler_options, signature.with_symbol(None),
+                architecture, context, replace(context.config))
+
+    def _lookup(self, key):
+        return next((entry for entry in self._compiled if entry.key == key), None)
+
+    def compile(self, requests):
+        """Compile (kernel, bound arguments) requests in their declared order.
+
+        Return each request's SDK failure, or None on success. A failed candidate
+        remains a failed candidate when the unchanged SDK tuner encounters it.
+        """
         from cuda.tile._cext import default_tile_context
+        from cuda.tile.compilation import CallingConvention, KernelSignature
 
-        def signature_for(kernel, arguments):
+        context = default_tile_context
+        keys, pending = [], []
+        for kernel, arguments in requests:
             static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
                                 for annotation in kernel._annotated_function.parameter_annotations)
             convention = (CallingConvention.cutile_python_v2() if static_arrays
                           else CallingConvention.cutile_python_v1())
             signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
-            return signature, static_arrays
-
-        def compile_kernel(stream, grid, kernel, arguments):
-            signature, _ = signature_for(kernel, arguments)
-            kernel._compile(signature, default_tile_context)
-
-        def compile_search(configs, stream, grid_fn, kernel, args_fn, hints_fn=None, **kwargs):
-            first = None
-            last_error = None
-            pending = []
-            architecture = get_sm_arch()
-            for config in configs:
-                candidate = kernel.replace_hints(**(hints_fn(config) if hints_fn else {}))
-                signature, static_arrays = signature_for(candidate, args_fn(config))
-                pending.append((config, candidate, signature, executor.submit(
-                    _compile_configuration, candidate._pyfunc.__module__,
-                    bindings[candidate._pyfunc], signature.parameters, static_arrays,
-                    signature.symbol, candidate._compiler_options, architecture,
-                    default_tile_context.config.compiler_timeout_sec)))
-            for config, candidate, signature, future in pending:
-                result, diagnostic = future.result()
-                error = ct.TileError(diagnostic) if diagnostic is not None else None
-                key = (candidate._pyfunc, candidate._compiler_options,
-                       signature.with_symbol(None), architecture, default_tile_context)
-                self.compiled.append((key, result, error))
-                if error is not None:
-                    last_error = error
-                    self.failures.append({"kernel": kernel._pyfunc.__name__,
-                                          "config": str(config), "error": str(error)})
+            key = self._key(kernel, signature, context)
+            keys.append(key)
+            with self._lock:
+                if self._lookup(key) is not None or any(key == item[0] for item in pending):
                     continue
-                if first is None:
-                    first = config
-            if first is None:
-                raise RuntimeError(
-                    f"no cuTile configuration compiled for the current device: {last_error}"
-                ) from last_error
-            return SimpleNamespace(best=SimpleNamespace(config=first))
+            pending.append((key, kernel._intent_entry, signature, kernel._compiler_options))
 
-        class CompilationState:
-            def __init__(self, views, writable):
-                self.views = views
-
-            def arguments(self, arguments):
-                return arguments
-
-        original_launch = ct.launch
-        sources = []
-        bindings = {}
-        with ExitStack() as contexts:
-            for artifact in artifacts:
-                provider = artifact.runtime.provider
-                kernel = provider.kernel
-                for name, value in provider.native_kernels.items():
-                    bindings[value._pyfunc] = name
-                sources.append((kernel._pyfunc.__module__,
-                                kernel._pyfunc.__code__.co_filename, artifact.source))
-                contexts.enter_context(provider.compilation_only(compile_search,
-                                                                  CompilationState))
-            ct.launch = compile_kernel
-            try:
-                # Each process owns the SDK compiler lock; this phase does not
-                # execute candidates or publish a placeholder tuning winner.
-                with ProcessPoolExecutor(max_workers=4,
-                                         mp_context=multiprocessing.get_context("spawn"),
-                                         initializer=_initialize_compiler,
-                                         initargs=(sources,)) as executor:
-                    yield
-            finally:
-                ct.launch = original_launch
+        if pending:
+            exemplar = next(iter(self._kernels.values()))._pyfunc
+            with ProcessPoolExecutor(max_workers=4,
+                                     mp_context=multiprocessing.get_context("spawn"),
+                                     initializer=_initialize_compiler,
+                                     initargs=(exemplar.__module__, exemplar.__code__.co_filename,
+                                               self._source)) as executor:
+                submitted = [(key, executor.submit(_compile_configuration, name, signature.parameters,
+                                                   signature.calling_convention.code, signature.symbol,
+                                                   options, key[3], key[5]))
+                             for key, name, signature, options in pending]
+                for key, future in submitted:
+                    result, error = future.result()
+                    with self._lock:
+                        if self._lookup(key) is None:
+                            self._compiled.append(_Compilation(key, result, error))
+        with self._lock:
+            return tuple(self._lookup(key).error for key in keys)

@@ -20,6 +20,8 @@ class LaunchResult:
 
 
 class Provider(Protocol):
+    def compile(self, invocation: BoundInvocation) -> NativeObservation: ...
+
     def launch(self, invocation: BoundInvocation) -> LaunchResult: ...
 
     def tuning_configurations(self, invocation: BoundInvocation) -> tuple: ...
@@ -47,6 +49,20 @@ class PreparedCall(ObservedCall):
 
     def result(self):
         return self.invocation.result()
+
+    def compile(self) -> None:
+        """Compile this binding's eligible candidates without tuning or launching."""
+        import torch
+
+        try:
+            with self.program.invocation_context(), torch.cuda.device(self.program.device):
+                details = self.program.provider.compile(self.invocation)
+        except CompilationStageError as error:
+            self._record_observation(error.observation)
+            raise
+        except Exception as error:
+            raise CompilationStageError("provider_native_compilation", str(error)) from error
+        self._record_observation(details)
 
     def launch(self) -> None:
         import torch
