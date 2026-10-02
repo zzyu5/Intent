@@ -22,6 +22,12 @@ add_mlir_library(MLIRIntentGPUTransforms
   RealizeOnlineReduction.cpp
   RealizeRegionFold.cpp
   RealizeReductionBlocking.cpp
+  ReductionAnalysis.cpp
+  ReductionParameters.cpp
+  ReductionValues.cpp
+  ReductionCoverage.cpp
+  ReductionDecomposition.cpp
+  ReductionTraversal.cpp
   RefineProgramMapping.cpp
   ExecutionGroups.cpp
   EliminateCommonValues.cpp
