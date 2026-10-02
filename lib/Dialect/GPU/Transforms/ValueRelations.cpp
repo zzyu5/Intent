@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -147,8 +148,9 @@ private:
           kind == AccessKind::Store)
         push(operation, AccessValue);
     }
-    if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
-            BroadcastOp, TransposeOp>(operation)) push(operation, Pointwise);
+    if (isa<FragmentOpInterface>(operation) &&
+        !isa<SplatOp, ReshapeOp>(operation))
+      push(operation, Pointwise);
     if (isa<ReshapeOp>(operation)) push(operation, Reshape);
     if (isa<ContractOp>(operation)) push(operation, ContractOperands);
     if (isa<ContractOp, ScaledContractOp, SparseContractOp>(operation))
@@ -300,9 +302,12 @@ WalkResult alignContractOperands(Operation *operation, RelationWorklist &changes
     auto target = cast<FragmentType>(value.getType());
     if (!source)
       return false;
-    auto projection = queryBroadcastProjection(source, target);
+    auto relations = queryFragmentOperandRelations(broadcast);
     auto mapping = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
-    if (!projection.isExact() || projection.targetToSource[axis] ||
+    if (failed(relations) || !relations->front().hasCompatibleExtents())
+      return false;
+    const auto *group = relations->front().groupForResultAxis(axis);
+    if (!group || !group->sourceAxes.empty() ||
         queryFragmentAxes(target, sourceAxisIdentity(mapping)).size() != 1)
       return false;
     auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
@@ -524,15 +529,13 @@ bool preservesIntroducedUnitAxis(Value value, AxisSelector selects) {
         continue;
       }
       auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
-      BroadcastProjection projection =
-          target ? queryAxisProjection(result, target) : BroadcastProjection();
-      if (!target || !projection.isExact())
+      auto relations = queryFragmentOperandRelations(broadcast);
+      if (!target || failed(relations))
         return false;
       std::optional<unsigned> targetAxis;
-      for (auto [candidate, sourceAxis] :
-           llvm::enumerate(projection.targetToSource))
-        if (sourceAxis && *sourceAxis == *axis)
-          targetAxis = candidate;
+      for (const auto &group : relations->front().groups)
+        if (group.sourceAxes.size() == 1 && group.sourceAxes.front() == *axis)
+          targetAxis = group.resultAxes.front();
       if (!targetAxis)
         return false;
       expanded |= target.getShape()[*targetAxis] != result.getShape()[*axis];
@@ -843,15 +846,18 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
   };
 
     if (auto transpose = dyn_cast<TransposeOp>(operation)) {
-      auto source = cast<FragmentType>(transpose.getValue().getType());
-      auto target = cast<FragmentType>(transpose.getResult().getType());
-      SmallVector<Attribute> shape;
-      for (int64_t input : transpose.getPermutation())
-        shape.push_back(source.getShape()[input]);
-      changes.setType(transpose.getResult(), FragmentType::get(
-          kernel.getContext(), target.getElementType(),
-          ArrayAttr::get(kernel.getContext(), shape), target.getAxisMaps(),
-          target.getValidity(), target.getOwner()));
+      auto relations = queryFragmentOperandRelations(transpose);
+      if (failed(relations)) {
+        transpose.emitOpError("transpose has no physical operand relation");
+        return WalkResult::interrupt();
+      }
+      auto result = transportFragmentResultType(
+          *relations, transpose->getOperandTypes(), transpose.getResult().getType());
+      if (failed(result)) {
+        transpose.emitOpError("transpose cannot transport its physical operand schema");
+        return WalkResult::interrupt();
+      }
+      changes.setType(transpose.getResult(), *result);
       return WalkResult::advance();
     }
     if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
@@ -859,7 +865,8 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
       auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
       if (!target || !source)
         return WalkResult::advance();
-      if (!queryBroadcastProjection(source, target).isExact()) {
+      auto relations = queryFragmentOperandRelations(broadcast);
+      if (failed(relations) || !relations->front().hasCompatibleExtents()) {
         OpBuilder builder(broadcast);
       builder.setListener(&changes);
         FailureOr<Value> projected = projectPhysicalValueToSchema(
@@ -869,12 +876,9 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
           source = cast<FragmentType>(projected->getType());
         }
       }
-      BroadcastProjection projection = queryAxisProjection(source, target);
-      if (!projection.isExact()) {
-        broadcast.emitOpError(
-            projection.state == BroadcastProjectionState::Ambiguous
-                ? "broadcast has an ambiguous physical source projection"
-                : "broadcast has no physical source projection")
+      relations = queryFragmentOperandRelations(broadcast);
+      if (failed(relations)) {
+        broadcast.emitOpError("broadcast has no unique physical source projection")
             << "; input=" << source << "; result=" << target;
         return WalkResult::interrupt();
       }
@@ -886,13 +890,15 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
       // before asking the verifier to observe the intermediate program.  A true
       // singleton broadcast remains an expansion and never acquires the
       // consumer's extent.
-      for (auto [targetAxis, sourceAxis] :
-           llvm::enumerate(projection.targetToSource)) {
-        if (!sourceAxis ||
-            source.getShape()[*sourceAxis] == target.getShape()[targetAxis])
+      for (const FragmentAxisGroup &group : relations->front().groups) {
+        if (group.sourceAxes.empty())
+          continue;
+        unsigned sourceAxis = group.sourceAxes.front();
+        unsigned targetAxis = group.resultAxes.front();
+        if (source.getShape()[sourceAxis] == target.getShape()[targetAxis])
           continue;
         auto sourceExtent =
-            cast<PhysicalExprAttr>(source.getShape()[*sourceAxis]);
+            cast<PhysicalExprAttr>(source.getShape()[sourceAxis]);
         bool singleton =
             sourceExtent.getKind() ==
                 PhysicalExprKind::Constant &&
@@ -907,7 +913,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
             targetExtent.getValue() == 1;
         if (targetSingleton) {
           PhysicalProgramAnalysis analysis(kernel);
-          auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+          auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
           auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
           bool derivedOccurrence =
               targetMap.getDerived() && sourceMap.getDimensionId() > 0 &&
@@ -942,11 +948,11 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
           return WalkResult::interrupt();
         }
         bool sourceParameter =
-            isParameterExtent(source.getShape()[*sourceAxis]);
+            isParameterExtent(source.getShape()[sourceAxis]);
         bool targetParameter = isParameterExtent(targetExtent);
         if (!sourceParameter && !targetParameter) {
           PhysicalProgramAnalysis analysis(kernel);
-          auto input = analysis.axisRealization(broadcast.getValue(), *sourceAxis);
+          auto input = analysis.axisRealization(broadcast.getValue(), sourceAxis);
           auto output = analysis.axisRealization(broadcast.getResult(), targetAxis);
           if (input.hasExtentAuthority() && !input.constructionScalarSeed &&
               !output.hasExtentAuthority()) {
@@ -964,7 +970,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
           return WalkResult::interrupt();
         }
         auto sourceMap =
-            cast<AxisMapAttr>(source.getAxisMaps()[*sourceAxis]);
+            cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
         auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
         if (sourceMap.getDimensionId() <= 0 || targetMap.getDimensionId() <= 0) {
           broadcast.emitOpError(
@@ -1001,8 +1007,7 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
     FragmentType target;
     if (operation->getNumResults() == 1)
       target = dyn_cast<FragmentType>(operation->getResult(0).getType());
-    if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(
-            operation))
+    if (!isa<FragmentOpInterface>(operation) || isa<SplatOp>(operation))
       return WalkResult::advance();
     if (!target && operation->getNumResults() == 1 &&
         isa<IntegerType, FloatType, IndexType>(
@@ -1021,14 +1026,24 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
     }
     if (!target)
       return WalkResult::advance();
-    if (Value value = queryElementwiseShapeSource(operation)) {
-      auto source = dyn_cast<FragmentType>(value.getType());
-      if (source) {
-        changes.setType(operation->getResult(0), FragmentType::get(
-            kernel.getContext(), target.getElementType(), source.getShape(),
-            source.getAxisMaps(), source.getValidity(), source.getOwner()));
-        return WalkResult::advance();
+    // Sole-source operations acquire their operand's complete lane schema.
+    // Multi-operand operations first resolve extent authorities below: their
+    // still-unprojected uniform inputs need not yet have the result's rank.
+    if (isa<UnaryOp, CastOp, BitcastOp>(operation) &&
+        isa<FragmentType>(operation->getOperand(0).getType())) {
+      auto relations = queryFragmentOperandRelations(operation);
+      if (failed(relations)) {
+        operation->emitOpError("pointwise operation has no physical operand relation");
+        return WalkResult::interrupt();
       }
+      auto result = transportFragmentResultType(
+          *relations, operation->getOperandTypes(), target);
+      if (failed(result)) {
+        operation->emitOpError("pointwise operation cannot transport its physical operand schema");
+        return WalkResult::interrupt();
+      }
+      changes.setType(operation->getResult(0), *result);
+      return WalkResult::advance();
     }
     FailureOr<FragmentType> refined =
         queryValueSchema(kernel, target, operation->getOperands());
@@ -1285,85 +1300,17 @@ LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) 
 }
 
 static LogicalResult refreshReshapeRelation(ReshapeOp reshape, RelationWorklist &changes) {
-    auto kernel = reshape->getParentOfType<func::FuncOp>();
-    // Reassociation is the typed row-major relation selected from canonical
-    // KIR.  Refinement passes may change physical extents, but they may not
-    // rediscover and replace that relation from the new shapes: doing so turns
-    // physical shape coincidence into a second algorithm authority.  Validate
-    // the preserved carrier here; the mutating pass that changed an extent is
-    // responsible for updating both sides of each existing group.
-    auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
-    auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
-    if (!source || !target) {
-      reshape.emitOpError(
-          "reshape relation requires physical fragment operands and result");
-      return failure();
-    }
-    unsigned logicalSourceRank = 0;
-    unsigned logicalResultRank = 0;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = dyn_cast<ReshapeGroupAttr>(attribute);
-      if (!group) {
-        reshape.emitOpError("reshape relation contains an untyped group");
-        return failure();
-      }
-      if (!group.getSourceAxes().empty())
-        logicalSourceRank = std::max(
-            logicalSourceRank,
-            static_cast<unsigned>(
-                group.getSourceAxes().asArrayRef().back() + 1));
-      if (!group.getResultAxes().empty())
-        logicalResultRank = std::max(
-            logicalResultRank,
-            static_cast<unsigned>(
-                group.getResultAxes().asArrayRef().back() + 1));
-    }
-    if (logicalSourceRank > source.getShape().size() ||
-        logicalResultRank > target.getShape().size()) {
-      reshape.emitOpError(
-          "reshape relation rank exceeds the current physical fragments");
-      return failure();
-    }
-    unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
-    unsigned resultPrefix = target.getShape().size() - logicalResultRank;
-    SmallVector<Attribute> resultShape(target.getShape().begin(),
-                                       target.getShape().end());
-    if (sourcePrefix == resultPrefix &&
-        llvm::equal(source.getAxisMaps().getValue().take_front(sourcePrefix),
-                    target.getAxisMaps().getValue().take_front(resultPrefix)))
-      llvm::copy(source.getShape().getValue().take_front(sourcePrefix),
-                 resultShape.begin());
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
-      ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
-      if (resultAxes.size() == 1) {
-        resultShape[resultPrefix + resultAxes.front()] = productExtent(
-            kernel.getContext(), source.getShape().getValue(), sourceAxes,
-            sourcePrefix);
-        continue;
-      }
-      if (sourceAxes.size() != 1 || resultAxes.empty())
-        continue;
-      SmallVector<int64_t> nonUnitAxes;
-      for (int64_t axis : resultAxes) {
-        auto extent = cast<PhysicalExprAttr>(
-            resultShape[resultPrefix + axis]);
-        if (extent.getKind() !=
-                PhysicalExprKind::Constant ||
-            extent.getValue() != 1)
-          nonUnitAxes.push_back(axis);
-      }
-      if (nonUnitAxes.size() == 1)
-        resultShape[resultPrefix + nonUnitAxes.front()] =
-            cast<PhysicalExprAttr>(
-                source.getShape()[sourcePrefix + sourceAxes.front()]);
-    }
-    changes.setType(reshape.getResult(), FragmentType::get(
-        kernel.getContext(), target.getElementType(),
-        ArrayAttr::get(kernel.getContext(), resultShape), target.getAxisMaps(),
-        target.getValidity(), target.getOwner()));
-    return reshape.verify();
+  // The operation owns its row-major groups. Refinement transports extents
+  // through that existing relation; it does not infer a new reassociation.
+  auto relations = queryFragmentOperandRelations(reshape);
+  if (failed(relations))
+    return reshape.emitOpError("reshape has no physical operand relation");
+  auto result = transportFragmentResultType(
+      *relations, reshape->getOperandTypes(), reshape.getResult().getType());
+  if (failed(result))
+    return reshape.emitOpError("reshape cannot transport its physical operand schema");
+  changes.setType(reshape.getResult(), *result);
+  return reshape.verify();
 }
 
 
@@ -1743,9 +1690,14 @@ static void retargetExtent(Value root, AxisSelector selects,
       worklist.append(record.getFields().begin(), record.getFields().end());
     if (auto extract = value.getDefiningOp<ExtractOp>())
       worklist.push_back(extract.getRecord());
-    if (Operation *producer = value.getDefiningOp())
-      if (Value source = queryElementwiseShapeSource(producer))
-        worklist.push_back(source);
+    if (Operation *producer = value.getDefiningOp();
+        isa_and_nonnull<FragmentOpInterface>(producer)) {
+      auto relations = queryFragmentOperandRelations(producer);
+      if (succeeded(relations))
+        for (const auto &relation : *relations)
+          if (relation.preservesSourceSchema)
+            worklist.push_back(producer->getOperand(relation.operandNumber));
+    }
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       if (auto structured = dyn_cast<StructuredOpInterface>(argument.getOwner()->getParentOp()))
         appendStructuredRelations(structured, argument, worklist, selects, StructuredBoundary::Parent);
@@ -1830,67 +1782,44 @@ static void retargetExtent(Value root, AxisSelector selects,
           }
         }
       }
-      if (auto broadcast = dyn_cast<BroadcastOp>(user)) {
-        auto target = dyn_cast<FragmentType>(broadcast.getResult().getType());
-        if (previousFragment && target) {
-          BroadcastProjection projection =
-              queryBroadcastProjection(previousFragment, target);
-          if (projection.isExact())
-            for (auto [targetAxis, sourceAxis] :
-                 llvm::enumerate(projection.targetToSource)) {
-              if (!sourceAxis)
+      if (previousFragment && isa<BroadcastOp, ReshapeOp>(user)) {
+        Value result = user->getResult(0);
+        auto target = dyn_cast<FragmentType>(result.getType());
+        if (target) {
+          // Query the operation with its pre-rewrite operand schema. Expansion
+          // and one-to-one reassociation cannot be recovered from the mutated
+          // source's extent alone.
+          auto relations = queryFragmentOperandRelations(
+              user, TypeRange{previousFragment}, target);
+          bool broadcast = isa<BroadcastOp>(user);
+          if (succeeded(relations) &&
+              (!broadcast || relations->front().hasCompatibleExtents())) {
+            for (const FragmentAxisGroup &group : relations->front().groups) {
+              if (group.sourceAxes.size() != 1 || group.resultAxes.size() != 1 ||
+                  (!broadcast && group.kind != FragmentAxisRelationKind::Reassociation))
                 continue;
-              auto inputMap =
-                  cast<AxisMapAttr>(previousFragment.getAxisMaps()[*sourceAxis]);
+              unsigned sourceAxis = group.sourceAxes.front();
+              unsigned targetAxis = group.resultAxes.front();
+              auto inputMap = cast<AxisMapAttr>(previousFragment.getAxisMaps()[sourceAxis]);
               auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
-              auto oldExtent =
-                  cast<PhysicalExprAttr>(previousFragment.getShape()[*sourceAxis]);
-              bool unit = oldExtent.getKind() ==
-                              PhysicalExprKind::Constant &&
-                          oldExtent.getValue() <= 1;
-              bool sameLogicalExtent = inputMap.getDimensionId() > 0 &&
-                  inputMap.getDimensionId() == targetMap.getDimensionId();
-              if (selects(inputMap) && !selects(targetMap) &&
-                  (!unit || sameLogicalExtent) &&
-                  !isIntroducedReshapeUnitAxis(value, *sourceAxis) &&
-                  oldExtent == target.getShape()[targetAxis] &&
-                  target.getShape()[targetAxis] != extent) {
-                std::pair<Value, AxisMapAttr> alias{broadcast.getResult(),
-                                                    targetMap};
-                if (!llvm::is_contained(valueAliases, alias))
-                  valueAliases.push_back(alias);
+              auto oldExtent = cast<PhysicalExprAttr>(previousFragment.getShape()[sourceAxis]);
+              if (!selects(inputMap) || selects(targetMap) ||
+                  oldExtent != target.getShape()[targetAxis] ||
+                  target.getShape()[targetAxis] == extent)
+                continue;
+              if (broadcast) {
+                bool unit = oldExtent.getKind() == PhysicalExprKind::Constant &&
+                            oldExtent.getValue() <= 1;
+                bool sameLogicalExtent = inputMap.getDimensionId() > 0 &&
+                    inputMap.getDimensionId() == targetMap.getDimensionId();
+                if ((unit && !sameLogicalExtent) ||
+                    isIntroducedReshapeUnitAxis(value, sourceAxis))
+                  continue;
               }
+              std::pair<Value, AxisMapAttr> alias{result, targetMap};
+              if (!llvm::is_contained(valueAliases, alias))
+                valueAliases.push_back(alias);
             }
-        }
-      }
-      if (auto reshape = dyn_cast<ReshapeOp>(user)) {
-        auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
-        if (previousFragment && target) {
-          unsigned sourceRank = 0, resultRank = 0;
-          for (Attribute attribute : reshape.getReassociation()) {
-            auto group = cast<ReshapeGroupAttr>(attribute);
-            sourceRank += group.getSourceAxes().size();
-            resultRank += group.getResultAxes().size();
-          }
-          unsigned sourcePrefix = previousFragment.getShape().size() - sourceRank;
-          unsigned resultPrefix = target.getShape().size() - resultRank;
-          for (Attribute attribute : reshape.getReassociation()) {
-            auto group = cast<ReshapeGroupAttr>(attribute);
-            if (group.getSourceAxes().size() != 1 ||
-                group.getResultAxes().size() != 1)
-              continue;
-            unsigned sourceAxis = sourcePrefix + group.getSourceAxes()[0];
-            unsigned targetAxis = resultPrefix + group.getResultAxes()[0];
-            auto inputMap =
-                cast<AxisMapAttr>(previousFragment.getAxisMaps()[sourceAxis]);
-            auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
-            if (!selects(inputMap) || selects(targetMap) ||
-                previousFragment.getShape()[sourceAxis] != target.getShape()[targetAxis] ||
-                target.getShape()[targetAxis] == extent)
-              continue;
-            std::pair<Value, AxisMapAttr> alias{reshape.getResult(), targetMap};
-            if (!llvm::is_contained(valueAliases, alias))
-              valueAliases.push_back(alias);
           }
         }
       }

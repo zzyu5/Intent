@@ -11,6 +11,7 @@
 #include "OnlineSummary.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -562,43 +563,47 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     if (operation.getNumResults() == 1 &&
         mapping.lookupOrNull(operation.getResult(0)))
       continue;
+    // Read the original operation's coordinate contract before its cloned
+    // operands and result schemas acquire the selected segment extents.
+    SmallVector<SmallVector<FragmentOperandRelation>> relations;
+    if (isa<FragmentOpInterface>(operation)) {
+      for (OpResult result : operation.getResults()) {
+        auto relation = queryFragmentOperandRelations(result);
+        if (failed(relation)) {
+          reason = "helper value operation has no complete fragment relation";
+          return failure();
+        }
+        relations.push_back(std::move(*relation));
+      }
+    }
     Operation *clone = builder.clone(operation, mapping);
     bindClonedOperationTypes(clone, extentBindings);
-    if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
-      auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      auto output = dyn_cast<FragmentType>(broadcast.getResult().getType());
-      auto cloned = cast<BroadcastOp>(clone);
-      auto actualInput = dyn_cast<FragmentType>(cloned.getValue().getType());
-      auto actualOutput = dyn_cast<FragmentType>(cloned.getResult().getType());
-      if (input && output && actualInput && actualOutput &&
-          input.getShape().size() == actualInput.getShape().size()) {
-        auto projection = queryAxisProjection(input, output);
-        SmallVector<Attribute> shape(actualOutput.getShape().getValue());
-        SmallVector<unsigned> changedAxes;
-        if (projection.isExact())
-          for (auto [axis, inputAxis] :
-               llvm::enumerate(projection.targetToSource)) {
-            if (!inputAxis || isUnitExtent(input.getShape()[*inputAxis]) ||
-                input.getShape()[*inputAxis] != output.getShape()[axis])
-              continue;
-            Attribute extent = actualInput.getShape()[*inputAxis];
-            if (shape[axis] != extent)
-              changedAxes.push_back(axis);
-            shape[axis] = extent;
-          }
-        if (!changedAxes.empty()) {
-          // A helper-local occurrence can rename a sliced axis. Carry its
-          // selected extent through that relation, including a one-lane tail;
-          // genuine singleton broadcasts retain their original expansion.
-          auto type = FragmentType::get(
-              actualOutput.getContext(), actualOutput.getElementType(),
-              builder.getArrayAttr(shape), actualOutput.getAxisMaps(),
-              actualOutput.getValidity(), actualOutput.getOwner());
-          cloned.getResult().setType(type);
-          if (failed(collectExtentBindings(output, type, extentBindings, reason,
-                                          changedAxes)))
-            return failure();
-        }
+    for (auto [index, relation] : llvm::enumerate(relations)) {
+      auto original = dyn_cast<FragmentType>(operation.getResult(index).getType());
+      auto actual = dyn_cast<FragmentType>(clone->getResult(index).getType());
+      if (!original || !actual)
+        continue;
+      auto transported = transportFragmentResultType(
+          relation, clone->getOperandTypes(), actual);
+      if (failed(transported)) {
+        reason = "helper operands cannot transport the declared fragment schema";
+        return failure();
+      }
+      auto type = cast<FragmentType>(*transported);
+      if (type == actual)
+        continue;
+      SmallVector<unsigned> changedAxes;
+      bool changedRank = actual.getShape().size() != type.getShape().size();
+      if (!changedRank)
+        for (auto [axis, extent] : llvm::enumerate(actual.getShape()))
+          if (extent != type.getShape()[axis] ||
+              actual.getAxisMaps()[axis] != type.getAxisMaps()[axis])
+            changedAxes.push_back(axis);
+      clone->getResult(index).setType(type);
+      if (changedRank || !changedAxes.empty()) {
+        if (failed(collectExtentBindings(original, type, extentBindings, reason,
+                                        changedAxes)))
+          return failure();
       }
     }
     for (auto [source, result] :

@@ -1,6 +1,7 @@
 #include "OnlineSummary.h"
 
 #include "Intent/Analysis/OnlineSummaryCombine.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -148,49 +149,24 @@ FailureOr<SummaryAxes> summaryProjection(Value value, Value summary) {
       select && isBooleanConstant(select.getCondition(), true) &&
       isZero(select.getFalseValue()))
     return summaryProjection(select.getTrueValue(), summary);
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
-    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-    auto projection = queryAxisProjection(input, output);
-    auto source = summaryProjection(broadcast.getValue(), summary);
-    if (!projection.isExact() || failed(source))
-      return failure();
-    SummaryAxes axes;
-    for (auto axis : projection.targetToSource)
-      axes.push_back(axis ? (*source)[*axis] : std::nullopt);
-    return axes;
-  }
-  auto reshape = value.getDefiningOp<ReshapeOp>();
-  if (!reshape)
+  Operation *projection = value.getDefiningOp();
+  if (!isa_and_nonnull<BroadcastOp, ReshapeOp>(projection))
     return failure();
-  auto source = summaryProjection(reshape.getValue(), summary);
-  if (failed(source))
-    return failure();
-  unsigned sourceRank = 0, resultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    sourceRank += group.getSourceAxes().size();
-    resultRank += group.getResultAxes().size();
-  }
-  unsigned sourcePrefix = source->size() - sourceRank;
-  unsigned resultPrefix = output.getShape().size() - resultRank;
-  if (sourcePrefix != resultPrefix)
+  auto relations = queryFragmentOperandRelations(projection);
+  auto source = summaryProjection(projection->getOperand(0), summary);
+  if (failed(relations) || failed(source))
     return failure();
   SummaryAxes axes(output.getShape().size());
-  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
-    axes[axis] = (*source)[axis];
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().size() == 1 &&
-        group.getResultAxes().size() == 1) {
-      axes[resultPrefix + group.getResultAxes()[0]] =
-          (*source)[sourcePrefix + group.getSourceAxes()[0]];
+  for (const FragmentAxisGroup &group : relations->front().groups) {
+    if (group.sourceAxes.size() == 1 && group.resultAxes.size() == 1) {
+      axes[group.resultAxes.front()] = (*source)[group.sourceAxes.front()];
       continue;
     }
     // Inserting, dropping or regrouping axes that do not index the summary
     // does not change its reference. A flattened summary axis needs a more
     // general coordinate proof and is deliberately left unchanged here.
-    for (int64_t axis : group.getSourceAxes().asArrayRef())
-      if ((*source)[sourcePrefix + axis])
+    for (unsigned axis : group.sourceAxes)
+      if ((*source)[axis])
         return failure();
   }
   return axes;

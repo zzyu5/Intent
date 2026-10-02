@@ -951,9 +951,10 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
         continue;
       }
       if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
-        if (llvm::any_of(reshape.getReassociation(), [](Attribute attribute) {
-              auto group = cast<ReshapeGroupAttr>(attribute);
-              return group.getSourceAxes().size() > 1 || group.getResultAxes().size() > 1;
+        auto relations = queryFragmentOperandRelations(reshape.getOperation());
+        if (failed(relations) ||
+            llvm::any_of(relations->front().groups, [](const auto &group) {
+              return group.sourceAxes.size() > 1 || group.resultAxes.size() > 1;
             }))
           return MakeRangeOp();
         value = reshape.getValue();

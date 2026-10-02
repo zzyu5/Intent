@@ -1,6 +1,7 @@
 #include "Legalization.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -54,33 +55,8 @@ void canonicalizeBroadcastProjections(func::FuncOp kernel) {
   });
   SmallVector<gpu::ReshapeOp> projections;
   for (gpu::ReshapeOp reshape : candidates) {
-    auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
-    auto target = cast<gpu::FragmentType>(reshape.getResult().getType());
-    if (source.getShape().size() >= target.getShape().size() ||
-        !llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
-          auto group = cast<gpu::ReshapeGroupAttr>(attribute);
-          return !group.getResultAxes().empty() &&
-                 group.getSourceAxes().size() <= 1 &&
-                 (group.getSourceAxes().empty() ||
-                  group.getResultAxes().size() == 1);
-        }))
-      continue;
-    auto projection = gpu::queryBroadcastProjection(source, target);
-    if (!projection.isExact())
-      continue;
-    unsigned nextSource = 0;
-    bool insertsUnits = llvm::all_of(
-        llvm::enumerate(projection.targetToSource), [&](const auto &entry) {
-          auto [axis, mapped] = entry;
-          if (mapped)
-            return *mapped == nextSource++ &&
-                   source.getShape()[*mapped] == target.getShape()[axis];
-          auto extent = cast<gpu::PhysicalExprAttr>(target.getShape()[axis]);
-          return extent.getKind() ==
-                     gpu::PhysicalExprKind::Constant &&
-                 extent.getValue() == 1;
-        });
-    if (insertsUnits && nextSource == source.getShape().size())
+    auto relations = gpu::queryFragmentOperandRelations(reshape);
+    if (succeeded(relations) && relations->front().isUnitAxisInsertion())
       projections.push_back(reshape);
   }
   // Expand-dims preserves dot input alignment and avoids redundant register

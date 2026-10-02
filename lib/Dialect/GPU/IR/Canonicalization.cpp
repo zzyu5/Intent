@@ -79,32 +79,11 @@ struct SingletonInsertion : OpRewritePattern<ReshapeOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(ReshapeOp reshape,
                                 PatternRewriter &rewriter) const override {
-    auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
-    auto target = dyn_cast<FragmentType>(reshape.getResult().getType());
-    if (!source || !target || source.getShape().size() >= target.getShape().size())
+    auto relations = queryFragmentOperandRelations(reshape.getOperation());
+    if (failed(relations) || !relations->front().isUnitAxisInsertion())
       return failure();
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      if (group.getResultAxes().empty() || group.getSourceAxes().size() > 1 ||
-          (!group.getSourceAxes().empty() && group.getResultAxes().size() != 1))
-        return failure();
-    }
-    auto projection = queryBroadcastProjection(source, target);
-    if (!projection.isExact()) return failure();
-    unsigned nextSource = 0;
-    for (auto [axis, mapped] : llvm::enumerate(projection.targetToSource)) {
-      if (mapped) {
-        if (*mapped != nextSource++ ||
-            source.getShape()[*mapped] != target.getShape()[axis]) return failure();
-      } else {
-        auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
-        if (extent.getKind() != PhysicalExprKind::Constant || extent.getValue() != 1)
-          return failure();
-      }
-    }
-    if (nextSource != source.getShape().size()) return failure();
-    auto replacement = rewriter.create<BroadcastOp>(reshape.getLoc(), target,
-                                                    reshape.getValue());
+    auto replacement = rewriter.create<BroadcastOp>(
+        reshape.getLoc(), reshape.getResult().getType(), reshape.getValue());
     replacement->setDiscardableAttrs(llvm::to_vector(reshape->getDiscardableAttrs()));
     rewriter.replaceOp(reshape, replacement.getResult());
     return success();

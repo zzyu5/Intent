@@ -6,6 +6,7 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   GPUOps.cpp
   Canonicalization.cpp
   AccessOpInterface.cpp
+  FragmentOpInterface.cpp
 
   DEPENDS
   IntentGPUIncGen

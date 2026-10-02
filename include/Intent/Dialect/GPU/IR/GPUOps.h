@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/Intent/IR/IntentAttrs.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"

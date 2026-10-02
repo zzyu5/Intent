@@ -62,60 +62,6 @@ bool valueMatchesPhysicalExtent(Value value, PhysicalExprAttr extent) {
   return false;
 }
 
-struct PhysicalProduct {
-  llvm::APInt constant = llvm::APInt(256, 1);
-  SmallVector<PhysicalExprAttr> orderedTerms;
-  bool valid = true;
-};
-
-void collectPhysicalProduct(PhysicalExprAttr value, PhysicalProduct &product) {
-  if (!product.valid)
-    return;
-  auto kind = value.getKind();
-  if (kind == PhysicalExprKind::Multiply) {
-    if (value.getOperands().size() != 2) {
-      product.valid = false;
-      return;
-    }
-    collectPhysicalProduct(cast<PhysicalExprAttr>(value.getOperands()[0]),
-                           product);
-    collectPhysicalProduct(cast<PhysicalExprAttr>(value.getOperands()[1]),
-                           product);
-    return;
-  }
-  if (kind == PhysicalExprKind::Constant) {
-    if (value.getValue() < 0) {
-      product.valid = false;
-      return;
-    }
-    product.constant *= llvm::APInt(256, value.getValue());
-    return;
-  }
-  product.orderedTerms.push_back(value);
-}
-
-bool sameElementCount(FragmentType lhs, FragmentType rhs) {
-  PhysicalProduct left;
-  PhysicalProduct right;
-  for (Attribute extent : lhs.getShape())
-    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), left);
-  for (Attribute extent : rhs.getShape())
-    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), right);
-  return left.valid && right.valid && left.constant == right.constant &&
-         left.orderedTerms == right.orderedTerms;
-}
-
-bool sameElementCount(ArrayRef<Attribute> lhs, ArrayRef<Attribute> rhs) {
-  PhysicalProduct left;
-  PhysicalProduct right;
-  for (Attribute extent : lhs)
-    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), left);
-  for (Attribute extent : rhs)
-    collectPhysicalProduct(cast<PhysicalExprAttr>(extent), right);
-  return left.valid && right.valid && left.constant == right.constant &&
-         left.orderedTerms == right.orderedTerms;
-}
-
 LogicalResult verifyDataSchemas(Operation *operation, TypeRange operands,
                                 Type result, bool resultIsPredicate = false) {
   for (auto [index, operand] : llvm::enumerate(operands))
@@ -343,7 +289,7 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
     unsigned score = 0;
     for (unsigned resultAxis = resultBegin; resultAxis < resultEnd;
          ++resultAxis) {
-      if (sameElementCount(ArrayRef<Attribute>(),
+      if (haveEqualPhysicalElementCounts(ArrayRef<Attribute>(),
                            resultShape.slice(resultAxis, 1)))
         continue;
       auto resultMap = dyn_cast<AxisMapAttr>(resultMappings[resultAxis]);
@@ -370,9 +316,9 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
     return score;
   };
   while (sourceBegin < sourceRank && resultBegin < resultRank) {
-    bool sourceUnit = sameElementCount(
+    bool sourceUnit = haveEqualPhysicalElementCounts(
         sourceShape.slice(sourceBegin, 1), ArrayRef<Attribute>());
-    bool resultUnit = sameElementCount(
+    bool resultUnit = haveEqualPhysicalElementCounts(
         ArrayRef<Attribute>(), resultShape.slice(resultBegin, 1));
     // Unit axes are real row-major structure, not an ambiguous factor of the
     // neighboring dynamic extent.  Preserve insertion/removal explicitly so a
@@ -402,7 +348,7 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
          sourceEnd <= sourceRank; ++sourceEnd) {
       for (unsigned resultEnd = resultBegin + 1;
            resultEnd <= resultRank; ++resultEnd) {
-        if (!sameElementCount(
+        if (!haveEqualPhysicalElementCounts(
                 sourceShape.slice(sourceBegin, sourceEnd - sourceBegin),
                 resultShape.slice(resultBegin, resultEnd - resultBegin)))
           continue;
@@ -430,7 +376,7 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
   }
   if (sourceBegin < sourceRank) {
     ArrayRef<Attribute> remaining = sourceShape.drop_front(sourceBegin);
-    if (!sameElementCount(remaining, ArrayRef<Attribute>()))
+    if (!haveEqualPhysicalElementCounts(remaining, ArrayRef<Attribute>()))
       return failure();
     SmallVector<int64_t> sourceAxes;
     for (unsigned axis = sourceBegin; axis < sourceRank; ++axis)
@@ -442,7 +388,7 @@ static FailureOr<ArrayAttr> inferReshapeReassociationImpl(
   }
   if (resultBegin < resultRank) {
     ArrayRef<Attribute> remaining = resultShape.drop_front(resultBegin);
-    if (!sameElementCount(ArrayRef<Attribute>(), remaining))
+    if (!haveEqualPhysicalElementCounts(ArrayRef<Attribute>(), remaining))
       return failure();
     SmallVector<int64_t> resultAxes;
     for (unsigned axis = resultBegin; axis < resultRank; ++axis)
@@ -643,12 +589,9 @@ LogicalResult BroadcastOp::verify() {
         input.getShape().size() > result.getShape().size())
       return emitOpError("broadcast physical schema is invalid")
              << "; input=" << input << "; result=" << result;
-    BroadcastProjection projection = queryBroadcastProjection(input, result);
-    if (!projection.isExact())
-      return emitOpError(
-                 projection.state == BroadcastProjectionState::Ambiguous
-                     ? "broadcast physical axis projection is ambiguous"
-                     : "broadcast physical axis projection is unknown")
+    auto relations = queryFragmentOperandRelations(getOperation());
+    if (failed(relations) || !relations->front().hasCompatibleExtents())
+      return emitOpError("broadcast physical axis projection is unknown or incompatible")
              << "; input=" << input << "; result=" << result;
   } else if (getValue().getType() != getResult().getType().getElementType()) {
       return emitOpError("scalar broadcast element type disagrees: value=")
@@ -735,70 +678,25 @@ LogicalResult ReshapeOp::verify() {
   auto source = dyn_cast<FragmentType>(getValue().getType());
   auto result = dyn_cast<FragmentType>(getResult().getType());
   if (!source || !result || source.getElementType() != result.getElementType() ||
-      source.getOwner() != result.getOwner() || !getReassociation() ||
-      !sameElementCount(source, result)) {
+      source.getOwner() != result.getOwner() || !getReassociation()) {
     return emitOpError("reshape physical schema is invalid: source=")
            << getValue().getType() << ", result=" << getResult().getType()
            << ", reassociation=" << getReassociation();
   }
-  unsigned nextSource = 0;
-  unsigned nextResult = 0;
-  for (Attribute attribute : getReassociation()) {
-    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
-    if (!group ||
-        (!group.getSourceAxes().empty() &&
-         group.getSourceAxes()[0] != nextSource) ||
-        (!group.getResultAxes().empty() &&
-         group.getResultAxes()[0] != nextResult))
-      return emitOpError(
-          "reshape reassociation must consecutively cover both physical shapes");
-    ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
-    ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
-    if (!sourceAxes.empty())
-      nextSource = sourceAxes.back() + 1;
-    if (!resultAxes.empty())
-      nextResult = resultAxes.back() + 1;
-  }
-  unsigned logicalSourceRank = nextSource;
-  unsigned logicalResultRank = nextResult;
-  if (logicalSourceRank > source.getShape().size() ||
-      logicalResultRank > result.getShape().size())
-    return emitOpError("reshape reassociation axis is out of bounds");
-  unsigned sourcePrefix = source.getShape().size() - logicalSourceRank;
-  unsigned resultPrefix = result.getShape().size() - logicalResultRank;
-  if (sourcePrefix != resultPrefix)
+  auto relations = queryFragmentOperandRelations(getOperation());
+  if (failed(relations))
     return emitOpError(
-        "reshape must preserve its physical execution prefix: source=")
-           << source << ", result=" << result;
-  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
-    if (source.getShape()[axis] != result.getShape()[axis] ||
-        source.getAxisMaps()[axis] != result.getAxisMaps()[axis])
-      return emitOpError(
-          "reshape changed a physical execution-prefix axis");
-
-  nextSource = 0;
-  nextResult = 0;
-  for (Attribute attribute : getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    ArrayRef<int64_t> sourceAxes = group.getSourceAxes().asArrayRef();
-    ArrayRef<int64_t> resultAxes = group.getResultAxes().asArrayRef();
-    SmallVector<Attribute> sourceExtents;
-    SmallVector<Attribute> resultExtents;
-    for (int64_t axis : sourceAxes)
-      sourceExtents.push_back(source.getShape()[sourcePrefix + axis]);
-    for (int64_t axis : resultAxes)
-      resultExtents.push_back(result.getShape()[resultPrefix + axis]);
-    if (!sameElementCount(sourceExtents, resultExtents))
-      return emitOpError(
-          "reshape reassociation group does not preserve row-major elements");
-    if (!sourceAxes.empty())
-      nextSource = sourceAxes.back() + 1;
-    if (!resultAxes.empty())
-      nextResult = resultAxes.back() + 1;
-  }
-  if (nextSource != logicalSourceRank || nextResult != logicalResultRank)
+        "reshape reassociation must cover consecutive axes and preserve the "
+        "execution-prefix rank");
+  const auto &relation = relations->front();
+  for (const auto &group : relation.groups)
+    if (group.kind == FragmentAxisRelationKind::Corresponding &&
+        source.getAxisMaps()[group.sourceAxes[0]] !=
+            result.getAxisMaps()[group.resultAxes[0]])
+      return emitOpError("reshape changed a physical execution-prefix axis");
+  if (!relation.hasCompatibleExtents())
     return emitOpError(
-        "reshape reassociation does not cover every logical physical axis");
+        "reshape reassociation group does not preserve row-major elements");
   return success();
 }
 
@@ -810,11 +708,9 @@ LogicalResult TransposeOp::verify() {
       source.getElementType() != result.getElementType() ||
       source.getOwner() != result.getOwner())
     return emitOpError("transpose physical rank/type/owner is invalid");
-  llvm::DenseSet<int64_t> axes;
-  for (auto [target, input] : llvm::enumerate(getPermutation()))
-    if (input < 0 || static_cast<size_t>(input) >= source.getShape().size() ||
-        !axes.insert(input).second || source.getShape()[input] != result.getShape()[target])
-      return emitOpError("transpose permutation does not map physical extents");
+  auto relations = queryFragmentOperandRelations(getOperation());
+  if (failed(relations) || !relations->front().hasCompatibleExtents())
+    return emitOpError("transpose permutation does not map physical extents");
   return success();
 }
 

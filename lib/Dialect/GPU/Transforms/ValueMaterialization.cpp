@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -295,15 +296,19 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
   } else if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
     auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
     if (input && input.getShape().size() < target.getShape().size()) {
-      auto inputRelation = queryAxisProjection(input, source);
+      auto inputRelations = queryFragmentOperandRelations(broadcast.getOperation());
       auto resultRelation = queryAxisProjection(source, target);
-      if (inputRelation.isExact() && resultRelation.isExact()) {
+      if (succeeded(inputRelations) && inputRelations->size() == 1 &&
+          resultRelation.isExact()) {
         SmallVector<Attribute> shape(input.getShape().getValue());
         for (auto [targetAxis, sourceAxis] :
              llvm::enumerate(resultRelation.targetToSource)) {
-          if (!sourceAxis || !inputRelation.targetToSource[*sourceAxis])
+          if (!sourceAxis)
             continue;
-          unsigned inputAxis = *inputRelation.targetToSource[*sourceAxis];
+          const auto *group = inputRelations->front().groupForResultAxis(*sourceAxis);
+          if (!group || group->sourceAxes.size() != 1)
+            continue;
+          unsigned inputAxis = group->sourceAxes.front();
           auto extent = cast<PhysicalExprAttr>(shape[inputAxis]);
           if (extent.getKind() !=
                   PhysicalExprKind::Constant ||
@@ -330,51 +335,21 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
     }
   } else if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
     auto input = cast<FragmentType>(reshape.getValue().getType());
-    unsigned inputRank = 0, resultRank = 0;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      inputRank += group.getSourceAxes().size();
-      resultRank += group.getResultAxes().size();
-    }
-    bool projects = inputRank <= input.getShape().size() &&
-                    resultRank <= source.getShape().size() &&
-                    source.getShape().size() == target.getShape().size();
+    bool projects = source.getShape().size() == target.getShape().size();
     BroadcastProjection relation = queryAxisProjection(source, target);
     projects &= relation.isExact() && llvm::all_of(
         llvm::enumerate(relation.targetToSource), [](auto item) {
           return item.value() && *item.value() == item.index();
         });
-    SmallVector<Attribute> inputShape(input.getShape().begin(),
-                                       input.getShape().end());
-    if (projects) {
-      unsigned inputPrefix = input.getShape().size() - inputRank;
-      unsigned resultPrefix = source.getShape().size() - resultRank;
-      projects = inputPrefix == resultPrefix;
-      if (projects)
-        for (unsigned axis = 0; axis < inputPrefix; ++axis)
-          inputShape[axis] = target.getShape()[axis];
-      for (Attribute attribute : reshape.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        bool changed = llvm::any_of(group.getResultAxes().asArrayRef(),
-                                    [&](int64_t axis) {
-          return source.getShape()[resultPrefix + axis] !=
-                 target.getShape()[resultPrefix + axis];
-        });
-        if (!changed)
-          continue;
-        if (group.getSourceAxes().size() != 1 ||
-            group.getResultAxes().size() != 1) {
-          projects = false;
-          break;
-        }
-        inputShape[inputPrefix + group.getSourceAxes()[0]] =
-            target.getShape()[resultPrefix + group.getResultAxes()[0]];
-      }
-    }
-    if (projects) {
-      auto inputTarget = FragmentType::get(
-          target.getContext(), input.getElementType(), builder.getArrayAttr(inputShape),
-          input.getAxisMaps(), target.getValidity(), target.getOwner());
+    auto relations = queryFragmentOperandRelations(reshape.getOperation());
+    auto declaredInput = FragmentType::get(
+        target.getContext(), input.getElementType(), input.getShape(),
+        input.getAxisMaps(), target.getValidity(), target.getOwner());
+    auto transported = projects && succeeded(relations) && relations->size() == 1
+        ? transportFragmentOperandType(relations->front(), target, declaredInput)
+        : FailureOr<Type>(failure());
+    if (succeeded(transported)) {
+      auto inputTarget = cast<FragmentType>(*transported);
       FailureOr<Value> projected =
           projectFragmentValue(builder, location, reshape.getValue(), inputTarget, changed);
       if (succeeded(projected))
@@ -441,8 +416,8 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
     projection = builder.create<BroadcastOp>(location, target, value);
   Operation *definition = value.getDefiningOp();
   if (!projection &&
-      (queryElementwiseShapeSource(definition) ||
-       isa_and_nonnull<BinaryOp, CompareOp, SelectOp>(definition))) {
+      isa_and_nonnull<UnaryOp, CastOp, BitcastOp, BinaryOp, CompareOp, SelectOp>(
+          definition)) {
     IRMapping mapping;
     for (Value operand : definition->getOperands()) {
       Type element = operand.getType();
@@ -865,6 +840,7 @@ FailureOr<Value> materializeReplayedValue(
     if (!producer)
       return failure();
 
+    auto operandRelations = queryFragmentOperandRelations(producer);
     auto replayOperand = [&](Value operand) -> FailureOr<Value> {
       std::optional<unsigned> operandAxis;
       auto input = dyn_cast<FragmentType>(operand.getType());
@@ -873,21 +849,42 @@ FailureOr<Value> materializeReplayedValue(
         auto reduction = dyn_cast<ReduceOp>(producer);
         bool reductionSource = reduction && llvm::is_contained(
             reduction.getSources(), operand);
-        if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
-                BroadcastOp, SplatOp>(producer) ||
-            (reduction && !reductionSource)) {
+        if (isa<FragmentOpInterface>(producer)) {
+          if (failed(operandRelations))
+            return failure();
+          bool found = false;
+          bool introduced = false;
+          for (const auto &relation : *operandRelations) {
+            if (producer->getOperand(relation.operandNumber) != operand)
+              continue;
+            const auto *group = relation.groupForResultAxis(axis);
+            if (!group || group->sourceAxes.size() > 1 ||
+                (!group->sourceAxes.empty() && group->resultAxes.size() != 1))
+              return failure();
+            if (group->kind == FragmentAxisRelationKind::Reassociation &&
+                group->sourceAxes.empty() &&
+                !relation.isIntroducedUnitAxis(axis))
+              return failure();
+            std::optional<unsigned> selected = group->sourceAxes.empty()
+                ? std::nullopt : std::optional<unsigned>(group->sourceAxes.front());
+            if (found && (selected != operandAxis ||
+                          introduced != group->sourceAxes.empty()))
+              return failure();
+            operandAxis = selected;
+            introduced = group->sourceAxes.empty();
+            found = true;
+          }
+          if (!found)
+            return failure();
+          if (introduced)
+            return operand;
+        } else if (reduction && !reductionSource) {
           BroadcastProjection relation = queryAxisProjection(input, fragment);
           if (!relation.isExact())
             return failure();
           operandAxis = relation.targetToSource[axis];
           if (!operandAxis)
             return operand;
-        } else if (auto transpose = dyn_cast<TransposeOp>(producer)) {
-          operandAxis = transpose.getPermutation()[axis];
-        } else if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-          if (isIntroducedReshapeUnitAxis(current, axis))
-            return operand;
-          operandAxis = reshapeInputAxis(reshape, axis);
         } else if (reduction) {
           SmallVector<unsigned> freeAxes;
           for (unsigned inputAxis = 0; inputAxis < input.getShape().size();
@@ -943,14 +940,14 @@ FailureOr<Value> materializeReplayedValue(
 
     if (auto broadcast = dyn_cast<BroadcastOp>(producer)) {
       auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      BroadcastProjection relation =
-          input ? queryAxisProjection(input, fragment) : BroadcastProjection{};
-      if (relation.isExact() && axis < relation.targetToSource.size()) {
-        if (auto inputAxis = relation.targetToSource[axis]) {
-          auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[*inputAxis]);
+      if (input && succeeded(operandRelations) && operandRelations->size() == 1) {
+        const auto *group = operandRelations->front().groupForResultAxis(axis);
+        if (group && group->sourceAxes.size() == 1) {
+          unsigned inputAxis = group->sourceAxes.front();
+          auto inputMap = cast<AxisMapAttr>(input.getAxisMaps()[inputAxis]);
           auto resultMap = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
           auto inputExtent =
-              cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
+              cast<PhysicalExprAttr>(input.getShape()[inputAxis]);
           bool sameLogicalAxis = inputMap.getDimensionId() > 0 &&
                                  inputMap.getDimensionId() ==
                                      resultMap.getDimensionId();
@@ -958,14 +955,14 @@ FailureOr<Value> materializeReplayedValue(
               inputExtent.getKind() ==
                   PhysicalExprKind::Constant &&
               inputExtent.getValue() > 1 &&
-              queryBroadcastProjection(input, fragment).isExact();
+              operandRelations->front().hasCompatibleExtents();
           if (!(sourceAxisIdentity(inputMap) == sourceAxisIdentity(resultMap)) &&
               (sameLogicalAxis || nonUnitStaticExtent) &&
-              input.getShape()[*inputAxis] == fragment.getShape()[axis]) {
+              input.getShape()[inputAxis] == fragment.getShape()[axis]) {
             // An extent-preserving projection can rename an occurrence. Replay
             // its input with that input's identity, retaining the output map.
             ReplayMaterializationOptions inputOptions = options;
-            inputOptions.fragmentAxis = *inputAxis;
+            inputOptions.fragmentAxis = inputAxis;
             FailureOr<Value> replayed = materializeReplayedValue(
                 builder, location, broadcast.getValue(),
                 sourceAxisIdentity(inputMap), blockedExtent, mapping,

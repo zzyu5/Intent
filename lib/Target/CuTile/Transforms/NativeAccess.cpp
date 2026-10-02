@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -328,32 +329,9 @@ extractionTileIndex(OpBuilder &builder, Location location, Value coordinate,
     return std::pair{*index, true};
   }
   if (auto reshape = coordinate.getDefiningOp<gpu::ReshapeOp>()) {
-    auto input = cast<gpu::FragmentType>(reshape.getValue().getType());
-    auto output = cast<gpu::FragmentType>(reshape.getResult().getType());
-    unsigned sourceRank = 0, resultRank = 0;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<gpu::ReshapeGroupAttr>(attribute);
-      sourceRank += group.getSourceAxes().size();
-      resultRank += group.getResultAxes().size();
-    }
-    unsigned sourcePrefix = input.getShape().size() - sourceRank;
-    unsigned resultPrefix = output.getShape().size() - resultRank;
-    if (sourcePrefix != resultPrefix)
+    auto relations = gpu::queryFragmentOperandRelations(reshape);
+    if (failed(relations) || !relations->front().preservesNonUnitAxes())
       return failure();
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<gpu::ReshapeGroupAttr>(attribute);
-      SmallVector<Attribute> before, after;
-      for (int64_t axis : group.getSourceAxes().asArrayRef())
-        if (Attribute extent = input.getShape()[sourcePrefix + axis];
-            !isUnitExtent(extent))
-          before.push_back(extent);
-      for (int64_t axis : group.getResultAxes().asArrayRef())
-        if (Attribute extent = output.getShape()[resultPrefix + axis];
-            !isUnitExtent(extent))
-          after.push_back(extent);
-      if (before.size() > 1 || before != after)
-        return failure();
-    }
     return extractionTileIndex(builder, location, reshape.getValue(), range,
                                sourceExtent);
   }

@@ -57,9 +57,9 @@ bool collectProductConstraint(PhysicalExprAttr extent,
              cast<PhysicalExprAttr>(extent.getOperands()[1]), constraint);
 }
 
-bool collectProductConstraint(FragmentType fragment, ArrayRef<int64_t> axes,
+bool collectProductConstraint(FragmentType fragment, ArrayRef<unsigned> axes,
                               ProductConstraint &constraint) {
-  for (int64_t axis : axes)
+  for (unsigned axis : axes)
     if (!collectProductConstraint(
             cast<PhysicalExprAttr>(fragment.getShape()[axis]), constraint))
       return false;
@@ -96,10 +96,13 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
     auto result = dyn_cast<FragmentType>(reshape.getResult().getType());
     if (!source || !result)
       continue;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      auto sourceAxes = group.getSourceAxes().asArrayRef();
-      auto resultAxes = group.getResultAxes().asArrayRef();
+    auto relations = queryFragmentOperandRelations(reshape.getOperation());
+    if (failed(relations))
+      return reshape.emitOpError(
+          "static fragment constraint has no physical axis relation");
+    for (const auto &group : relations->front().groups) {
+      ArrayRef<unsigned> sourceAxes = group.sourceAxes;
+      ArrayRef<unsigned> resultAxes = group.resultAxes;
       // Unmerged axes carry their tile extent through the reshape. They do
       // not become full-coverage dimensions because other axes are reshaped.
       if (sourceAxes.size() <= 1 && resultAxes.size() <= 1)
@@ -117,7 +120,7 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
       if (sourceAxes.size() == 1 && resultAxes.size() > 1 &&
           sourceProduct.parameterCount == 0 && resultProduct.parameterCount == 0 &&
           sourceProduct.constant == resultProduct.constant)
-        for (int64_t axis : resultAxes)
+        for (unsigned axis : resultAxes)
           fixedAxes.emplace_back(reshape.getResult(), axis);
       if (sourceProduct.parameterCount != 1 ||
           resultProduct.parameterCount != 0 ||
@@ -141,7 +144,6 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
       auto [value, axis] = pending.pop_back_val();
       if (!visited.insert({value, axis}).second)
         continue;
-      auto source = cast<FragmentType>(value.getType());
       for (Operation *user : value.getUsers()) {
         if (user->getNumResults() != 1)
           continue;
@@ -149,22 +151,19 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
         if (!result)
           continue;
         std::optional<unsigned> resultAxis;
-        if (auto reshape = dyn_cast<ReshapeOp>(user)) {
-          for (Attribute attribute : reshape.getReassociation()) {
-            auto group = cast<ReshapeGroupAttr>(attribute);
-            if (group.getSourceAxes().size() == 1 &&
-                group.getResultAxes().size() == 1 &&
-                group.getSourceAxes()[0] == static_cast<int64_t>(axis))
-              resultAxis = group.getResultAxes()[0];
-          }
-        } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
-                       CastOp, BitcastOp>(user)) {
-          BroadcastProjection projection = queryAxisProjection(source, result);
-          if (projection.isExact())
-            for (auto [position, inputAxis] :
-                 llvm::enumerate(projection.targetToSource))
-              if (inputAxis && *inputAxis == axis)
-                resultAxis = position;
+        if (!isa<ReshapeOp, BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
+                 CastOp, BitcastOp>(user))
+          continue;
+        auto relations = queryFragmentOperandRelations(user);
+        if (failed(relations))
+          continue;
+        for (const auto &relation : *relations) {
+          if (user->getOperand(relation.operandNumber) != value)
+            continue;
+          for (const auto &group : relation.groups)
+            if (group.sourceAxes.size() == 1 && group.resultAxes.size() == 1 &&
+                group.sourceAxes[0] == axis)
+              resultAxis = group.resultAxes[0];
         }
         if (!resultAxis)
           continue;
@@ -185,14 +184,15 @@ LogicalResult bindStructurallyRequiredStaticFragments(func::FuncOp kernel) {
                 cast<PhysicalExprAttr>(result.getShape()[*resultAxis]))))
           return failure();
         if (!isa<ReshapeOp>(user))
-          for (Value operand : user->getOperands()) {
+          for (const auto &relation : *relations) {
+            Value operand = user->getOperand(relation.operandNumber);
             auto input = dyn_cast<FragmentType>(operand.getType());
             if (!input)
               continue;
-            BroadcastProjection projection = queryAxisProjection(input, result);
-            if (projection.isExact() && projection.targetToSource[*resultAxis] &&
-                failed(constrain(cast<PhysicalExprAttr>(input.getShape()[
-                    *projection.targetToSource[*resultAxis]]), true)))
+            const auto *group = relation.groupForResultAxis(*resultAxis);
+            if (group && group->sourceAxes.size() == 1 &&
+                failed(constrain(cast<PhysicalExprAttr>(
+                    input.getShape()[group->sourceAxes[0]]), true)))
               return failure();
           }
         pending.emplace_back(user->getResult(0), *resultAxis);

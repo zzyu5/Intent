@@ -89,12 +89,19 @@ planBlockAccess(gpu::AccessOpInterface access,
       auto source = dyn_cast<gpu::FragmentType>(broadcast.getValue().getType());
       if (!source)
         return std::nullopt;
-      auto step = gpu::queryBroadcastProjection(source, coordinateType);
-      if (!step.isExact())
+      auto relations = gpu::queryFragmentOperandRelations(broadcast.getOperation());
+      if (failed(relations) || !relations->front().hasCompatibleExtents())
         return std::nullopt;
-      for (std::optional<unsigned> &axis : projection.targetToSource)
-        if (axis)
-          axis = step.targetToSource[*axis];
+      for (std::optional<unsigned> &axis : projection.targetToSource) {
+        if (!axis)
+          continue;
+        const auto *group = relations->front().groupForResultAxis(*axis);
+        if (!group || group->sourceAxes.size() > 1)
+          return std::nullopt;
+        axis = group->sourceAxes.empty()
+                   ? std::nullopt
+                   : std::optional<unsigned>(group->sourceAxes.front());
+      }
       coordinate = broadcast.getValue();
       coordinateType = source;
     }

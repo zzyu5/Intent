@@ -666,12 +666,19 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
           auto output = cast<FragmentType>(value.getType());
           if (!input || input.getValidity() != output.getValidity())
             break;
-          auto step = queryBroadcastProjection(input, output);
-          if (!step.isExact())
+          auto relations = queryFragmentOperandRelations(broadcast.getOperation());
+          if (failed(relations) || !relations->front().hasCompatibleExtents())
             break;
-          for (auto &axis : projection.targetToSource)
-            if (axis)
-              axis = step.targetToSource[*axis];
+          for (auto &axis : projection.targetToSource) {
+            if (!axis)
+              continue;
+            const auto *group = relations->front().groupForResultAxis(*axis);
+            if (!group || group->sourceAxes.size() > 1)
+              return std::pair{value, BroadcastProjection{}};
+            axis = group->sourceAxes.empty()
+                       ? std::nullopt
+                       : std::optional<unsigned>(group->sourceAxes.front());
+          }
           value = broadcast.getValue();
         } else if (auto conversion = dyn_cast<CastOp>(producer)) {
           if (conversion.getValue().getType() != value.getType())
@@ -680,12 +687,13 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
         } else if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
           auto source = dyn_cast<FragmentType>(reshape.getValue().getType());
           auto target = dyn_cast<FragmentType>(value.getType());
+          auto relations = queryFragmentOperandRelations(reshape.getOperation());
           if (!source || !target || source.getShape() != target.getShape() ||
               source.getValidity() != target.getValidity() ||
-              !llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
-                auto group = cast<ReshapeGroupAttr>(attribute);
-                return group.getSourceAxes().size() == 1 &&
-                       group.getSourceAxes() == group.getResultAxes();
+              failed(relations) ||
+              !llvm::all_of(relations->front().groups, [](const auto &group) {
+                return group.sourceAxes.size() == 1 &&
+                       group.sourceAxes == group.resultAxes;
               }))
             break;
           value = reshape.getValue();

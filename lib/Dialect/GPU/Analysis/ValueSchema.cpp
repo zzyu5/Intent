@@ -25,12 +25,6 @@ using namespace mlir;
 
 namespace intent::gpu {
 
-Value queryElementwiseShapeSource(Operation *operation) {
-  if (isa_and_nonnull<UnaryOp, CastOp, BitcastOp>(operation))
-    return operation->getOperand(0);
-  return {};
-}
-
 SmallVector<StructuredSchemaGroup>
 queryStructuredSchemaGroups(Operation *operation) {
   if (!isa<RegionFoldOp, RegionScanOp>(operation)) return {};
@@ -233,62 +227,16 @@ PhysicalExprAttr productExtent(MLIRContext *context,
 
 bool isIntroducedReshapeUnitAxis(Value value, unsigned fragmentAxis) {
   auto reshape = value.getDefiningOp<ReshapeOp>();
-  auto result = dyn_cast<FragmentType>(value.getType());
-  if (!reshape || !result || fragmentAxis >= result.getShape().size())
-    return false;
-  auto extent = cast<PhysicalExprAttr>(result.getShape()[fragmentAxis]);
-  if (extent.getKind() !=
-          PhysicalExprKind::Constant ||
-      extent.getValue() != 1)
-    return false;
-  unsigned logicalResultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
-    if (!group || group.getResultAxes().empty())
-      continue;
-    logicalResultRank =
-        std::max(logicalResultRank,
-                 static_cast<unsigned>(
-                     group.getResultAxes().asArrayRef().back() + 1));
-  }
-  if (logicalResultRank > result.getShape().size())
-    return false;
-  unsigned resultPrefix = result.getShape().size() - logicalResultRank;
-  if (fragmentAxis < resultPrefix)
-    return false;
-  int64_t logicalAxis = fragmentAxis - resultPrefix;
-  return llvm::any_of(reshape.getReassociation(), [&](Attribute attribute) {
-    auto group = dyn_cast<ReshapeGroupAttr>(attribute);
-    return group && group.getSourceAxes().empty() &&
-           llvm::is_contained(group.getResultAxes().asArrayRef(), logicalAxis);
-  });
+  if (!reshape) return false;
+  auto relations = queryFragmentOperandRelations(reshape.getOperation());
+  return succeeded(relations) && relations->front().isIntroducedUnitAxis(fragmentAxis);
 }
 
 std::optional<unsigned> reshapeInputAxis(ReshapeOp reshape,
                                          unsigned resultAxis) {
-  auto input = cast<FragmentType>(reshape.getValue().getType());
-  auto result = cast<FragmentType>(reshape.getResult().getType());
-  unsigned sourceRank = 0, resultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    for (int64_t axis : group.getSourceAxes().asArrayRef())
-      sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
-    for (int64_t axis : group.getResultAxes().asArrayRef())
-      resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
-  }
-  unsigned sourcePrefix = input.getShape().size() - sourceRank;
-  unsigned resultPrefix = result.getShape().size() - resultRank;
-  if (resultAxis < resultPrefix)
-    return sourcePrefix == resultPrefix ? std::optional<unsigned>(resultAxis)
-                                         : std::nullopt;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().size() == 1 &&
-        group.getResultAxes().size() == 1 &&
-        resultPrefix + group.getResultAxes()[0] == resultAxis)
-      return sourcePrefix + group.getSourceAxes()[0];
-  }
-  return std::nullopt;
+  auto relations = queryFragmentOperandRelations(reshape.getOperation());
+  return succeeded(relations) ? relations->front().correspondingSourceAxis(resultAxis)
+                              : std::nullopt;
 }
 
 Value stripAdditiveProjection(Value value, bool singleUse) {

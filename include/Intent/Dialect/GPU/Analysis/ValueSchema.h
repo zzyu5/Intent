@@ -7,9 +7,6 @@
 
 namespace intent::gpu {
 
-// Current-IR schema edges, independent of element values and numeric casts.
-mlir::Value queryElementwiseShapeSource(mlir::Operation *operation);
-
 // One positional summary/state component. Seeds are kept as operand slots:
 // different components may intentionally start from the same SSA constant.
 struct StructuredSchemaGroup {

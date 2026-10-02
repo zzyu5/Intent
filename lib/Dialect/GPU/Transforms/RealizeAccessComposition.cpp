@@ -8,6 +8,7 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -415,6 +416,13 @@ bool sameUniformValue(Value lhs, Value rhs) {
   return false;
 }
 
+bool unitAxes(FragmentType type, ArrayRef<unsigned> axes) {
+  return llvm::all_of(axes, [&](unsigned axis) {
+    auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
+    return extent.getKind() == PhysicalExprKind::Constant && extent.getValue() == 1;
+  });
+}
+
 FailureOr<bool> composeSelectLoad(SelectOp select) {
   auto resultType = dyn_cast<FragmentType>(select.getResult().getType());
   Value loaded = select.getTrueValue();
@@ -426,48 +434,22 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
     auto result = dyn_cast<FragmentType>(loaded.getType());
     if (!source || !result || !loaded.hasOneUse())
       return false;
-    if (auto transpose = dyn_cast<TransposeOp>(operation)) {
-      for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
-        auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-        auto transposed = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
-        if (!(sourceAxisIdentity(original) == sourceAxisIdentity(transposed)) ||
-            original.getDimensionId() != transposed.getDimensionId())
-          return false;
-      }
-    } else if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
-      unsigned sourceRank = 0, resultRank = 0;
-      for (Attribute attribute : reshape.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        if (!group.getSourceAxes().empty())
-          sourceRank = group.getSourceAxes().asArrayRef().back() + 1;
-        if (!group.getResultAxes().empty())
-          resultRank = group.getResultAxes().asArrayRef().back() + 1;
-      }
-      unsigned sourcePrefix = source.getShape().size() - sourceRank;
-      unsigned resultPrefix = result.getShape().size() - resultRank;
-      auto unitAxes = [](FragmentType type, unsigned prefix,
-                         ArrayRef<int64_t> axes) {
-        return llvm::all_of(axes, [&](int64_t axis) {
-          auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
-          return extent.getKind() ==
-                     PhysicalExprKind::Constant &&
-                 extent.getValue() == 1;
-        });
-      };
-      for (Attribute attribute : reshape.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        auto from = group.getSourceAxes().asArrayRef();
-        auto to = group.getResultAxes().asArrayRef();
+    auto relations = queryFragmentOperandRelations(operation);
+    if (failed(relations))
+      return false;
+    if (isa<TransposeOp, ReshapeOp>(operation)) {
+      for (const FragmentAxisGroup &group : relations->front().groups) {
+        ArrayRef<unsigned> from = group.sourceAxes;
+        ArrayRef<unsigned> to = group.resultAxes;
         if (from.empty() || to.empty()) {
-          if (!unitAxes(source, sourcePrefix, from) ||
-              !unitAxes(result, resultPrefix, to))
+          if (!unitAxes(source, from) || !unitAxes(result, to))
             return false;
           continue;
         }
         if (from.size() != 1 || to.size() != 1)
           return false;
-        unsigned sourceAxis = sourcePrefix + from.front();
-        unsigned resultAxis = resultPrefix + to.front();
+        unsigned sourceAxis = from.front();
+        unsigned resultAxis = to.front();
         auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
         auto target = cast<AxisMapAttr>(result.getAxisMaps()[resultAxis]);
         if (!(sourceAxisIdentity(original) == sourceAxisIdentity(target)) ||
@@ -476,10 +458,10 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
           return false;
       }
     } else {
-      auto projection = queryAxisProjection(source, result);
-      if (source.getShape() != result.getShape() || !projection.isExact() ||
-          llvm::any_of(llvm::enumerate(projection.targetToSource), [](auto item) {
-            return !item.value() || *item.value() != item.index();
+      if (source.getShape() != result.getShape() ||
+          llvm::any_of(relations->front().groups, [](const FragmentAxisGroup &group) {
+            return group.sourceAxes.size() != 1 || group.resultAxes.size() != 1 ||
+                   group.sourceAxes.front() != group.resultAxes.front();
           }))
         return false;
     }
@@ -608,6 +590,10 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     return false;
   auto source = cast<FragmentType>(reshape.getValue().getType());
   auto shaped = cast<FragmentType>(reshape.getResult().getType());
+  auto relations = queryFragmentOperandRelations(reshape);
+  if (failed(relations))
+    return false;
+  const auto &groups = relations->front().groups;
   // Scalar indexing is a rectangular extraction in the reshaped layout.
   // Flattening it can turn a native split into a strided fragment gather.
   if (result && !gather.getCoordinates().empty() &&
@@ -631,10 +617,9 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
       }))
     return false;
   if (source.getShape() == shaped.getShape() &&
-      llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        return group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1 &&
-               group.getSourceAxes()[0] == group.getResultAxes()[0];
+      llvm::all_of(groups, [](const FragmentAxisGroup &group) {
+        return group.sourceAxes.size() == 1 && group.resultAxes.size() == 1 &&
+               group.sourceAxes.front() == group.resultAxes.front();
       }))
     return false;
   PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
@@ -644,25 +629,14 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
   for (unsigned axis = 0; axis < shaped.getShape().size(); ++axis)
     if (analysis.axisRealization(reshape.getResult(), axis).constructionScalarSeed)
       return false;
-  unsigned sourceRank = 0, resultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    sourceRank += group.getSourceAxes().size();
-    resultRank += group.getResultAxes().size();
-  }
-  unsigned sourcePrefix = source.getShape().size() - sourceRank;
-  unsigned resultPrefix = shaped.getShape().size() - resultRank;
-  if (sourcePrefix != resultPrefix)
-    return false;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1)
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.sourceAxes.size() == 1 && group.resultAxes.size() == 1)
       continue;
     for (auto [type, axes] :
-         {std::pair{source, group.getSourceAxes().asArrayRef()},
-          std::pair{shaped, group.getResultAxes().asArrayRef()}})
-      for (int64_t axis : axes) {
-        auto extent = cast<PhysicalExprAttr>(type.getShape()[sourcePrefix + axis]);
+         {std::pair{source, ArrayRef<unsigned>(group.sourceAxes)},
+          std::pair{shaped, ArrayRef<unsigned>(group.resultAxes)}})
+      for (unsigned axis : axes) {
+        auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
         if (extent.getKind() != PhysicalExprKind::Constant ||
             extent.getValue() <= 0)
           return false;
@@ -738,28 +712,24 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
     coordinates[axis] = *projected;
   }
   SmallVector<Value> selected(source.getShape().size());
-  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
-    selected[axis] = coordinates[axis];
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty())
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.sourceAxes.empty())
       continue;
-    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1) {
-      selected[sourcePrefix + group.getSourceAxes()[0]] =
-          coordinates[resultPrefix + group.getResultAxes()[0]];
+    if (group.sourceAxes.size() == 1 && group.resultAxes.size() == 1) {
+      selected[group.sourceAxes.front()] = coordinates[group.resultAxes.front()];
       continue;
     }
     Value ordinal = indexValue(zero);
-    for (int64_t axis : group.getResultAxes().asArrayRef()) {
-      Value extent = indexValue(extentValue(shaped.getShape()[resultPrefix + axis]));
+    for (unsigned axis : group.resultAxes) {
+      Value extent = indexValue(extentValue(shaped.getShape()[axis]));
       ordinal = builder.create<BinaryOp>(location, indexType, ordinal, extent,
                                         BinaryOperator::Multiply);
       ordinal = builder.create<BinaryOp>(location, indexType, ordinal,
-          coordinates[resultPrefix + axis], BinaryOperator::Add);
+          coordinates[axis], BinaryOperator::Add);
     }
-    auto axes = group.getSourceAxes().asArrayRef();
+    ArrayRef<unsigned> axes = group.sourceAxes;
     for (unsigned position = axes.size(); position-- > 0;) {
-      unsigned axis = sourcePrefix + axes[position];
+      unsigned axis = axes[position];
       Value coordinate = ordinal;
       if (position != 0) {
         Value extent = indexValue(extentValue(source.getShape()[axis]));
@@ -1980,26 +1950,19 @@ FailureOr<bool> composeBroadcastGather(GatherOp gather) {
   return true;
 }
 
-bool hasNonUnitAxisSplit(ReshapeOp reshape) {
-  auto source = cast<FragmentType>(reshape.getValue().getType());
-  auto result = cast<FragmentType>(reshape.getResult().getType());
+bool hasNonUnitAxisSplit(const FragmentOperandRelation &relation) {
+  auto source = cast<FragmentType>(relation.sourceType);
+  auto result = cast<FragmentType>(relation.resultType);
   if (source.getShape().size() >= result.getShape().size())
     return false;
   bool split = false;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getResultAxes().empty())
+  for (const FragmentAxisGroup &group : relation.groups) {
+    if (group.resultAxes.empty())
       return false;
-    if (group.getSourceAxes().empty())
-      for (int64_t axis : group.getResultAxes().asArrayRef()) {
-        auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
-        if (extent.getKind() !=
-                PhysicalExprKind::Constant ||
-            extent.getValue() != 1)
-          return false;
-      }
-    if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() > 1) {
-      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+    if (group.sourceAxes.empty() && !unitAxes(result, group.resultAxes))
+      return false;
+    if (group.sourceAxes.size() == 1 && group.resultAxes.size() > 1) {
+      for (unsigned axis : group.resultAxes) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (extent.getKind() !=
                 PhysicalExprKind::Constant ||
@@ -2029,7 +1992,10 @@ bool composeReshapedPointwise(ReshapeOp reshape) {
     reshape.erase();
     return true;
   }
-  if (!hasNonUnitAxisSplit(reshape) &&
+  auto relations = queryFragmentOperandRelations(reshape);
+  if (failed(relations))
+    return false;
+  if (!hasNonUnitAxisSplit(relations->front()) &&
       source.getShape().size() <= result.getShape().size())
     return false;
   Operation *producer = reshape.getValue().getDefiningOp();
@@ -2075,10 +2041,11 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       auto output = dyn_cast<FragmentType>(broadcast.getResult().getType());
       if (!input || !output || input.getShape() != output.getShape())
         break;
-      BroadcastProjection projection = queryAxisProjection(input, output);
-      if (!projection.isExact() || llvm::any_of(
-              llvm::enumerate(projection.targetToSource), [](auto item) {
-                return !item.value() || *item.value() != item.index();
+      auto relations = queryFragmentOperandRelations(broadcast);
+      if (failed(relations) || llvm::any_of(
+              relations->front().groups, [](const FragmentAxisGroup &group) {
+                return group.sourceAxes.size() != 1 || group.resultAxes.size() != 1 ||
+                       group.sourceAxes.front() != group.resultAxes.front();
               }))
         break;
       loaded = broadcast.getValue();
@@ -2089,9 +2056,12 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       break;
     auto source = cast<FragmentType>(transpose.getValue().getType());
     auto result = cast<FragmentType>(transpose.getResult().getType());
-    for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
-      auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-      auto transposed = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
+    auto relations = queryFragmentOperandRelations(transpose);
+    if (failed(relations))
+      return false;
+    for (const FragmentAxisGroup &group : relations->front().groups) {
+      auto original = cast<AxisMapAttr>(source.getAxisMaps()[group.sourceAxes.front()]);
+      auto transposed = cast<AxisMapAttr>(result.getAxisMaps()[group.resultAxes.front()]);
       if (!(sourceAxisIdentity(original) == sourceAxisIdentity(transposed)) ||
           original.getDimensionId() != transposed.getDimensionId())
         return false;
@@ -2105,17 +2075,26 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       !canReplayReadAt(load, reshape))
     return false;
   auto source = cast<FragmentType>(sourceValue.getType());
+  auto relations = queryFragmentOperandRelations(reshape);
+  if (failed(relations))
+    return false;
+  const auto &groups = relations->front().groups;
   if (source.getShape().size() <= result.getShape().size() &&
-      !hasNonUnitAxisSplit(reshape) && !transposed)
+      !hasNonUnitAxisSplit(relations->front()) && !transposed)
     return false;
   auto kernel = reshape->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
-  unsigned sourceRank = 0;
-  unsigned resultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getResultAxes().empty())
-      for (int64_t axis : group.getSourceAxes().asArrayRef()) {
+  // This access rewrite owns the whole load coordinate frame; execution-prefix
+  // axes are handled by their existing traversal, outside this policy's scope.
+  if (llvm::any_of(groups, [](const FragmentAxisGroup &group) {
+        return group.kind != FragmentAxisRelationKind::Reassociation;
+      }))
+    return false;
+  unsigned sourceRank = source.getShape().size();
+  unsigned resultRank = result.getShape().size();
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.resultAxes.empty())
+      for (unsigned axis : group.sourceAxes) {
         auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
         PhysicalRangeFact ranges = analysis.axisRanges(sourceValue, axis);
         if (extent.getKind() !=
@@ -2124,40 +2103,32 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
             !llvm::all_of(ranges.roots, isProvablySingletonLogicalRange))
           return false;
       }
-    if (group.getSourceAxes().empty())
-      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+    if (group.sourceAxes.empty())
+      for (unsigned axis : group.resultAxes) {
         auto extent = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (extent.getKind() !=
                 PhysicalExprKind::Constant ||
             extent.getValue() != 1)
           return false;
       }
-    for (int64_t axis : group.getSourceAxes().asArrayRef())
-      sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
-    for (int64_t axis : group.getResultAxes().asArrayRef())
-      resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
   }
-  if (sourceRank != source.getShape().size() || resultRank != result.getShape().size())
-    return false;
   SmallVector<bool> preservedSource(sourceRank, false);
   SmallVector<bool> preservedResult(resultRank, false);
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty()) {
-      for (int64_t axis : group.getResultAxes().asArrayRef())
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.sourceAxes.empty()) {
+      for (unsigned axis : group.resultAxes)
         preservedResult[axis] = true;
       continue;
     }
-    if (group.getResultAxes().empty()) {
-      for (int64_t axis : group.getSourceAxes().asArrayRef())
+    if (group.resultAxes.empty()) {
+      for (unsigned axis : group.sourceAxes)
         preservedSource[axis] = true;
       continue;
     }
-    if (group.getSourceAxes().size() != 1 ||
-        group.getResultAxes().size() != 1)
+    if (group.sourceAxes.size() != 1 || group.resultAxes.size() != 1)
       continue;
-    unsigned sourceAxis = group.getSourceAxes()[0];
-    unsigned resultAxis = group.getResultAxes()[0];
+    unsigned sourceAxis = group.sourceAxes.front();
+    unsigned resultAxis = group.resultAxes.front();
     auto original = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
     auto target = cast<AxisMapAttr>(result.getAxisMaps()[resultAxis]);
     if (sourceAxisIdentity(original) == sourceAxisIdentity(target) &&
@@ -2237,21 +2208,20 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
     sourceExtents[axis] = extent;
   }
   SmallVector<PhysicalExprAttr> resultExtents(resultRank);
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getResultAxes().empty())
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.resultAxes.empty())
       continue;
-    unsigned resultAxis = group.getResultAxes()[0];
+    unsigned resultAxis = group.resultAxes.front();
     if (preservedResult[resultAxis])
       continue;
-    auto axes = group.getSourceAxes().asArrayRef();
+    ArrayRef<unsigned> axes = group.sourceAxes;
     auto extent = cast<PhysicalExprAttr>(sourceExtents[axes.front()]);
-    if (group.getResultAxes().size() > 1) {
+    if (group.resultAxes.size() > 1) {
       // The declared row-major group may split a complete source axis.
       // Static result extents give each constituent its own exact range;
       // physical padding or a partial source tile cannot satisfy this proof.
       int64_t product = 1;
-      for (int64_t axis : group.getResultAxes().asArrayRef()) {
+      for (unsigned axis : group.resultAxes) {
         auto part = cast<PhysicalExprAttr>(result.getShape()[axis]);
         if (part.getKind() !=
                 PhysicalExprKind::Constant ||
@@ -2262,7 +2232,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
         resultExtents[axis] = part;
       }
       int64_t sourceProduct = 1;
-      for (int64_t axis : axes) {
+      for (unsigned axis : axes) {
         auto part = cast<PhysicalExprAttr>(sourceExtents[axis]);
         if (part.getKind() != PhysicalExprKind::Constant ||
             part.getValue() <= 0 ||
@@ -2274,7 +2244,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
         return false;
       continue;
     }
-    for (int64_t axis : axes.drop_front())
+    for (unsigned axis : axes.drop_front())
       extent = PhysicalExprAttr::get(reshape.getContext(),
           PhysicalExprKind::Multiply, 0,
           StringAttr::get(reshape.getContext(), ""),
@@ -2382,24 +2352,23 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
   }
   SmallVector<Value> sourceCoordinates(sourceRank);
   IRMapping mapping;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty())
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.sourceAxes.empty())
       continue;
-    if (group.getResultAxes().empty()) {
+    if (group.resultAxes.empty()) {
       // A removed logical singleton still contributes its original address.
       // It becomes uniform in the destination shape, not an extra flat axis.
-      for (int64_t axis : group.getSourceAxes().asArrayRef())
+      for (unsigned axis : group.sourceAxes)
         for (MakeRangeOp root : sourceRoots[axis])
           mapping.map(root.getResult(), builder.create<SplatOp>(
               reshape.getLoc(), indexType, root.getStart()).getResult());
       continue;
     }
-    if (preservedResult[group.getResultAxes()[0]]) {
+    if (preservedResult[group.resultAxes.front()]) {
       // Unmerged axes retain their current tile and coordinates, including
       // program-local batch coordinates and already blocked free dimensions.
-      for (MakeRangeOp root : sourceRoots[group.getSourceAxes()[0]]) {
-        unsigned axis = group.getResultAxes()[0];
+      for (MakeRangeOp root : sourceRoots[group.sourceAxes.front()]) {
+        unsigned axis = group.resultAxes.front();
         SmallVector<Attribute> shape(resultRank,
             PhysicalExprAttr::get(result.getContext(),
                 PhysicalExprKind::Constant, 1,
@@ -2427,8 +2396,8 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
       }
       continue;
     }
-    Value ordinal = flatCoordinates[group.getResultAxes()[0]];
-    for (int64_t axis : group.getResultAxes().asArrayRef().drop_front()) {
+    Value ordinal = flatCoordinates[group.resultAxes.front()];
+    for (unsigned axis : ArrayRef<unsigned>(group.resultAxes).drop_front()) {
       Value extent = builder.create<SplatOp>(reshape.getLoc(), indexType,
                                             resultStops[axis]);
       ordinal = builder.create<BinaryOp>(reshape.getLoc(), indexType, ordinal,
@@ -2437,7 +2406,7 @@ FailureOr<bool> composeReshapedLoad(ReshapeOp reshape) {
                                         flatCoordinates[axis],
                                         BinaryOperator::Add);
     }
-    auto axes = group.getSourceAxes().asArrayRef();
+    ArrayRef<unsigned> axes = group.sourceAxes;
     for (unsigned position = axes.size(); position-- > 0;) {
       unsigned axis = axes[position];
       MakeRangeOp range = sourceRanges[axis];
@@ -2526,22 +2495,25 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
           source.getElementType() != result.getElementType() ||
           source.getOwner() != result.getOwner() || source.getValidity() != result.getValidity())
         return false;
-      if (auto reshape = dyn_cast<ReshapeOp>(operation))
-        return llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
-          auto group = cast<ReshapeGroupAttr>(attribute);
-          return group.getSourceAxes().size() == 1 &&
-                 group.getResultAxes().size() == 1 &&
-                 group.getSourceAxes()[0] == group.getResultAxes()[0];
-        });
-      BroadcastProjection relation = queryAxisProjection(source, result);
-      if (!relation.isExact())
+      auto relations = queryFragmentOperandRelations(operation);
+      if (failed(relations))
         return false;
-      for (auto [axis, inputAxis] : llvm::enumerate(relation.targetToSource)) {
+      for (const FragmentAxisGroup &group : relations->front().groups) {
+        if (group.resultAxes.size() != 1 || group.sourceAxes.size() > 1)
+          return false;
+        unsigned axis = group.resultAxes.front();
+        if (!group.sourceAxes.empty()) {
+          if (group.sourceAxes.front() != axis)
+            return false;
+          continue;
+        }
+        if (isa<ReshapeOp>(operation))
+          return false;
         auto extent = cast<PhysicalExprAttr>(source.getShape()[axis]);
         bool unit = extent.getKind() ==
                         PhysicalExprKind::Constant &&
                     extent.getValue() == 1;
-        if (inputAxis ? *inputAxis != axis : !unit)
+        if (!unit)
           return false;
       }
       return true;
@@ -2594,12 +2566,15 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       [&](Value value, SmallVector<unsigned> axes) {
         value = stripPositionalRebindings(value);
         if (auto transpose = value.getDefiningOp<TransposeOp>()) {
-          if (transpose.getPermutation().size() != axes.size())
-            return false;
           auto source = cast<FragmentType>(transpose.getValue().getType());
           auto result = cast<FragmentType>(transpose.getResult().getType());
+          auto relations = queryFragmentOperandRelations(transpose);
+          if (failed(relations) || result.getShape().size() != axes.size())
+            return false;
           SmallVector<unsigned> inputAxes(axes.size());
-          for (auto [axis, sourceAxis] : llvm::enumerate(transpose.getPermutation())) {
+          for (const FragmentAxisGroup &group : relations->front().groups) {
+            unsigned axis = group.resultAxes.front();
+            unsigned sourceAxis = group.sourceAxes.front();
             auto sourceMap = cast<AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
             auto resultMap = cast<AxisMapAttr>(result.getAxisMaps()[axis]);
             if (!(sourceAxisIdentity(sourceMap) == sourceAxisIdentity(resultMap)) ||
@@ -2665,8 +2640,11 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       if (!transposes.contains(producer))
         return false;
       OutputAxes inputAxes(axes.size());
-      for (auto [axis, inputAxis] : llvm::enumerate(transpose.getPermutation()))
-        inputAxes[inputAxis] = axes[axis];
+      auto relations = queryFragmentOperandRelations(transpose);
+      if (failed(relations))
+        return false;
+      for (const FragmentAxisGroup &group : relations->front().groups)
+        inputAxes[group.sourceAxes.front()] = axes[group.resultAxes.front()];
       return canReplayEpilogue(transpose.getValue(), std::move(inputAxes));
     }
     if (auto load = dyn_cast_or_null<LoadOp>(producer)) {
@@ -2710,41 +2688,21 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
           sourceReshapes.push_back(companion);
         return true;
       }
-      auto unitAxes = [](FragmentType type, ArrayRef<int64_t> axes, unsigned prefix) {
-        return llvm::all_of(axes, [&](int64_t axis) {
-          auto extent = cast<PhysicalExprAttr>(type.getShape()[prefix + axis]);
-          return extent.getKind() ==
-                     PhysicalExprKind::Constant &&
-                 extent.getValue() == 1;
-        });
-      };
-      unsigned sourceRank = 0, resultRank = 0;
-      for (Attribute attribute : companion.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        sourceRank += group.getSourceAxes().size();
-        resultRank += group.getResultAxes().size();
-      }
-      unsigned sourcePrefix = source.getShape().size() - sourceRank;
-      unsigned resultPrefix = result.getShape().size() - resultRank;
-      if (sourcePrefix != resultPrefix)
+      auto relations = queryFragmentOperandRelations(companion);
+      if (failed(relations))
         return false;
       OutputAxes inputAxes(source.getShape().size());
-      for (unsigned axis = 0; axis < sourcePrefix; ++axis)
-        inputAxes[axis] = axes[axis];
-      for (Attribute attribute : companion.getReassociation()) {
-        auto group = cast<ReshapeGroupAttr>(attribute);
-        if (group.getSourceAxes().empty()) {
-          if (!unitAxes(result, group.getResultAxes().asArrayRef(), resultPrefix))
+      for (const FragmentAxisGroup &group : relations->front().groups) {
+        if (group.sourceAxes.empty()) {
+          if (!unitAxes(result, group.resultAxes))
             return false;
-        } else if (group.getResultAxes().empty()) {
-          if (!unitAxes(source, group.getSourceAxes().asArrayRef(), sourcePrefix))
+        } else if (group.resultAxes.empty()) {
+          if (!unitAxes(source, group.sourceAxes))
             return false;
-        } else if (group.getSourceAxes().size() != 1 ||
-                   group.getResultAxes().size() != 1) {
+        } else if (group.sourceAxes.size() != 1 || group.resultAxes.size() != 1) {
           return false;
         } else {
-          inputAxes[sourcePrefix + group.getSourceAxes()[0]] =
-              axes[resultPrefix + group.getResultAxes()[0]];
+          inputAxes[group.sourceAxes.front()] = axes[group.resultAxes.front()];
         }
       }
       return canReplayEpilogue(companion.getValue(), std::move(inputAxes));
@@ -2777,16 +2735,14 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   if (!input)
     return false;
-  unsigned logicalSourceRank = 0;
-  unsigned logicalResultRank = 0;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    for (int64_t axis : group.getSourceAxes().asArrayRef())
-      logicalSourceRank = std::max(logicalSourceRank, static_cast<unsigned>(axis + 1));
-    for (int64_t axis : group.getResultAxes().asArrayRef())
-      logicalResultRank = std::max(logicalResultRank, static_cast<unsigned>(axis + 1));
-  }
-  if (logicalSourceRank != input.getShape().size() || logicalResultRank != outputRank)
+  auto relations = queryFragmentOperandRelations(reshape);
+  if (failed(relations) ||
+      cast<FragmentType>(relations->front().resultType).getShape().size() != outputRank)
+    return false;
+  const auto &groups = relations->front().groups;
+  if (llvm::any_of(groups, [](const FragmentAxisGroup &group) {
+        return group.kind != FragmentAxisRelationKind::Reassociation;
+      }))
     return false;
   SmallVector<MakeRangeOp> inputRanges;
   SmallVector<Attribute> inputExtents;
@@ -2811,19 +2767,18 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     inputRanges.push_back(*range);
     inputExtents.push_back(extent);
   }
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getSourceAxes().empty() && group.getResultAxes().empty())
+  for (const FragmentAxisGroup &group : groups) {
+    if (group.sourceAxes.empty() && group.resultAxes.empty())
       return false;
     SmallVector<Attribute> sourceExtents;
-    for (int64_t axis : group.getSourceAxes().asArrayRef()) {
-      if (axis < 0 || axis >= static_cast<int64_t>(inputRanges.size()))
+    for (unsigned axis : group.sourceAxes) {
+      if (axis >= inputRanges.size())
         return false;
       sourceExtents.push_back(inputExtents[axis]);
     }
     SmallVector<Attribute> resultExtents;
-    for (int64_t axis : group.getResultAxes().asArrayRef()) {
-      if (axis < 0 || axis >= static_cast<int64_t>(outerAxes.size()))
+    for (unsigned axis : group.resultAxes) {
+      if (axis >= outerAxes.size())
         return false;
       PhysicalExprAttr extent = queryLaunchExpression(
           outputRanges[outerAxes[axis]].getLogicalStop());
@@ -2854,10 +2809,9 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       input.getAxisMaps(), input.getValidity(), input.getOwner());
   SmallVector<Value> coordinates(store.getCoordinates());
   IRMapping mapping;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
+  for (const FragmentAxisGroup &group : groups) {
     Value ordinal;
-    for (int64_t sourceAxis : group.getSourceAxes().asArrayRef()) {
+    for (unsigned sourceAxis : group.sourceAxes) {
       auto rangeType = inputRanges[sourceAxis].getResult().getType();
       SmallVector<Attribute> axisShape(input.getShape().size(),
           PhysicalExprAttr::get(store.getContext(),
@@ -2896,7 +2850,7 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       Value zero = builder.create<arith::ConstantIndexOp>(store.getLoc(), 0);
       ordinal = builder.create<SplatOp>(store.getLoc(), indexType, zero);
     }
-    auto axes = group.getResultAxes().asArrayRef();
+    ArrayRef<unsigned> axes = group.resultAxes;
     for (unsigned position = axes.size(); position-- > 0;) {
       unsigned outerAxis = outerAxes[axes[position]];
       MakeRangeOp range = outputRanges[outerAxis];

@@ -583,37 +583,28 @@ bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
       else if (auto splat = current.getDefiningOp<SplatOp>())
         input = splat.getValue();
       else if (auto transpose = current.getDefiningOp<TransposeOp>()) {
+        auto relations = queryFragmentOperandRelations(transpose.getOperation());
+        if (failed(relations))
+          return std::nullopt;
         for (std::optional<unsigned> &axis : axes)
           if (axis)
-            axis = transpose.getPermutation()[*axis];
+            axis = relations->front().correspondingSourceAxis(*axis);
         return std::make_pair(transpose.getValue(), std::move(axes));
       } else if (auto reshape = current.getDefiningOp<ReshapeOp>()) {
         auto source = cast<FragmentType>(reshape.getValue().getType());
         auto target = cast<FragmentType>(current.getType());
         if (source.getShape() == target.getShape())
           return std::make_pair(reshape.getValue(), std::move(axes));
-        unsigned sourceRank = 0, resultRank = 0;
-        for (Attribute attribute : reshape.getReassociation()) {
-          auto group = cast<ReshapeGroupAttr>(attribute);
-          sourceRank += group.getSourceAxes().size();
-          resultRank += group.getResultAxes().size();
-        }
-        unsigned sourcePrefix = source.getShape().size() - sourceRank;
-        unsigned resultPrefix = target.getShape().size() - resultRank;
-        if (sourcePrefix != resultPrefix)
-          return std::nullopt;
+        auto relations = queryFragmentOperandRelations(reshape.getOperation());
+        if (failed(relations)) return std::nullopt;
         Axes resultToSource(target.getShape().size());
-        for (unsigned axis = 0; axis < sourcePrefix; ++axis)
-          resultToSource[axis] = axis;
-        for (Attribute attribute : reshape.getReassociation()) {
-          auto group = cast<ReshapeGroupAttr>(attribute);
-          if (group.getSourceAxes().empty() || group.getResultAxes().empty())
+        for (const FragmentAxisGroup &group : relations->front().groups) {
+          if (group.sourceAxes.empty() || group.resultAxes.empty())
             continue;
-          if (group.getSourceAxes().size() != 1 ||
-              group.getResultAxes().size() != 1)
+          if (group.sourceAxes.size() != 1 || group.resultAxes.size() != 1)
             return std::nullopt;
-          unsigned sourceAxis = sourcePrefix + group.getSourceAxes()[0];
-          unsigned resultAxis = resultPrefix + group.getResultAxes()[0];
+          unsigned sourceAxis = group.sourceAxes[0];
+          unsigned resultAxis = group.resultAxes[0];
           if (source.getShape()[sourceAxis] != target.getShape()[resultAxis])
             return std::nullopt;
           resultToSource[resultAxis] = sourceAxis;
@@ -1251,17 +1242,17 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
                      PhysicalExprKind::Constant &&
                  extent.getValue() == 1;
         };
-        bool projection = llvm::all_of(
-            reshape.getReassociation(), [&](Attribute attribute) {
-              auto group = cast<ReshapeGroupAttr>(attribute);
-              auto inputs = group.getSourceAxes().asArrayRef();
-              auto outputs = group.getResultAxes().asArrayRef();
+        auto relations = queryFragmentOperandRelations(reshape.getOperation());
+        bool projection = succeeded(relations) && llvm::all_of(
+            relations->front().groups, [&](const FragmentAxisGroup &group) {
+              ArrayRef<unsigned> inputs = group.sourceAxes;
+              ArrayRef<unsigned> outputs = group.resultAxes;
               if (inputs.empty())
-                return llvm::all_of(outputs, [&](int64_t axis) {
+                return llvm::all_of(outputs, [&](unsigned axis) {
                   return unit(target.getShape()[axis]);
                 });
               if (outputs.empty())
-                return llvm::all_of(inputs, [&](int64_t axis) {
+                return llvm::all_of(inputs, [&](unsigned axis) {
                   return unit(source.getShape()[axis]);
                 });
               return inputs.size() == 1 && outputs.size() == 1 &&
@@ -1449,10 +1440,13 @@ Value stripRangeProjection(Value value) {
       continue;
     }
     auto reshape = value.getDefiningOp<ReshapeOp>();
-    if (!reshape || llvm::any_of(reshape.getReassociation(), [](Attribute attribute) {
-          auto group = cast<ReshapeGroupAttr>(attribute);
-          return group.getSourceAxes().size() > 1 || group.getResultAxes().size() > 1;
-        }))
+    if (!reshape)
+      break;
+    auto relations = queryFragmentOperandRelations(reshape.getOperation());
+    if (failed(relations) || llvm::any_of(
+            relations->front().groups, [](const FragmentAxisGroup &group) {
+              return group.sourceAxes.size() > 1 || group.resultAxes.size() > 1;
+            }))
       break;
     projections.push_back(reshape);
     value = reshape.getValue();
@@ -1465,30 +1459,16 @@ Value stripRangeProjection(Value value) {
     auto input = cast<FragmentType>(operation->getOperand(0).getType());
     auto output = cast<FragmentType>(operation->getResult(0).getType());
     std::optional<unsigned> projected;
-    if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
-      unsigned rank = 0;
-      for (Attribute attribute : reshape.getReassociation())
-        rank += cast<ReshapeGroupAttr>(attribute).getSourceAxes().size();
-      unsigned prefix = input.getShape().size() - rank;
-      if (axis < prefix)
-        projected = axis;
-      else
-        for (Attribute attribute : reshape.getReassociation()) {
-          auto group = cast<ReshapeGroupAttr>(attribute);
-          if (group.getSourceAxes().size() == 1 && group.getResultAxes().size() == 1 &&
-              group.getSourceAxes()[0] + prefix == axis)
-            projected = group.getResultAxes()[0] + prefix;
-        }
-    } else {
-      auto mapping = queryAxisProjection(input, output);
-      if (mapping.isExact())
-        for (auto [position, source] : llvm::enumerate(mapping.targetToSource))
-          if (source && *source == axis) {
-            if (projected)
-              return original;
-            projected = position;
-          }
-    }
+    auto relations = queryFragmentOperandRelations(operation);
+    if (failed(relations))
+      return original;
+    for (const FragmentAxisGroup &group : relations->front().groups)
+      if (group.sourceAxes.size() == 1 && group.resultAxes.size() == 1 &&
+          group.sourceAxes.front() == axis) {
+        if (projected)
+          return original;
+        projected = group.resultAxes.front();
+      }
     if (!projected || input.getShape()[axis] != output.getShape()[*projected])
       return original;
     axis = *projected;
@@ -3069,95 +3049,76 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       result.state = PhysicalFactState::Unknown;
     return;
   }
-  if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
-    auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
-    if (!input) {
+  if (isa<FragmentOpInterface>(operation)) {
+    auto relations = queryFragmentOperandRelations(cast<OpResult>(value));
+    if (failed(relations)) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    unsigned logicalSourceRank = 0;
-    unsigned logicalResultRank = 0;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = dyn_cast<ReshapeGroupAttr>(attribute);
+    auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
+    for (const FragmentOperandRelation &relation : *relations) {
+      auto input = dyn_cast<FragmentType>(relation.sourceType);
+      if (!input)
+        continue;
+      Value operand = operation->getOperand(relation.operandNumber);
+      const FragmentAxisGroup *group = relation.groupForResultAxis(fragmentAxis);
       if (!group) {
         result.state = PhysicalFactState::Unknown;
         appendUnique(result.blockers, operation);
-        return;
-      }
-      if (!group.getSourceAxes().empty())
-        logicalSourceRank =
-            std::max(logicalSourceRank,
-                     static_cast<unsigned>(
-                         group.getSourceAxes().asArrayRef().back() + 1));
-      if (!group.getResultAxes().empty())
-        logicalResultRank =
-            std::max(logicalResultRank,
-                     static_cast<unsigned>(
-                         group.getResultAxes().asArrayRef().back() + 1));
-    }
-    if (logicalSourceRank > input.getShape().size() ||
-        logicalResultRank > fragment.getShape().size()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    unsigned sourcePrefix = input.getShape().size() - logicalSourceRank;
-    unsigned resultPrefix = fragment.getShape().size() - logicalResultRank;
-    if (fragmentAxis < resultPrefix) {
-      if (sourcePrefix != resultPrefix || fragmentAxis >= sourcePrefix) {
-        result.state = PhysicalFactState::Unknown;
-        appendUnique(result.blockers, operation);
-        return;
-      }
-      collectAxisRanges(reshape.getValue(), fragmentAxis, result, visited);
-      return;
-    }
-    unsigned logicalResultAxis = fragmentAxis - resultPrefix;
-    auto expected =
-        cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
-    std::optional<unsigned> sourceAxis;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      if (!llvm::is_contained(group.getResultAxes().asArrayRef(),
-                              logicalResultAxis))
         continue;
-      if (group.getSourceAxes().size() == 1 &&
-          group.getResultAxes().size() == 1) {
-        sourceAxis = sourcePrefix + group.getSourceAxes()[0];
-        break;
       }
-      for (int64_t logicalSourceAxis : group.getSourceAxes().asArrayRef()) {
-        if (logicalSourceAxis < 0 ||
-            sourcePrefix + static_cast<unsigned>(logicalSourceAxis) >=
-                input.getShape().size())
-          continue;
-        unsigned physicalSourceAxis = sourcePrefix + logicalSourceAxis;
-        auto mapping =
-            cast<AxisMapAttr>(input.getAxisMaps()[physicalSourceAxis]);
-        if (mapping.getDimensionId() != expected.getDimensionId())
-          continue;
-        if (sourceAxis) {
-          result.state = PhysicalFactState::Ambiguous;
-          appendUnique(result.blockers, operation);
-          return;
+      std::optional<unsigned> sourceAxis;
+      if (group->sourceAxes.size() == 1 && group->resultAxes.size() == 1) {
+        sourceAxis = group->sourceAxes.front();
+      } else if (group->kind == FragmentAxisRelationKind::Reassociation) {
+        // A row-major group is exact, but selecting a single provenance root
+        // within a split/merge still needs this analysis's occurrence proof.
+        for (unsigned axis : group->sourceAxes) {
+          auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
+          if (mapping.getDimensionId() != expected.getDimensionId())
+            continue;
+          if (sourceAxis) {
+            result.state = PhysicalFactState::Ambiguous;
+            appendUnique(result.blockers, operation);
+            return;
+          }
+          sourceAxis = axis;
         }
-        sourceAxis = physicalSourceAxis;
       }
-      break;
+      if (!sourceAxis) {
+        auto extent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
+        if (group->kind != FragmentAxisRelationKind::Broadcast &&
+            !(extent.getKind() == PhysicalExprKind::Constant &&
+              extent.getValue() == 1)) {
+          result.state = PhysicalFactState::Unknown;
+          appendUnique(result.blockers, operation);
+        }
+        continue;
+      }
+      if (group->kind == FragmentAxisRelationKind::Broadcast) {
+        PhysicalRangeFact inputRanges;
+        inputRanges.state = PhysicalFactState::Exact;
+        collectAxisRanges(operand, *sourceAxis, inputRanges, visited);
+        // A physical unit may be an unexpanded construction seed. Only a
+        // proven singleton logical range makes its broadcast provenance empty.
+        if (inputRanges.state != PhysicalFactState::Unknown &&
+            inputRanges.blockers.empty() &&
+            llvm::all_of(inputRanges.roots, isProvablySingletonLogicalRange))
+          continue;
+        if (result.state != PhysicalFactState::Unknown &&
+            inputRanges.state != PhysicalFactState::Exact)
+          result.state = inputRanges.state;
+        for (MakeRangeOp root : inputRanges.roots)
+          appendUnique(result.roots, root);
+        for (Operation *access : inputRanges.accesses)
+          appendUnique(result.accesses, access);
+        for (Operation *blocker : inputRanges.blockers)
+          appendUnique(result.blockers, blocker);
+      } else {
+        collectAxisRanges(operand, *sourceAxis, result, visited);
+      }
     }
-    if (sourceAxis) {
-      collectAxisRanges(reshape.getValue(), *sourceAxis, result, visited);
-      return;
-    }
-    auto extent =
-        cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
-    if (extent.getKind() ==
-            PhysicalExprKind::Constant &&
-        extent.getValue() == 1)
-      return;
-    result.state = PhysicalFactState::Unknown;
-    appendUnique(result.blockers, operation);
     return;
   }
   if (auto scan = dyn_cast<ScanOp>(operation)) {
@@ -3239,59 +3200,6 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     collectRecordField(extract.getRecord());
     if (!followed)
       result.state = PhysicalFactState::Unknown;
-    return;
-  }
-  if (auto splat = dyn_cast<SplatOp>(operation))
-    return;
-  if (auto broadcast = dyn_cast<BroadcastOp>(operation)) {
-    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
-    if (!input)
-      return;
-    BroadcastProjection projection = queryAxisProjection(input, fragment);
-    if (!projection.isExact()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    std::optional<unsigned> inputAxis = projection.targetToSource[fragmentAxis];
-    if (!inputAxis)
-      return;
-    auto inputExtent = cast<PhysicalExprAttr>(input.getShape()[*inputAxis]);
-    auto outputExtent = cast<PhysicalExprAttr>(fragment.getShape()[fragmentAxis]);
-    if (inputExtent.getKind() ==
-            PhysicalExprKind::Constant &&
-        inputExtent.getValue() == 1 && inputExtent != outputExtent) {
-      PhysicalRangeFact inputRanges;
-      inputRanges.state = PhysicalFactState::Exact;
-      collectAxisRanges(broadcast.getValue(), *inputAxis, inputRanges, visited);
-      if (inputRanges.state != PhysicalFactState::Unknown &&
-          inputRanges.blockers.empty() &&
-          llvm::all_of(inputRanges.roots, isProvablySingletonLogicalRange))
-        return;
-      if (result.state != PhysicalFactState::Unknown &&
-          inputRanges.state != PhysicalFactState::Exact)
-        result.state = inputRanges.state;
-      for (MakeRangeOp root : inputRanges.roots)
-        appendUnique(result.roots, root);
-      for (Operation *access : inputRanges.accesses)
-        appendUnique(result.accesses, access);
-      for (Operation *blocker : inputRanges.blockers)
-        appendUnique(result.blockers, blocker);
-      return;
-    }
-    collectAxisRanges(broadcast.getValue(), *inputAxis, result, visited);
-    return;
-  }
-  if (auto transpose = dyn_cast<TransposeOp>(operation)) {
-    ArrayRef<int64_t> permutation = transpose.getPermutation();
-    if (fragmentAxis >= permutation.size() || permutation[fragmentAxis] < 0) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    collectAxisRanges(transpose.getValue(),
-                      static_cast<unsigned>(permutation[fragmentAxis]), result,
-                      visited);
     return;
   }
   if (auto gather = dyn_cast<GatherOp>(operation)) {
@@ -3557,20 +3465,6 @@ void PhysicalProgramAnalysis::collectAxisRanges(
                         fragmentAxis, result, visited);
     return;
   }
-  if (auto select = dyn_cast<SelectOp>(operation)) {
-    // Even uniform alternatives vary by lane when the condition does.  Its
-    // coordinate range must be replayed with the selected result axis.
-    for (Value selected : {select.getCondition(), select.getTrueValue(),
-                           select.getFalseValue()}) {
-      auto selectedType = dyn_cast<FragmentType>(selected.getType());
-      if (!selectedType ||
-          selectedType.getShape().size() != fragment.getShape().size() ||
-          fragmentAxis >= selectedType.getShape().size())
-        continue;
-      collectAxisRanges(selected, fragmentAxis, result, visited);
-    }
-    return;
-  }
   if (!isCoordinateReplayNode(operation)) {
     result.state = PhysicalFactState::Unknown;
     appendUnique(result.blockers, operation);
@@ -3677,11 +3571,10 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
     auto source = dyn_cast<FragmentType>(broadcast.getValue().getType());
     if (source) {
-      BroadcastProjection projection = queryAxisProjection(source, fragment);
-      if (projection.isExact() &&
-          fragmentAxis < projection.targetToSource.size())
+      auto relations = queryFragmentOperandRelations(broadcast.getOperation());
+      if (succeeded(relations))
         if (std::optional<unsigned> sourceAxis =
-                projection.targetToSource[fragmentAxis];
+                relations->front().correspondingSourceAxis(fragmentAxis);
             sourceAxis && source.getShape()[*sourceAxis] == extent) {
           PhysicalAxisRealizationFact input =
               axisRealization(broadcast.getValue(), *sourceAxis);
@@ -3748,25 +3641,14 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
   }
 
   if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
-    auto inputType = cast<FragmentType>(reshape.getValue().getType());
-    unsigned sourceRank = 0, resultRank = 0;
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      sourceRank += group.getSourceAxes().size();
-      resultRank += group.getResultAxes().size();
-    }
-    unsigned sourcePrefix = inputType.getShape().size() - sourceRank;
-    unsigned resultPrefix = fragment.getShape().size() - resultRank;
-    if (fragmentAxis < resultPrefix)
-      return axisRealization(reshape.getValue(), fragmentAxis);
-    for (Attribute attribute : reshape.getReassociation()) {
-      auto group = cast<ReshapeGroupAttr>(attribute);
-      if (!llvm::is_contained(group.getResultAxes().asArrayRef(),
-                              fragmentAxis - resultPrefix))
-        continue;
+    auto relations = queryFragmentOperandRelations(reshape.getOperation());
+    if (failed(relations)) return result;
+    if (const FragmentAxisGroup *group = relations->front().groupForResultAxis(fragmentAxis)) {
+      if (group->kind == FragmentAxisRelationKind::Corresponding)
+        return axisRealization(reshape.getValue(), group->sourceAxes.front());
       bool physicalized = llvm::all_of(
-          group.getSourceAxes().asArrayRef(), [&](int64_t axis) {
-            auto input = axisRealization(reshape.getValue(), sourcePrefix + axis);
+          group->sourceAxes, [&](unsigned axis) {
+            auto input = axisRealization(reshape.getValue(), axis);
             return input.isExact() && input.physicalized &&
                    !input.constructionScalarSeed;
           });
@@ -3780,12 +3662,13 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
             PhysicalAxisRealizationFact::ExtentAuthority::Structural;
         return result;
       }
-      break;
     }
   }
 
   if (Operation *producer = value.getDefiningOp();
       isa_and_nonnull<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(producer)) {
+    // One input can establish extent authority while other inputs still need
+    // relation closure. Query this edge's projection independently.
     for (Value operand : producer->getOperands()) {
       auto source = dyn_cast<FragmentType>(operand.getType());
       if (!source)
@@ -4548,11 +4431,13 @@ void PhysicalProgramAnalysis::analyzeReplay(
     auto output = dyn_cast<FragmentType>(value.getType());
     PhysicalAxisProjection requested = queryFragmentAxis(output, *source);
     if (input && requested.isExact()) {
-      BroadcastProjection projection = queryAxisProjection(input, output);
-      if (projection.isExact() &&
-          requested.fragmentAxis < projection.targetToSource.size())
-        if (auto axis = projection.targetToSource[requested.fragmentAxis]) {
-          auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[*axis]);
+      auto relations = queryFragmentOperandRelations(operation);
+      if (succeeded(relations)) {
+        const FragmentAxisGroup *group =
+            relations->front().groupForResultAxis(requested.fragmentAxis);
+        if (group && group->sourceAxes.size() == 1) {
+          auto mapping = cast<AxisMapAttr>(
+              input.getAxisMaps()[group->sourceAxes.front()]);
           if (sourceDimension && mapping.getDimensionId() <= 0) {
             appendUnique(result.blockers, operation);
             result.state = PhysicalFactState::Unknown;
@@ -4566,6 +4451,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
                         dominance, result, visited);
           return;
         }
+      }
     }
   }
   for (Value operand : operation->getOperands())
@@ -4727,19 +4613,21 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
             auto output = dyn_cast<FragmentType>(user->getResult(0).getType());
             if (!output)
               continue;
-            if (auto reshape = dyn_cast<ReshapeOp>(user)) {
+            if (isa<ReshapeOp>(user)) {
+              auto relations = queryFragmentOperandRelations(user);
               bool positional = input.getShape() == output.getShape() &&
-                  llvm::all_of(reshape.getReassociation(), [](Attribute attribute) {
-                    auto group = cast<ReshapeGroupAttr>(attribute);
-                    return group.getSourceAxes() == group.getResultAxes();
-                  });
+                  succeeded(relations) && llvm::all_of(
+                      relations->front().groups, [](const FragmentAxisGroup &group) {
+                        return group.sourceAxes == group.resultAxes;
+                      });
               if (positional)
                 pending.emplace_back(user->getResult(0), axis);
-            } else if (auto transpose = dyn_cast<TransposeOp>(user)) {
-              for (auto [targetAxis, sourceAxis] :
-                   llvm::enumerate(transpose.getPermutation()))
-                if (sourceAxis == static_cast<int64_t>(axis))
-                  pending.emplace_back(user->getResult(0), targetAxis);
+            } else if (isa<TransposeOp>(user)) {
+              auto relations = queryFragmentOperandRelations(user);
+              if (succeeded(relations))
+                for (const FragmentAxisGroup &group : relations->front().groups)
+                  if (group.sourceAxes.front() == axis)
+                    pending.emplace_back(user->getResult(0), group.resultAxes.front());
             } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
                            CastOp, BitcastOp>(user)) {
               auto projection = queryBroadcastProjection(input, output);
@@ -4797,50 +4685,34 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
       appendUnique(exact.blockers, operation);
       return exact;
     }
-    for (Value operand : operation->getOperands()) {
+    auto relations = queryFragmentOperandRelations(operation);
+    for (OpOperand &operandSlot : operation->getOpOperands()) {
+      Value operand = operandSlot.get();
       SmallVector<Traversal, 4> traversals{context};
       auto input = dyn_cast<FragmentType>(operand.getType());
       auto output = dyn_cast<FragmentType>(current.getType());
-      auto requested = output ? queryFragmentAxis(output, source) : PhysicalAxisProjection{};
+      auto requested = output ? queryFragmentAxis(output, source)
+                              : PhysicalAxisProjection{};
       if (input && requested.isExact() &&
           (!sourceDimension || requested.dimensionId == *sourceDimension)) {
         SmallVector<unsigned> inputAxes;
-        if (auto reshape = dyn_cast<ReshapeOp>(operation)) {
-          unsigned sourceRank = 0, resultRank = 0;
-          for (Attribute attribute : reshape.getReassociation()) {
-            auto group = cast<ReshapeGroupAttr>(attribute);
-            sourceRank += group.getSourceAxes().size();
-            resultRank += group.getResultAxes().size();
-          }
-          unsigned sourcePrefix = input.getShape().size() - sourceRank;
-          unsigned resultPrefix = output.getShape().size() - resultRank;
-          if (requested.fragmentAxis < resultPrefix && sourcePrefix == resultPrefix)
-            inputAxes.push_back(requested.fragmentAxis);
-          else
-            for (Attribute attribute : reshape.getReassociation()) {
-              auto group = cast<ReshapeGroupAttr>(attribute);
-              if (llvm::is_contained(group.getResultAxes().asArrayRef(),
-                    static_cast<int64_t>(requested.fragmentAxis) - resultPrefix))
-                for (int64_t axis : group.getSourceAxes().asArrayRef())
-                  inputAxes.push_back(sourcePrefix + axis);
-            }
-        } else if (auto transpose = dyn_cast<TransposeOp>(operation)) {
-          inputAxes.push_back(transpose.getPermutation()[requested.fragmentAxis]);
-        } else if (isa<BroadcastOp, UnaryOp, BinaryOp, CompareOp, SelectOp,
-                       CastOp, BitcastOp>(operation)) {
-          auto projection = queryAxisProjection(input, output);
-          if (projection.isExact() && projection.targetToSource[requested.fragmentAxis])
-            inputAxes.push_back(*projection.targetToSource[requested.fragmentAxis]);
-        }
+        if (succeeded(relations))
+          for (const FragmentOperandRelation &relation : *relations)
+            if (relation.operandNumber == operandSlot.getOperandNumber())
+              if (const FragmentAxisGroup *group =
+                      relation.groupForResultAxis(requested.fragmentAxis))
+                llvm::append_range(inputAxes, group->sourceAxes);
         for (unsigned axis : inputAxes) {
           auto mapping = cast<AxisMapAttr>(input.getAxisMaps()[axis]);
-          Traversal projected{sourceAxisIdentity(mapping), mapping.getDimensionId()};
+          Traversal projected{sourceAxisIdentity(mapping),
+                              mapping.getDimensionId()};
           if (!llvm::is_contained(traversals, projected))
             traversals.push_back(projected);
         }
       }
       for (auto [selected, dimension] : traversals) {
-        PhysicalReductionDependencyFact nested = analyze(operand, selected, dimension);
+        PhysicalReductionDependencyFact nested =
+            analyze(operand, selected, dimension);
         if (nested.depends)
           return nested;
         if (!nested.isExact()) {
