@@ -113,6 +113,14 @@ Use a new work directory and a separate output directory. The command builds the
 
 This recipe fixes the native build route to GCC, Ninja and Release mode and uses the existing CMake runtime bundling rules. It accepts `--mlir-dir`, `--llvm-dir`, `--runtime-notices`, and the paired `--weft-source-dir` / `--weft-binary-dir` options. It does not publish the package or assign a manylinux tag. System ABI compatibility still follows the selected build SDK and platform; the recipe is not a claim of byte-identical builds. Other environments can use the manual source build below.
 
+### Download a CI build
+
+The [Distribution workflow](../.github/workflows/distribution.yml) invokes this same recipe for pull requests affecting the product, build inputs or documentation, and can also be started with **Run workflow** in GitHub Actions. It uses a GitHub-hosted Ubuntu 22.04 x86-64 runner, Python 3.10 and the LLVM/MLIR 20 packages. The base job installs no Torch, GPU SDK, external CPU compiler or device runner; optional Weft support is not built into this artifact.
+
+Open the chosen workflow run and download `intentdsl-ubuntu-22.04-x86_64` from its **Artifacts** section. Extract the archive and install its wheel using the existing wheel instructions above, then select `intent setup --target triton` or `--target cutile` in the corresponding separate environment. The archive also contains the source distribution. These are artifacts of that reviewed run, retained for 14 days, rather than a PyPI or GitHub release. They carry the same local Linux ABI requirements and third-party notices as the direct build; the workflow does not choose a project license.
+
+The `intentdsl-distribution-diagnostics` artifact retains the build transcript, ordered `commands/*.command`, `.log` and `.status` files, and the installed tools' actual JSON/IR/log outputs, including on failure. The build helper uses the same command logs locally. Hosted CI establishes packaging, installed compiler startup and the original softmax KIR/optimization path; device execution and performance continue to use the existing production registries. The fixed Ubuntu user space is part of the binary ABI baseline, so changing the runner to `ubuntu-latest` is not an equivalent build.
+
 Once the SDK and selected backend dependencies are installed:
 
 ```bash

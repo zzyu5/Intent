@@ -1,0 +1,99 @@
+name: Distribution
+
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'include/**'
+      - 'lib/**'
+      - 'tools/**'
+      - 'python/**'
+      - 'environment/**'
+      - 'examples/**'
+      - 'doc/**'
+      - 'pyproject.toml'
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  distribution:
+    name: Ubuntu 22.04 x86-64 / LLVM 20 / Python 3.10
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the proposed source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the LLVM/MLIR 20 build SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ca-certificates curl gnupg
+          curl --fail --silent --show-error --location \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            --output "$RUNNER_TEMP/intent-llvm-key.asc"
+          gpg --batch --yes --dearmor --output "$RUNNER_TEMP/intent-llvm-key.gpg" \
+            "$RUNNER_TEMP/intent-llvm-key.asc"
+          sudo install --mode=0644 "$RUNNER_TEMP/intent-llvm-key.gpg" /usr/share/keyrings/intent-llvm.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/intent-llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-20 main' \
+            | sudo tee /etc/apt/sources.list.d/intent-llvm.list
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cmake ninja-build gcc g++ python3.10-venv \
+            llvm-20-dev libmlir-20-dev mlir-20-tools \
+            libffi-dev libedit-dev libzstd-dev zlib1g-dev libxml2-dev
+
+      - name: Build the sdist and wheel and inspect the installed product
+        run: |
+          /usr/bin/python3.10 environment/build.py \
+            --output-dir "$RUNNER_TEMP/intent-distribution" \
+            --work-dir "$RUNNER_TEMP/intent-distribution-work" \
+            --mlir-dir /usr/lib/llvm-20/lib/cmake/mlir \
+            --llvm-dir /usr/lib/llvm-20/lib/cmake/llvm \
+            --jobs 2 \
+            2>&1 | tee "$RUNNER_TEMP/intent-distribution.log"
+
+      - name: Upload the installable artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: intentdsl-ubuntu-22.04-x86_64
+          path: |
+            ${{ runner.temp }}/intent-distribution/*.whl
+            ${{ runner.temp }}/intent-distribution/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build and installed-tool diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: intentdsl-distribution-diagnostics
+          path: |
+            ${{ runner.temp }}/intent-distribution.log
+            ${{ runner.temp }}/intent-distribution-work/commands/
+            ${{ runner.temp }}/intent-distribution-work/*.json
+            ${{ runner.temp }}/intent-distribution-work/cache/intentdsl/**/*.mlir
+            ${{ runner.temp }}/intent-distribution-work/cache/intentdsl/**/*.json
+            ${{ runner.temp }}/intent-distribution-work/cache/intentdsl/**/*.log
+            ${{ runner.temp }}/intent-distribution-work/native-build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
+          retention-days: 14

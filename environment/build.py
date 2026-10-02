@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from email.parser import BytesParser
+from itertools import count
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -23,6 +24,7 @@ import zipfile
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 AUTHOR_SOURCE = PurePosixPath("examples/kernels/normalization/softmax.py")
+COMMANDS = count(1)
 
 
 def outside_source(path: Path) -> Path:
@@ -36,14 +38,35 @@ def run(*command: str | Path, cwd: Path, env: dict[str, str],
         output: Path | None = None) -> str:
     arguments = [str(value) for value in command]
     print("+ " + shlex.join(arguments), flush=True)
-    completed = subprocess.run(arguments, cwd=cwd, env=env, text=True,
-                               stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE if output else None)
-    if output is not None:
-        output.write_text(completed.stdout, encoding="utf-8")
-        print(f"  output: {output}", flush=True)
-    completed.check_returncode()
-    return completed.stdout if output is not None else ""
+    logs = cwd / "commands"
+    logs.mkdir(exist_ok=True)
+    record = logs / f"{next(COMMANDS):02d}"
+    record.with_suffix(".command").write_text(shlex.join(arguments) + "\n", encoding="utf-8")
+    log_path = record.with_suffix(".log")
+    print(f"  log: {log_path}", flush=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        if output is None:
+            with subprocess.Popen(arguments, cwd=cwd, env=env, text=True,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT) as process:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    print(line, end="", flush=True)
+                returncode = process.wait()
+        else:
+            # Keep machine-readable stdout separate from diagnostics. These
+            # public tool requests are short; compiler subprocess logs remain
+            # available at the artifact paths reported in their JSON responses.
+            with output.open("w", encoding="utf-8") as destination:
+                returncode = subprocess.run(arguments, cwd=cwd, env=env,
+                                            stdin=subprocess.DEVNULL,
+                                            stdout=destination, stderr=log).returncode
+            print(f"  output: {output}", flush=True)
+    record.with_suffix(".status").write_text(str(returncode) + "\n", encoding="utf-8")
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, arguments)
+    return output.read_text(encoding="utf-8") if output is not None else ""
 
 
 def one_artifact(directory: Path, pattern: str) -> Path:
