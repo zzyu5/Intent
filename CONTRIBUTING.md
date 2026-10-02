@@ -378,6 +378,51 @@ MLIR SCF 的 `SCFOps.td:136–148,953–958` 在循环上声明 region branch �
 Intent 同样让运算提供自身结构，但保留显式 identity/capture、逻辑坐标与 region segmentation 合同；
 没有将这些语义交给 provider serializer 或框架名称推断。
 
+普通 GPU 值运算的坐标关系由
+[FragmentOpInterface](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) 提供。
+Unary、binary、compare、select、cast、broadcast、transpose 和 reshape 的
+`queryFragmentOperandRelations` 按 **operand slot** 返回有序轴组；同一 SSA 值
+占据两个操作数位置时仍是两条关系。Reshape 的 execution prefix 和 reassociation
+在 [IR 实现](lib/Dialect/GPU/IR/FragmentOpInterface.cpp) 中解释一次。
+新增同类运算在 ODS 声明接口并实现关系，不在每个分析和 provider 中各加分派。
+
+`transportFragmentResultType` / `transportFragmentOperandType` 消费改写前的关系
+和改写后的类型。Unary/cast 转发输入的完整 lane schema，保留声明的结果 dtype；
+投影运算则保留目标的逻辑轴身份、validity 和 owner，传递确定的物理 extents。
+需要分解一个多轴乘积而没有足够关系时，查询失败，不猜测某个维度的除法。
+关系只在当前改写内使用；修改 operands、types 或 reassociation 后重新查询。
+
+[PhysicalProgram](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 使用轴组追踪范围；
+[ValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp) 负责工作队列和 schema
+维护；[ValueMaterialization](lib/Dialect/GPU/Transforms/ValueMaterialization.cpp)
+与 region helper 展开使用它传递分段形状。Pointwise coverage、访问组合和
+online-summary 查询也消费相同的物理轴组，不能把逻辑 reshape 轴直接用作物理下标。
+Triton/cuTile 的局部资格判断也读同一关系。
+坐标对应不证明数值相等：cast 舍入、逻辑 singleton、effects 和可重放资格仍由
+各自分析或变换检查，不能仅因物理 extent 为 1 就消除整条逻辑轴。
+
+变换中的 extent authority 可由一个已知输入建立，而其它输入仍待闭合；这种单条边的
+合法投影继续使用 IR 的 `queryAxisProjection` / `queryBroadcastProjection`，不要求
+整个运算已经具备最终 schema，也不在消费者重写这两个查询的规则。
+
+职责参考：Triton `lib/Dialect/Triton/IR/Ops.cpp:221–244,800–825` 由运算推导
+shape/layout，`lib/Dialect/TritonGPU/Transforms/Utility.cpp:503–641` 共享前后向
+layout 推导。Intent 在 GPU IR 内共享自身的 fragment 轴合同，provider 继续负责
+目标布局；不把 Triton 的 layout 表示移植为另一套共享执行计划。
+
+### 跨执行模型的标量数值 lowering
+
+[Conversion/ScalarLowering](include/Intent/Conversion/ScalarLowering.h) 接受当前 KIR
+运算与 family 已物化的 scalar operands，统一生成 arith/math 操作。CPU 与 DSA
+construction 复用普通算术、比较、转换和选择；CPU 的循环/向量、DSA 的 local-memory
+遍历及原生近似 primitive 仍由各自模块形成。它属于 conversion，不放入只读 Analysis。
+
+先根据 KIR 的逻辑 signedness 选择运算，再用 `realizeIntegerStorage` 将执行载体
+归一为 signless integer；公共 `InterfaceAttr` 保留作者 dtype。新的 unsigned
+lowering 必须同时接通 provider 对应的原语和发射，不能只让上游产生新 arith op。
+若原生 tile primitive 无法表达 signedness，DSA 使用已有逐元素构造消费共同标量
+lowering，而不把 unsigned storage 当作 signed 数值运算。
+
 ### 分析与改写的职责
 
 访问操作的 operand schema 也由 IR 自己提供。KIR 的
@@ -453,6 +498,7 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | GPU 类型与形状属性自身的不变量 | [IR/TypeVerification.h](include/Intent/Dialect/GPU/IR/TypeVerification.h) | `verifyGPUTypeInvariants` 用 MLIR `AttrTypeWalker` 复用各类型/属性的 `verify`；完整 GPU verifier 在操作验证前调用，避免 release 构造绕过 checked constructor 后漏检 |
 | 执行组构造、重建与 provider 展开 | [Transforms/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
+| 普通值运算的 operand/result 轴关系与形状传递 | [IR/FragmentOpInterface.h](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) | 按操作数位置查询；改写前取得关系，传递 extents，数值与重放资格由调用方证明 |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
 | range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
 | 常量、大小关系与访问对齐 | [Analysis/IndexRelations.h](include/Intent/Dialect/GPU/Analysis/IndexRelations.h) | `IndexRelations` 共用于范围谓词、Triton descriptor 与 cuTile tile access；按 typed index 与回绕合同证明，不创建 guard 或选择原生 form |
