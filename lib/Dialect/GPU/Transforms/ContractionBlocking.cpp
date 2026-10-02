@@ -1505,20 +1505,12 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
           "blocked scaled-contract output lost source coordinates");
     coordinates[*storeRow] = rows;
     coordinates[*storeColumn] = columns;
-    Value originalValidity = path.store.getValid();
-    if (originalValidity) {
-      IRMapping replay;
-      replay.map(rowRange->getResult(), rows);
-      FailureOr<Value> replayed = replaySourceValue(
-          builder, location, kernel, originalValidity,
-          sourceAxisIdentity(*rowMap), unitM, *rowRange, rows, replay,
-          contract.getOperation());
-      if (failed(replayed))
-        return reject("result store validity could not be relocated");
-      originalValidity = *replayed;
-    }
+    // Strip the original tail against its original ranges, as for the input
+    // accesses above. Replaying only one coordinate first would leave the mask
+    // and its tail authority describing different traversals. Any scalar
+    // residual already dominates this original store insertion point.
     FailureOr<Value> valid = materializeRetargetedValidity(
-        builder, location, originalValidity, outputTailRanges,
+        builder, location, path.store.getValid(), outputTailRanges,
         outputValid, outputPredicateType);
     if (failed(valid))
       return reject("result store residual validity could not be retargeted");
