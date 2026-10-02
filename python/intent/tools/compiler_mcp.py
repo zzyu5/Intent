@@ -1,7 +1,8 @@
 """Explicitly enabled compilation tools, separate from the read-only manual."""
 from pathlib import Path
 
-from .compilation import compile_request, doctor, generate_ir_request, materialize_request, optimize_request
+from .compilation import (compile_request, describe as describe_interface, doctor, generate_ir_request,
+                          materialize_request, optimize_request, read_artifact as read_artifact_file)
 
 
 def main() -> None:
@@ -18,6 +19,8 @@ def main() -> None:
         "Loading that module executes its top-level Python host code. "
         "These tools use the public Intent pipeline and do not themselves launch the selected kernel. "
         "Generated/materialized does not mean numerical or performance validation. "
+        "Use describe to discover public signatures and environment to inspect prerequisites; "
+        "use read_artifact to page through returned source, IR and diagnostic files. "
         "Use the separate intent_manual server for language contracts."
     ))
 
@@ -46,12 +49,9 @@ def main() -> None:
         It can change rounding/underflow/overflow but does not enable global fast
         math or FTZ. The online switch controls optimization, not permission.
         """
-        path = Path(program_path).expanduser().resolve(strict=True)
-        if not path.is_file() or path.suffix != ".py":
-            raise ValueError("program_path must name an existing Python file supplied by the user")
         # Run synchronously in the server event loop: module loading temporarily
         # owns sys.path/stdout, so concurrent compilation requests must not overlap.
-        return compile_request(str(path), kernel, target, target_options=target_options,
+        return compile_request(Path(program_path), kernel, target, target_options=target_options,
                                constexprs=constexprs, compiler=compiler,
                                tuning_config=tuning_config, materialize=materialize, stage=stage,
                                target_facts=target_facts, export_directory=export_directory,
@@ -96,14 +96,34 @@ def main() -> None:
         return optimize_request(ir_file, pipeline, optimizer=optimizer)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
-    async def environment(target: str, target_options: dict | None = None,
+    async def environment(target: str | None = None, target_options: dict | None = None,
                           compiler: str | None = None, target_facts: dict | None = None) -> dict:
-        """Inspect the selected compiler/target; explicit facts skip local SDK/device probing.
+        """Inspect base compiler/KIR, or a selected provider's prerequisites.
 
-        Without explicit facts, also inspect selected runtime dependencies. This
-        does not establish numerical correctness or device execution.
+        Omit target to check the compiler without any provider SDK or device.
+        Explicit facts skip local SDK/device probing. Otherwise inspect only the
+        selected runtime dependencies. This does not establish numerical
+        correctness or device execution, or support for a particular program.
         """
         return doctor(target, target_options=target_options, compiler=compiler, target_facts=target_facts)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+    async def describe(target: str | None = None) -> dict:
+        """Discover public API, compile options and backend constructor fields.
+
+        Declarations are read from the installed Python API. This neither probes
+        a device nor claims that the selected native compiler supports a program.
+        """
+        return describe_interface(target)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+    async def read_artifact(path: str, offset: int = 0, limit: int = 16000) -> dict:
+        """Read an explicit source, IR, metadata or log path returned by compilation.
+
+        This reads UTF-8 text only. offset and limit count characters, with limit
+        at most 64000. Continue at next_offset until eof. No program is executed.
+        """
+        return read_artifact_file(path, offset=offset, limit=limit)
 
     server.run(transport="stdio")
 

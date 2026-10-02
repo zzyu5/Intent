@@ -6,7 +6,8 @@ from pathlib import Path
 import sys
 
 from .backends import BACKENDS
-from .compilation import compile_request, doctor, generate_ir_request, materialize_request, optimize_request
+from .compilation import (compile_request, describe, doctor, generate_ir_request,
+                          materialize_request, optimize_request, read_artifact)
 
 
 def _assignments(parser, values: list[str]) -> dict:
@@ -25,11 +26,11 @@ def _assignments(parser, values: list[str]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect an Intent environment, compile a kernel or transform existing IR")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, help_text in (("doctor", "Check selected backend dependencies and target facts"),
+    for name, help_text in (("doctor", "Check the base compiler, or selected backend dependencies and target facts"),
                             ("compile", "Compile a Python file:kernel or importable.module:kernel"),
                             ("generate-ir", "Generate provider source from existing KIR or shared IR")):
         command = commands.add_parser(name, help=help_text)
-        command.add_argument("--target", choices=BACKENDS, required=name in {"doctor", "generate-ir"})
+        command.add_argument("--target", choices=BACKENDS, required=name == "generate-ir")
         command.add_argument("--target-option", action="append", default=[], metavar="NAME=JSON")
         command.add_argument("--compiler", help="Intent compiler override")
         command.add_argument("--target-facts", type=Path,
@@ -65,8 +66,20 @@ def main() -> None:
     optimize_parser.add_argument("--pipeline", required=True, help="Standard MLIR pass pipeline")
     optimize_parser.add_argument("--optimizer", help="intent-opt executable override")
     optimize_parser.add_argument("--json", action="store_true", help="Write a structured result")
+    describe_parser = commands.add_parser("describe", help="Discover installed public API and target fields without probing SDKs or devices")
+    describe_parser.add_argument("--target", choices=BACKENDS)
+    describe_parser.add_argument("--json", action="store_true")
+    read_parser = commands.add_parser("read-artifact", help="Read an explicit source, IR, metadata or log file without execution")
+    read_parser.add_argument("path")
+    read_parser.add_argument("--offset", type=int, default=0, help="Unicode character offset")
+    read_parser.add_argument("--limit", type=int, default=16000, help="Maximum characters, from 1 to 64000")
+    read_parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args()
-    if arguments.command == "optimize":
+    if arguments.command == "describe":
+        result = describe(arguments.target)
+    elif arguments.command == "read-artifact":
+        result = read_artifact(arguments.path, offset=arguments.offset, limit=arguments.limit)
+    elif arguments.command == "optimize":
         result = optimize_request(arguments.ir_file, arguments.pipeline, optimizer=arguments.optimizer)
     else:
         options = _assignments(parser, arguments.target_option)
@@ -104,13 +117,21 @@ def main() -> None:
                                      materialize=arguments.materialize, stage=arguments.stage,
                                      target_facts=facts, export_directory=arguments.export_directory,
                                      options=compile_options or None)
-    if arguments.json:
+    if arguments.json or arguments.command == "describe":
         print(json.dumps(result, indent=2))
     elif arguments.command == "doctor":
-        print(f"{arguments.target}: {result['status']}")
+        print(f"{arguments.target or 'base compiler'}: {result['status']}")
         for check in result["checks"]:
-            print(f"  {check['name']}: {check['status']} — {check.get('message', check.get('detail'))}")
+            detail = check["diagnostic"]["message"] if "diagnostic" in check else check.get("detail")
+            print(f"  {check['name']}: {check['status']} — {detail}")
         print(result["scope"])
+    elif arguments.command == "read-artifact":
+        if result["status"] == "read":
+            print(result["text"], end="")
+            if not result["eof"]:
+                print(f"\nContinue with --offset {result['next_offset']}", file=sys.stderr)
+        else:
+            print(f"Stage: {result['stage']}\n{result['diagnostic']['message']}", file=sys.stderr)
     else:
         if arguments.command == "optimize":
             print(f"{arguments.ir_file}: {result['status']} with {arguments.pipeline}")

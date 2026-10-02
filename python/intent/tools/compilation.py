@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import asdict, is_dataclass
+from dataclasses import MISSING, asdict, fields, is_dataclass
 import importlib
 import importlib.util
+import inspect
 from itertools import count
 import io
 import os
@@ -12,20 +13,20 @@ from pathlib import Path
 import shutil
 import sys
 
-from .backends import backend, make_target
+from .backends import BACKENDS, backend, make_target
 
 _MODULE_IDS = count()
 
 
 @contextmanager
-def _definition(program: str, symbol: str):
+def _definition(program: str | Path, symbol: str):
     from intent.api import KernelDefinition
 
     if not symbol.isidentifier():
         raise ValueError("kernel must be a module-level Python identifier")
     path = Path(program).expanduser()
     module_name = None
-    if path.suffix == ".py" or "/" in program:
+    if isinstance(program, Path) or path.suffix == ".py" or "/" in program:
         path = path.resolve(strict=True)
         if not path.is_file() or path.suffix != ".py":
             raise ValueError("program must name an existing Python file")
@@ -57,31 +58,132 @@ def _definition(program: str, symbol: str):
 
 
 def _files(directory: Path | None) -> dict[str, str]:
-    if directory is None:
+    if directory is None or not directory.is_dir():
         return {}
-    return {name: str(directory / name) for name in
-            ("input.mlir", "kernel.mlir", "kernel.source", "artifact.json", "request.json", "compiler.log")
-            if (directory / name).is_file()}
+    names = {"input.mlir", "kernel.mlir", "kernel.source", "artifact.json", "request.json",
+             "compiler.log", "kernel.mojo", "fp_environment.c", "native.json", "link.d"}
+    suffixes = {".command", ".stdout", ".stderr", ".status", ".seconds"}
+    return {path.name: str(path) for path in sorted(directory.iterdir())
+            if path.is_file() and (path.name in names or path.suffix in suffixes)}
 
 
 def _failure(result: dict, error: BaseException, stage: str) -> None:
-    directory = getattr(error, "cache_directory", None)
-    if directory is not None:
-        result.update(cache_directory=str(directory), files=_files(directory))
     diagnostic = {"type": type(error).__name__, "message": str(error)}
+    causes = []
+    directories = []
     cause = error
     while cause is not None:
+        detail = {"type": type(cause).__name__, "message": str(cause)}
+        if getattr(cause, "stage", None) is not None:
+            detail["stage"] = cause.stage
+        if getattr(cause, "candidate", None) is not None:
+            detail["candidate"] = cause.candidate
+        directory = getattr(cause, "cache_directory", None)
+        if directory is not None:
+            detail["cache_directory"] = str(directory)
+            if str(directory) not in directories:
+                directories.append(str(directory))
+        artifacts = getattr(cause, "artifacts", {})
+        if artifacts:
+            detail["files"] = {name: str(path) for name, path in artifacts.items()}
+        causes.append(detail)
         for name in ("stdout", "stderr"):
             value = getattr(cause, name, None)
             if isinstance(value, str) and value:
                 diagnostic.setdefault(name, value)
-        detail = getattr(cause, "diagnostic", None)
-        if detail is not None and is_dataclass(detail):
-            diagnostic["frontend"] = asdict(detail)
-            break
+        frontend = getattr(cause, "diagnostic", None)
+        if frontend is not None and is_dataclass(frontend):
+            diagnostic["frontend"] = asdict(frontend)
         cause = cause.__cause__
-    result.update(status="error", stage=getattr(error, "stage", stage),
+    diagnostic["causes"] = causes
+    structured = next((item for item in causes if "stage" in item), None)
+    if directories:
+        # Keep earlier compiler output reachable when native materialization has
+        # a different directory. A log directory is evidence, not a new cache.
+        previous = result.get("cache_directory")
+        if previous is not None and previous not in directories:
+            directories.append(previous)
+        result["artifact_directories"] = [
+            {"path": path, "files": _files(Path(path))} for path in directories]
+        result.update(cache_directory=directories[0], files=_files(Path(directories[0])))
+    if causes[0].get("files"):
+        result.setdefault("files", {}).update(causes[0]["files"])
+    if structured is not None and "candidate" in structured:
+        diagnostic["candidate"] = structured["candidate"]
+    result.update(status="error", stage=structured["stage"] if structured is not None else stage,
                   diagnostic=diagnostic, tool_invoked_kernel=False)
+
+
+def read_artifact(path: str, *, offset: int = 0, limit: int = 16000) -> dict:
+    """Read an explicitly selected UTF-8 source, IR, metadata or log file.
+
+    Offset and limit count Unicode characters. Continue at next_offset until eof;
+    no module is imported and no compiler or kernel is invoked.
+    """
+    result = {"path": path, "tool_invoked_kernel": False}
+    try:
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer character offset")
+        if type(limit) is not int or not 1 <= limit <= 64000:
+            raise ValueError("limit must be an integer from 1 through 64000 characters")
+        selected = Path(path).expanduser().resolve(strict=True)
+        if not selected.is_file():
+            raise ValueError("path must name an existing text file")
+        with selected.open(encoding="utf-8", newline="") as stream:
+            remaining, line = offset, 1
+            while remaining:
+                skipped = stream.read(min(remaining, 65536))
+                if not skipped:
+                    raise ValueError("offset exceeds the file's character length")
+                remaining -= len(skipped)
+                line += skipped.count("\n")
+            page = stream.read(limit + 1)
+        text = page[:limit]
+        result.update(status="read", path=str(selected), offset=offset, first_line=line,
+                      text=text, next_offset=offset + len(text), eof=len(page) <= limit)
+    except Exception as error:
+        _failure(result, error, "artifact_reading")
+    return result
+
+
+def _declaration(value) -> dict:
+    declaration = {"name": f"{value.__module__}.{value.__qualname__}",
+                   "signature": str(inspect.signature(value)), "description": inspect.getdoc(value)}
+    if is_dataclass(value):
+        declaration["fields"] = []
+        for field in fields(value):
+            if not field.init:
+                continue
+            item = {"name": field.name, "type": str(field.type), "required": field.default is MISSING
+                    and field.default_factory is MISSING}
+            if field.default is not MISSING:
+                item["default"] = field.default
+            elif field.default_factory is not MISSING:
+                item["default_factory"] = field.default_factory.__qualname__
+            declaration["fields"].append(item)
+    return declaration
+
+
+def describe(target: str | None = None) -> dict:
+    """Discover public call signatures and target fields without probing a device or SDK."""
+    import intent
+
+    result = {"target": target, "tool_invoked_kernel": False}
+    try:
+        names = (target,) if target is not None else tuple(BACKENDS)
+        result["backends"] = {name: {**backend(name),
+            "target": _declaration(getattr(intent, backend(name)["target"]))} for name in names}
+        result["api"] = {name: _declaration(getattr(intent, name)) for name in (
+            "compile", "generate", "compile_ir", "generate_from_ir", "optimize_ir", "CompileOptions",
+            "GPUCompilationTarget", "GPUCapabilities", "CPUCompilationTarget", "DSACompilationTarget")}
+        result["tools"] = {name: _declaration(function) for name, function in (
+            ("compile", compile_request), ("generate_from_ir", generate_ir_request),
+            ("materialize", materialize_request), ("optimize", optimize_request),
+            ("environment", doctor), ("read_artifact", read_artifact))}
+        result.update(status="described", scope="Declarations only; compiler availability and device support are not checked")
+    except Exception as error:
+        _failure(result, error, "interface_discovery")
+    return result
 
 
 def _ir_text(ir_file: str) -> str:
@@ -103,7 +205,7 @@ def _generated_result(result: dict, generated, materialize: bool, *,
     result.update(status="materialized" if materialize else "generated")
 
 
-def compile_request(program: str, kernel: str, target: str | None = None, *,
+def compile_request(program: str | Path, kernel: str, target: str | None = None, *,
                     target_options: dict | None = None, constexprs: dict | None = None,
                     compiler: str | None = None, tuning_config: str | None = None,
                     materialize: bool = False, stage: str = "provider",
@@ -119,7 +221,7 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
 
     current_stage = "request"
     transcript = io.StringIO()
-    result = {"program": program, "kernel": kernel, "target": target, "requested_stage": stage}
+    result = {"program": str(program), "kernel": kernel, "target": target, "requested_stage": stage}
     try:
         compile_options = None
         if options is not None:
@@ -243,25 +345,34 @@ def optimize_request(ir_file: str, pipeline: str, *, optimizer: str | None = Non
     return result
 
 
-def doctor(target: str, *, target_options: dict | None = None, compiler: str | None = None,
+def doctor(target: str | None = None, *, target_options: dict | None = None, compiler: str | None = None,
            target_facts: dict | None = None) -> dict:
+    """Check the compiler alone, or one selected provider's dependencies and target.
+
+    No target checks base compiler startup and the KIR stage. Explicit target
+    facts check offline generation prerequisites; local targets resolve their
+    actual SDK/device requirements. No kernel is compiled or executed.
+    """
     from intent.compiler.toolchain import compiler_info
     from intent.targets.base import ResolvedTarget
 
-    description = backend(target)
     checks = []
     result = {"target": target, "scope": "Dependency and target resolution only; no kernel compilation or execution",
-              "toolchain": description["toolchain"], "checks": checks}
+              "checks": checks, "tool_invoked_kernel": False}
 
-    def check(name, action):
+    def check(name, category, action):
         output = io.StringIO()
         try:
             with redirect_stdout(output):
                 value = action()
         except Exception as error:
-            checks.append({"name": name, "status": "error", "type": type(error).__name__, "message": str(error)})
+            failed = {"name": name, "category": category}
+            _failure(failed, error, category)
+            if output.getvalue():
+                failed["stdout"] = output.getvalue()
+            checks.append(failed)
             return None
-        checks.append({"name": name, "status": "available", "detail": value})
+        checks.append({"name": name, "category": category, "status": "available", "detail": value})
         if output.getvalue():
             checks[-1]["stdout"] = output.getvalue()
         return value
@@ -272,14 +383,35 @@ def doctor(target: str, *, target_options: dict | None = None, compiler: str | N
 
     def inspect_compiler():
         facts = compiler_info(compiler)
-        if target not in facts["providers"]:
-            raise NotImplementedError(
-                f"The selected Intent compiler does not contain {target!r}; "
-                f"built providers: {', '.join(facts['providers'])}"
-            )
+        if "kir" not in facts["stages"] or "ir" not in facts["outputs"]["kir"]:
+            raise NotImplementedError("The selected compiler does not provide verified KIR output")
         return facts
 
-    information = check("intent compiler", inspect_compiler)
+    information = check("intent compiler", "compiler", inspect_compiler)
+    if target is None:
+        if target_options or target_facts is not None:
+            def require_target():
+                raise ValueError("target_options and target_facts require an explicitly selected target")
+            check("target options", "target_options", require_target)
+        result["scope"] = "Base compiler startup and KIR availability only; provider packages, SDKs and devices were not checked"
+        result["status"] = "available" if all(item["status"] == "available" for item in checks) else "unavailable"
+        return result
+    description = check("backend selection", "target_options", lambda: backend(target))
+    if description is None:
+        result["status"] = "unavailable"
+        return result
+    result["toolchain"] = description["toolchain"]
+
+    def inspect_provider():
+        if target not in information["providers"]:
+            raise NotImplementedError(
+                f"The selected Intent compiler does not contain {target!r}; "
+                f"built providers: {', '.join(information['providers'])}"
+            )
+        return target
+
+    if information is not None:
+        check("compiled provider", "compiler_provider", inspect_provider)
     executable = information["executable"] if information is not None else None
     if executable is not None and target != "bangc":
         def profiles():
@@ -289,37 +421,58 @@ def doctor(target: str, *, target_options: dict | None = None, compiler: str | N
                 if not path.is_file():
                     raise FileNotFoundError(f"Compiler profile is missing: {path}")
             return [str(path) for path in paths]
-        check("compiler profiles", profiles)
+        check("compiler profiles", "compiler_resources", profiles)
     if target_facts is None:
         for name in description["modules"]:
-            check(name, lambda name=name: python_module(name))
+            check(name, "python_package", lambda name=name: python_module(name))
     else:
         result["scope"] = "Compiler and explicit compiler facts only; provider SDK, runtime device and execution were not checked"
     if target == "cutile" and target_facts is None:
         def tile_compiler():
             from cuda.tile._compile import _find_compiler_bin
             return {"path": _find_compiler_bin().path, "resolver": "cuda.tile"}
-        check("cuTile native compiler", tile_compiler)
+        check("cuTile native compiler", "provider_toolchain", tile_compiler)
 
+    resolved = None
     def resolve():
-        value = make_target(target, dict(target_options or {}), facts=target_facts).resolve()
-        result["callable_materialization"] = isinstance(value, ResolvedTarget)
-        compilation = value.compilation if isinstance(value, ResolvedTarget) else value
+        nonlocal resolved
+        resolved = make_target(target, dict(target_options or {}), facts=target_facts).resolve()
+        result["callable_materialization"] = isinstance(resolved, ResolvedTarget)
+        compilation = resolved.compilation if isinstance(resolved, ResolvedTarget) else resolved
         return {"compiler_options": list(compilation.compiler_options),
-                "facts": asdict(value) if is_dataclass(value) else {}}
+                "facts": asdict(resolved) if is_dataclass(resolved) else {}}
 
-    check("target", resolve)
-    if target == "bangc" and target_facts is None:
+    check("target", "target_resolution", resolve)
+    if target == "weft":
+        result["scope"] = "Weft source generation prerequisites only; the external AOT toolchain and RISC-V device were not checked"
+    if target == "bangc" and target_facts is None and resolved is not None:
         def neuware():
-            value = make_target(target, dict(target_options or {})).resolve()
-            path = shutil.which(value.compiler or os.environ.get("INTENT_BANGC_CNCC") or
-                                str(Path(value.neuware) / "bin/cncc"))
+            path = shutil.which(resolved.compiler or os.environ.get("INTENT_BANGC_CNCC") or
+                                str(Path(resolved.neuware) / "bin/cncc"))
             if path is None:
                 raise FileNotFoundError("BANG C compiler is unavailable; select compiler and neuware paths")
-            library = Path(value.neuware) / "lib64/libcnrt.so"
+            library = Path(resolved.neuware) / "lib64/libcnrt.so"
             if not library.is_file():
                 raise FileNotFoundError(f"CNRT runtime library is missing: {library}")
-            return {"compiler": path, "runtime": str(library), "device_execution": "not checked"}
-        check("NeuWare tools", neuware)
+            return {"compiler": path, "runtime": str(library)}
+        check("NeuWare tools", "provider_toolchain", neuware)
+        def mlu_device():
+            import ctypes
+            from intent.runtime.bangc.buffer import runtime
+
+            count = ctypes.c_uint()
+            runtime(resolved.neuware).invoke("cnrtGetDeviceCount", ctypes.byref(count))
+            if resolved.device >= count.value:
+                raise ValueError(f"MLU device {resolved.device} is unavailable; CNRT reports {count.value} devices")
+            return {"device": resolved.device, "visible_devices": count.value,
+                    "scope": "Runtime enumeration only; hardware compatibility and execution were not checked"}
+        check("MLU device", "device", mlu_device)
+    if target == "mojo" and target_facts is None:
+        def c_compiler():
+            path = shutil.which("cc")
+            if path is None:
+                raise FileNotFoundError("Mojo floating-point environment compilation requires a C compiler (cc)")
+            return {"path": path, "scope": "Executable discovery only; compilation was not performed"}
+        check("FP environment compiler", "provider_toolchain", c_compiler)
     result["status"] = "available" if all(item["status"] == "available" for item in checks) else "unavailable"
     return result

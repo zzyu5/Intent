@@ -14,9 +14,11 @@ intent doctor --target triton
 python examples/softmax.py
 ```
 
-This route does not inspect SDK paths, build C++, or install MLIR bindings. The wheel includes `intent-compile`, its profiles, the language manual, and the compiler's non-system ELF dependencies. The binary finds its libraries through relative `$ORIGIN` paths. Third-party copyright/license files and a library-to-notice listing are installed under `intent/_bin/third-party/`.
+This route does not inspect SDK paths, build C++, or install MLIR bindings. The wheel includes `intent-compile`, `intent-opt`, their shared profiles, the language manual, and the tools' non-system ELF dependencies. The binaries find their libraries through relative `$ORIGIN` paths. Third-party copyright/license files and a library-to-notice listing are installed under `intent/_bin/third-party/`.
 
 These are local Linux platform wheels. They require a compatible host architecture, glibc, libstdc++, libgcc, and selected backend environment; bundling does not make a binary built against a newer system work on an older one. No manylinux compatibility or public release is implied. For an environment whose backend dependencies are already installed, `python -m pip install "${INTENT_WHEEL}[manual]"` installs the package directly without a checkout.
+
+For compiler/KIR tools and the MCP servers alone, the same wheel installation needs no provider SDK or tensor framework. Run `intent doctor --json` to check the installed compiler and its KIR output stage. Add a selected backend's dependencies when you need its runtime; a base compiler check does not establish device or kernel support.
 
 ## Source build prerequisites
 
@@ -60,7 +62,7 @@ The common installer:
 
 1. Creates or reuses the chosen virtual environment, without adding the caller's `PYTHONPATH` or user site packages.
 2. Installs only the selected backend's Python dependencies.
-3. Installs the selected wheel, or builds `intent-compile` and packages its runtime libraries and notices.
+3. Installs the selected wheel, or builds `intent-compile` and `intent-opt` and packages their runtime libraries and notices.
 4. Queries the installed compiler and checks the selected backend. The public CLI and both MCP entry points are included.
 
 For another build SDK location, supply `--mlir-dir` and `--llvm-dir`, or set `INTENT_MLIR_DIR` and `INTENT_LLVM_DIR`. Add `--wheel "$INTENT_WHEEL"` to install an existing wheel instead; SDK/build flags are then unnecessary and rejected. `--torch-index-url` overrides the selected route's wheel index for the same PyTorch release; check the [PyTorch installation combinations](https://pytorch.org/get-started/previous-versions/).
@@ -124,8 +126,12 @@ Use `--runtime-notices /path/to/notices.json` with the source installer, or `--c
 
 ## Compile and diagnose
 
+`intent describe --target BACKEND --json` reads the installed public API's signatures, compile option declarations, and target fields without probing an SDK or device. Omit `--target` to see all declared provider routes. `intent doctor --json` checks the base compiler independently of those routes.
+
 `intent doctor --target BACKEND --json` launches the compiler's `--compiler-info` query and checks its actual built providers, then checks only the selected backend's dependencies and target facts. A built source provider is not a claim that a device or kernel is supported. `intent compile path/to/program.py:kernel --stage kir --json` captures, normalizes, and verifies KIR without a target/device. `--target BACKEND` instead selects full provider generation; `--stage shared --target BACKEND` stops after the execution-family program. These commands use the public pipeline and return artifact paths or the actual failure stage. An importable `package.module:kernel` is also accepted. `--constexpr NAME=JSON`, `--target-option NAME=JSON`, `--compiler`, and `--tuning-config` forward existing public settings. `--materialize` applies only to provider generation; the tool does not actively launch the selected kernel.
 
-The `intent-manual` MCP stays read-only. Explicitly enable `intent-compiler-mcp` when an agent should compile an existing user-supplied `.py` file; its compilation tool shares the CLI implementation. Both servers use the `manual` dependency extra. Module loading executes ordinary top-level Python host code, while kernel execution and numerical validation remain separate.
+Use `intent read-artifact PATH --offset 0 --limit 16000 --json` on a returned source, IR, metadata, or log path. Offsets count Unicode characters; continue with `next_offset` until `eof`. Compilation failures retain their actual stage, exception causes and artifact paths; native compilation may report a different directory from the Intent compiler's output.
+
+The `intent-manual` MCP stays read-only. Explicitly enable `intent-compiler-mcp` when an agent should compile an existing user-supplied `.py` file; its compilation tool shares the CLI implementation. Its `describe`, `environment`, and `read_artifact` tools provide discovery, prerequisite inspection, and paged artifact/log reading through that same implementation. Both servers use the `manual` dependency extra. Module loading executes ordinary top-level Python host code, while kernel execution and numerical validation remain separate.
 
 [tilelang.txt](tilelang.txt) retains its prior environment and source corpus. It is not one of the installer routes above.

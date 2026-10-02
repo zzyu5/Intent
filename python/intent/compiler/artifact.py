@@ -162,6 +162,8 @@ class GeneratedProgram:
             if not isinstance(binding, ResolvedTarget):
                 raise NotImplementedError("the selected target supplies compiler facts only; use a runtime target or its AOT toolchain")
             artifact = binding.materialize(self)
+        except CompilationStageError:
+            raise
         except Exception as error:
             raise CompilationStageError("generated_source_materialization", str(error),
                                         cache_directory=self.cache_directory) from error

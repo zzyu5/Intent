@@ -15,6 +15,7 @@ import time
 from uuid import uuid4
 
 from intent.compiler.cache import cache_root, file_identity, locked_cache_entry
+from intent.compiler.toolchain import CompilationStageError
 from .toolchain import resolve_toolchain, runtime_dependencies
 from ..native import NativeABI
 
@@ -134,7 +135,8 @@ def _write_source(path: Path, text: str) -> None:
 def _compile_fp_environment(environment: dict[str, str]) -> tuple[Path, bytes]:
     executable = shutil.which("cc", path=environment.get("PATH"))
     if executable is None:
-        raise FileNotFoundError("Mojo floating-point environment compilation requires a C compiler (cc)")
+        raise CompilationStageError("native_toolchain_resolution",
+                                    "Mojo floating-point environment compilation requires a C compiler (cc)")
     compiler = file_identity(Path(executable))
     source = Path(__file__).with_name("fp_environment.c").read_text(encoding="utf-8")
     options = ("-O2", "-fPIC", "-c")
@@ -155,8 +157,11 @@ def _compile_fp_environment(environment: dict[str, str]) -> tuple[Path, bytes]:
             if not payload:
                 raise RuntimeError("C compiler produced an empty FP environment object")
         except Exception as error:
-            raise RuntimeError(f"Mojo FP environment compilation failed: {error}\n"
-                               f"Native compiler artifacts: {attempt}") from error
+            raise CompilationStageError(
+                "fp_environment_compilation", f"Mojo FP environment compilation failed: {error}\n"
+                f"Native compiler artifacts: {attempt}",
+                cache_directory=attempt, artifacts={"source": source_path},
+            ) from error
         cache.publish(attempt)
         return output, payload
 
@@ -240,12 +245,15 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
     candidate, = metadata["candidates"]
     entry = candidate["entry"]
     root = cache_root() / "mojo"
+    source_path = None
     stage = "artifact_lookup"
     try:
         with locked_cache_entry("mojo", key) as cache:
             root = cache.directory
+            source_path = cache.directory / "kernel.mojo"
             previous = cache.ready_attempt() if snapshot.identity is not None else None
             if previous is not None:
+                root = previous
                 manifest = json.loads((previous / "native.json").read_text(encoding="utf-8"))
                 library_path = previous / "kernel.so"
                 valid = all(_unchanged(dependency) for dependency in
@@ -255,10 +263,11 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
                     valid = json.dumps(current) == json.dumps(manifest["runtime_inputs"])
                 if valid:
                     stage = "cached_native_loading"
+                    root = previous
                     library = _load_library(previous / "kernel.so", entry)
                     return NativeLibrary(previous, library, True, None)
                 cache.invalidate_ready()
-            source_path = cache.directory / "kernel.mojo"
+            root = cache.directory
             _write_source(source_path, source)
             root = cache.create_attempt()
             (root / "artifact.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -297,15 +306,22 @@ def _compile_unit(source: str, metadata: dict[str, object], key: str, target,
                 cache.publish(root)
             return NativeLibrary(root, library, False, snapshot.reason)
     except Exception as error:
-        raise RuntimeError(
-            f"Mojo {stage} failed for candidate {entry}:\n{error}\nNative compiler artifacts: {root}"
+        raise CompilationStageError(
+            stage, f"Mojo {stage} failed for candidate {entry}:\n{error}\nNative compiler artifacts: {root}",
+            cache_directory=root, candidate=entry,
+            artifacts={"source": source_path} if source_path is not None else None,
         ) from error
 
 
 def compile_library(source: str, metadata: dict[str, object], target, *, abi: NativeABI) -> NativeCompilation:
     environment = dict(os.environ)
-    snapshot = resolve_toolchain(target.executable, tuple(metadata.get("native_dependencies", ())), environment)
-    fp_object, fp_bytes = _compile_fp_environment(environment)
+    try:
+        snapshot = resolve_toolchain(target.executable, tuple(metadata.get("native_dependencies", ())), environment)
+        fp_object, fp_bytes = _compile_fp_environment(environment)
+    except CompilationStageError:
+        raise
+    except Exception as error:
+        raise CompilationStageError("native_toolchain_resolution", str(error)) from error
     encoded = source.encode("utf-8")
     prelude = encoded[:metadata["source_prelude_end"]]
     units = []
