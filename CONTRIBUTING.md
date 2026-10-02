@@ -637,7 +637,11 @@ Intent 将可参数化的 block 条件写入当前 IR，保留真实 view 检查
 
 CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pipeline](lib/Dialect/CPU/Transforms/Passes.cpp) 依次完成 source 规范化、候选形成、region 实现、供数与分块、task 形成；每个完整组包含所需规范化并验证当前 CPU program。Mojo 和 Weft 共用这些 family 机制，provider 的微程序及机器表示仍各自实现。
 
-Pointwise combine 的普通 reduce 在 construction 中统一形成 `linalg.generic`，保留 source、identity、captures 和归约轴。[NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/NormalizeReductions.cpp) 在候选选择前查询当前单轴归约与私有 rank-zero 结果槽：只有初始化、全部使用与生命周期闭合时才形成标量 SSA `cpu.reduce` 并删除结果槽，不按 f32 或原 KIR rank 选择另一套构造。Shaped DPS 和多分量 combine 保持原表示；无法证明时保留 generic。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为两种表示提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
+普通 reduce 在 construction 中统一形成 `cpu.slice_reduce`，保存 sources、逐分量 identities、captures、outputs、归约轴和完整 combine。标量 helper 保留多分量 SSA 计算；完整 slice helper 使用显式 state/member/capture/destination 参数，不在 construction 提前生成归约循环。作者 product 的各分量可以有不同 rank 和保留形状，但归约 member axes 必须一致；负 axis 在每个分量上归一后必须指向同一组 canonical 位置。
+
+[SliceCollectives.cpp](lib/Dialect/CPU/Transforms/SliceCollectives.cpp) 在候选选择前消费当前 CPU IR：同 free-axis 域、可逐元素提升的 scalar combine 形成原 `linalg.generic`；完整 slice combine 形成多归约轴遍历及逐分量私有 state/next slots，全部分量更新完成后再提交下一状态，最终写回 outputs。空域保留 identities；scalar helper 的不同 free-axis 域未获得明确提升关系时拒绝，不把未知动态 extent 当成相等。该模块和 slice scan 共用成员 subview、scratch、copy 与 helper 实例化，scan 仍独立保持 prefix、方向和 inclusive 合同。[CollectiveHelpers.h](include/Intent/Dialect/CPU/IR/CollectiveHelpers.h) 为 scan、slice reduction 和分段 region 提供 helper 的输入只读、局部 scratch 与调用方 destination 验证；嵌套 helper 按 operation 的实际 operands/effects 检查，不把其 formal arguments 当成外部存储。
+
+[NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/NormalizeReductions.cpp) 随后从当前单轴 generic 和私有 rank-zero 结果槽形成标量 SSA `cpu.reduce`：初始化、全部使用与生命周期必须闭合，才删除结果槽。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为 scalar SSA 与 shaped DPS 提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
 
 普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
 
@@ -886,6 +890,14 @@ SDK loader 路径，调用已有 doctor、公开声明、MCP 服务启动与 EOF
 定义的 KIR 编译和标准 MLIR 优化入口；失败保留工作目录与诊断。它不启动 kernel，
 也不证明 provider 的数值与性能。此 recipe 不承诺 manylinux 或逐字节一致；
 其他平台仍可手工源构建，实际生产运行继续使用对应实验组的原入口。
+
+[Distribution workflow](.github/workflows/distribution.yml) 在产品源码、构建输入和文档的
+PR 变更及手动 dispatch 中调用同一 recipe，使用 hosted Ubuntu 22.04、Python 3.10 和
+LLVM/MLIR 20，不连接私有或 self-hosted 设备。Checkout 只读且不保留凭据；同一 PR
+的新运行取消旧运行。成功产物为可下载的 sdist/wheel，失败诊断包含 build.py 保存的
+逐命令日志、退出码和现有工具输出。下载与安装方式见[安装说明](environment/README.md#download-a-ci-build)。
+CI 不安装 GPU SDK、不代替原 production 数值与计时，也不执行公开发布；新增设备验收
+仍先使用真实存在的环境和对应 registry，不在分发 workflow 中假定设备 runner。
 
 安装 wheel 后，`intent setup --target BACKEND` 使用包内的依赖声明配置当前 Python
 环境；[environment/install.py](environment/install.py) 也调用这个入口。它只安装
