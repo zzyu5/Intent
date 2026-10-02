@@ -1,6 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,2.814944,2.560424,1.099405,pass,同算法；source 使用 FTZ 与近似除法
-block_scaled_gemm,M4096-N14336-K4096-fp8-block32,0.966352,1.081632,0.893420,pass,
+block_scaled_gemm,M4096-N14336-K4096-fp8-block32,0.946456,1.062672,0.890638,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.086656,2.098880,0.994176,pass,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.505312,6.210560,0.725428,pass,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.087728,0.265840,0.330003,pass,同算法；source 额外写 Mean/Rstd
