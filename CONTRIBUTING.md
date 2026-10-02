@@ -576,22 +576,33 @@ types 中的引用。标准 DCE/CSE 可以删除或合并读取，无需保活�
 跨类型参数引用不是 MLIR 标准 SymbolTable 的完整遍历合同，因此这里使用 kernel-owned
 typed references 和显式 owner API，不把自有参数冒充通用 module symbols。
 
-`ConfigurationSetAttr.requirements` 保存 `ConfigurationRequirementAttr`：种类、数量、
-`usage <= limit` 的两侧表达式和诊断原因。`legality` 表示 provider 硬性限制，
+`ConfigurationSetAttr.requirements` 保存 `ConfigurationRequirementAttr`：种类、单位、
+有限 predicate、数量表达式、可选 activation 和诊断原因。Predicate 包括上界、相等、
+正值、2 的幂和整除；上界/相等/整除有两侧表达式，正值/2 的幂只消费 usage。
+Activation 只引用 provider 阶段的 `i1` 参数；未选择的形式不求值其数量条件，
+不能把任意数据相关分支提升为 kernel 约束。`legality` 表示 provider 硬性限制，
 `nominal_budget` 表示按当前物理结构使用的预算策略；`fragment_register_words` 的
 单位是结构上的 32-bit words，不是机器码实际分配的寄存器。表达式引用当前参数或
 host metadata binding，不依赖某个比较 SSA 值仍然存活。
 
 新增条件时，先在所属 family/provider 从当前 typed facts 构造一次 requirement，
-再交给 [Resources](lib/Dialect/GPU/Transforms/Resources.cpp) 筛选和发布。Triton 的
-静态 tensor/collective 条件与最终 deferred 条件共用收集器；cuTile 复用共同归约预算，
-保留自身的适用范围。普通分支内 primitive assertion 仍留在原分支，不提升成无条件
-kernel requirement。Serializer 只导出当前 attributes，不识别 `cf.assert` 的比较形状。
+再交给 [Resources](lib/Dialect/GPU/Transforms/Resources.cpp) 筛选和发布。
+[Triton ConfigurationRequirements](lib/Target/Triton/Transforms/ConfigurationRequirements.cpp)
+从当前 range、fragment 和 descriptor 取得条件，包括真实 block shape、元素上限、
+连续字节与多 stage 对齐；descriptor 条件由当前 choice 参数激活。
+[cuTile Configurations](lib/Target/CuTile/Transforms/Configurations.cpp) 保留共同归约预算
+的适用范围，并表达 resident workers 与 CTA/occupancy 的派生等式。
+候选形成与最终发布调用同一收集器；最终 verifier 重新读取当前 IR，核对条件集合及
+候选绑定。条件集合不依赖遍历顺序，候选行仍保留原顺序。普通分支内 primitive assertion
+留在原分支。Serializer 只导出当前 attributes，不识别 `cf.assert` 的比较形状。
 
 参数改名、替换和改域通过现有 mutation owner 同时维护 requirements；失效的是候选行，
 不能顺便丢弃条件。Verifier 检查参数和 metadata 引用；改变控制域的变换必须证明条件
 仍适用，不能把分支约束无条件合并。分析的 `Unknown` 保留给 invocation 绑定，
 不是静态拒绝理由；实际 launch 时尚未绑定则明确报 `candidate_binding`。
+共同 runtime 先检查 activation，再按 native evaluator 的逐节点有符号 64 位范围求值；
+未溢出的正数量才参与 predicate。正 Add/Multiply 超过有限预算时可直接证明拒绝，
+不把溢出解释为合法的小值。任一已知违反条件即可淘汰该行；剩余未知条件不能默认为通过。
 全部候选被拒绝时，`candidate_selection` 给出类别、实际 usage/limit 和候选值。
 已有 `optimization_remarks` 输出静态拒绝与待绑定条件，不另造决策日志路径。
 
@@ -599,13 +610,20 @@ Triton 的 [ConfigurationSchema](include/Intent/Target/Triton/IR/Configuration.h
 统一查询 kernel constexpr 顺序以及 `num_warps/stages/ctas` 对应的参数符号，
 不保存候选值。Serializer 机械导出最终表与符号映射；
 [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) 负责一次解析、deferred
-绑定和已声明资源条件的求值。Triton 的真实 `Config` 从这张表投影，pruning 读取原行；
+绑定和已声明条件的求值。参数的 `value_type` 从 IR 声明导出，不根据候选恰好是 0/1
+猜测 bool。Triton 的真实 `Config` 从这张表投影，pruning、公开候选查询和 launch 前检查
+共享筛选入口；单配置和缓存 winner 同样必须满足当前条件。实际 tensor 的指针、shape、
+stride 及 allocator 仍由 descriptor runtime 检查，不能伪装成编译期数量。
+Descriptor allocator 在本次调用的独立 Python context 内绑定，不覆盖宿主程序的设置。
 cuTile 保留自己的 JIT 与调优入口。CPU 仍使用独立函数候选和 implementation
 binding，不套用 GPU 的 block/config 表。
 
 职责参考：Triton `python/triton/runtime/autotuner.py:140–147,276–279` 在试跑与最终调用中
 消费同一 `Config.all_kwargs()`；`:328–380` 区分 kernel kwargs 与 native 编译选项。
 Intent 先由 IR 验证完整绑定，再在 provider adapter 中投影这两类参数；runtime 不补默认候选。
+Triton `python/triton/_utils.py:63–74` 核对 block 的 2 次幂与元素上限，
+`python/triton/tools/tensor_descriptor.py:15–30` 区分 block 约束与实际 base/stride；
+Intent 将可参数化的 block 条件写入当前 IR，保留真实 view 检查在 host adapter。
 
 ### CPU 中直接可复用的接口
 
