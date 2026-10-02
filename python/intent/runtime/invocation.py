@@ -58,7 +58,8 @@ def build_invocation_binders(
     observe_view: Callable[[object, ViewParameter, object], ViewFacts],
     allocate_output: Callable[[object, ViewParameter, tuple], tuple[object, ViewFacts]],
     check_relation: Callable[[object, object, str], None] = _check_relation,
-    check_view_requirements: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
+    check_view_geometry: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
+    check_view_storage: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
     check_alias_requirements: Callable[[AliasCheck, ViewFacts, ViewFacts], None] | None = None,
     check_dimensions: Callable[[object, dict[int, int]], None] | None = None,
     abstract: bool = False,
@@ -68,8 +69,9 @@ def build_invocation_binders(
     Callbacks observe the selected family's objects and enforce its actual entry
     requirements. Generated code retains only static schema and callbacks, never
     tensor facts or an invocation owner. Abstract binding checks the same shape
-    and stride relations through its supplied assertion callback, without pointer
-    checks or concrete entry requirements.
+    and stride relations through its supplied assertion callback, including entry
+    geometry requirements. Only concrete binding observes addresses and checks
+    storage or allocation relations.
     """
     def tuple_expression(entries: Sequence[str]) -> str:
         return "(" + ", ".join(entries) + ("," if entries else "") + ")"
@@ -81,7 +83,8 @@ def build_invocation_binders(
         bindings = {binding.parameter.position: binding for binding in relations.views}
         namespace = {
             "_observe": observe_view, "_allocate": allocate_output,
-            "_check_relation": check_relation, "_check_view_requirements": check_view_requirements,
+            "_check_relation": check_relation, "_check_view_geometry": check_view_geometry,
+            "_check_view_storage": check_view_storage,
             "_check_alias_contract": _check_alias_contract,
             "_check_alias_requirements": check_alias_requirements,
             "_check_dimensions": check_dimensions, "_BoundPublicArguments": BoundPublicArguments,
@@ -93,6 +96,13 @@ def build_invocation_binders(
             f"    if len(arguments) != {len(supplied)}:",
             f"        raise TypeError(f'expected {len(supplied)} runtime arguments, got {{len(arguments)}}')",
         ]
+        if relations.allocation_errors:
+            namespace["_require_output_allocation"] = relations.require_output_allocation
+            lines.append("    _require_output_allocation()")
+            code = compile("\n".join(lines) + "\n", "<intent.public.invocation>", "exec", dont_inherit=True)
+            exec(code, namespace)
+            result.append(namespace["bind"])
+            continue
 
         def reference(value: int | ViewAxis, field: str) -> str:
             return f"f{value.parameter}.{field}[{value.axis}]" if isinstance(value, ViewAxis) else repr(value)
@@ -102,10 +112,14 @@ def build_invocation_binders(
             for field, checks in (("shape", binding.shape_checks), ("strides", binding.stride_checks)):
                 for axis, expected in checks:
                     message = f"{parameter.name}.{field}[{axis}] violates the declared interface relation"
+                    if parameter.output and not explicit_outputs and field == "strides":
+                        message += "; provide explicit output buffers with the required layout"
                     lines.append(f"    _check_relation(f{parameter.position}.{field}[{axis}], "
                                  f"{reference(expected, field)}, {message!r})")
-            if not abstract and check_view_requirements is not None:
-                lines.append(f"    _check_view_requirements(owner, _p{parameter.position}, f{parameter.position})")
+            if check_view_geometry is not None:
+                lines.append(f"    _check_view_geometry(owner, _p{parameter.position}, f{parameter.position})")
+            if not abstract and check_view_storage is not None:
+                lines.append(f"    _check_view_storage(owner, _p{parameter.position}, f{parameter.position})")
 
         for position, parameter in enumerate(supplied):
             index = parameter.position
@@ -121,20 +135,10 @@ def build_invocation_binders(
             lines.append(f"    _check_dimensions(owner, {{{dimensions}}})")
         if not explicit_outputs:
             for parameter in interface.outputs:
-                extents = []
-                for axis, extent in enumerate(bindings[parameter.position].output_shape):
-                    if extent is None:
-                        message = (f"cannot infer {parameter.name} output dimension {parameter.dimensions[axis]} "
-                                   "from supplied inputs; provide explicit output buffers")
-                        lines.append(f"    raise ValueError({message!r})")
-                        break
-                    extents.append(reference(extent, "shape"))
-                else:
-                    index = parameter.position
-                    lines.append(f"    v{index}, f{index} = _allocate(owner, _p{index}, {tuple_expression(extents)})")
-                    check_view(parameter)
-                    continue
-                break
+                extents = [reference(extent, "shape") for extent in bindings[parameter.position].output_shape]
+                index = parameter.position
+                lines.append(f"    v{index}, f{index} = _allocate(owner, _p{index}, {tuple_expression(extents)})")
+                check_view(parameter)
         if not abstract:
             for index, check in enumerate(interface.alias_checks):
                 namespace[f"_a{index}"] = check

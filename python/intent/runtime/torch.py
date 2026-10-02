@@ -41,6 +41,7 @@ def register_operator(artifact, name: str):
         raise NotImplementedError("a functional PyTorch registration requires at least one Out tensor")
     if not any(isinstance(parameter, ViewParameter) for parameter in interface.inputs):
         raise NotImplementedError("PyTorch registration requires an input tensor to determine device dispatch")
+    interface.binding_relations(explicit_outputs=False).require_output_allocation()
     pieces = name.split("::")
     if len(pieces) != 2 or not all(piece.isidentifier() for piece in pieces):
         raise ValueError("operator name must be 'your_namespace::your_operator'")

@@ -62,11 +62,23 @@ class ViewBinding:
 
 @dataclass(frozen=True, slots=True)
 class BindingRelations:
-    """Static equalities in invocation order; no observed tensor facts."""
+    """Static relations and output-construction eligibility for one call mode.
+
+    A declaration may require explicit output buffers without preventing its
+    program from being compiled, saved, loaded or called with those buffers.
+    """
 
     supplied: tuple[ScalarParameter | ViewParameter, ...]
     views: tuple[ViewBinding, ...]
     dimensions: tuple[tuple[int, ViewAxis], ...]
+    allocation_errors: tuple[str, ...]
+
+    def require_output_allocation(self) -> None:
+        """Require that this call can construct its omitted Out buffers."""
+        if self.allocation_errors:
+            raise NotImplementedError(
+                "Cannot allocate the declared outputs: " + "; ".join(self.allocation_errors) +
+                ". Provide explicit output buffers with prepare(..., outputs=(...)) or launch(...).")
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +189,17 @@ class PublicInterface:
         ordered = tuple(parameter for parameter in supplied if isinstance(parameter, ViewParameter))
         if not explicit_outputs:
             ordered += self.outputs
+        # Static declarations constrain the entire shared dimension, including
+        # a dynamic Out that precedes its statically sized sibling in the ABI.
+        static_extents: dict[int, int] = {}
+        allocation_errors = []
+        for view in self.views:
+            for extent, identity in zip(view.shape, view.dimensions, strict=True):
+                if extent >= 0 and identity > 0:
+                    known = static_extents.setdefault(identity, extent)
+                    if known != extent and not explicit_outputs:
+                        allocation_errors.append(
+                            f"dimension {identity} has conflicting static extents {known} and {extent}")
         dimensions: dict[int, ViewAxis] = {}
         stride_symbols: dict[str, ViewAxis] = {}
         bindings = []
@@ -185,9 +208,12 @@ class PublicInterface:
             earlier_dimensions = dict(dimensions)
             for axis, (extent, identity) in enumerate(zip(view.shape, view.dimensions, strict=True)):
                 reference = dimensions.get(identity) if identity > 0 else None
-                output_shape.append(extent if extent >= 0 else earlier_dimensions.get(identity))
+                known = extent if extent >= 0 else static_extents.get(identity)
+                output_shape.append(known if known is not None else earlier_dimensions.get(identity))
                 if extent >= 0:
                     shape_checks.append((axis, extent))
+                elif known is not None:
+                    shape_checks.append((axis, known))
                 if reference is not None:
                     shape_checks.append((axis, reference))
                 elif identity > 0:
@@ -202,4 +228,18 @@ class PublicInterface:
                 elif constraint is not None:
                     stride_checks.append((axis, constraint))
             bindings.append(ViewBinding(view, tuple(shape_checks), tuple(stride_checks), tuple(output_shape)))
-        return BindingRelations(supplied, tuple(bindings), tuple(dimensions.items()))
+        if not explicit_outputs:
+            for binding in bindings:
+                if binding.parameter.output:
+                    for axis, extent in enumerate(binding.output_shape):
+                        if extent is None:
+                            allocation_errors.append(
+                                f"{binding.parameter.name}.shape[{axis}] has no extent supplied by inputs "
+                                "or fixed by the public shape declarations")
+            for check in self.alias_checks:
+                left, right = self.parameters[check.left], self.parameters[check.right]
+                if check.same_allocation and (left.output or right.output):
+                    allocation_errors.append(
+                        f"{left.name} and {right.name} must share an allocation; independently allocated "
+                        "outputs cannot establish that relation")
+        return BindingRelations(supplied, tuple(bindings), tuple(dimensions.items()), tuple(allocation_errors))

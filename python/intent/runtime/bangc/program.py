@@ -113,7 +113,8 @@ class NativeProgram(NativePreparedRuntime):
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
             check_alias=requirements.check_pair,
             scalar_argument=lambda parameter, value: scalar_converters[parameter.position](value),
-            check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
+            check_view_geometry=lambda owner, parameter, facts: requirements.check_geometry(parameter, facts),
+            check_view_storage=lambda owner, parameter, facts: requirements.check_storage(parameter, facts),
             check_dimensions=type(self)._check_dimensions,
         )
         parameters_by_name = {parameter.name: parameter for parameter in self.interface.parameters}

@@ -6,6 +6,11 @@ from .interface import AliasCheck, PublicInterface, ViewParameter, byte_spans_ov
 from .invocation import ViewFacts
 
 
+def _check_geometry_relation(actual, expected, message: str) -> None:
+    if actual != expected:
+        raise NotImplementedError(message)
+
+
 @dataclass(frozen=True, slots=True)
 class NativeViewRequirements:
     layout: str
@@ -58,15 +63,20 @@ class NativeRequirements:
             disjoint.add((left, right))
         return cls(interface, tuple(views), frozenset(disjoint))
 
-    def check_view(self, parameter: ViewParameter, facts: ViewFacts) -> None:
+    def check_geometry(self, parameter: ViewParameter, facts: ViewFacts, *,
+                       check_relation=_check_geometry_relation) -> None:
+        """Check address-independent entry requirements, including abstract views."""
         requirements = self.views[parameter.position]
         if requirements.layout == "contiguous":
             expected_stride = 1
             for extent, stride in zip(reversed(facts.shape), reversed(facts.strides), strict=True):
-                if stride != expected_stride:
-                    raise NotImplementedError(
-                        f"{parameter.name}: native entry requires canonical contiguous element strides")
+                check_relation(stride, expected_stride,
+                               f"{parameter.name}: native entry requires canonical contiguous element strides")
                 expected_stride *= extent
+
+    def check_storage(self, parameter: ViewParameter, facts: ViewFacts) -> None:
+        """Check actual pointer requirements; abstract views have no addresses."""
+        requirements = self.views[parameter.position]
         if facts.pointer % requirements.alignment:
             raise ValueError(
                 f"{parameter.name}: native entry requires {requirements.alignment}-byte pointer alignment")

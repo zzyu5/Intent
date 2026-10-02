@@ -103,7 +103,8 @@ class NativeABI:
         view_key: Callable[[ViewFacts, int], object] | None = None,
         scalar_key: Callable[[ScalarParameter, object], object] | None = None,
         scalar_argument: Callable[[ScalarParameter, object], object] | None = None,
-        check_view_requirements: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
+        check_view_geometry: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
+        check_view_storage: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
         check_dimensions: Callable[[object, dict[int, int]], None] | None = None,
     ) -> tuple[Callable[[object, tuple[object, ...]], BoundArguments], ...]:
         """Compose the common invocation binder with native slots and tuning keys.
@@ -121,7 +122,7 @@ class NativeABI:
 
         public_binders = build_invocation_binders(
             self.interface, observe_view=observe_view, allocate_output=allocate_output,
-            check_view_requirements=check_view_requirements,
+            check_view_geometry=check_view_geometry, check_view_storage=check_view_storage,
             check_alias_requirements=check_alias, check_dimensions=check_dimensions,
         )
         result = []

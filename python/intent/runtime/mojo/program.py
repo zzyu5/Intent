@@ -79,7 +79,8 @@ class NativeProgram(NativePreparedRuntime):
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
             check_alias=requirements.check_pair,
-            check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
+            check_view_geometry=lambda owner, parameter, facts: requirements.check_geometry(parameter, facts),
+            check_view_storage=lambda owner, parameter, facts: requirements.check_storage(parameter, facts),
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.offset, facts.dtype, group),
             scalar_key=lambda parameter, value: parameter.dtype.name,
         )
@@ -87,6 +88,8 @@ class NativeProgram(NativePreparedRuntime):
             self.interface, observe_view=type(self)._abstract_view,
             allocate_output=type(self)._abstract_output,
             check_relation=check_abstract_relation, abstract=True,
+            check_view_geometry=lambda owner, parameter, facts: requirements.check_geometry(
+                parameter, facts, check_relation=check_abstract_relation),
         )[0]
         self.compilation = compile_library(facts, target, abi=abi)
         argument_types = abi.argument_types()
