@@ -35,7 +35,7 @@ JSON 包含原定义位置、真实编译阶段、source/IR/metadata 和日志�
 
 执行、reference baseline、生产 registry、实验结果和 pass 对照在 [experiments/](../experiments/README.md)：
 
-- [GPU：Triton / cuTile，保留 TileLang](../experiments/gpu/README.md)
+- [GPU：Triton / cuTile](../experiments/gpu/README.md)
 - [CPU：Mojo / Weft](../experiments/cpu/README.md)
 - [MLU：DSA / BANG C](../experiments/mlu/README.md)
 - [Agent TritonBench](../experiments/agent_tritonbench/README.md)

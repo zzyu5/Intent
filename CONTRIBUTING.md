@@ -461,8 +461,7 @@ KIR 的验证入口直接属于 operation，按合同分布在
 及 segment 范围；mapping 和 traversal 改写维护这一个 owner。
 Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/ProgramGrid.cpp) 先读取它调整网格，
 再由 [Triton prepareTritonMemory](lib/Target/Triton/Transforms/Legalize.cpp)、
-[cuTile prepareProgram](lib/Target/CuTile/Transforms/Legalize.cpp)、
-[TileLang formNativeMemory](lib/Target/TileLang/Transforms/Legalize.cpp) 各自调用共同的
+[cuTile prepareProgram](lib/Target/CuTile/Transforms/Legalize.cpp) 各自调用共同的
 `lowerExecutionGroups`，生成纯 `DelinearizeOp` 坐标计算并展开 body。
 正常编译与 shared IR 续编译使用同一入口；serializer 不保留或解释执行组。
 
@@ -547,7 +546,7 @@ Triton 的 [ConfigurationSchema](include/Intent/Target/Triton/IR/Configuration.h
 不保存候选值。Serializer 机械导出最终表与符号映射；
 [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) 负责一次解析、deferred
 绑定和已声明资源条件的求值。Triton 的真实 `Config` 从这张表投影，pruning 读取原行；
-cuTile/TileLang 保留自己的 JIT 与调优入口。CPU 仍使用独立函数候选和 implementation
+cuTile 保留自己的 JIT 与调优入口。CPU 仍使用独立函数候选和 implementation
 binding，不套用 GPU 的 block/config 表。
 
 职责参考：Triton `python/triton/runtime/autotuner.py:140–147,276–279` 在试跑与最终调用中
@@ -647,7 +646,7 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 | 已导出的整数表达式 | [gpu/expressions.py](python/intent/runtime/gpu/expressions.py) | 只求值 compiler 已声明的表达式，不按算法名或观察到的 shape 发明策略 |
 | 候选、deferred coverage 与资源条件 | [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) | 唯一解析已导出的候选表；provider 明确选择用于执行或展示的现有行，不再重建第二份配置 |
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
-| Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py)、[runtime/tilelang.py](python/intent/runtime/tilelang.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
+| Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
 | 原生资源与候选观察 | [runtime/diagnostics.py](python/intent/runtime/diagnostics.py) | 不可变 `NativeObservation` 保存实际调用、已选配置、SDK 返回值与失败；不持有 tensor，不参与候选策略 |
 | PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `TorchOutputInference` 能力注册 CPU/CUDA opaque 调用；GPU 与 Mojo CPU 支持只读 In/scalar 和 fresh Out，backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
@@ -690,15 +689,15 @@ stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()`
 
 Triton 读取 loaded kernel 的寄存器、local-memory words、shared memory 与线程限制。
 `n_spills` 在当前 NVIDIA driver 中是每线程 local-memory bytes 除以四，不能称为
-“溢出的寄存器数”。cuTile 当前公开编译结果不提供这些资源字段；TileLang 的这些
-查询限于 HIP，CUDA 观察保留 unavailable reason。SDK 未返回完整失败历史或无法
+“溢出的寄存器数”。cuTile 当前公开编译结果不提供这些资源字段，观察保留
+unavailable reason。SDK 未返回完整失败历史或无法
 区分磁盘缓存命中时明确保留未知，不重跑 tuner 补造记录。失败快照附在
 `CompilationStageError.observation`，CLI/MCP 错误响应导出为 `native_observation`。
 
 职责参考：本地 Triton `python/triton/compiler/compiler.py:468–484` 在 native loading
 检查真实 shared-memory 上限并接收 driver 的资源数；Intent 的结构预算发生在 GPU IR
-候选形成阶段。两者依据与时机不同。TileLang `tilelang/autotuner/tuner.py:1003–1020`
-可直接命中 SDK 缓存，因此 Intent 自己没有缓存记录不能证明 SDK 未命中。
+候选形成阶段。两者依据与时机不同。SDK 的缓存属于下层，Intent 自己没有缓存记录
+不能证明 SDK 未命中。
 
 PyTorch fake 通过 runtime 的 `infer_outputs` 调用同一个公共 binder，使用 symbolic
 关系断言，既不读取 data pointer，也不创建 GPU workspace 或执行 native code。
@@ -733,8 +732,8 @@ Triton/cuTile 的 `Transforms/Configurations.cpp` 负责各自的候选策略与
 
 矩阵 primitive 需要的二维物理投影由现有
 [ContractionProjection.cpp](lib/Dialect/GPU/Transforms/ContractionProjection.cpp) 依据
-typed free/batch/reduction axes 形成，并恢复结果的原坐标映射。Triton、cuTile 和
-TileLang 在各自准备边界共用 `normalizeMatrixContractShapes`；serializer 只输出
+typed free/batch/reduction axes 形成，并恢复结果的原坐标映射。Triton 和 cuTile
+在各自准备边界共用 `normalizeMatrixContractShapes`；serializer 只输出
 已决定的 transpose/reshape。新增 provider 不应重新限制作者只能声明二维矩阵。
 
 Value schema 的闭合先查询 [ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h)：
@@ -744,18 +743,6 @@ operand、helper formals、yield 与 result。正向刷新、反向 extent 传�
 materialization 使用这些关系。不同 state 分量可复用同一个零值 SSA，仍是不同
 operand slot，不能仅按 SSA 相等合并 schema。这里闭合的是物理表示，不改变作者的
 combine/apply/emit、迭代次序或数值运算。
-
-TileLang 的 [Bufferize.cpp](lib/Target/TileLang/Transforms/Bufferize.cpp) 在这份当前
-GPU program 上维护短期 buffer bindings：每条绑定同时携带初始化的可见位置与原生
-轴顺序。复用要证明初始化支配本次使用，不能只证明 allocation 支配使用。
-Loop/carry 各自拥有可变存储，SSA 初值仍是不可变值；原生矩阵只有在旧 accumulator
-没有其他读取者时才可原位更新。Gather 读取已经形成的 SSA snapshot，并在有效分支
-中取值；不能为补缓存重读外部 memory。Binding 在删除源 SSA 前结束生命周期。
-矩阵 alignment padding 属于对应 GEMM 的原生 buffer；不按 source-axis 标签向全图
-传播另一份容量。普通 reduce、scan、控制状态和输出继续消费当前 Fragment 的逻辑范围。
-Scalar if/loop 的可变槽位使用 provider `BufferSpace::Local`，由 serializer 映射到
-`T.alloc_local`；分布在多个线程上的 fragment 不能用单元素数组冒充线程私有标量。
-Collective 的 fragment 输出继续使用自己的空间和通信合同。
 
 cuTile 的 [Analysis/Tuning.h](include/Intent/Target/CuTile/Analysis/Tuning.h) 从最终 provider IR 查询哪些 runtime scalar 必须按值区分调优结果。证明覆盖 SSA、类型/属性中的 ScalarABI 以及潜在的写后读依赖；索引、控制、形状、资源和未知用途保持区分，只有完整证明为数据用途时才移除其值。Serializer 消费这份只读结果，并保留 view、overlap、完整覆盖和 array-view eligibility 的实际事实；它不改变 scalar 的原生传参或候选执行。
 

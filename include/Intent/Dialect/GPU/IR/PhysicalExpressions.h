@@ -2,7 +2,6 @@
 #define INTENT_DIALECT_GPU_IR_PHYSICALEXPRESSIONS_H
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include <optional>
 
@@ -13,9 +12,7 @@ namespace intent::gpu {
 // absent binding, division by zero or unrepresentable result is not a constant.
 std::optional<int64_t> evaluatePhysicalExpression(
     PhysicalExprAttr expression,
-    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf,
-    llvm::function_ref<bool(PhysicalExprAttr, llvm::ArrayRef<int64_t>)>
-        supportsOperation = {});
+    llvm::function_ref<std::optional<int64_t>(PhysicalExprAttr)> resolveLeaf);
 std::optional<int64_t> constantPhysicalExpression(PhysicalExprAttr expression);
 
 } // namespace intent::gpu

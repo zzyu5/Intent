@@ -11,7 +11,7 @@
 
 namespace intent::compiler {
 
-enum class Provider { Triton, CuTile, TileLang, Mojo, Weft, BangC };
+enum class Provider { Triton, CuTile, Mojo, Weft, BangC };
 enum class InputStage { Kernel, Shared };
 enum class Stage { Kernel, Shared, Provider };
 enum class Failure {

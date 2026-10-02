@@ -8,7 +8,7 @@ Intent 既不是图编译器，也不是完整算子库选择器。它的编译�
 
 ## 2. Target 由编译调用选择
 
-Triton、cuTile、TileLang、CPU、RISC-V/RVV 等 target 是编译调用的外部输入。它们不是 DSL value、`Constexpr`、类型、函数参数或算法分支。
+Triton、cuTile、CPU、RISC-V/RVV 等 target 是编译调用的外部输入。它们不是 DSL value、`Constexpr`、类型、函数参数或算法分支。
 
 ```text
 Intent source + specialization + external target selection
@@ -40,7 +40,7 @@ Intent source + specialization + external target selection
 - 寄存器、shared memory、TMEM、local memory 等存储层级；
 - pointer tensor、物理地址宽度、尾块 mask 与 neutral padding；
 - copy instruction、MMA variant、layout、swizzle、pipeline、barrier 与物理 atomic scope；
-- Triton/cuTile/TileLang API form、autotune candidates 与 winner；
+- Triton/cuTile API form、autotune candidates 与 winner；
 - provider capability 或设备型号分支。
 
 作者可用`I.assume_in_bounds`声明typed index relation的范围，并用external-view annotation声明`alias/noalias`。语言没有一般布尔precondition或优化hint；其它输入关系必须由类型、普通operations或未来被真实kernel逼出的closed typed construct表达。

@@ -4,7 +4,7 @@
 
 Compilation context分别选择：
 
-- source provider：Triton、cuTile、TileLang或未来的直接backend；
+- source provider：Triton、cuTile或未来的直接backend；
 - hardware target：NVIDIA/AMD及具体SM/gfx，或其它GPU architecture。
 
 Provider与hardware不是同一分类。Triton source可以继续由外部Triton编译到NVIDIA或AMD；Intent不得为每个provider预建一份vendor IR，也不得为每个SM/gfx版本建立dialect。
@@ -86,23 +86,7 @@ cuTile-local legality/forms包括最多三维block identity、tile-space index m
 
 若selected cuTile surface不提供共同program某项协作行为所需的copy/barrier/sync形式，provider必须明确legalize到其已有等价能力或拒绝，不能生成串行慢路径冒充支持。
 
-## 6. TileLang
-
-TileLang同样消费共同的grid、loops、fragments、accesses与structured compute，但其author surface显式要求更多physical structure：
-
-- storage allocation：fragment/local/shared等；
-- `T.copy`、async/TMA copy与BufferRegion；
-- `T.gemm`/reduce对operand storage的要求；
-- `T.Pipelined` schedule metadata；
-- synchronization与barrier forms。
-
-TileLang provider pass根据共同IR的lifetime、sharing、access、dependency与structured-op facts形成必要的storage/copy/sync extensions。Region fold/scan的segment loop、summary/state flow与chunk-local contract已经来自共同IR；TileLang只补其storage、copy、pipeline与sync形式。WGMMA、TCGEN05、mbarrier parity、named barrier、TMA instruction preference等只留在TileLang CUDA-target lowering或local extensions。
-
-TileLang的普通reduce与cumsum使用各自的原生operation。映射成立时，后续LayoutInference、reducer materialization及thread all-reduce属于TileLang compiler；Intent不复制这些plans。自定义combine若没有等价TileLang原语，必须按真实能力合法展开或拒绝，不能由固定sum/max等原语的存在推断任意callback均受支持。
-
-若共同program可以直接使用普通TileLang loops/access/compute表达，则不创建extension；不能为了让三家形式对称而强制Triton/cuTile也拥有allocation/copy dialect。
-
-## 7. Vendor 与 architecture extensions
+## 6. Vendor 与 architecture extensions
 
 共同IR加局部extensions采用与TritonGPU相同的组织原则：
 
@@ -115,7 +99,7 @@ common GPU program
 
 Extension op可以只在某些features上合法；同一pass也可以按features选择不同rewrite pattern。Architecture差异不得进入KIR，也不通过kernel-name branch表达。
 
-## 8. Provider verifier
+## 7. Provider verifier
 
 Provider legalization完成后检查：
 
@@ -126,7 +110,7 @@ Provider legalization完成后检查：
 - physical parameters完整绑定到provider constexpr/config；
 - no provider pass重新读取KIR去推导shared ownership、axis、range、coordinate provenance、access或validity。
 
-## 9. Terminal serialization
+## 8. Terminal serialization
 
 Serializer只能：
 
@@ -144,7 +128,7 @@ Serializer不得：
 - 增加未声明physical parameters；
 - 捕获异常并切换fallback。
 
-## 10. Unsupported 的性质
+## 9. Unsupported 的性质
 
 Unsupported必须在最早拥有足够信息的层声明：
 

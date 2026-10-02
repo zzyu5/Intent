@@ -4,7 +4,7 @@
 
 | 目录 | 范围 | 入口 |
 |---|---|---|
-| [gpu](gpu/README.md) | Triton、cuTile；保留 TileLang | `python -m experiments.gpu <provider>` |
+| [gpu](gpu/README.md) | Triton、cuTile | `python -m experiments.gpu <provider>` |
 | [cpu](cpu/README.md) | Mojo、Weft/RVV/IME | `python -m experiments.cpu <provider>` |
 | [mlu](mlu/README.md) | DSA → BANG C / MLU | `python -m experiments.mlu bangc` |
 | [agent_tritonbench](agent_tritonbench/README.md) | Intent 与 agent Triton 的单次生成实验 | `python -m experiments.agent_tritonbench` |

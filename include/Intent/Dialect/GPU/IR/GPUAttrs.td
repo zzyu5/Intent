@@ -107,7 +107,6 @@ def IntentGPU_ParameterRole : IntentGPU_I32Enum<
       I32EnumAttrCase<"ProviderWarps", 4, "provider_warps">,
       I32EnumAttrCase<"ProviderStages", 5, "provider_stages">,
       I32EnumAttrCase<"ProviderCTAs", 6, "provider_ctas">,
-      I32EnumAttrCase<"ProviderThreads", 7, "provider_threads">,
       I32EnumAttrCase<"TraversalWorkers", 8, "traversal_workers">,
       I32EnumAttrCase<"TraversalGroup", 9, "traversal_group">,
       I32EnumAttrCase<"ResidentWorkers", 10, "resident_workers">,

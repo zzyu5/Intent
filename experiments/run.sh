@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <triton|cutile|tilelang|mojo|weft|bangc> <output.csv> [kernel ...]" >&2
+  echo "usage: $0 <triton|cutile|mojo|weft|bangc> <output.csv> [kernel ...]" >&2
   exit 2
 fi
 
@@ -34,10 +34,6 @@ case "${provider}" in
   cutile)
     experiment=gpu
     default_python=/home/kingdom/.venvs/intentdsl-cutile/bin/python
-    ;;
-  tilelang)
-    experiment=gpu
-    default_python=/home/kingdom/.venvs/intentdsl-tilelang/bin/python
     ;;
   weft)
     experiment=cpu

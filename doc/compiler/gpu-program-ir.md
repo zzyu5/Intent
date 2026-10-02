@@ -2,7 +2,7 @@
 
 ## 1. 角色
 
-Shared GPU IR是一份provider-neutral、launchable、可独立验证的block program。它位于canonical KIR之后、Triton/cuTile/TileLang source legalization之前。
+Shared GPU IR是一份provider-neutral、launchable、可独立验证的block program。它位于canonical KIR之后、Triton/cuTile source legalization之前。
 
 它表达GPU source providers共同需要的program-level事实，但不表达下层distributed layout或机器指令。Provider serializer不得把缺失的执行结构留到字符串阶段补齐。
 
@@ -128,7 +128,7 @@ Physical loops可以使用runtime bounds或compile-time physical parameters。�
 - atomic load/store/RMW/CAS；
 - buffer load/store。
 
-Invalid load不产生memory access并返回显式fill；invalid write不产生effect。Pointer tensor、cuTile tile index、TileLang BufferRegion或descriptor是provider representation，不是共同access identity。
+Invalid load不产生memory access并返回显式fill；invalid write不产生effect。Pointer tensor、cuTile tile index或descriptor是provider representation，不是共同access identity。
 
 Atomic operation另外显式保存memory order、logical sharing domain、RMW kind、old-value/CAS result schema。Provider scope由该sharing domain与current program mapping推得，而不是由serializer选择默认值。
 
@@ -169,7 +169,7 @@ Structured op可以另外保存一个由typed predicate analysis得到的physica
 
 共同IR使用SSA、memory effects、resource identities和explicit dependence edges表达producer-consumer、visibility与lifetime obligations。它不预先选择TMA/cp.async、mbarrier、named barrier或software pipeline。
 
-共同IR不定义跨physical program instances的barrier；跨instances的冲突只能由KIR已有的atomic/scatter-reduction semantics闭合，否则该mapping非法。只有shared physical transformation在一个program instance内部真实创建了异步producer-consumer行为时，才可引入具有跨provider execution meaning的dependency token/operation。仅为TileLang拼出`T.copy`或为NVIDIA拼出mbarrier，不得污染共同IR。
+共同IR不定义跨physical program instances的barrier；跨instances的冲突只能由KIR已有的atomic/scatter-reduction semantics闭合，否则该mapping非法。只有shared physical transformation在一个program instance内部真实创建了异步producer-consumer行为时，才可引入具有跨provider execution meaning的dependency token/operation。仅为拼出某个provider的copy API或为NVIDIA拼出mbarrier，不得污染共同IR。
 
 Provider-local pass可以把共同dependency/lifetime展开成explicit allocation、copy、wait与barrier，也可以把它们委托给下层compiler。
 
@@ -227,4 +227,4 @@ kernel @gemm<BM, BN, BK>(A, B, C, M, N, K) {
 }
 ```
 
-BM/BN/BK、grid、loops、fragments、coordinates、validity、loads、accumulator与store都属于当前program。Triton serializer只把它们机械写成`tl.program_id`、`tl.arange`、`tl.load`、`tl.dot`和`tl.store`；cuTile映射到`ct.bid`、tile indices、`ct.load/mma/store`；TileLang legalization可以进一步产生显式buffers、copies与`T.gemm`。
+BM/BN/BK、grid、loops、fragments、coordinates、validity、loads、accumulator与store都属于当前program。Triton serializer只把它们机械写成`tl.program_id`、`tl.arange`、`tl.load`、`tl.dot`和`tl.store`；cuTile映射到`ct.bid`、tile indices、`ct.load/mma/store`。

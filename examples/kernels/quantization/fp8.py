@@ -4,7 +4,6 @@ import intent.language as I
 
 ROWS = 8192
 FEATURES = 4096
-TILELANG_FEATURES = 8192
 GROUP_SIZE = 128
 FP8_MAX = 448.0
 

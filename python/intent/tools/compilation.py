@@ -419,7 +419,7 @@ def doctor(target: str | None = None, *, target_options: dict | None = None, com
     executable = information["executable"] if information is not None else None
     if executable is not None and target != "bangc":
         def profiles():
-            names = ("shared", target) if target in {"triton", "cutile", "tilelang"} else (target,)
+            names = ("shared", target) if target in {"triton", "cutile"} else (target,)
             paths = [Path(executable).parent / "profiles" / f"{name}.json" for name in names]
             for path in paths:
                 if not path.is_file():

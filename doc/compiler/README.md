@@ -59,7 +59,7 @@ Intent KIR
 
 ## 5. Provider 与 hardware target
 
-Triton、cuTile、TileLang是source providers；NVIDIA/AMD及SM/gfx版本是hardware targets。两者是正交维度。
+Triton、cuTile是GPU source providers；NVIDIA/AMD及SM/gfx版本是hardware targets。两者是正交维度。
 
 CPU 同样区分 Mojo/Weft provider 与 x86/RISC-V hardware。共同 CPU IR 保留 task/block 与 structured compute；target lowering 可查询实现需求、选择并实例化专家编写的微程序，而非仅做 API 映射或调用整算子库旁路。具体向量宽度、AMX/IME 等能力参与实现合法性，职责与参数边界由 [CPU 规格](cpu-program-ir.md)统一定义。
 

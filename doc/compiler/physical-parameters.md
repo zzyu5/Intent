@@ -19,14 +19,13 @@ Physical parameter不进入KIR，也不成为作者DSL参数。
 
 `intent.compile(..., tuning_config=path)`与`compile_shared_gpu(..., tuning_config=path)`接受有限JSON profile覆盖；CLI对应`--tuning-config <path>`。不传时读取随compiler分发的默认表。表与其shared/provider职责相邻，编译器在配置物化前读取一次；调表不需要重编译C++，但必须重新编译kernel artifact。launch与autotune不再读取该文件。
 
-覆盖文件的顶层命名空间为`shared`、`triton`、`cutile`、`tilelang`，每个命名空间包含已有family到候选行数组的映射。例如：
+覆盖文件的顶层命名空间为`shared`、`triton`、`cutile`，每个命名空间包含已有family到候选行数组的映射。例如：
 
 ```json
 {
   "shared": {"contraction_narrow": [[128, 128, 32, 1, 128, 1, 8]]},
   "triton": {"contraction": [[4, 2, 1], [8, 3, 1]]},
-  "cutile": {"occupancy_loop": [[1], [2]]},
-  "tilelang": {"stages": [[2], [3]]}
+  "cutile": {"occupancy_loop": [[1], [2]]}
 }
 ```
 
@@ -34,7 +33,7 @@ Physical parameter不进入KIR，也不成为作者DSL参数。
 
 Shared行的列依次为`ownership_m, ownership_n, reduction, reduction_outer, scan, traversal_workers, traversal_group`。它们是按role消费的相关粒度偏好，不是对任意shape强制生效的parameter binding：既有投影选择typed domain内不超过请求值的最大值，无此值时选择domain最小值；程序已固定的维度保持固定。相同规则用于默认表和覆盖表。IR graph classification、profile correlation、候选预算与role绑定仍由shared transformations决定，最终tuple明确保存实际值，不能把profile原值冒充最终binding。
 
-Triton行依次为`warps, stages, ctas`；cuTile与TileLang的各family使用单列实际provider值。Provider值不投影到另一个值：先过滤可证明非法的值/组合，再物化typed domain与完整config。cuTile occupancy的可接受范围独立于选用的搜索集合；TileLang按当前GEMM分区选择普通或小线程family，不因该family全部非法而另读默认候选。若当前程序没有合法候选则编译失败，不换算法、不退回默认表。外部provider compiler继续负责其独有的机器资源约束。
+Triton行依次为`warps, stages, ctas`；cuTile的各family使用单列实际provider值。Provider值不投影到另一个值：先过滤可证明非法的值/组合，再物化typed domain与完整config。cuTile occupancy的可接受范围独立于选用的搜索集合。若当前程序没有合法候选则编译失败，不换算法、不退回默认表。外部provider compiler继续负责其独有的机器资源约束。
 
 ## 2. Parameter expressions
 
@@ -76,7 +75,7 @@ Provider autotuner对剩余candidates分别编译、benchmark并选择winner。W
 
 调优试跑不属于作者的一次可观察invocation。Runtime依据external view的读写方向和实际allocation alias关系维护trial state；需要原始内容的`InOut`、读写alias和atomic状态在每次试跑前保持同一初始内容，不能只在候选之间恢复。Trial参数保留shape、dtype、strides、offset与alias关系，不把每个view独立clone成互不alias的输入。Winner只对调用者参数执行一次；调优失败也不把试跑效果留在调用者状态中。
 
-Triton路径应生成一份参数角色明确的kernel与真实`Config`集合，让Triton autotuner选择BM/BN/BK、num_warps、num_stages、num_ctas及被允许的provider forms。cuTile/TileLang使用各自实际支持的tuning入口；没有下层tuner时，provider runtime可以对同一已声明candidate set实测选择。
+Triton路径应生成一份参数角色明确的kernel与真实`Config`集合，让Triton autotuner选择BM/BN/BK、num_warps、num_stages、num_ctas及被允许的provider forms。cuTile使用其实际支持的tuning入口；没有下层tuner时，provider runtime可以对同一已声明candidate set实测选择。
 
 ## 6. Provider form candidates
 

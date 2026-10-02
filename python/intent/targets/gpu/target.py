@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from intent.runtime import CompiledArtifact
 from intent.runtime.cutile import materialize_cutile_artifact
-from intent.runtime.tilelang import materialize_tilelang_artifact
 from intent.runtime.triton import materialize_triton_artifact
 
 from ..specification import GPUCompilationTarget, require_matching_target
@@ -22,7 +21,6 @@ class _Provider:
 _PROVIDERS = {
     "triton": _Provider("Triton", materialize_triton_artifact),
     "cutile": _Provider("cuTile", materialize_cutile_artifact),
-    "tilelang": _Provider("TileLang", materialize_tilelang_artifact),
 }
 
 

@@ -100,49 +100,7 @@ CUTILE = (
 )
 
 
-TILELANG = (
-    Entry("block_sparse_gqa_decode", "B8-QH32-KVH8-S8192-D128-blocks128", "block_sparse_gqa_decode_tilelang", ("streaming/block_sparse_attention.py:block_sparse_gqa_decode_partials", "streaming/block_sparse_attention.py:block_sparse_gqa_decode_combine"), "experiments/gpu/baselines/tilelang/tilelang/attention/blocksparse_gqa_decode_varlen/example_tilelang_sparse_gqa_decode_varlen_indice_runtime.py"),
-    Entry("dense_flash_attention", "B4-S4096-H32-D128-fp16-causal", "flash_attention_forward", ("streaming/attention.py:flash_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/attention/flash_forward_bshd/example_mha_fwd_bshd_runtime.py"),
-    Entry("varlen_gqa_prefill", "packed8-QH32-KVH8-D128-fp16-causal", "varlen_gqa_prefill_v2", ("streaming/attention.py:flash_varlen_gqa_prefill",), "experiments/gpu/baselines/tilelang/tilelang/attention/flash_forward_varlen/example_gqa_fwd_varlen_runtime.py"),
-    Entry("gqa_decode", "B32-QH32-KVH8-S8192-D128-fp16", "gqa_decode_v2", ("streaming/attention.py:continuous_gqa_decode",), "experiments/gpu/baselines/tilelang/tilelang/attention/gqa_decode/example_gqa_decode_runtime.py"),
-    Entry("varlen_gqa_decode_logits", "B16-QH32-KVH8-S4096-D64-fp16", "varlen_gqa_decode_logits_v2", ("streaming/attention.py:varlen_gqa_decode_with_sink_logits",), "experiments/gpu/baselines/tilelang/tilelang/attention/gqa_decode_varlen_logits/example_gqa_decode_varlen_logits_runtime.py"),
-    Entry("paged_mla_decode", "B32-QH128-KVH1-S8192-V128-R64-page64-fp16", "paged_mla_decode_tilelang_v2", ("streaming/mla.py:paged_mla_decode",), "experiments/gpu/baselines/tilelang/tilelang/attention/mla_decode_paged/example_mla_decode_paged_runtime.py"),
-    Entry("persistent_mla_decode", "B8-H64-S16384-C128-R64-split4-fp16", "persistent_mla_decode", (), "experiments/gpu/baselines/tilelang/tilelang/attention/mla_decode_persistent/example_mla_decode_persistent_runtime.py"),
-    Entry("conv2d", "NHWC32x128x128x256-K3x3x256x512-fp16", "conv2d_tilelang_v2", ("convolution/direct.py:conv2d_nhwc",), "experiments/gpu/baselines/tilelang/tilelang/convolution/basic/example_convolution_runtime.py"),
-    Entry("dense_gemm", "M4096-N14336-K4096-fp16", "dense_gemm", ("contraction/gemm.py:gemm",), "experiments/gpu/baselines/tilelang/tilelang/gemm/dense/example_gemm_runtime.py"),
-    Entry("w4a8_gemm", "M4096-N14336-K4096-int8-int4", "w4a8_tilelang_v2", ("contraction/weight_only_int4.py:w4a8_packed_matmul",), "experiments/gpu/baselines/tilelang/tilelang/gemm/dequantize_w4a8/example_dequant_gemm_w4a8_runtime.py"),
-    Entry("fp8_gemm", "M4096-N14336-K4096-e4m3", "fp8_gemm_tilelang_v2", ("contraction/weight_only_int4.py:fp8_e4m3_matmul",), "experiments/gpu/baselines/tilelang/tilelang/gemm/fp8/example_tilelang_gemm_fp8_runtime.py"),
-    Entry("grouped_gemm", "rows256-512-1024-2048-K4096-N4096-fp16", "grouped_gemm_tilelang_v2", ("ragged/grouped_gemm.py:ragged_grouped_gemm",), "experiments/gpu/baselines/tilelang/tilelang/gemm/grouped/example_grouped_gemm_fwd_runtime.py"),
-    Entry("sparse_2to4_gemm", "M8192-N14336-K8192-fp16", "sparse_2to4_tilelang_v2", ("contraction/sparse_2to4.py:sparse_2to4_gemm",), "experiments/gpu/baselines/tilelang/tilelang/gemm/sparse_2to4/example_gemm_sp_runtime.py"),
-    Entry("deepgemm_fp8_2xacc", "M4096-N4096-K4096-e4m3-bf16", "deepgemm_fp8_2xacc", ("contraction/block_scaled.py:deepgemm_fp8_2xacc",), "experiments/gpu/baselines/tilelang/tilelang/gemm/fp8_2xacc/example_deepgemm_fp8_2xAcc_runtime.py"),
-    Entry("online_softmax", "8192x8192-fp16", "online_softmax_f16", ("streaming/online_softmax.py:streamed_online_softmax_f16",), "experiments/gpu/baselines/tilelang/tilelang/normalization/online_softmax/online_softmax_runtime.py"),
-    Entry("deepseek_topk_selector", "B32-S32768-topk2048-fp32", "deepseek_topk_selector", (), "experiments/gpu/baselines/tilelang/tilelang/routing/deepseek_v32_topk/topk_selector_runtime.py"),
-    Entry("rms_norm", "8192x4096-fp32", "rms_norm_f32", ("normalization/rms_norm.py:rms_norm_f32",), "experiments/gpu/baselines/tilelang/tilelang/normalization/rms_norm/rms_norm_runtime.py"),
-    Entry("mamba_chunk_scan", "B1-S2048-H32-G8-P64-N128-C256-fp16", "mamba_chunk_scan_v2", ("streaming/selective_scan.py:mamba_chunk_scan_fwd",), "experiments/gpu/baselines/tilelang/tilelang/scan/mamba_chunk_scan/example_mamba_chunk_scan_runtime.py"),
-    Entry("mamba_chunk_state", "B1-S2048-H32-G8-P64-N128-C256-fp16", "mamba_chunk_state", ("streaming/mamba.py:mamba_chunk_state_fwd",), "experiments/gpu/baselines/tilelang/tilelang/scan/mamba_chunk_state/example_mamba_chunk_state_runtime.py"),
-    Entry("linear_attention_forward", "B1-S2048-H16-D128-fp16", "linear_attention_forward", ("streaming/linear_attention.py:fused_chunk_linear_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/linear_attention/fused_chunk_forward/example_linear_attn_fwd_runtime.py"),
-    Entry("linear_attention_backward", "B1-S2048-H16-D128-fp16", "linear_attention_backward", ("streaming/linear_attention.py:fused_chunk_linear_attention_bwd",), "experiments/gpu/baselines/tilelang/tilelang/linear_attention/fused_chunk_backward/example_linear_attn_bwd_runtime.py"),
-    Entry("retention_forward", "B1-S2048-H16-D128-fp16", "retention_forward", ("streaming/linear_attention.py:chunk_retention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/linear_attention/retention/example_retention_fwd_runtime.py"),
-    Entry("mhc_pre", "T2048-H4096-streams4-bf16", "mhc_pre", ("routing/mhc.py:mhc_pre_gemm_sqrsum", "routing/mhc.py:mhc_pre_fuse"), "experiments/gpu/baselines/tilelang/tilelang/mhc/pre/example_mhc_pre_runtime.py"),
-    Entry("block_causal_attention", "B2-S4096-H16-D128-block64-fp16", "block_causal_attention", ("streaming/attention_specialized.py:block_causal_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/attention/block_causal/block_causal_attention_runtime.py"),
-    Entry("varlen_block_causal_attention", "lengths4096-3840-3584-3328-H16-D128-fp16", "varlen_block_causal_attention", ("streaming/attention_specialized.py:varlen_block_causal_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/attention/block_causal_varlen/block_causal_attention_varlen_runtime.py"),
-    Entry("native_sparse_attention_forward", "B2-S4096-QH32-KVH2-D128-blocks64", "native_sparse_attention_forward", ("streaming/attention_specialized.py:native_sparse_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/attention/native_sparse_forward/example_tilelang_nsa_fwd_runtime.py"),
-    Entry("native_sparse_attention_decode", "B8-S8192-QH32-KVH2-D128-blocks32", "native_sparse_attention_decode", ("streaming/attention_specialized.py:native_sparse_attention_fwd",), "experiments/gpu/baselines/tilelang/tilelang/attention/native_sparse_decode/example_tilelang_nsa_decode_runtime.py"),
-    Entry("gqa_attention_backward", "B1-S4096-QH32-KVH8-D64-fp16-causal", "gqa_attention_backward_v2", ("backward/attention.py:attention_backward_delta", "backward/attention.py:attention_backward_dkdv", "backward/attention.py:attention_backward_dq"), "experiments/gpu/baselines/tilelang/tilelang/attention/gqa_backward/example_gqa_bwd_runtime.py"),
-    Entry("sparse_mla_backward", "B1-S4096-SKV8192-H64-D576-topk2048-bf16", "sparse_mla_backward", ("backward/sparse_mla.py:sparse_mla_backward_delta", "backward/sparse_mla.py:sparse_mla_backward_main", "backward/sparse_mla.py:sparse_mla_grad_kv_cast"), "experiments/gpu/baselines/tilelang/tilelang/attention/sparse_mla_backward/sparse_mla_bwd_runtime.py"),
-    Entry("fp8_lighting_indexer", "S4096-SKV8192-H32-D64-fp8", "fp8_lighting_indexer_v2", ("routing/mqa_logits.py:fp8_mqa_logits",), "experiments/gpu/baselines/tilelang/tilelang/attention/fp8_lighting_indexer/fp8_lighting_indexer_runtime.py"),
-    Entry("per_token_fp8", "8192x8192-group128-f32-e4m3", "f32_groupwise_fp8_quantize", ("quantization/fp8.py:f32_groupwise_fp8_quantize",), "experiments/gpu/baselines/tilelang/tilelang/quantization/per_token_fp8/example_per_token_cast_to_fp8_runtime.py"),
-    Entry("block_sparse_gemm", "M4096-N4096-K4096-block128x128x32-50pct", "block_sparse_gemm", ("contraction/block_sparse.py:block_sparse_matmul",), "experiments/gpu/baselines/tilelang/tilelang/gemm/block_sparse/example_blocksparse_gemm_runtime.py"),
-    Entry("grouped_gemm_backward", "rows256-512-1024-2048-K4096-N4096-fp16", "grouped_gemm_backward", ("ragged/grouped_gemm.py:ragged_grouped_gemm_backward_weight",), "experiments/gpu/baselines/tilelang/tilelang/gemm/grouped_backward/example_grouped_gemm_bwd_runtime.py"),
-    Entry("bitnet_int2_decode", "M1-N4096-K4096-int8-int2", "bitnet_int2_decode", ("contraction/weight_only_int4.py:bitnet_int2_matmul",), "experiments/gpu/baselines/tilelang/tilelang/gemm/bitnet_int2_decode/tilelang_bitnet_158_int8xint2_decode_runtime.py"),
-    Entry("dequant_bf16_fp4", "M4096-N4096-K4096-bf16-fp4", "dequant_bf16_fp4", ("contraction/weight_only_int4.py:dequant_bf16_fp4_matmul",), "experiments/gpu/baselines/tilelang/tilelang/gemm/dequant_bf16_fp4/example_dequant_gemm_bf16_fp4_hopper_runtime.py"),
-    Entry("block_fp4_quant", "8192x4096-block32-bf16", "block_fp4_quant", (), "experiments/gpu/baselines/tilelang/tilelang/quantization/block_fp4/act_quant_runtime.py"),
-    Entry("mhc_post", "T4096-H2560-streams4-bf16", "mhc_post", ("routing/mhc.py:mhc_apply_residual",), "experiments/gpu/baselines/tilelang/tilelang/mhc/post/example_mhc_post_runtime.py"),
-)
-
-
 BY_PROVIDER = {
     "triton": TRITON,
     "cutile": CUTILE,
-    "tilelang": TILELANG,
 }

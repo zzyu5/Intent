@@ -16,7 +16,6 @@ add_mlir_library(MLIRIntentCompiler
   MLIRIntentGPUTransforms
   MLIRIntentTritonTransforms MLIRIntentTritonSerialization
   MLIRIntentCuTileTransforms MLIRIntentCuTileSerialization
-  MLIRIntentTileLangTransforms MLIRIntentTileLangSerialization
   MLIRIntentTransforms MLIRPass MLIRTransforms MLIRIR MLIRSupport
 )
 if(TARGET MLIRIntentWeftTransforms)

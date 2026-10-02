@@ -133,5 +133,3 @@ Use `--runtime-notices /path/to/notices.json` with the source installer, or `--c
 Use `intent read-artifact PATH --offset 0 --limit 16000 --json` on a returned source, IR, metadata, or log path. Offsets count Unicode characters; continue with `next_offset` until `eof`. Compilation failures retain their actual stage, exception causes and artifact paths; native compilation may report a different directory from the Intent compiler's output.
 
 The `intent-manual` MCP stays read-only. Explicitly enable `intent-compiler-mcp` when an agent should compile an existing user-supplied `.py` file; its compilation tool shares the CLI implementation. Its `describe`, `environment`, and `read_artifact` tools provide discovery, prerequisite inspection, and paged artifact/log reading through that same implementation. Both servers use the `manual` dependency extra. Module loading executes ordinary top-level Python host code, while kernel execution and numerical validation remain separate.
-
-[tilelang.txt](tilelang.txt) retains its prior environment and source corpus. It is not one of the installer routes above.

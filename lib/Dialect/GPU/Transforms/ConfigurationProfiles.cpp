@@ -101,7 +101,6 @@ int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
   case ParameterRole::ProviderWarps:
   case ParameterRole::ProviderStages:
   case ParameterRole::ProviderCTAs:
-  case ParameterRole::ProviderThreads:
   case ParameterRole::ProviderAccessForm:
   case ParameterRole::ProviderOccupancy:
   case ParameterRole::ProviderLoadPolicy:

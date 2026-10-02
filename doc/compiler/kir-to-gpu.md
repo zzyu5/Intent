@@ -45,7 +45,7 @@ Construction把互相连接、必须共同拥有或存在依赖的worksets形成
 - 无法证明independence的程序slice退化为单instance group，并在内部保留ordered loops；
 - cross-instance logical-buffer dependence使相关instances合并，除非KIR已经使用atomic/reduction semantics定义并发更新。
 
-Execution group只是同一个physical kernel body中的内部dispatch region，不是kernel、artifact或launch。一个`@intent.kernel` specialization仍只产生一次launch；多个execution groups通过同一个physical program space执行，不形成隐藏kernels。多kernel算法由作者定义多个kernels并由host wrapper编排，这是一项Intent语义边界，不是对Triton/cuTile/TileLang一般能力的描述。
+Execution group只是同一个physical kernel body中的内部dispatch region，不是kernel、artifact或launch。一个`@intent.kernel` specialization仍只产生一次launch；多个execution groups通过同一个physical program space执行，不形成隐藏kernels。多kernel算法由作者定义多个kernels并由host wrapper编排，这是一项Intent语义边界，不是对Triton/cuTile一般能力的描述。
 
 ## 4. Initial physical program
 

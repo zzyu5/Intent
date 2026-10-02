@@ -1,6 +1,5 @@
 from .cutile import CuTileTarget
 from .triton import TritonTarget
-from .tilelang import TileLangTarget
 from .gpu import ResolvedGPUTarget
 from .mojo import MojoTarget
 from .bangc import BangCTarget
@@ -12,7 +11,6 @@ from .specification import GPUCapabilities, GPUCompilationTarget, CPUCompilation
 __all__ = [
     "CuTileTarget",
     "ResolvedGPUTarget",
-    "TileLangTarget",
     "TritonTarget",
     "MojoTarget",
     "BangCTarget",

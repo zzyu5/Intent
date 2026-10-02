@@ -62,8 +62,6 @@ def _target(provider: str, entry):
         return intent.TritonTarget(device=0)
     if provider == "cutile":
         return intent.CuTileTarget(device=0)
-    if provider == "tilelang":
-        return intent.TileLangTarget(device=0)
     raise ValueError(f"unknown provider: {provider}")
 
 

@@ -81,23 +81,6 @@ class CandidateRecorder:
             return tuple(self._records.values())
 
 
-def describe_tuning_failure(error: Exception,
-                            candidates: tuple[CandidateObservation, ...]) -> str:
-    """Expose a recorded candidate failure beside the SDK aggregate error."""
-    message = str(error)
-    for candidate in candidates:
-        if candidate.status != "failed":
-            continue
-        configuration = (dict(candidate.configuration)
-                         if candidate.configuration is not None else None)
-        return (
-            f"{message}\nFirst recorded failed candidate: "
-            f"configuration={configuration!r}, stage={candidate.stage}, "
-            f"error_type={candidate.error_type}\n{candidate.message}"
-        )
-    return message
-
-
 def observation(provider: str, target: dict, invocation, configuration,
                 resources: tuple[NativeResource, ...], candidates=(), *,
                 stage: str = "launched", history_unavailable: str | None = None,

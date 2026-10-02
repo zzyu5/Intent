@@ -40,7 +40,7 @@ class GPUCompilationTarget:
     capabilities: GPUCapabilities
 
     def __post_init__(self) -> None:
-        if self.provider not in {"triton", "cutile", "tilelang"}:
+        if self.provider not in {"triton", "cutile"}:
             raise ValueError(f"unsupported GPU source provider: {self.provider}")
         if not isinstance(self.capabilities, GPUCapabilities):
             raise TypeError("GPU compilation requires GPUCapabilities")

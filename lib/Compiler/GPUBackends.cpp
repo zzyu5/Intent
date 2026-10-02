@@ -7,9 +7,6 @@
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
-#include "Intent/Target/TileLang/IR/TileLangDialect.h"
-#include "Intent/Target/TileLang/Serialization/Serializer.h"
-#include "Intent/Target/TileLang/Transforms/Passes.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
@@ -31,13 +28,7 @@ ArrayRef<Backend> gpuBackends() {
        [](DialectRegistry &registry) { registry.insert<cutile::IntentCuTileDialect>(); },
        cutile::registerCuTilePasses,
        [](OpPassManager &manager, const Request &) { cutile::buildCuTilePipeline(manager); },
-       cutile::serializeProgram},
-      {Provider::TileLang, "tilelang", true,
-       GPUBackend{false, false, tilelang::tuningProfileSchema(), "tilelang.json"},
-       [](DialectRegistry &registry) { registry.insert<tilelang::IntentTileLangDialect>(); },
-       [] { tilelang::registerTileLangPasses(); tilelang::registerTileLangPipelines(); },
-       [](OpPassManager &manager, const Request &) { tilelang::buildTileLangPipeline(manager); },
-       tilelang::serializeProgram}};
+       cutile::serializeProgram}};
   return adapters;
 }
 

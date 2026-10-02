@@ -13,12 +13,6 @@ BACKENDS = {
         "torch_index": "https://download.pytorch.org/whl/cu130",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and the CUDA tile compiler",
     },
-    "tilelang": {
-        "target": "TileLangTarget", "modules": ("torch", "tilelang"),
-        "requirements": None, "torch": "2.10.0",
-        "torch_index": "https://download.pytorch.org/whl/cu130",
-        "python_max": (3, 12), "toolchain": "An explicitly installed TileLang compiler and CUDA runtime",
-    },
     "mojo": {
         "target": "MojoTarget", "modules": ("torch",),
         "requirements": None, "torch": "2.10.0",

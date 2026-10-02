@@ -603,7 +603,7 @@ LogicalResult ParameterAttr::verify(
     DenseI64ArrayAttr candidates, ConfigurationBindingPhase phase,
     ParameterBindingAttr binding) {
   if (!name || name.empty() ||
-      role > ParameterRole::ProviderLoadPolicy ||
+      !symbolizeParameterRole(static_cast<uint32_t>(role)) ||
       category >
           ParameterCategory::Histogram ||
       !candidates || candidates.empty() || !valueType ||
@@ -616,7 +616,6 @@ LogicalResult ParameterAttr::verify(
       typedRole == ParameterRole::ProviderWarps ||
       typedRole == ParameterRole::ProviderStages ||
       typedRole == ParameterRole::ProviderCTAs ||
-      typedRole == ParameterRole::ProviderThreads ||
       typedRole == ParameterRole::ProviderAccessForm ||
       typedRole == ParameterRole::ProviderOccupancy ||
       typedRole == ParameterRole::ProviderLoadPolicy;
