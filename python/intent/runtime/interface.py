@@ -80,7 +80,7 @@ class AliasCheck:
     def noalias_violation(self, left: tuple[int, int], right: tuple[int, int]) -> bool:
         return self.noalias and byte_spans_overlap(left, right)
 
-    def allocation_violation(self, left: int, right: int) -> bool:
+    def allocation_violation(self, left: object, right: object) -> bool:
         return self.same_allocation and left != right
 
 

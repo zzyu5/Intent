@@ -99,7 +99,7 @@ def batch_norm(context):
                               tuning_config=context.tuning_config, options=context.compile_options)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
-    def side(function):
+    def side(function, *, include_running_state=False):
         mean, variance = initial_mean.clone(), initial_variance.clone()
         state = {}
 
@@ -108,13 +108,14 @@ def batch_norm(context):
             variance.copy_(initial_variance)
 
         def launch():
-            state["output"] = function(x, weight, bias, mean, variance, epsilon, momentum)
+            outputs = function(x, weight, bias, mean, variance, epsilon, momentum)
+            state["output"] = (mean, variance, *outputs) if include_running_state else outputs
 
         return PreparedLaunch(launch, lambda: state["output"], prepare=prepare)
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(runtime.batch_norm_training),
+        side(artifact.run, include_running_state=True), side(runtime.batch_norm_training),
         (Tolerance(atol=2e-5), Tolerance(atol=2e-5), Tolerance(atol=1e-2),
          Tolerance(atol=2e-5), Tolerance(atol=2e-5)),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,

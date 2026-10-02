@@ -42,7 +42,6 @@ def reshape_and_cache_case(context: Context) -> PreparedComparison:
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
         "intent_cpu_reference_reshape_and_cache",
     )
-    generated_state: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     source_state: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def generated_prepare() -> None:
@@ -50,7 +49,7 @@ def reshape_and_cache_case(context: Context) -> PreparedComparison:
         generated_value_cache.zero_()
 
     def generated_launch() -> None:
-        generated_state["output"] = artifact.run(
+        artifact.run(
             key,
             value,
             slots,
@@ -75,7 +74,7 @@ def reshape_and_cache_case(context: Context) -> PreparedComparison:
     return PreparedComparison(
         PreparedLaunch(
             generated_launch,
-            lambda: generated_state["output"],
+            lambda: (generated_key_cache, generated_value_cache),
             prepare=generated_prepare,
         ),
         PreparedLaunch(

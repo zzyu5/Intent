@@ -30,6 +30,42 @@ llvm::json::Array NativeABI::serialize() const {
   return result;
 }
 
+llvm::json::Object NativeEntryRequirements::serialize() const {
+  llvm::json::Array viewEntries, pairs;
+  for (const auto &[parameter, requirements] : views)
+    viewEntries.push_back(llvm::json::Object{
+        {"parameter", parameter},
+        {"layout", requirements.layout == NativeViewLayout::Contiguous ? "contiguous" : "strided"},
+        {"alignment", requirements.alignment}});
+  for (auto [left, right] : disjoint)
+    pairs.push_back(llvm::json::Object{{"left", left}, {"right", right}});
+  return llvm::json::Object{{"views", std::move(viewEntries)}, {"disjoint", std::move(pairs)}};
+}
+
+FailureOr<NativeEntryRequirements> queryNativeEntryRequirements(
+    func::FuncOp function, InterfaceAttr interface, bool disjointWritableViews,
+    function_ref<FailureOr<NativeViewRequirements>(unsigned, ViewType)> viewRequirements) {
+  if (failed(verifyPublicInterface(function, interface))) return failure();
+  if (function.getNumArguments() != interface.getArguments().size())
+    return function.emitError("native entry requirements disagree with the public parameters"), failure();
+  NativeEntryRequirements result;
+  for (unsigned ordinal = 0; ordinal < function.getNumArguments(); ++ordinal) {
+    auto view = getPublicView(interface, ordinal);
+    if (!view) continue;
+    auto requirements = viewRequirements(ordinal, view);
+    if (failed(requirements)) return failure();
+    if (requirements->alignment <= 0)
+      return function.emitError("native view alignment must be positive"), failure();
+    if (disjointWritableViews)
+      for (const auto &[previous, unused] : result.views) {
+        if (view.getAccess() != 0 || getPublicView(interface, previous).getAccess() != 0)
+          result.disjoint.emplace_back(previous, ordinal);
+      }
+    result.views.emplace_back(ordinal, *requirements);
+  }
+  return result;
+}
+
 FailureOr<NativeABI> queryNativeABI(
     func::FuncOp function, InterfaceAttr interface,
     function_ref<FailureOr<Type>(Type)> scalarCarrier) {

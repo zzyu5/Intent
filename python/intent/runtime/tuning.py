@@ -1,21 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-def view_byte_span(view) -> tuple[int, int]:
-    pointer = view.data_ptr()
-    elements = view.numel()
-    if elements == 0:
-        return pointer, pointer
-    if view.is_contiguous():
-        return pointer, pointer + elements * view.element_size()
-    low = high = 0
-    for extent, stride in zip(view.shape, view.stride()):
-        displacement = (extent - 1) * stride
-        low += min(0, displacement)
-        high += max(0, displacement)
-    size = view.element_size()
-    return pointer + low * size, pointer + (high + 1) * size
+from .torch_views import view_byte_span
 
 
 @dataclass

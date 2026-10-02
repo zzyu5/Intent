@@ -32,8 +32,18 @@ def prepare_source(path: Path, entry: str, parameters, target, arguments):
     if target.workers != 8:
         raise NotImplementedError("the initial Mojo source corpus uses an explicit eight-worker budget")
     source = path.read_text(encoding="utf-8")
+    views = [(position, parameter.declaration) for position, parameter in enumerate(parameters)
+             if parameter.declaration["kind"] == "view"]
+    requirements = {
+        "views": [{"parameter": position, "layout": "contiguous", "alignment": 1}
+                  for position, _ in views],
+        "disjoint": [{"left": left, "right": right}
+                     for index, (left, lhs) in enumerate(views)
+                     for right, rhs in views[index + 1:]
+                     if lhs["access"] != 0 or rhs["access"] != 0],
+    }
     metadata = {"interface": {"parameters": [parameter.declaration for parameter in parameters]},
-                "native": {"contiguous_views": True, "disjoint_outputs": True,
+                "native": {"requirements": requirements,
                            "slots": [{**slot, "parameter": position} for position, parameter in enumerate(parameters)
                                      for slot in parameter.slots]},
                 "source_prelude_end": 0,

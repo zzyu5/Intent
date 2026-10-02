@@ -88,16 +88,16 @@ def moe_alignment(context: Context) -> PreparedComparison:
         sorted_routes.fill_(ROUTES)
 
     def generated_launch() -> None:
-        expert_counts_result = count.run(source_ids, expert_counts)
-        expert_offsets, total_padded = prefix.run(expert_counts_result)
-        _, sorted_routes_result = scatter.run(
+        count.run(source_ids, expert_counts)
+        expert_offsets, total_padded = prefix.run(expert_counts)
+        scatter.run(
             source_ids,
             expert_offsets,
             expert_cursors,
             sorted_routes,
         )
         expert_blocks = mark.run(expert_offsets)
-        generated_state["output"] = (sorted_routes_result, expert_blocks, total_padded)
+        generated_state["output"] = (sorted_routes, expert_blocks, total_padded)
 
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",

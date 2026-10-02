@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from math import prod
 import statistics
 
 import torch
 
 from .compilation import compile_library
-from ..cpu import check_alias
 from ..interface import ViewParameter
-from ..native import NativeABI, NativePreparedRuntime, ViewFacts
-from ..torch import torch_dtype
+from ..invocation import ViewFacts, build_invocation_binders, invocation_result
+from ..native import NativeABI, NativePreparedRuntime
+from ..torch_views import allocate_output, check_abstract_relation, observe_view
 
 
 _winners: dict[tuple[object, ...], dict[tuple[object, ...], int]] = {}
@@ -68,28 +67,27 @@ class NativeCall:
         return _timing_samples(self.program.measurements[self.choose()], self.native_arguments, samples=7)
 
     def result(self):
-        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+        return invocation_result(self.outputs)
 
 
 class NativeProgram(NativePreparedRuntime):
     def __init__(self, source: str, metadata: dict[str, object], target) -> None:
         abi = NativeABI.read(metadata)
         self.interface = abi.interface
-        self._view_dtypes = tuple(
-            torch_dtype(parameter.dtype)
-            if isinstance(parameter, ViewParameter) else None
-            for parameter in self.interface.parameters
-        )
         self.candidates = metadata["candidates"]
-        self.contiguous_views = metadata["native"]["contiguous_views"]
-        if not metadata["native"]["disjoint_outputs"]:
-            raise NotImplementedError("Mojo runtime requires declared disjoint-output entry legality")
+        self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            check_alias=check_alias,
+            check_alias=requirements.check_pair,
+            check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.offset, facts.dtype, group),
             scalar_key=lambda parameter, value: parameter.dtype.name,
         )
+        self._infer = build_invocation_binders(
+            self.interface, observe_view=type(self)._abstract_view,
+            allocate_output=type(self)._abstract_output,
+            check_relation=check_abstract_relation, abstract=True,
+        )[0]
         self.compilation = compile_library(source, metadata, target, abi=abi)
         argument_types = abi.argument_types()
         self.functions = []
@@ -107,54 +105,28 @@ class NativeProgram(NativePreparedRuntime):
         self.timings = _candidate_timings.setdefault(self.compilation.identity, {})
 
     def _view(self, parameter: ViewParameter, tensor) -> ViewFacts:
-        dtype = self._view_dtypes[parameter.position]
-        if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or tensor.dtype != dtype:
-            raise ValueError(f"{parameter.name} must be a CPU {parameter.dtype} tensor")
+        facts = observe_view(parameter, tensor, device=torch.device("cpu"))
         if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
-        shape, strides = tuple(tensor.shape), tuple(tensor.stride())
-        if len(shape) != len(parameter.shape):
-            raise ValueError(f"{parameter.name} has an incompatible rank")
-        if self.contiguous_views or parameter.access != 0:
-            expected_stride = 1
-            for extent, stride in zip(reversed(shape), reversed(strides)):
-                if stride != expected_stride:
-                    raise NotImplementedError("Mojo CPU writable views require canonical contiguous strides")
-                expected_stride *= extent
-        pointer = tensor.data_ptr()
-        element_size = tensor.element_size()
-        lower, upper = 0, 1
-        for extent, stride in zip(shape, strides):
-            offset = (extent - 1) * stride
-            lower += min(0, offset)
-            upper += max(0, offset)
-        storage = tensor.untyped_storage()
-        return ViewFacts(shape, strides, pointer, storage.data_ptr(), storage.data_ptr() + storage.nbytes(),
-                         tensor.storage_offset(), dtype, pointer + lower * element_size,
-                         pointer + upper * element_size)
+        return facts
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[torch.Tensor, ViewFacts]:
-        dtype = self._view_dtypes[parameter.position]
-        tensor = torch.empty(shape, dtype=dtype, device="cpu")
-        elements = prod(shape)
-        if elements == 0:
+        tensor, facts = allocate_output(parameter, shape, device=torch.device("cpu"))
+        if tensor.numel() == 0:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
-        strides = tensor.stride()
-        pointer = tensor.data_ptr()
-        # This invocation owns the new contiguous allocation. Shape, dtype,
-        # zero offset and storage identity follow from the factory contract.
-        facts = ViewFacts(shape, strides, pointer, pointer, pointer + tensor.untyped_storage().nbytes(), 0, dtype,
-                          pointer, pointer + elements * tensor.element_size())
         return tensor, facts
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         bound = self._binders[bool(explicit_outputs)](self, arguments)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs, bound.key)
 
-    def run(self, *arguments):
-        call = self.prepare(arguments)
-        call.launch()
-        return call.result()
+    @staticmethod
+    def _abstract_view(owner, parameter: ViewParameter, value) -> ViewFacts:
+        return observe_view(parameter, value, device=torch.device("cpu"), abstract=True)
 
-    def launch(self, *arguments):
-        self.prepare(arguments, explicit_outputs=True).launch()
+    @staticmethod
+    def _abstract_output(owner, parameter: ViewParameter, shape: tuple):
+        return allocate_output(parameter, shape, device=torch.device("cpu"), abstract=True)
+
+    def infer_outputs(self, arguments: tuple):
+        return self._infer(self, arguments).result()

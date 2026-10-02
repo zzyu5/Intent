@@ -195,18 +195,19 @@ def causal_conv_update(context):
                               constexprs={"SILU": True})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
-    def side(function):
+    def side(function, *, include_state=False):
         state = initial.clone()
         result = {}
 
         def launch():
-            result["output"] = function(x, state, weight, bias)
+            output = function(x, state, weight, bias)
+            result["output"] = (state, output) if include_state else output
 
         return PreparedLaunch(launch, lambda: result["output"], prepare=lambda: state.copy_(initial))
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(runtime.causal_conv_update),
+        side(artifact.run, include_state=True), side(runtime.causal_conv_update),
         (Tolerance(atol=0.0), Tolerance(atol=2e-3)),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有B64-D4096-W4 f16缓存卷积更新及SiLU；单NUMA8核，PyTorch eager同算法，完整host调用；每次恢复同一state且恢复不计时。",
@@ -224,18 +225,19 @@ def causal_conv_update_bf16(context):
                               constexprs={"SILU": True})
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
-    def side(function):
+    def side(function, *, include_state=False):
         state = initial.clone()
         result = {}
 
         def launch():
-            result["output"] = function(x, state, weight, bias)
+            output = function(x, state, weight, bias)
+            result["output"] = (state, output) if include_state else output
 
         return PreparedLaunch(launch, lambda: result["output"], prepare=lambda: state.copy_(initial))
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(runtime.causal_conv_update),
+        side(artifact.run, include_state=True), side(runtime.causal_conv_update),
         (Tolerance(atol=0.0), Tolerance(atol=5e-2, rtol=5e-2)),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有 B32-D4096-W4 bf16 state/input、f32 weight/bias、SiLU；完整缓存更新及输出，PyTorch CPU reference，沿用原容差；单 NUMA 8 核，完整 host 调用，每次恢复 state 且恢复不计时。",

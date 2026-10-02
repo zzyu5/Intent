@@ -37,14 +37,15 @@ class PreparedCall:
     def result(self):
         return self.invocation.result()
 
-    def launch(self):
+    def launch(self) -> None:
         import torch
 
         with self.program.invocation_context():
             if torch.cuda.current_device() != self.program.device:
                 with torch.cuda.device(self.program.device):
-                    return self._invoke()
-            return self._invoke()
+                    self._invoke()
+            else:
+                self._invoke()
 
     def _invoke(self):
         if self._launch is None or self._launch.replay is None:
@@ -53,7 +54,6 @@ class PreparedCall:
             self._launch.replay()
         if self.program.artifact is not None:
             self.program.artifact._capture_backend_ir(self._launch.kernel)
-        return self._launch.kernel
 
     __call__ = launch
 
@@ -81,8 +81,11 @@ class GPUProgram:
         call.launch()
         return call.result()
 
-    def launch(self, *arguments):
-        return self.prepare(*arguments, explicit_outputs=True).launch()
+    def infer_outputs(self, arguments: tuple):
+        return self.binding.bind(arguments, device=self.device, abstract=True).result()
+
+    def launch(self, *arguments) -> None:
+        self.prepare(*arguments, explicit_outputs=True).launch()
 
     def tuning_configurations(self, *arguments):
         invocation = self.binding.bind(arguments, device=self.device, explicit_outputs=True)

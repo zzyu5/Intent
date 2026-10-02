@@ -6,8 +6,9 @@ import statistics
 
 from .buffer import DeviceBuffer, DeviceView, runtime
 from .compilation import compile_library
-from ..interface import AliasCheck, ScalarParameter, ViewParameter, byte_spans_overlap
-from ..native import NativeABI, NativePreparedRuntime, ViewFacts
+from ..interface import ScalarParameter, ViewParameter
+from ..invocation import ViewFacts, invocation_result
+from ..native import NativeABI, NativePreparedRuntime
 
 
 @dataclass
@@ -38,7 +39,7 @@ class NativeCall:
         self.program.runtime.invoke("cnrtQueueSync", self.program.queue)
 
     def result(self):
-        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+        return invocation_result(self.outputs)
 
     def benchmark(self) -> float:
         return benchmark_calls((self,))
@@ -104,9 +105,11 @@ class NativeProgram(NativePreparedRuntime):
         self.metadata = metadata
         abi = NativeABI.read(metadata)
         self.interface = abi.interface
+        self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            check_alias=type(self)._check_alias, scalar_argument=type(self)._scalar,
+            check_alias=requirements.check_pair, scalar_argument=type(self)._scalar,
+            check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
             check_dimensions=type(self)._check_dimensions,
         )
         parameters_by_name = {parameter.name: parameter for parameter in self.interface.parameters}
@@ -125,20 +128,9 @@ class NativeProgram(NativePreparedRuntime):
         self.function.argtypes = (ctypes.c_void_p, *abi.argument_types())
         self.function.restype = ctypes.c_int
 
-    def run(self, *arguments):
-        call = self.prepare(arguments)
-        call.launch()
-        return call.result()
-
-    def launch(self, *arguments):
-        self.prepare(arguments, explicit_outputs=True).launch()
-
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         bound = self._binders[bool(explicit_outputs)](self, arguments)
-        # BANG C run returns only declared Out buffers. CPU runtimes also return
-        # their InOut state; that difference is not part of the flattened ABI.
-        outputs = tuple(bound.arguments[parameter.position] for parameter in self.interface.outputs)
-        return NativeCall(self, bound.arguments, bound.native_arguments, outputs)
+        return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs)
 
     def _view(self, parameter: ViewParameter, value) -> ViewFacts:
         if not isinstance(value, (DeviceBuffer, DeviceView)) or not value.pointer:
@@ -151,14 +143,14 @@ class NativeProgram(NativePreparedRuntime):
         owner = value.owner if isinstance(value, DeviceView) else value
         return ViewFacts(value.shape, value.strides, value.pointer, value.allocation_pointer,
                          owner.pointer + owner.nbytes,
-                         value.pointer - value.allocation_pointer, value.dtype, lower, upper)
+                         value.pointer - value.allocation_pointer, value.dtype, lower, upper, value.allocation_pointer)
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[DeviceBuffer, ViewFacts]:
         value = DeviceBuffer(shape, parameter.dtype.name, device=self.target.device, neuware=self.target.neuware)
         lower, upper = value.byte_bounds
         return value, ViewFacts(value.shape, value.strides, value.pointer, value.allocation_pointer,
                                 value.pointer + value.nbytes,
-                                0, value.dtype, lower, upper)
+                                0, value.dtype, lower, upper, value.allocation_pointer)
 
     def _check_dimensions(self, dimensions: dict[int, int]) -> None:
         for identity in self.metadata["full_extent_dimensions"]:
@@ -168,15 +160,6 @@ class NativeProgram(NativePreparedRuntime):
     @staticmethod
     def _scalar(parameter: ScalarParameter, value):
         return float(value) if parameter.dtype.name == "f32" else int(value)
-
-    @staticmethod
-    def _check_alias(check: AliasCheck, left: ViewFacts, right: ViewFacts) -> None:
-        if check.noalias_violation((left.allocation, left.allocation_end), (right.allocation, right.allocation_end)):
-            raise ValueError("MLU views violate a declared noalias contract")
-        if check.writable and byte_spans_overlap((left.begin, left.end), (right.begin, right.end)):
-            raise NotImplementedError("BANG C currently requires nonoverlapping writable views")
-        if check.allocation_violation(left.allocation, right.allocation):
-            raise ValueError("MLU views violate a declared allocation alias relation")
 
     def close(self) -> None:
         if self.queue.value:

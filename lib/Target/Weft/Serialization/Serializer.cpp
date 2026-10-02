@@ -3,6 +3,7 @@
 #include "Intent/Target/Weft/IR/WeftAttrs.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
+#include "Intent/Serialization/NativeABI.h"
 #include "TaskABI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -72,14 +73,16 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
   llvm::raw_string_ostream output(source);
   modules->device.print(output, OpPrintingFlags().enableDebugInfo());
   output << '\n';
-  auto requirements = candidates.front()->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
-  llvm::json::Array alignments;
-  for (unsigned index = 0; index < interface.getArguments().size(); ++index) {
-    if (getPublicView(interface, index))
-      alignments.push_back(candidates.front().getArgAttrOfType<ArgumentAlignmentAttr>(
-          index, argumentAlignmentAttr).getBytes());
-    else alignments.push_back(nullptr);
-  }
+  auto entry = candidates.front()->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
+  auto requirements = queryNativeEntryRequirements(candidates.front(), interface,
+      entry.getDisjointOutputs(), [&](unsigned index, intent::ViewType view) -> FailureOr<NativeViewRequirements> {
+        auto layout = entry.getContiguousViews() || view.getAccess() != 0
+            ? NativeViewLayout::Contiguous : NativeViewLayout::Strided;
+        auto alignment = candidates.front().getArgAttrOfType<ArgumentAlignmentAttr>(
+            index, argumentAlignmentAttr);
+        return NativeViewRequirements{layout, alignment.getBytes()};
+      });
+  if (failed(requirements)) return failure();
   auto capabilities = modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   llvm::raw_string_ostream metadataStream(metadata);
   metadataStream << llvm::json::Value(llvm::json::Object{{"kind", "weft-generation"},
@@ -92,8 +95,7 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
           {"matrix_i8_i32", capabilities.getMatrixI8I32()}}},
       {"host_source", hostSource}, {"tasks", std::move(*tasks)},
       {"interface", std::move(*parameters)}, {"candidates", std::move(configurations)},
-      {"native", llvm::json::Object{{"contiguous_views", requirements.getContiguousViews()},
-          {"disjoint_outputs", requirements.getDisjointOutputs()}, {"alignments", std::move(alignments)},
+      {"native", llvm::json::Object{{"requirements", requirements->serialize()},
           {"slots", nativeABI->serialize()}}}});
   return success();
 }

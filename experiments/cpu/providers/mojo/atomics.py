@@ -89,7 +89,7 @@ def compare_exchange(context):
         generated_state.copy_(initial)
 
     def generated_launch():
-        _, generated_outputs["previous"] = artifact.run(generated_state)
+        generated_outputs["previous"] = artifact.run(generated_state)
 
     generated = PreparedLaunch(
         generated_launch,

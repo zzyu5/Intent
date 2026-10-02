@@ -628,11 +628,18 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
     if (first) {
       auto abi = serializePublicInterface(function, getPublicInterface(function));
       if (failed(abi)) return failure();
-      auto requirements = function->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
+      auto entry = function->getAttrOfType<cpu::EntryRequirementsAttr>(cpu::entryRequirementsAttr);
+      auto requirements = queryNativeEntryRequirements(function, getPublicInterface(function),
+          entry.getDisjointOutputs(), [&](unsigned, intent::ViewType view) -> FailureOr<NativeViewRequirements> {
+            auto layout = entry.getContiguousViews() || view.getAccess() != 0
+                ? NativeViewLayout::Contiguous : NativeViewLayout::Strided;
+            return NativeViewRequirements{layout, 1};
+          });
+      if (failed(requirements)) return failure();
       interface["entry_name"] = function.getName();
       interface["interface"] = std::move(*abi);
-      interface["native"] = llvm::json::Object{{"contiguous_views", requirements.getContiguousViews()},
-          {"disjoint_outputs", requirements.getDisjointOutputs()}, {"slots", nativeABI->serialize()}};
+      interface["native"] = llvm::json::Object{{"requirements", requirements->serialize()},
+          {"slots", nativeABI->serialize()}};
       first = false;
     }
     auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");

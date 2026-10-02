@@ -13,9 +13,9 @@ import sys
 from .buffer import Buffer
 from .compilation import validate_artifact
 from .target import TargetProfile, matrix_capability
-from ..cpu import check_alias
 from ..interface import ViewParameter
-from ..native import NativeABI, NativePreparedRuntime, ViewFacts
+from ..invocation import ViewFacts, invocation_result
+from ..native import NativeABI, NativePreparedRuntime
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -153,7 +153,7 @@ class NativeCall:
         return statistics.median(values)
 
     def result(self):
-        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+        return invocation_result(self.outputs)
 
 
 class NativeProgram(NativePreparedRuntime):
@@ -166,10 +166,11 @@ class NativeProgram(NativePreparedRuntime):
         self.metadata = manifest["program"]
         abi = NativeABI.read(self.metadata)
         self.interface = abi.interface
-        self._alignments = tuple(self.metadata["native"]["alignments"])
+        self.requirements = requirements = abi.requirements
         self._binders = abi.binders(
             observe_view=type(self)._view, allocate_output=type(self)._allocate_output,
-            check_alias=check_alias,
+            check_alias=requirements.check_pair,
+            check_view_requirements=lambda owner, parameter, facts: requirements.check_view(parameter, facts),
             view_key=lambda facts, group: (facts.shape, facts.strides, facts.dtype, facts.offset, group),
             scalar_key=lambda parameter, value: (parameter.dtype.name, value),
         )
@@ -207,19 +208,15 @@ class NativeProgram(NativePreparedRuntime):
             raise TypeError(f"{parameter.name} requires a native {parameter.dtype} Buffer")
         if len(value.shape) != len(parameter.shape):
             raise ValueError("native view rank disagrees with the compiler ABI")
-        if value.pointer % self._alignments[parameter.position]:
-            raise ValueError("native view does not meet the compiler alignment requirement")
         return ViewFacts(value.shape, value.strides, value.pointer, value.allocation, value.allocation_end,
                          value.pointer - value.allocation, value.dtype,
-                         value.pointer, value.pointer + value.nbytes)
+                         value.pointer, value.pointer + value.nbytes, value.allocation)
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[Buffer, ViewFacts]:
         value = Buffer.empty(shape, parameter.dtype.name)
-        if value.pointer % self._alignments[parameter.position]:
-            raise ValueError("native view does not meet the compiler alignment requirement")
         facts = ViewFacts(value.shape, value.strides, value.pointer, value.allocation, value.allocation_end,
                           value.pointer - value.allocation, value.dtype,
-                          value.pointer, value.pointer + value.nbytes)
+                          value.pointer, value.pointer + value.nbytes, value.allocation)
         return value, facts
 
     def prepare(self, arguments: tuple, *, explicit_outputs: bool = False) -> NativeCall:
@@ -229,14 +226,6 @@ class NativeProgram(NativePreparedRuntime):
                           for parameter in self.interface.mutable_inputs)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
                           (self.identity, bound.key), snapshots)
-
-    def run(self, *arguments):
-        call = self.prepare(arguments)
-        call.launch()
-        return call.result()
-
-    def launch(self, *arguments) -> None:
-        self.prepare(arguments, explicit_outputs=True).launch()
 
     def close(self) -> None:
         import _ctypes

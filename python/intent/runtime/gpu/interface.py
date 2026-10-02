@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from heapq import heappop, heappush
 
 from ...language.dtypes import DType, dtype
-from ..interface import PublicInterface, ScalarParameter, ViewAxis, ViewBinding, ViewParameter, byte_spans_overlap
+from ..interface import PublicInterface, ScalarParameter, ViewParameter, byte_spans_overlap
+from ..invocation import build_invocation_binders, invocation_result
 from ..torch import torch_dtype
-from ..tuning import view_byte_span
+from ..torch_views import allocate_output, check_abstract_relation, observe_view, view_byte_span
 from .configurations import ConfigurationSpace, CoverageBinding
 from .expressions import Expression, evaluate_shape, read_expressions
 
@@ -65,9 +66,7 @@ class BoundInvocation:
         return tuple(self.values[view.id] for view in self.interface.public_views)
 
     def result(self):
-        if not self.outputs:
-            return None
-        return self.outputs[0] if len(self.outputs) == 1 else self.outputs
+        return invocation_result(self.outputs)
 
 
 class GPUInterface:
@@ -122,8 +121,11 @@ class GPUInterface:
         self.grid = read_expressions(physical["grid"])
         self.overlaps = tuple(physical["overlaps"])
         self.configuration_space = ConfigurationSpace(physical)
-        self._relations = tuple(self.public.binding_relations(explicit_outputs=mode) for mode in (False, True))
-        self._noalias_pairs = tuple(check for check in self.public.alias_checks if check.noalias)
+        self._binders = build_invocation_binders(
+            self.public, observe_view=self._observe_view, allocate_output=self._allocate_output)
+        self._abstract_binders = build_invocation_binders(
+            self.public, observe_view=self._observe_abstract_view, allocate_output=self._allocate_abstract_output,
+            check_relation=check_abstract_relation, abstract=True)
         self._host_order = self._host_bindings()
 
     def _host_bindings(self) -> tuple[MetadataArgument | CoverageBinding | WorkspaceArgument, ...]:
@@ -208,77 +210,40 @@ class GPUInterface:
         return values
 
     @staticmethod
-    def _reference(reference: int | ViewAxis, views: dict, field: str):
-        if not isinstance(reference, ViewAxis):
-            return reference
-        value = views[reference.parameter]
-        return value.shape[reference.axis] if field == "shape" else value.stride(reference.axis)
-
-    def _check_view(self, binding: ViewBinding, value, views: dict, *, device: int, abstract: bool) -> None:
+    def _observe_view(device: int, parameter: ViewParameter, value):
         import torch
+        return observe_view(parameter, value, device=torch.device("cuda", device))
 
-        parameter = binding.parameter
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(f"{parameter.name} must be a torch.Tensor")
-        expected = torch_dtype(parameter.dtype)
-        if value.dtype != expected:
-            raise TypeError(f"{parameter.name} must have dtype {expected}, got {value.dtype}")
-        if value.ndim != len(parameter.shape):
-            raise ValueError(f"{parameter.name} must have rank {len(parameter.shape)}, got {value.ndim}")
-        if value.device != torch.device("cuda", device):
-            raise ValueError(f"{parameter.name} must be on cuda:{device}, got {value.device}")
-        for field, checks in (("shape", binding.shape_checks), ("strides", binding.stride_checks)):
-            for axis, reference in checks:
-                actual = value.shape[axis] if field == "shape" else value.stride(axis)
-                required = self._reference(reference, views, field)
-                message = f"{parameter.name}.{field}[{axis}] violates the declared interface relation"
-                if abstract:
-                    torch._check(actual == required, lambda message=message: message)
-                elif actual != required:
-                    raise ValueError(message)
+    @staticmethod
+    def _allocate_output(device: int, parameter: ViewParameter, shape: tuple):
+        import torch
+        return allocate_output(parameter, shape, device=torch.device("cuda", device))
+
+    @staticmethod
+    def _observe_abstract_view(device: int, parameter: ViewParameter, value):
+        import torch
+        return observe_view(parameter, value, device=torch.device("cuda", device), abstract=True)
+
+    @staticmethod
+    def _allocate_abstract_output(device: int, parameter: ViewParameter, shape: tuple):
+        import torch
+        return allocate_output(parameter, shape, device=torch.device("cuda", device), abstract=True)
 
     def bind(self, arguments: tuple, *, device: int, outputs: tuple | None = None,
              explicit_outputs: bool = False, abstract: bool = False) -> BoundInvocation:
         import torch
 
-        relations = self._relations[bool(explicit_outputs)]
-        if len(arguments) != len(relations.supplied):
-            names = ", ".join(parameter.name for parameter in relations.supplied)
-            raise TypeError(f"expected {len(relations.supplied)} runtime arguments ({names}), got {len(arguments)}")
         if explicit_outputs and outputs is not None:
             raise TypeError("explicit arguments already contain the output buffers")
-        if outputs is not None and len(outputs) != len(self.public.outputs):
-            raise TypeError(f"expected {len(self.public.outputs)} output buffers, got {len(outputs)}")
-        public_values = {parameter.position: value for parameter, value in zip(relations.supplied, arguments)}
-        values = {self._public_bindings[position].id: value for position, value in public_values.items()}
-        bindings = {binding.parameter.position: binding for binding in relations.views}
-        for parameter in relations.supplied:
-            if isinstance(parameter, ViewParameter):
-                self._check_view(bindings[parameter.position], public_values[parameter.position], public_values,
-                                 device=device, abstract=abstract)
-        if not explicit_outputs:
-            for index, parameter in enumerate(self.public.outputs):
-                binding = bindings[parameter.position]
-                if outputs is None:
-                    if any(extent is None for extent in binding.output_shape):
-                        raise ValueError(f"cannot infer {parameter.name} output shape from supplied inputs; provide explicit output buffers")
-                    shape = tuple(self._reference(extent, public_values, "shape") for extent in binding.output_shape)
-                    output = torch.empty(shape, dtype=torch_dtype(parameter.dtype), device=torch.device("cuda", device))
-                else:
-                    output = outputs[index]
-                public_values[parameter.position] = output
-                self._check_view(binding, output, public_values, device=device, abstract=abstract)
-                values[self._public_bindings[parameter.position].id] = output
-        result = BoundInvocation(self, tuple(public_values[parameter.position] for parameter in self.public.parameters),
-                                 tuple(public_values[parameter.position] for parameter in self.public.outputs), values)
+        if outputs is not None:
+            arguments = self.public.explicit_arguments(arguments, outputs)
+            explicit_outputs = True
+        binders = self._abstract_binders if abstract else self._binders
+        public = binders[bool(explicit_outputs)](device, arguments)
+        values = {self._public_bindings[position].id: value for position, value in enumerate(public.arguments)}
+        result = BoundInvocation(self, public.arguments, public.outputs, values)
         if abstract:
             return result
-        for check in self._noalias_pairs:
-            left, right = self._public_bindings[check.left], self._public_bindings[check.right]
-            lhs, rhs = values[left.id].untyped_storage(), values[right.id].untyped_storage()
-            if check.noalias_violation((lhs.data_ptr(), lhs.data_ptr() + lhs.nbytes()),
-                                       (rhs.data_ptr(), rhs.data_ptr() + rhs.nbytes())):
-                raise ValueError(f"{left.parameter.name} and {right.parameter.name} violate the declared noalias allocation contract")
         for entry in self._host_order:
             if isinstance(entry, MetadataArgument):
                 source = values[entry.source]

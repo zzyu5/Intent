@@ -46,8 +46,8 @@ def unique_consecutive(context: Context) -> PreparedComparison:
         )
 
     def generated_outputs():
-        unique_values, returned_lengths, inverse, counts = generated_state["output"]
-        return unique_values, inverse, counts, returned_lengths
+        unique_values, inverse, counts = generated_state["output"]
+        return unique_values, inverse, counts, generated_lengths
 
     def source_launch():
         source_state["output"] = runtime.unique_consecutive(

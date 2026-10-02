@@ -25,7 +25,7 @@ class PreparedCall(Protocol):
     result() returns output containers; it does not perform synchronization.
     """
 
-    def launch(self) -> object:
+    def launch(self) -> None:
         """Execute with the bound arguments and the provider's synchronization semantics."""
         ...
 
@@ -101,7 +101,11 @@ class CompiledArtifact:
         return {"intent": self.mlir, **self.backend_ir}
 
     def run(self, *arguments: Any) -> object:
-        """Allocate declared Out buffers and execute with inputs in declaration order."""
+        """Allocate declared Out buffers and execute with inputs in declaration order.
+
+        Return None, the single Out, or an ordered tuple of Out buffers. InOut
+        updates are observed through the original arguments, not extra results.
+        """
         return self._invoke(self.runtime.run, arguments)
 
     @property
@@ -130,9 +134,9 @@ class CompiledArtifact:
         return self._invoke(lambda *args: self.runtime.prepare_call(args, outputs=outputs), arguments)
 
     def as_torch_op(self, name: str):
-        """Return a PyTorch CustomOpDef for this allocating GPU call.
+        """Return a PyTorch CustomOpDef for this allocating tensor call.
 
-        Only read-only In tensors, scalar inputs and fresh Out tensors are supported;
+        GPU and Mojo CPU calls support read-only In tensors, scalar inputs and fresh Out tensors;
         InOut and output aliases are unsupported. The fake implementation uses the
         declared interface without provider execution or data-pointer access.
         Backward is not inferred; authors may use the result's register_autograd.
@@ -150,9 +154,13 @@ class CompiledArtifact:
             )
         return self._invoke(self.runtime.tuning_configurations, arguments)
 
-    def __call__(self, *arguments: Any) -> None:
+    def launch(self, *arguments: Any) -> None:
+        """Execute with every runtime argument, including explicit Out buffers."""
         compiled_kernel = self._invoke(self.runtime.launch, arguments)
-        self._capture_backend_ir(compiled_kernel)
+        if compiled_kernel is not None:
+            self._capture_backend_ir(compiled_kernel)
+
+    __call__ = launch
 
     def _capture_backend_ir(self, compiled_kernel: object) -> None:
         if self._backend_ir_collector is not None and (

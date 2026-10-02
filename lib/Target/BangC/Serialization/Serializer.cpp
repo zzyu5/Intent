@@ -41,6 +41,12 @@ public:
       return failure();
     });
     if (failed(nativeABI)) return failure();
+    auto entry = function->getAttrOfType<dsa::EntryRequirementsAttr>(dsa::entryRequirementsAttr);
+    auto requirements = queryNativeEntryRequirements(function, interface,
+        entry.getDisjointOutputs(), [](unsigned, intent::ViewType) -> FailureOr<NativeViewRequirements> {
+          return NativeViewRequirements{NativeViewLayout::Strided, 1};
+        });
+    if (failed(requirements)) return failure();
     auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
     for (const NativeSlot &slot : nativeABI->slots) {
       std::string name = slot.name();
@@ -62,8 +68,7 @@ public:
             {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
             {"region_tile", config.getRegionTile()}, {"local_bytes", config.getLocalBytes()}}},
         {"full_extent_dimensions", std::move(fullExtents)},
-        {"native", llvm::json::Object{{"disjoint_outputs",
-            function->getAttrOfType<dsa::EntryRequirementsAttr>(dsa::entryRequirementsAttr).getDisjointOutputs()},
+        {"native", llvm::json::Object{{"requirements", requirements->serialize()},
             {"slots", nativeABI->serialize()}}}};
     out << "#pragma bang walign(" << function->getAttrOfType<IntegerAttr>("bangc.wram_align").getInt() << ")\n"
         << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";

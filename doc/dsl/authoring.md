@@ -21,7 +21,7 @@
 
 Host 的 `I.dtype(name)` 按公开 dtype 的 canonical 名称查找相同 token，例如 `I.dtype("f32")` 得到 `I.f32`，`I.dtype("i64")` 得到 `I.i64`。名称不使用 Torch 的 `float32`、`int64` 拼写；直接使用 `I.f32`、`I.i64` 等 token 同样有效。
 
-View 注解的第三个可选参数是 `I.constraints(...)`，例如 `I.Out[I.f32, ("N",), I.constraints(noalias=True)]`。不同 view 默认可以 alias；`noalias=True` 声明该 view 的底层 allocation 与其它 view 不重叠，是调用方必须满足的前置条件，不能仅凭 `Out` 访问方向推断。`alias="group"` 声明 alias group，不能与 `noalias=True` 同时指定；这些字段不改变读写方向、shape 或 dtype。
+View 注解的第三个可选参数是 `I.constraints(...)`，例如 `I.Out[I.f32, ("N",), I.constraints(noalias=True)]`。不同 view 默认可以 alias；`noalias=True` 声明该 view 的底层 allocation 与其它 view 不重叠，是调用方必须满足的前置条件，不能仅凭 `Out` 访问方向推断。相同 `alias="group"` 的 views 必须来自同一底层 allocation，可以具有不同 offset、shape，也可以是不相交的子视图；不同 group 不推出 allocation 不相交。`alias` 不能与 `noalias=True` 同时指定；这些字段不改变读写方向、shape 或 dtype。某个 target 尚不支持重叠可写 views 时须明确报告其执行能力限制，不能把它解释为语言的默认 noalias 合同。
 
 Rank-0 view 使用空索引 tuple：`value = view[()]` 读取 scalar，`view[()] = value` 写入 scalar。读写仍遵守 view 的访问方向、dtype 和先写后读规则。
 
@@ -125,6 +125,8 @@ for i in I.parallel(I.domain(0, values.shape[0])):
 ### Host 编译与调用
 
 Public 调用为 `intent.compile(kernel, compiler=..., target=..., constexprs=...)`，返回 artifact。显式调用 `artifact(...)` 按 kernel 声明顺序传入全部 runtime 参数，`Out` 保留在声明位置；`artifact.run(...)` 只省略 `Out`，其余 views 与 scalars 保持原顺序，由 runtime 分配并返回输出。例如声明顺序为 `A: In, B: Out, scale: f32` 时，调用为 `artifact(A, B, scale)` 或 `artifact.run(A, scale)`。`Constexpr` 在编译时绑定，不传入这两种 runtime 调用。
+
+`artifact.run(...)` 与 prepared call 的 `result()` 只返回声明的 `Out`：零个返回 `None`，一个返回该输出对象，多个按声明顺序返回 tuple。`InOut` 始终由调用方传入，通过原对象观察修改，不加入返回值。`artifact(...)`、`artifact.launch(...)` 与 prepared call 的 `launch()` 只执行并返回 `None`。`artifact.prepare(..., outputs=(...))` 按 `Out` 声明顺序绑定显式输出；省略 `outputs` 则分配输出。Prepare 不执行 kernel；`result()` 只取得输出容器，不执行或同步。CPU task join、GPU 当前 stream 和 MLU queue 的完成规则仍由相应 runtime 定义。
 
 Host callable 可以用普通 Python `for/while/if` 编排已经编译的 artifacts，包括重复调用同一个 artifact。每次调用都是一次 kernel invocation，runtime scalars 可随调用变化；这与在 `@intent.kernel` 内写循环不同，也不要求在 host 循环中重新编译。`Constexpr` 的绑定仍属于编译阶段。
 

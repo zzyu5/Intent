@@ -49,6 +49,7 @@ def _validate_target(artifact: dict, profile: TargetProfile) -> None:
 
 
 def validate_artifact(manifest: dict) -> None:
+    NativeABI.read(manifest["program"])
     artifact = manifest["weft"]
     _validate_target(artifact, TargetProfile(**manifest["profile"]))
     kernels = {kernel["symbol"]: kernel for kernel in artifact["kernels"]}

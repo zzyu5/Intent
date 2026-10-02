@@ -5,27 +5,14 @@ import ctypes
 from dataclasses import dataclass
 
 from ..language.dtypes import DType, dtype
-from .interface import AliasCheck, PublicInterface, ScalarParameter, ViewAxis, ViewParameter
+from .interface import AliasCheck, PublicInterface, ScalarParameter, ViewParameter
+from .invocation import ViewFacts, build_invocation_binders
+from .native_requirements import NativeRequirements
 
 
 _CARRIERS = {"ptr": ctypes.c_void_p, "bool": ctypes.c_bool,
              "i8": ctypes.c_int8, "i16": ctypes.c_int16, "i32": ctypes.c_int32,
              "i64": ctypes.c_int64, "f32": ctypes.c_float, "f64": ctypes.c_double}
-
-@dataclass(slots=True)
-class ViewFacts:
-    """Observed for one invocation; never retained as facts about a later call."""
-
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    pointer: int
-    allocation: int
-    allocation_end: int
-    offset: int
-    dtype: object
-    begin: int
-    end: int
-
 
 @dataclass(slots=True)
 class BoundArguments:
@@ -52,11 +39,12 @@ class NativeSlot:
 class NativeABI:
     """CPU/DSA pointer, extent and stride slots over the public declaration."""
 
-    def __init__(self, interface: PublicInterface, slots: tuple[NativeSlot, ...]) -> None:
+    def __init__(self, interface: PublicInterface, slots: tuple[NativeSlot, ...],
+                 requirements: NativeRequirements) -> None:
         self.interface = interface
         self.slots = slots
+        self.requirements = requirements
         self.pointer_slots = {slot.parameter.position: slot for slot in slots if slot.role == "pointer"}
-        self.alias_checks = interface.alias_checks
 
     @classmethod
     def read(cls, metadata: dict) -> NativeABI:
@@ -101,7 +89,8 @@ class NativeABI:
                 for axis in range(len(parameter.shape)):
                     if any((parameter.position, role, axis) not in seen for role in ("extent", "stride")):
                         raise ValueError("native ABI must bind the extent and stride of every view axis")
-        return cls(interface, tuple(slots))
+        requirements = NativeRequirements.read(metadata, interface)
+        return cls(interface, tuple(slots), requirements)
 
     def argument_types(self) -> tuple[object, ...]:
         return tuple(_CARRIERS[slot.carrier] for slot in self.slots)
@@ -114,13 +103,15 @@ class NativeABI:
         view_key: Callable[[ViewFacts, int], object] | None = None,
         scalar_key: Callable[[ScalarParameter, object], object] | None = None,
         scalar_argument: Callable[[ScalarParameter, object], object] | None = None,
+        check_view_requirements: Callable[[object, ViewParameter, ViewFacts], None] | None = None,
         check_dimensions: Callable[[object, dict[int, int]], None] | None = None,
     ) -> tuple[Callable[[object, tuple[object, ...]], BoundArguments], ...]:
-        """Compile the two call modes once; bind fresh invocation facts on use.
+        """Compose the common invocation binder with native slots and tuning keys.
 
-        Only ABI positions and schema constants enter the generated statements.
-        Observers are unbound methods: the callable neither retains a program
-        instance nor caches any tensor, allocation or dimension observation.
+        Both functions are compiled once from the declared interface. Each call
+        observes fresh facts, then packs only the compiler's explicit native slots.
+        check_alias enforces family entry requirements; the common binder already
+        checks the author's alias and noalias contract.
         """
         if (view_key is None) != (scalar_key is None):
             raise ValueError("a native tuning key requires both view and scalar components")
@@ -128,68 +119,28 @@ class NativeABI:
         def tuple_expression(entries: Sequence[str]) -> str:
             return "(" + ", ".join(entries) + ("," if entries else "") + ")"
 
+        public_binders = build_invocation_binders(
+            self.interface, observe_view=observe_view, allocate_output=allocate_output,
+            check_view_requirements=check_view_requirements,
+            check_alias_requirements=check_alias, check_dimensions=check_dimensions,
+        )
         result = []
-        for explicit_outputs in (False, True):
-            relations = self.interface.binding_relations(explicit_outputs=explicit_outputs)
-            supplied = relations.supplied
-            views = {binding.parameter.position: binding for binding in relations.views}
-            namespace = {"_observe": observe_view, "_allocate": allocate_output,
-                         "_BoundArguments": BoundArguments, "_check_alias": check_alias,
+        for public_bind in public_binders:
+            namespace = {"_bind_public": public_bind, "_BoundArguments": BoundArguments,
                          "_view_key": view_key, "_scalar_key": scalar_key,
-                         "_scalar_argument": scalar_argument, "_check_dimensions": check_dimensions}
+                         "_scalar_argument": scalar_argument}
             for parameter in self.interface.parameters:
                 namespace[f"_p{parameter.position}"] = parameter
             lines = [
                 "def bind(program, arguments):",
-                f"    if len(arguments) != {len(supplied)}:",
-                f"        raise TypeError(f'expected {len(supplied)} native artifact arguments, got {{len(arguments)}}')",
+                "    public = _bind_public(program, arguments)",
             ]
-            def reference(value: int | ViewAxis, field: str) -> str:
-                return f"f{value.parameter}.{field}[{value.axis}]" if isinstance(value, ViewAxis) else repr(value)
-
-            def check_view(parameter: ViewParameter, *, allocated: bool = False) -> None:
-                binding = views[parameter.position]
-                for field, checks in (("shape", binding.shape_checks), ("strides", binding.stride_checks)):
-                    for axis, expected in checks:
-                        # Fresh dynamic Out extents came from exactly this owner.
-                        if allocated and field == "shape" and parameter.shape[axis] < 0:
-                            continue
-                        lines.append(f"    if f{parameter.position}.{field}[{axis}] != {reference(expected, field)}:")
-                        lines.append(f"        raise ValueError({parameter.name + ' violates a declared ' + field + ' relation'!r})")
-
-            for position, parameter in enumerate(supplied):
+            for parameter in self.interface.parameters:
                 index = parameter.position
-                lines.append(f"    v{index} = arguments[{position}]")
                 if isinstance(parameter, ViewParameter):
-                    lines.append(f"    f{index} = _observe(program, _p{index}, v{index})")
-                    check_view(parameter)
-            if check_dimensions is not None:
-                supplied_positions = {parameter.position for parameter in supplied}
-                bindings = ", ".join(f"{identity}: {reference(value, 'shape')}" for identity, value in relations.dimensions
-                                     if value.parameter in supplied_positions)
-                lines.append(f"    _check_dimensions(program, {{{bindings}}})")
-            if not explicit_outputs:
-                for parameter in self.interface.outputs:
-                    extents = []
-                    for axis, extent in enumerate(views[parameter.position].output_shape):
-                        if extent is None:
-                            message = (
-                                f"cannot infer {parameter.name} output dimension {parameter.dimensions[axis]} "
-                                "from supplied inputs; provide explicit output buffers"
-                            )
-                            lines.append(f"    raise ValueError({message!r})")
-                            break
-                        extents.append(reference(extent, "shape"))
-                    else:
-                        index = parameter.position
-                        lines.append(f"    v{index}, f{index} = _allocate(program, _p{index}, {tuple_expression(extents)})")
-                        check_view(parameter, allocated=True)
-                        continue
-                    break
-            for index, check in enumerate(self.alias_checks):
-                namespace[f"_a{index}"] = check
-                left, right = f"f{check.left}", f"f{check.right}"
-                lines.append(f"    _check_alias(_a{index}, {left}, {right})")
+                    lines.append(f"    f{index} = public.views[{index}]")
+                else:
+                    lines.append(f"    v{index} = public.arguments[{index}]")
             native, key = [], []
             if view_key is not None:
                 lines.append("    groups = {}")
@@ -206,14 +157,13 @@ class NativeABI:
                 value, view = f"v{index}", f"f{index}"
                 if isinstance(parameter, ViewParameter):
                     if view_key is not None:
-                        lines.append(f"    g{index} = groups.setdefault({view}.allocation, len(groups))")
+                        lines.append(f"    g{index} = groups.setdefault({view}.allocation_identity, len(groups))")
                         key.append(f"_view_key({view}, g{index})")
                 else:
                     if scalar_key is not None:
                         key.append(f"_scalar_key(_p{index}, {value})")
-            values = tuple_expression([f"v{parameter.position}" for parameter in self.interface.parameters])
-            outputs = tuple_expression([f"v{parameter.position}" for parameter in self.interface.views if parameter.writable])
-            lines.append(f"    return _BoundArguments({values}, {tuple_expression(native)}, {outputs}, {tuple_expression(key)})")
+            lines.append(f"    return _BoundArguments(public.arguments, {tuple_expression(native)}, "
+                         f"public.outputs, {tuple_expression(key)})")
             code = compile("\n".join(lines) + "\n", "<intent.native.abi>", "exec", dont_inherit=True)
             exec(code, namespace)
             result.append(namespace["bind"])
@@ -228,6 +178,14 @@ class NativePreparedRuntime:
     """
 
     interface: PublicInterface
+
+    def run(self, *arguments):
+        call = self.prepare(arguments)
+        call.launch()
+        return call.result()
+
+    def launch(self, *arguments) -> None:
+        self.prepare(arguments, explicit_outputs=True).launch()
 
     def prepare_call(self, arguments: tuple, *, outputs: tuple | None = None):
         if outputs is None:

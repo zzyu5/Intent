@@ -99,10 +99,24 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
 def prepare_host_run_only(context, definition, arguments, *, constexprs=None, note):
     artifact = _compile(context, definition, constexprs=constexprs)
     state = {}
+    interface = artifact.interface
+    mutable = {parameter.position: argument
+               for parameter, argument in zip(interface.inputs, arguments, strict=True)
+               if parameter in interface.mutable_inputs}
+    observed = tuple(parameter for parameter in interface.views if parameter.writable)
 
     def launch():
         state["output"] = artifact.run(*arguments)
 
+    def outputs():
+        returned = state["output"]
+        values = () if not interface.outputs else (returned,) if len(interface.outputs) == 1 else returned
+        available = dict(mutable)
+        available.update((parameter.position, value)
+                         for parameter, value in zip(interface.outputs, values, strict=True))
+        result = tuple(available[parameter.position] for parameter in observed)
+        return result[0] if len(result) == 1 else result
+
     report_stage("adapter_preparation")
-    return PreparedComparison(PreparedLaunch(launch, lambda: state["output"]), None, None,
+    return PreparedComparison(PreparedLaunch(launch, outputs), None, None,
         cuda_graph=False, status="run_only", device_type="cpu", cpu_host_timing=True, note=note)
