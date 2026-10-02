@@ -655,7 +655,8 @@ LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
         subregions.push_back(range);
     });
     for (MakeRangeOp range : subregions) {
-      retargetSourceExtent(range.getResult(), source, parameterExtent);
+      if (failed(retargetSourceExtent(range.getResult(), source, parameterExtent)))
+        return failure();
       range->setOperand(1, materializeParameter(entry, range.getLoc(), parameter->getReference()));
     }
   }

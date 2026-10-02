@@ -1,4 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Analysis/ControlFlow.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 
@@ -51,10 +53,7 @@ public:
   ValueTypeChangeCallback typeChanged() { return callback; }
 
   void setType(Value value, Type type) {
-    Type previous = value.getType();
-    if (previous == type) return;
-    value.setType(type);
-    typeChanged(value, previous);
+    setPhysicalValueType(value, type, callback);
   }
 
   void notifyOperationInserted(Operation *operation,
@@ -137,8 +136,7 @@ private:
       push(operation, ReductionIdentity);
       push(operation, ReductionYield);
     }
-    if (isa<MakeRecordOp, ExtractOp, scf::IfOp, scf::ForOp,
-            RegionFoldOp, RegionScanOp>(operation))
+    if (hasSchemaBoundary(operation))
       push(operation, Aggregate);
     if (auto access = dyn_cast<AccessOpInterface>(operation)) {
       AccessKind kind = access.getAccessKind();
@@ -255,12 +253,14 @@ LogicalResult alignContractAccumulator(Operation *operation, RelationWorklist &c
       if (dimension <= 0)
         return owner->emitOpError(
             "contract accumulator alignment has no dimension authority");
-      retargetDimensionExtent(
+      if (failed(retargetDimensionExtent(
           result, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged());
-      retargetDimensionExtent(
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged(), &changes)))
+        return failure();
+      if (failed(retargetDimensionExtent(
           accumulator, dimension,
-          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged());
+          cast<PhysicalExprAttr>(aligned.getShape()[axis]), changes.typeChanged(), &changes)))
+        return failure();
     }
     changes.setType(accumulator, aligned);
     changes.setType(result, aligned);
@@ -377,15 +377,17 @@ WalkResult alignContractOperands(Operation *operation, RelationWorklist &changes
         if (rebindLhs) {
           auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
           Value authority = batch ? batchExtentAuthority(lhs, mapping) : lhs;
-          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
+          if (failed(retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(rhsExtent),
-                               mapping.getDimensionId(), changes.typeChanged());
+                               mapping.getDimensionId(), changes.typeChanged(), &changes)))
+            return failure();
         } else {
           auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
           Value authority = batch ? batchExtentAuthority(rhs, mapping) : rhs;
-          retargetSourceExtent(authority, sourceAxisIdentity(mapping),
+          if (failed(retargetSourceExtent(authority, sourceAxisIdentity(mapping),
                                cast<PhysicalExprAttr>(lhsExtent),
-                               mapping.getDimensionId(), changes.typeChanged());
+                               mapping.getDimensionId(), changes.typeChanged(), &changes)))
+            return failure();
         }
       }
       return success();
@@ -799,10 +801,11 @@ WalkResult alignAccessResult(Operation *operation, RelationWorklist &changes) {
       if (axis >= current.getShape().size() ||
           current.getShape()[axis] == (*refined).getShape()[axis])
         continue;
-      retargetSourceExtent(
+      if (failed(retargetSourceExtent(
           result, sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-          cast<AxisMapAttr>(mapping).getDimensionId(), changes.typeChanged());
+          cast<AxisMapAttr>(mapping).getDimensionId(), changes.typeChanged(), &changes)))
+        return WalkResult::interrupt();
     }
     changes.setType(result, *refined);
     return WalkResult::advance();
@@ -937,8 +940,9 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
               });
           if (realization.constructionScalarSeed || derivedOccurrence ||
               selectedProgramExtent) {
-            retargetSourceExtent(broadcast.getResult(),
-                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
+            if (failed(retargetSourceExtent(broadcast.getResult(),
+                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+              return WalkResult::interrupt();
             target = cast<FragmentType>(broadcast.getResult().getType());
             continue;
           }
@@ -957,8 +961,9 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
           if (input.hasExtentAuthority() && !input.constructionScalarSeed &&
               !output.hasExtentAuthority()) {
             auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
-            retargetSourceExtent(broadcast.getResult(),
-                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
+            if (failed(retargetSourceExtent(broadcast.getResult(),
+                                 sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+              return WalkResult::interrupt();
             target = cast<FragmentType>(broadcast.getResult().getType());
             continue;
           }
@@ -977,13 +982,16 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
               "broadcast extent refinement has no logical occurrence authority");
           return WalkResult::interrupt();
         }
-        if (targetParameter)
-          retargetSourceExtent(
+        if (targetParameter) {
+          if (failed(retargetSourceExtent(
               broadcast.getValue(), sourceAxisIdentity(sourceMap),
-              cast<PhysicalExprAttr>(target.getShape()[targetAxis]), std::nullopt, changes.typeChanged());
-        else
-          retargetSourceExtent(broadcast.getResult(),
-                               sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged());
+              cast<PhysicalExprAttr>(target.getShape()[targetAxis]), std::nullopt, changes.typeChanged(), &changes)))
+            return WalkResult::interrupt();
+        } else {
+          if (failed(retargetSourceExtent(broadcast.getResult(),
+                               sourceAxisIdentity(targetMap), sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+            return WalkResult::interrupt();
+        }
         source = cast<FragmentType>(broadcast.getValue().getType());
         target = cast<FragmentType>(broadcast.getResult().getType());
       }
@@ -1065,11 +1073,12 @@ WalkResult alignPointwiseValue(Operation *operation, RelationWorklist &changes) 
             "pointwise result refinement has no logical dimension authority");
         return WalkResult::interrupt();
       }
-      retargetSourceExtent(
+      if (failed(retargetSourceExtent(
           operation->getResult(0),
           sourceAxisIdentity(cast<AxisMapAttr>(target.getAxisMaps()[axis])),
           cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-          cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId(), changes.typeChanged());
+          cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId(), changes.typeChanged(), &changes)))
+        return WalkResult::interrupt();
     }
     target = *refined;
     changes.setType(operation->getResult(0), target);
@@ -1246,8 +1255,9 @@ LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) 
             projection.dimensionId != mapping.getDimensionId() ||
             coordinateType.getShape()[projection.fragmentAxis] == extent)
           continue;
-        retargetSourceExtent(coordinate, projection.source, extent,
-                             projection.dimensionId, changes.typeChanged());
+        if (failed(retargetSourceExtent(coordinate, projection.source, extent,
+                             projection.dimensionId, changes.typeChanged(), &changes)))
+          return failure();
       }
     }
     currentType = cast<FragmentType>(store.getValue().getType());
@@ -1266,9 +1276,10 @@ LogicalResult alignAccessValue(Operation *operation, RelationWorklist &changes) 
       if (dimension <= 0)
         return store.emitOpError(
             "store coordinate refinement has no logical dimension authority");
-      retargetSourceExtent(
+      if (failed(retargetSourceExtent(
           store.getValue(), sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-          cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension, changes.typeChanged());
+          cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension, changes.typeChanged(), &changes)))
+        return failure();
     }
     FailureOr<Value> value = project(builder, store.getLoc(), store.getValue(),
                                      *valueType);
@@ -1315,285 +1326,21 @@ static LogicalResult refreshReshapeRelation(ReshapeOp reshape, RelationWorklist 
 
 
 
-WalkResult alignAggregateValue(Operation *operation, RelationWorklist &changes) {
-  auto kernel = operation->getParentOfType<func::FuncOp>();
-  if (auto record = dyn_cast<MakeRecordOp>(operation)) {
-    RecordType current = record.getResult().getType();
-    SmallVector<Attribute> fields;
-    fields.reserve(record.getFields().size());
-    for (Value field : record.getFields())
-      fields.push_back(TypeAttr::get(field.getType()));
-    changes.setType(record.getResult(), RecordType::get(
-        kernel.getContext(), current.getFieldNames(),
-        ArrayAttr::get(kernel.getContext(), fields), current.getOwner()));
-    return WalkResult::advance();
-  }
-  std::function<FailureOr<Type>(Type, Type, Type)> joinTypes =
-      [&](Type current, Type lhs, Type rhs) -> FailureOr<Type> {
-    if (auto lhsFragment = dyn_cast<FragmentType>(lhs)) {
-      auto rhsFragment = dyn_cast<FragmentType>(rhs);
-      auto currentFragment = dyn_cast<FragmentType>(current);
-      if (!rhsFragment || !currentFragment ||
-          lhsFragment.getElementType() != rhsFragment.getElementType() ||
-          lhsFragment.getElementType() != currentFragment.getElementType() ||
-          lhsFragment.getShape().size() != rhsFragment.getShape().size() ||
-          lhsFragment.getShape().size() != currentFragment.getShape().size() ||
-          lhsFragment.getAxisMaps() != rhsFragment.getAxisMaps() ||
-          lhsFragment.getValidity() != rhsFragment.getValidity() ||
-          lhsFragment.getOwner() != rhsFragment.getOwner())
-        return failure();
-      SmallVector<Attribute> shape;
-      for (auto [left, right] :
-           llvm::zip(lhsFragment.getShape(), rhsFragment.getShape())) {
-        if (left == right) {
-          shape.push_back(left);
-          continue;
-        }
-        auto leftExtent = cast<PhysicalExprAttr>(left);
-        auto rightExtent = cast<PhysicalExprAttr>(right);
-        bool leftUnit =
-            leftExtent.getKind() ==
-                PhysicalExprKind::Constant &&
-            leftExtent.getValue() == 1;
-        bool rightUnit =
-            rightExtent.getKind() ==
-                PhysicalExprKind::Constant &&
-            rightExtent.getValue() == 1;
-        if (leftUnit == rightUnit)
-          return failure();
-        shape.push_back(leftUnit ? right : left);
-      }
-      return Type(FragmentType::get(
-          kernel.getContext(), lhsFragment.getElementType(),
-          ArrayAttr::get(kernel.getContext(), shape), lhsFragment.getAxisMaps(),
-          lhsFragment.getValidity(), lhsFragment.getOwner()));
-    }
-    auto lhsRecord = dyn_cast<RecordType>(lhs);
-    auto rhsRecord = dyn_cast<RecordType>(rhs);
-    auto currentRecord = dyn_cast<RecordType>(current);
-    if (lhsRecord || rhsRecord || currentRecord) {
-      if (!lhsRecord || !rhsRecord || !currentRecord ||
-          lhsRecord.getFieldNames() != rhsRecord.getFieldNames() ||
-          lhsRecord.getFieldNames() != currentRecord.getFieldNames() ||
-          lhsRecord.getFieldTypes().size() != rhsRecord.getFieldTypes().size() ||
-          lhsRecord.getFieldTypes().size() !=
-              currentRecord.getFieldTypes().size() ||
-          lhsRecord.getOwner() != rhsRecord.getOwner())
-        return failure();
-      SmallVector<Attribute> fields;
-      for (auto [base, left, right] :
-           llvm::zip(currentRecord.getFieldTypes(), lhsRecord.getFieldTypes(),
-                     rhsRecord.getFieldTypes())) {
-        FailureOr<Type> joined = joinTypes(
-            cast<TypeAttr>(base).getValue(), cast<TypeAttr>(left).getValue(),
-            cast<TypeAttr>(right).getValue());
-        if (failed(joined))
-          return failure();
-        fields.push_back(TypeAttr::get(*joined));
-      }
-      return Type(RecordType::get(
-          kernel.getContext(), lhsRecord.getFieldNames(),
-          ArrayAttr::get(kernel.getContext(), fields), lhsRecord.getOwner()));
-    }
-    return current == lhs && lhs == rhs ? FailureOr<Type>(current)
-                                        : FailureOr<Type>(failure());
-  };
-  if (auto branch = dyn_cast<scf::IfOp>(operation)) {
-    if (branch.getNumResults() == 0)
-      return WalkResult::advance();
-    auto thenYield = dyn_cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
-    auto elseYield = dyn_cast<scf::YieldOp>(branch.elseBlock()->getTerminator());
-    if (!thenYield || !elseYield ||
-        thenYield.getResults().size() != branch.getNumResults() ||
-        elseYield.getResults().size() != branch.getNumResults())
-      return WalkResult::interrupt();
-    for (unsigned index = 0; index < branch.getNumResults(); ++index) {
-      Value leftValue = thenYield.getResults()[index];
-      Value rightValue = elseYield.getResults()[index];
-      Type leftType = leftValue.getType(), rightType = rightValue.getType();
-      UniformValueAnalysis uniform(describeUniformValue);
-      bool leftUniform = static_cast<bool>(uniform.evaluate(leftValue));
-      bool rightUniform = static_cast<bool>(uniform.evaluate(rightValue));
-      if (leftUniform != rightUniform) {
-        Type &uniformType = leftUniform ? leftType : rightType;
-        if (auto fragment = dyn_cast<FragmentType>(uniformType)) {
-          // A uniform branch adopts the other branch's selected physical
-          // extents, while retaining its axis, dtype and ownership obligations.
-          auto unit = PhysicalExprAttr::get(
-              kernel.getContext(), PhysicalExprKind::Constant,
-              1, StringAttr::get(kernel.getContext(), ""),
-              ArrayAttr::get(kernel.getContext(), {}));
-          SmallVector<Attribute> units(fragment.getShape().size(), unit);
-          uniformType = FragmentType::get(
-              kernel.getContext(), fragment.getElementType(),
-              ArrayAttr::get(kernel.getContext(), units), fragment.getAxisMaps(),
-              fragment.getValidity(), fragment.getOwner());
-        }
-      }
-      FailureOr<Type> target = joinTypes(
-          branch.getResult(index).getType(), leftType, rightType);
-      if (failed(target)) {
-        branch.emitOpError(
-            "control-flow branches have no unique physical result relation")
-            << "; result_index=" << index
-            << "; then=" << thenYield.getResults()[index].getType()
-            << "; else=" << elseYield.getResults()[index].getType();
-        return WalkResult::interrupt();
-      }
-      OpBuilder thenBuilder(thenYield);
-      thenBuilder.setListener(&changes);
-      FailureOr<Value> projectedThen = projectPhysicalValueToSchema(
-          thenBuilder, branch.getLoc(), thenYield.getResults()[index], *target, changes.typeChanged());
-      OpBuilder elseBuilder(elseYield);
-      elseBuilder.setListener(&changes);
-      FailureOr<Value> projectedElse = projectPhysicalValueToSchema(
-          elseBuilder, branch.getLoc(), elseYield.getResults()[index], *target, changes.typeChanged());
-      if (failed(projectedThen) || failed(projectedElse)) {
-        branch.emitOpError(
-            "control-flow branch cannot adopt its joined physical relation")
-            << "; result_index=" << index << "; target=" << *target;
-        return WalkResult::interrupt();
-      }
-      thenYield->setOperand(index, *projectedThen);
-      elseYield->setOperand(index, *projectedElse);
-      changes.setType(branch.getResult(index), *target);
-    }
-    return WalkResult::advance();
-  }
-  if (isa<RegionFoldOp, RegionScanOp>(operation)) {
-    auto structured = cast<StructuredOpInterface>(operation);
-    if (failed(verifyStructuredArity(structured))) return WalkResult::interrupt();
-    OpBuilder builder(operation);
-    builder.setListener(&changes);
-    for (const StructuredSchemaGroup &group : queryStructuredSchemaGroups(operation)) {
-      Type target = group.producer->get().getType();
-      SmallVector<std::pair<int64_t, PhysicalExprAttr>> dimensions;
-      std::function<LogicalResult(Type)> collectDimensions =
-          [&](Type type) -> LogicalResult {
-        if (auto fragment = dyn_cast<FragmentType>(type)) {
-          for (auto [axis, mapping] :
-               llvm::enumerate(fragment.getAxisMaps())) {
-            int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
-            if (dimension <= 0)
-              continue;
-            auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-            auto found = llvm::find_if(dimensions, [&](const auto &entry) {
-              return entry.first == dimension;
-            });
-            if (found != dimensions.end()) {
-              if (found->second != extent)
-                return failure();
-              continue;
-            }
-            dimensions.emplace_back(dimension, extent);
-          }
-          return success();
-        }
-        if (auto record = dyn_cast<RecordType>(type))
-          for (Attribute field : record.getFieldTypes())
-            if (failed(collectDimensions(cast<TypeAttr>(field).getValue())))
-              return failure();
-        return success();
-      };
-      if (failed(collectDimensions(target))) {
-        operation->emitOpError(
-            "structured component has conflicting physical dimension extents")
-            << "; seed_operand=" << group.seedOperand << "; schema=" << target;
-        return WalkResult::interrupt();
-      }
-      for (auto [dimension, extent] : dimensions) {
-        for (Value result : group.results)
-          retargetDimensionExtent(result, dimension, extent, changes.typeChanged());
-        for (BlockArgument argument : group.arguments)
-          retargetDimensionExtent(argument, dimension, extent, changes.typeChanged());
-      }
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, operation->getLoc(), operation->getOperand(group.seedOperand),
-          target, changes.typeChanged());
-      if (failed(projected)) {
-        operation->emitOpError(
-            "structured seed cannot adopt its producer schema")
-            << "; seed_operand=" << group.seedOperand;
-        return WalkResult::interrupt();
-      }
-      operation->setOperand(group.seedOperand, *projected);
-      for (Value result : group.results) changes.setType(result, target);
-      for (BlockArgument argument : group.arguments) changes.setType(argument, target);
-      for (OpOperand *yield : group.yields) {
-        OpBuilder yieldBuilder(yield->getOwner());
-        yieldBuilder.setListener(&changes);
-        auto projectedYield = projectPhysicalValueToSchema(
-            yieldBuilder, yield->getOwner()->getLoc(), yield->get(), target,
-            changes.typeChanged());
-        if (failed(projectedYield)) {
-          operation->emitOpError("structured combine cannot adopt its producer schema")
-              << "; seed_operand=" << group.seedOperand;
-          return WalkResult::interrupt();
-        }
-        yield->set(*projectedYield);
-      }
-    }
-    return WalkResult::advance();
-  }
-  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    if (!yield || yield.getResults().size() != loop.getInitArgs().size())
-      return WalkResult::interrupt();
-    for (unsigned index = 0; index < loop.getInitArgs().size(); ++index) {
-      Value init = loop.getInitArgs()[index];
-      Value yielded = yield.getResults()[index];
-      // The loop-body update is the executable relation selected by the
-      // transformation that produced it.  The init value is an identity/seed
-      // at the structural boundary and must be projected to that relation; the
-      // boundary must not rank shapes or independently choose a competing one.
-      Type target = yielded.getType();
-      OpBuilder initBuilder(loop);
-      initBuilder.setListener(&changes);
-      FailureOr<Value> projectedInit = projectPhysicalValueToSchema(
-          initBuilder, loop.getLoc(), init, target, changes.typeChanged());
-      OpBuilder yieldBuilder(yield);
-      yieldBuilder.setListener(&changes);
-      FailureOr<Value> projectedYield = projectPhysicalValueToSchema(
-          yieldBuilder, loop.getLoc(), yielded, target, changes.typeChanged());
-      if (failed(projectedInit) || failed(projectedYield)) {
-        loop.emitOpError(
-            "loop-carried value cannot adopt its unique physical relation")
-            << "; init=" << init.getType() << "; yield=" << yielded.getType()
-            << "; target=" << target;
-        return WalkResult::interrupt();
-      }
-      loop.getInitArgsMutable()[index].assign(*projectedInit);
-      yield->setOperand(index, *projectedYield);
-      changes.setType(loop.getRegionIterArgs()[index], target);
-      changes.setType(loop.getResult(index), target);
-    }
-    return WalkResult::advance();
-  }
-  // Structured arguments/results are the record-schema authority.  Refresh
-  // projections only after those schemas have been aligned; doing this before
-  // the region owner leaves combine-body fields one refinement behind.
-  if (auto extract = dyn_cast<ExtractOp>(operation)) {
-    RecordType record = extract.getRecord().getType();
-    if (extract.getField() < record.getFieldTypes().size())
-      changes.setType(extract.getResult(),
-          cast<TypeAttr>(record.getFieldTypes()[extract.getField()]).getValue());
-  }
-  return WalkResult::advance();
-}
-
-static void retargetExtent(Value root, AxisSelector selects,
+static LogicalResult retargetExtent(Value root, AxisSelector selects,
                            PhysicalExprAttr extent,
                            bool followLogicalDimension,
-                           ValueTypeChangeCallback changed) {
+                           ValueTypeChangeCallback changed,
+                           OpBuilder::Listener *listener) {
   SmallVector<Attribute> previousExtents;
   collectSelectedExtents(root.getType(), selects, previousExtents);
   if (previousExtents.empty())
-    return;
+    return success();
   SmallVector<Attribute> connectedExtents(previousExtents.begin(),
                                           previousExtents.end());
   if (!llvm::is_contained(connectedExtents, Attribute(extent)))
     connectedExtents.push_back(extent);
   SmallVector<Value> worklist{root};
+  llvm::SetVector<Value> boundaries;
   llvm::DenseMap<Value, Type> visitedTypes;
   SmallVector<std::pair<Value, AxisMapAttr>> valueAliases;
   auto isSegmentSourceSlice = [&](Value value) {
@@ -1660,15 +1407,14 @@ static void retargetExtent(Value root, AxisSelector selects,
       Type replacement = replaceExtent(value.getType(), replaceableAxis,
                                        replaceableExtents, extent);
       if (replacement != value.getType()) {
-        Type previous = value.getType();
-        value.setType(replacement);
-        if (changed) changed(value, previous);
+        setPhysicalValueType(value, replacement, changed);
         // A make_range owns both the fragment schema and the SSA extent used
         // to materialize that schema.  Retarget them from the same physical
         // decision; leaving the operand behind creates two executable
         // authorities for one traversal.
         if (auto range = value.getDefiningOp<MakeRangeOp>()) {
           OpBuilder builder(range);
+          builder.setListener(listener);
           Value physicalExtent;
           if (extent.getKind() ==
               PhysicalExprKind::Constant)
@@ -1686,10 +1432,8 @@ static void retargetExtent(Value root, AxisSelector selects,
     // result uses.  A blocking decision for one provenance axis must cross
     // those boundaries; otherwise an operation can retain two physical
     // schemas for one summary/carry value.
-    if (auto record = value.getDefiningOp<MakeRecordOp>())
-      worklist.append(record.getFields().begin(), record.getFields().end());
-    if (auto extract = value.getDefiningOp<ExtractOp>())
-      worklist.push_back(extract.getRecord());
+    if (isa_and_nonnull<MakeRecordOp, ExtractOp>(value.getDefiningOp()))
+      boundaries.insert(value);
     if (Operation *producer = value.getDefiningOp();
         isa_and_nonnull<FragmentOpInterface>(producer)) {
       auto relations = queryFragmentOperandRelations(producer);
@@ -1698,52 +1442,27 @@ static void retargetExtent(Value root, AxisSelector selects,
           if (relation.preservesSourceSchema)
             worklist.push_back(producer->getOperand(relation.operandNumber));
     }
-    if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (auto argument = dyn_cast<BlockArgument>(value))
       if (auto structured = dyn_cast<StructuredOpInterface>(argument.getOwner()->getParentOp()))
         appendStructuredRelations(structured, argument, worklist, selects, StructuredBoundary::Parent);
-      auto loop = dyn_cast_or_null<scf::ForOp>(
-          argument.getOwner()->getParentOp());
-      if (loop)
-        for (auto [index, iterArgument] :
-             llvm::enumerate(loop.getRegionIterArgs()))
-          if (argument == iterArgument) {
-            worklist.push_back(loop.getInitArgs()[index]);
-            worklist.push_back(loop.getResult(index));
-          }
-      if (auto whileLoop = dyn_cast<scf::WhileOp>(argument.getOwner()->getParentOp())) {
-        unsigned index = argument.getArgNumber();
-        if (argument.getOwner() == &whileLoop.getBefore().front()) {
-          worklist.push_back(whileLoop.getInits()[index]);
-          worklist.push_back(whileLoop.getAfter().front().getTerminator()->getOperand(index));
-        } else {
-          auto condition = cast<scf::ConditionOp>(whileLoop.getBefore().front().getTerminator());
-          worklist.push_back(condition.getArgs()[index]);
-          worklist.push_back(whileLoop.getResult(index));
-        }
+    Operation *boundaryOwner = value.getDefiningOp();
+    if (!boundaryOwner) boundaryOwner = cast<BlockArgument>(value).getOwner()->getParentOp();
+    bool controlTarget = isa<RegionBranchOpInterface>(boundaryOwner);
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      controlTarget |= !argument.getOwner()->isEntryBlock();
+    if (controlTarget) {
+      auto incoming = queryControlFlowIncoming(value);
+      if (!incoming.complete)
+        return boundaryOwner->emitOpError("cannot retarget a produced or unknown control schema slot");
+      boundaries.insert(value);
+      for (const ControlFlowEdge &edge : incoming.edges) {
+        if (!edge.operand) return failure();
+        auto outgoing = queryControlFlowOutgoing(*edge.operand);
+        if (!outgoing.complete) return failure();
+        for (const ControlFlowEdge &successor : outgoing.edges)
+          worklist.push_back(successor.target);
       }
     }
-    if (auto loop = value.getDefiningOp<scf::ForOp>())
-      for (auto [index, result] : llvm::enumerate(loop.getResults()))
-        if (value == result) {
-          worklist.push_back(loop.getInitArgs()[index]);
-          worklist.push_back(loop.getRegionIterArgs()[index]);
-          worklist.push_back(loop.getBody()->getTerminator()->getOperand(index));
-        }
-    if (auto loop = value.getDefiningOp<scf::WhileOp>()) {
-      unsigned index = cast<OpResult>(value).getResultNumber();
-      auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
-      worklist.push_back(condition.getArgs()[index]);
-      worklist.push_back(loop.getAfterArguments()[index]);
-    }
-    if (auto branch = value.getDefiningOp<scf::IfOp>())
-      for (auto [index, result] : llvm::enumerate(branch.getResults())) {
-        if (value != result)
-          continue;
-        auto thenYield = cast<scf::YieldOp>(branch.thenBlock()->getTerminator());
-        auto elseYield = cast<scf::YieldOp>(branch.elseBlock()->getTerminator());
-        worklist.push_back(thenYield.getResults()[index]);
-        worklist.push_back(elseYield.getResults()[index]);
-      }
     if (auto structured = dyn_cast_or_null<StructuredOpInterface>(value.getDefiningOp()))
       appendStructuredRelations(structured, value, worklist, selects, StructuredBoundary::Result);
     for (OpOperand &use : value.getUses()) {
@@ -1772,13 +1491,10 @@ static void retargetExtent(Value root, AxisSelector selects,
                            llvm::PowerOf2Ceil(static_cast<uint64_t>(oldExtent.getValue()));
               });
           if (padding) {
-            Type previous = buffer.getResult().getType();
-            buffer.getResult().setType(BufferType::get(
+            setPhysicalValueType(buffer.getResult(), BufferType::get(
                 storage.getContext(), storage.getElementType(), initial.getShape(),
                 storage.getScope(), storage.getInstance(), storage.getOwner(),
-                storage.getInitialization(), storage.getVisibility()));
-            if (changed && previous != buffer.getResult().getType())
-              changed(buffer.getResult(), previous);
+                storage.getInitialization(), storage.getVisibility()), changed);
           }
         }
       }
@@ -1828,42 +1544,14 @@ static void retargetExtent(Value root, AxisSelector selects,
                                   selects, StructuredBoundary::Child, &use);
         continue;
       }
-      if (auto loop = dyn_cast<scf::ForOp>(user))
-        for (auto [index, init] : llvm::enumerate(loop.getInitArgs()))
-          if (value == init) {
-            worklist.push_back(loop.getRegionIterArgs()[index]);
-            worklist.push_back(loop.getResult(index));
-          }
-      if (auto loop = dyn_cast<scf::WhileOp>(user))
-        for (auto [index, init] : llvm::enumerate(loop.getInits()))
-          if (value == init)
-            worklist.push_back(loop.getBeforeArguments()[index]);
-      if (auto condition = dyn_cast<scf::ConditionOp>(user)) {
-        auto loop = cast<scf::WhileOp>(condition->getParentOp());
-        for (auto [index, argument] : llvm::enumerate(condition.getArgs()))
-          if (value == argument) {
-            worklist.push_back(loop.getAfterArguments()[index]);
-            worklist.push_back(loop.getResult(index));
-          }
-      }
-      if (auto yield = dyn_cast<scf::YieldOp>(user)) {
-        if (auto loop = dyn_cast<scf::WhileOp>(yield->getParentOp()))
-          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
-            if (value == yielded) {
-              worklist.push_back(loop.getInits()[index]);
-              worklist.push_back(loop.getBeforeArguments()[index]);
-            }
-        if (auto loop = dyn_cast_or_null<scf::ForOp>(yield->getParentOp()))
-          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
-            if (value == yielded) {
-              worklist.push_back(loop.getInitArgs()[index]);
-              worklist.push_back(loop.getRegionIterArgs()[index]);
-              worklist.push_back(loop.getResult(index));
-            }
-        if (auto branch = dyn_cast_or_null<scf::IfOp>(yield->getParentOp()))
-          for (auto [index, yielded] : llvm::enumerate(yield.getOperands()))
-            if (value == yielded)
-              worklist.push_back(branch.getResult(index));
+      if (isa<RegionBranchOpInterface, RegionBranchTerminatorOpInterface,
+              BranchOpInterface>(user)) {
+        auto outgoing = queryControlFlowOutgoing(use);
+        if (!outgoing.complete)
+          return user->emitOpError("cannot retarget an unknown control successor slot");
+        for (const ControlFlowEdge &edge : outgoing.edges)
+          worklist.push_back(edge.target);
+        continue;
       }
       if (isa<YieldOp>(user))
         if (auto structured = dyn_cast<StructuredOpInterface>(user->getParentOp()))
@@ -1884,25 +1572,30 @@ static void retargetExtent(Value root, AxisSelector selects,
         worklist.push_back(result);
     }
   }
+  for (Value boundary : boundaries)
+    if (failed(projectSchemaBoundary(boundary, changed, listener))) return failure();
   for (auto [value, axis] : valueAliases) {
     auto type = cast<FragmentType>(value.getType());
     if (type.getShape()[axis.getFragmentAxis()] == extent)
       continue;
-    retargetExtent(
+    if (failed(retargetExtent(
         value,
         [=](AxisMapAttr mapping) {
           return sourceAxisIdentity(mapping) == sourceAxisIdentity(axis) &&
                  mapping.getDimensionId() == axis.getDimensionId();
         },
-        extent, /*followLogicalDimension=*/false, changed);
+        extent, /*followLogicalDimension=*/false, changed, listener)))
+      return failure();
   }
+  return success();
 }
 
-void retargetSourceExtent(Value root, PhysicalSourceAxis source,
+LogicalResult retargetSourceExtent(Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent,
                           std::optional<int64_t> dimension,
-                          ValueTypeChangeCallback changed) {
-  retargetExtent(
+                          ValueTypeChangeCallback changed,
+                          OpBuilder::Listener *listener) {
+  return retargetExtent(
       root,
       [=](AxisMapAttr mapping) {
         return mapping.getSourceId() == source.sourceId &&
@@ -1910,19 +1603,20 @@ void retargetSourceExtent(Value root, PhysicalSourceAxis source,
                mapping.getDerived() == source.derived &&
                (!dimension || mapping.getDimensionId() == *dimension);
       },
-      extent, /*followLogicalDimension=*/false, changed);
+      extent, /*followLogicalDimension=*/false, changed, listener);
 }
 
-void retargetDimensionExtent(Value root, int64_t dimensionId,
+LogicalResult retargetDimensionExtent(Value root, int64_t dimensionId,
                              PhysicalExprAttr extent,
-                             ValueTypeChangeCallback changed) {
+                             ValueTypeChangeCallback changed,
+                           OpBuilder::Listener *listener) {
   if (dimensionId <= 0)
-    return;
-  retargetExtent(root,
+    return success();
+  return retargetExtent(root,
                  [=](AxisMapAttr mapping) {
                    return mapping.getDimensionId() == dimensionId;
                  },
-                 extent, /*followLogicalDimension=*/true, changed);
+                 extent, /*followLogicalDimension=*/true, changed, listener);
 }
 
 WalkResult alignStructuredCaptures(Operation *operation, RelationWorklist &changes) {
@@ -1974,8 +1668,9 @@ WalkResult alignStructuredCaptures(Operation *operation, RelationWorklist &chang
       auto mapping = cast<AxisMapAttr>(attribute);
       if (mapping.getDimensionId() <= 0)
         continue;
-      retargetDimensionExtent(argument, mapping.getDimensionId(),
-                              cast<PhysicalExprAttr>(authority.getShape()[axis]), changes.typeChanged());
+      if (failed(retargetDimensionExtent(argument, mapping.getDimensionId(),
+                              cast<PhysicalExprAttr>(authority.getShape()[axis]), changes.typeChanged(), &changes)))
+        return failure();
     }
     return capture.getType() == argument.getType()
                ? success()
@@ -2060,7 +1755,7 @@ LogicalResult RelationWorklist::run() {
     case Captures: status = checked(alignStructuredCaptures(operation, *this)); break;
     case ReductionResult: status = checked(alignReductionResultRelation(operation, *this)); break;
     case ReductionIdentity: status = checked(alignReductionIdentityRelation(operation, *this)); break;
-    case Aggregate: status = checked(alignAggregateValue(operation, *this)); break;
+    case Aggregate: status = closeSchemaBoundary(operation, typeChanged(), this); break;
     case AccessResult: status = checked(alignAccessResult(operation, *this)); break;
     case Pointwise: status = checked(alignPointwiseValue(operation, *this)); break;
     case ReductionYield: status = checked(alignReductionYield(operation, *this)); break;

@@ -254,11 +254,17 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
         replay.map(scan.getSources().front(), sourceSlice);
         auto local = cast<ScanOp>(nested.clone(*scan, replay));
         local.setInclusive(true);
-        retargetSourceExtent(local.getResult(0), source, extent);
+        if (failed(retargetSourceExtent(local.getResult(0), source, extent))) {
+          failedBody = true;
+          return;
+        }
         IRMapping combine;
         Block &body = local.getCombine().front();
         for (BlockArgument argument : body.getArguments())
-          retargetSourceExtent(argument, source, extent);
+          if (failed(retargetSourceExtent(argument, source, extent))) {
+            failedBody = true;
+            return;
+          }
         combine.map(body.getArgument(0), lift(carry.front()));
         combine.map(body.getArgument(1), local.getResult(0));
         for (Operation &operation : body.without_terminator())

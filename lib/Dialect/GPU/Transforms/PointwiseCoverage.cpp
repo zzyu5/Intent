@@ -294,10 +294,11 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
           !(sourceAxisIdentity(range) == sourceAxis))
         return range.emitOpError(
             "subregion scan source has incompatible physical ranges");
-      retargetSourceExtent(range.getResult(), sourceAxis, chunkExtent);
+      if (failed(retargetSourceExtent(range.getResult(), sourceAxis,
+                                      chunkExtent)))
+        return failure();
     }
-    retargetDimensionExtent(source, dimension, chunkExtent);
-    return success();
+    return retargetDimensionExtent(source, dimension, chunkExtent);
   }
   if (failed(dimensionArgument(kernel, dimension))) {
     FailureOr<int64_t> staticExtent =
@@ -316,10 +317,10 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
           range->hasAttr(sourceSubregionAttr))
         return range.emitOpError(
             "static scan source range does not match its logical dimension");
-      retargetDimensionExtent(range.getResult(), dimension, covered);
+      if (failed(retargetDimensionExtent(range.getResult(), dimension, covered)))
+        return failure();
     }
-    retargetDimensionExtent(source, dimension, covered);
-    return success();
+    return retargetDimensionExtent(source, dimension, covered);
   }
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
   ParameterAttr parameter = lookupParameter(kernel, StringAttr::get(kernel.getContext(), parameterName));
@@ -350,9 +351,11 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
         range->hasAttr(sourceSubregionAttr))
       return range.emitOpError(
           "scan source range does not match its full-coverage dimension");
-    retargetDimensionExtent(range.getResult(), dimension, covered);
+    if (failed(retargetDimensionExtent(range.getResult(), dimension, covered)))
+      return failure();
   }
-  retargetDimensionExtent(source, dimension, covered);
+  if (failed(retargetDimensionExtent(source, dimension, covered)))
+    return failure();
   if (failed(
           bindFullCoverageDimension(kernel, dimension,
               materializeParameter(builder, source.getLoc(), parameter.getReference()))))
@@ -384,9 +387,9 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
         extent.getValue() < *bound)
       return realizeFullCoverageDimension(kernel, source, axis);
     for (MakeRangeOp range : ranges.roots)
-      retargetSourceExtent(range.getResult(), sourceAxis, extent);
-    retargetSourceExtent(source, sourceAxis, extent);
-    return success();
+      if (failed(retargetSourceExtent(range.getResult(), sourceAxis, extent)))
+        return failure();
+    return retargetSourceExtent(source, sourceAxis, extent);
   }
   return realizeFullCoverageDimension(kernel, source, axis);
 }
@@ -613,8 +616,9 @@ LogicalResult addTailValidity(func::FuncOp kernel,
         auto blockedExtent =
             cast<PhysicalExprAttr>(rangeType.getShape()[0]);
         if (HistogramOp histogram = histogramSource(payload)) {
-          retargetDimensionExtent(histogram.getResult(), *dimension,
-                                  blockedExtent);
+          if (failed(retargetDimensionExtent(histogram.getResult(), *dimension,
+                                            blockedExtent)))
+            return failure();
           payload = store.getValue();
           valueType = dyn_cast<FragmentType>(payload.getType());
           if (!valueType)
@@ -884,8 +888,9 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
         return range.emitOpError("static traversal extent exceeds index range");
       physicalExtent = expression(kernel.getContext(),
                                   PhysicalExprKind::Constant, covered);
-      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                           physicalExtent);
+      if (failed(retargetSourceExtent(range.getResult(),
+                                      sourceAxisIdentity(range), physicalExtent)))
+        return failure();
       fragment = cast<FragmentType>(range.getResult().getType());
     }
     auto fixedExtent = constantPhysicalExpression(physicalExtent);
@@ -899,10 +904,14 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
       physicalExtent = expression(kernel.getContext(),
                                   PhysicalExprKind::Constant, padded);
       auto dimension = queryRangeDimension(range);
-      if (succeeded(dimension))
-        retargetDimensionExtent(range.getResult(), *dimension, physicalExtent);
-      else
-        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), physicalExtent);
+      LogicalResult retargeted =
+          succeeded(dimension)
+              ? retargetDimensionExtent(range.getResult(), *dimension,
+                                        physicalExtent)
+              : retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                     physicalExtent);
+      if (failed(retargeted))
+        return failure();
       fragment = cast<FragmentType>(range.getResult().getType());
     }
     if (!fixedSubregion && reuseTraversalRanges.contains(range.getOperation())) {

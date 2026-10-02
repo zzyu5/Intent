@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/SchemaMutation.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
@@ -429,47 +430,28 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
                  : type;
 }
 
-void bindClonedOperationTypes(Operation *root,
-                              ArrayRef<ExtentBinding> bindings) {
-  std::function<void(Operation *)> bind = [&](Operation *operation) {
-    for (Value result : operation->getResults()) {
-      Type replacement =
-          bindPhysicalExtents(result.getType(), bindings, operation);
-      result.setType(replacement);
-    }
-    if (auto range = dyn_cast<MakeRangeOp>(operation)) {
-      auto originalExtent =
-          range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
-      bool coveredIntroducedUnitDomain =
-          originalExtent && originalExtent.value() == 1 &&
-          samePhysicalScalarExpression(range.getStart(),
-                                       range.getLogicalStart()) &&
-          samePhysicalScalarExpression(range.getExtent(),
-                                       range.getLogicalStop());
-      auto fragment = cast<FragmentType>(range.getResult().getType());
-      auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
-      OpBuilder builder(range);
-      Value physicalExtent;
-      if (extent.getKind() ==
-          PhysicalExprKind::Constant)
-        physicalExtent = builder.create<arith::ConstantIndexOp>(
-            range.getLoc(), extent.getValue());
-      else
-        physicalExtent = builder.create<PhysicalExprOp>(
-            range.getLoc(), builder.getIndexType(), extent);
-      range.getExtentMutable().assign(physicalExtent);
-      if (coveredIntroducedUnitDomain)
-        range->setOperand(4, physicalExtent);
-    }
-    for (Region &region : operation->getRegions())
-      for (Block &block : region) {
-        for (BlockArgument argument : block.getArguments())
-          argument.setType(bindPhysicalExtents(argument.getType(), bindings));
-        for (Operation &nested : block)
-          bind(&nested);
-      }
-  };
-  bind(root);
+void bindClonedRanges(Operation *root) {
+  root->walk([&](MakeRangeOp range) {
+    auto originalExtent =
+        range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
+    bool coveredIntroducedUnitDomain =
+        originalExtent && originalExtent.value() == 1 &&
+        samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) &&
+        samePhysicalScalarExpression(range.getExtent(), range.getLogicalStop());
+    auto fragment = cast<FragmentType>(range.getResult().getType());
+    auto extent = cast<PhysicalExprAttr>(fragment.getShape()[0]);
+    OpBuilder builder(range);
+    Value physicalExtent;
+    if (extent.getKind() == PhysicalExprKind::Constant)
+      physicalExtent = builder.create<arith::ConstantIndexOp>(
+          range.getLoc(), extent.getValue());
+    else
+      physicalExtent = builder.create<PhysicalExprOp>(
+          range.getLoc(), builder.getIndexType(), extent);
+    range.getExtentMutable().assign(physicalExtent);
+    if (coveredIntroducedUnitDomain)
+      range->setOperand(4, physicalExtent);
+  });
 }
 
 FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &region,
@@ -563,43 +545,32 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     if (operation.getNumResults() == 1 &&
         mapping.lookupOrNull(operation.getResult(0)))
       continue;
-    // Read the original operation's coordinate contract before its cloned
-    // operands and result schemas acquire the selected segment extents.
-    SmallVector<SmallVector<FragmentOperandRelation>> relations;
-    if (isa<FragmentOpInterface>(operation)) {
-      for (OpResult result : operation.getResults()) {
-        auto relation = queryFragmentOperandRelations(result);
-        if (failed(relation)) {
-          reason = "helper value operation has no complete fragment relation";
-          return failure();
-        }
-        relations.push_back(std::move(*relation));
-      }
-    }
+    SmallVector<Type> selectedTypes;
+    for (Value result : operation.getResults())
+      selectedTypes.push_back(bindPhysicalExtents(result.getType(), extentBindings,
+                                                 &operation));
     Operation *clone = builder.clone(operation, mapping);
-    bindClonedOperationTypes(clone, extentBindings);
-    for (auto [index, relation] : llvm::enumerate(relations)) {
+    if (failed(rewriteClonedPhysicalTypes(&operation, clone, [&](Value original) {
+          return bindPhysicalExtents(original.getType(), extentBindings,
+                                     original.getDefiningOp());
+        }))) {
+      reason = "helper operands cannot transport the declared fragment schema";
+      return failure();
+    }
+    bindClonedRanges(clone);
+    for (unsigned index = 0; index < operation.getNumResults(); ++index) {
       auto original = dyn_cast<FragmentType>(operation.getResult(index).getType());
-      auto actual = dyn_cast<FragmentType>(clone->getResult(index).getType());
-      if (!original || !actual)
-        continue;
-      auto transported = transportFragmentResultType(
-          relation, clone->getOperandTypes(), actual);
-      if (failed(transported)) {
-        reason = "helper operands cannot transport the declared fragment schema";
-        return failure();
-      }
-      auto type = cast<FragmentType>(*transported);
-      if (type == actual)
+      auto selected = dyn_cast<FragmentType>(selectedTypes[index]);
+      auto type = dyn_cast<FragmentType>(clone->getResult(index).getType());
+      if (!original || !selected || !type || type == selected)
         continue;
       SmallVector<unsigned> changedAxes;
-      bool changedRank = actual.getShape().size() != type.getShape().size();
+      bool changedRank = selected.getShape().size() != type.getShape().size();
       if (!changedRank)
-        for (auto [axis, extent] : llvm::enumerate(actual.getShape()))
+        for (auto [axis, extent] : llvm::enumerate(selected.getShape()))
           if (extent != type.getShape()[axis] ||
-              actual.getAxisMaps()[axis] != type.getAxisMaps()[axis])
+              selected.getAxisMaps()[axis] != type.getAxisMaps()[axis])
             changedAxes.push_back(axis);
-      clone->getResult(index).setType(type);
       if (changedRank || !changedAxes.empty()) {
         if (failed(collectExtentBindings(original, type, extentBindings, reason,
                                         changedAxes)))

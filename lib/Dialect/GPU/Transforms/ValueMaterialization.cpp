@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/SchemaMutation.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -399,12 +400,14 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
         for (BlockArgument argument : clone.getCombine().front().getArguments())
           for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
             if (source.getShape()[axis] != target.getShape()[axis])
-              retargetSourceExtent(
+              if (failed(retargetSourceExtent(
                   argument,
                   sourceAxisIdentity(
                       cast<AxisMapAttr>(source.getAxisMaps()[axis])),
-                  cast<PhysicalExprAttr>(target.getShape()[axis]), std::nullopt, changed);
-        clone.getResult(0).setType(resultTarget);
+                  cast<PhysicalExprAttr>(target.getShape()[axis]), std::nullopt,
+                  changed, builder.getListener())))
+                return failure();
+        setPhysicalValueType(clone.getResult(0), resultTarget, changed);
         projection = clone.getOperation();
         if (resultTarget != target)
           projection = builder.create<BroadcastOp>(location, target,
@@ -686,26 +689,15 @@ FailureOr<Value> materializeReplayedValue(
                ? std::optional<unsigned>(projection.fragmentAxis)
                : std::nullopt;
   };
-  auto retargetHelperSourceExtent = [&](Region &region,
-                                        PhysicalExprAttr logicalExtent) {
-    auto retarget = [&](Value current) {
-      auto fragment = dyn_cast<FragmentType>(current.getType());
-      PhysicalAxisProjection projection =
-          fragment ? queryFragmentAxis(fragment, source, replayDimension(source))
-                   : PhysicalAxisProjection{};
-      if (!fragment || !projection.isExact() ||
-          fragment.getShape()[projection.fragmentAxis] != logicalExtent)
-        return;
-      current.setType(replaceReplayAxis(fragment, projection.fragmentAxis));
-    };
-    for (Block &block : region) {
-      for (BlockArgument argument : block.getArguments())
-        retarget(argument);
-      block.walk([&](Operation *operation) {
-        for (Value result : operation->getResults())
-          retarget(result);
-      });
-    }
+  auto replayHelperType = [&](Value current, PhysicalExprAttr logicalExtent) -> Type {
+    auto fragment = dyn_cast<FragmentType>(current.getType());
+    PhysicalAxisProjection projection =
+        fragment ? queryFragmentAxis(fragment, source, replayDimension(source))
+                 : PhysicalAxisProjection{};
+    if (!fragment || !projection.isExact() ||
+        fragment.getShape()[projection.fragmentAxis] != logicalExtent)
+      return current.getType();
+    return replaceReplayAxis(fragment, projection.fragmentAxis);
   };
 
   llvm::DenseMap<std::pair<Value, unsigned>, Value> axisValues;
@@ -786,26 +778,15 @@ FailureOr<Value> materializeReplayedValue(
           mapping.map(operand, *replayed);
       }
       Operation *clone = builder.clone(*producer, mapping);
+      if (failed(rewriteClonedPhysicalTypes(producer, clone, [&](Value original) {
+            return replaceReplayType(original.getType());
+          })))
+        return failure();
       for (auto [original, result] :
            llvm::zip(producer->getResults(), clone->getResults())) {
-        result.setType(replaceReplayType(result.getType()));
         if (!mapping.lookupOrNull(original))
           mapping.map(original, result);
       }
-      Region *combine = nullptr;
-      if (auto reduce = dyn_cast<ReduceOp>(clone))
-        combine = &reduce.getCombine();
-      else if (auto scan = dyn_cast<ScanOp>(clone))
-        combine = &scan.getCombine();
-      if (combine)
-        for (Block &block : *combine) {
-          for (BlockArgument argument : block.getArguments())
-            argument.setType(replaceReplayType(argument.getType()));
-          block.walk([&](Operation *operation) {
-            for (Value result : operation->getResults())
-              result.setType(replaceReplayType(result.getType()));
-          });
-        }
       auto result = dyn_cast<OpResult>(current);
       if (!result || result.getResultNumber() >= clone->getNumResults())
         return failure();
@@ -1140,10 +1121,28 @@ FailureOr<Value> materializeReplayedValue(
     }
     Operation *clone = builder.clone(*producer, cloneMapping);
     bool structuredResults = pureBranch || isa<ReduceOp, ScanOp>(clone);
+    bool introducedUnitAxis = isIntroducedReshapeUnitAxis(current, axis);
+    if (failed(rewriteClonedPhysicalTypes(producer, clone, [&](Value original) -> Type {
+          bool directResult = original.getDefiningOp() == producer;
+          Type type = original.getType();
+          if (!directResult)
+            return structuredResults
+                ? replayHelperType(original, cast<PhysicalExprAttr>(fragment.getShape()[axis]))
+                : type;
+          if (structuredResults)
+            type = replaceReplayType(type);
+          if (original != current)
+            return type;
+          if (pointwiseType)
+            return pointwiseType;
+          auto selected = dyn_cast<FragmentType>(type);
+          if (!selected || axis >= selected.getShape().size())
+            return {};
+          return introducedUnitAxis ? type : replaceReplayAxis(selected, axis);
+        })))
+      return failure();
     for (auto [original, cloned] :
          llvm::zip(producer->getResults(), clone->getResults())) {
-      if (structuredResults)
-        cloned.setType(replaceReplayType(cloned.getType()));
       if (!hasMultipleReplayAxes(original.getType()))
         mapping.map(original, cloned);
     }
@@ -1151,26 +1150,9 @@ FailureOr<Value> materializeReplayedValue(
     if (!result || result.getResultNumber() >= clone->getNumResults())
       return failure();
     Value clonedValue = clone->getResult(result.getResultNumber());
-    if (pureBranch)
-      for (Region &region : clone->getRegions())
-        retargetHelperSourceExtent(
-            region, cast<PhysicalExprAttr>(fragment.getShape()[axis]));
-    if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
-      retargetHelperSourceExtent(
-          clonedReduce.getCombine(),
-          cast<PhysicalExprAttr>(fragment.getShape()[axis]));
-    if (auto clonedScan = dyn_cast<ScanOp>(clone))
-      retargetHelperSourceExtent(
-          clonedScan.getCombine(),
-          cast<PhysicalExprAttr>(fragment.getShape()[axis]));
     auto clonedType = dyn_cast<FragmentType>(clonedValue.getType());
     if (!clonedType || axis >= clonedType.getShape().size())
       return failure();
-    bool introducedUnitAxis = isIntroducedReshapeUnitAxis(current, axis);
-    if (pointwiseType)
-      clonedValue.setType(pointwiseType);
-    else if (!introducedUnitAxis)
-      clonedValue.setType(replaceReplayAxis(clonedType, axis));
     remember(current, clonedValue, projection);
     return clonedValue;
   };

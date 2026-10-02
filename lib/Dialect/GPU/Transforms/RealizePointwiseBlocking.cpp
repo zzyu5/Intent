@@ -340,19 +340,23 @@ LogicalResult PointwiseRewrite::bindAxes() {
     // Repeated Cartesian axes use their proven occurrence classes. A unique
     // logical dimension can still bind connected pointwise values, while a
     // range-local source retains its own traversal relation.
-    if (occurrenceRoot)
-      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                           fragmentExtent(*parameter));
-    else if (FailureOr<uint64_t> dimension = rangeDimension(range);
-        succeeded(dimension))
-      retargetDimensionExtent(range.getResult(), *dimension,
-                              fragmentExtent(*parameter));
-    else if (FailureOr<PhysicalSourceAxis> source = axisSource(*axis);
-             succeeded(source))
-      retargetSourceExtent(range.getResult(), *source,
-                           fragmentExtent(*parameter));
-    else
+    if (occurrenceRoot) {
+      if (failed(retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                      fragmentExtent(*parameter))))
+        return failure();
+    } else if (FailureOr<uint64_t> dimension = rangeDimension(range);
+               succeeded(dimension)) {
+      if (failed(retargetDimensionExtent(range.getResult(), *dimension,
+                                        fragmentExtent(*parameter))))
+        return failure();
+    } else if (FailureOr<PhysicalSourceAxis> source = axisSource(*axis);
+               succeeded(source)) {
+      if (failed(retargetSourceExtent(range.getResult(), *source,
+                                      fragmentExtent(*parameter))))
+        return failure();
+    } else {
       return range.emitOpError("blocking parameter has no typed axis binding");
+    }
     auto found = parameters.find(*axis);
     if (found != parameters.end() && found->second != parameter->getReference())
       return range.emitOpError("one physical axis has multiple blocking parameters")
@@ -467,11 +471,14 @@ LogicalResult PointwiseRewrite::materializeRanges() {
     PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
     if (sourceType.getShape()[0] != tileExtent) {
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
-          succeeded(dimension) && !queryParameterBinding(*parameter).source)
-        retargetDimensionExtent(range.getResult(), *dimension, tileExtent);
-      else
-        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                             tileExtent);
+          succeeded(dimension) && !queryParameterBinding(*parameter).source) {
+        if (failed(retargetDimensionExtent(range.getResult(), *dimension,
+                                          tileExtent)))
+          return failure();
+      } else if (failed(retargetSourceExtent(
+                     range.getResult(), sourceAxisIdentity(range), tileExtent))) {
+        return failure();
+      }
       sourceType = cast<FragmentType>(range.getResult().getType());
     }
     Value physicalExtent = materializeParameter(builder, range.getLoc(), parameter->getReference());

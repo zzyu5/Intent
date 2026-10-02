@@ -250,11 +250,13 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
       if (failed(rangeDimension))
         return range.emitOpError("full coverage has no range dimension authority");
       rangeDimensions.insert(*rangeDimension);
-      retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered,
-                           *rangeDimension);
+      if (failed(retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                      covered, *rangeDimension)))
+        return failure();
     }
-    if (ranges.roots.empty())
-      retargetDimensionExtent(source, dimension, covered);
+    if (ranges.roots.empty() &&
+        failed(retargetDimensionExtent(source, dimension, covered)))
+      return failure();
     if (rangeDimensions.empty())
       rangeDimensions.insert(dimension);
     for (int64_t rangeDimension : rangeDimensions)
@@ -373,11 +375,13 @@ LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,
     if (failed(rangeDimension) || *rangeDimension != dimension)
       return range.emitOpError(
           "full-coverage range does not cover the selected logical dimension");
-    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range), covered,
-                         *rangeDimension);
+    if (failed(retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                    covered, *rangeDimension)))
+      return failure();
   }
-  if (ranges.roots.empty())
-    retargetDimensionExtent(source, dimension, covered);
+  if (ranges.roots.empty() &&
+      failed(retargetDimensionExtent(source, dimension, covered)))
+    return failure();
   OpBuilder entry(&kernel.front(), kernel.front().begin());
   if (failed(bindFullCoverageDimension(kernel, dimension,
         materializeParameter(entry, source.getLoc(), parameter.getReference()))))
@@ -444,8 +448,10 @@ LogicalResult bindFullCoverageDimension(func::FuncOp kernel, uint64_t dimension,
                         return range.getExtent() == physicalExtent;
                       });
   for (MakeRangeOp range : ranges)
-    retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                         parameterExtent, static_cast<int64_t>(dimension));
+    if (failed(retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                    parameterExtent,
+                                    static_cast<int64_t>(dimension))))
+      return failure();
   if (ranges.empty() || alreadyBound)
     return success();
 

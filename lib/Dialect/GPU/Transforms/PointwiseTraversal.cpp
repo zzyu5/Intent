@@ -529,7 +529,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
           for (BlockArgument argument : block.getArguments())
             argument.setType(replaceTraversalExtent(
                 argument.getType(), source, traversalDimensions, blockedExtent));
-          block.walk([&](Operation *nested) {
+          WalkResult walked = block.walk([&](Operation *nested) -> WalkResult {
             for (Region &region : nested->getRegions())
               for (Block &block : region)
                 for (BlockArgument argument : block.getArguments())
@@ -547,10 +547,12 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                 (!controlRanges.contains(range) &&
                  (!(sourceAxisIdentity(range) == source) || failed(dimension) ||
                   !llvm::is_contained(traversalDimensions, *dimension))))
-              return;
+              return WalkResult::advance();
             if (structuredControl) {
-              retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                                   blockedExtent);
+              if (failed(retargetSourceExtent(range.getResult(),
+                                              sourceAxisIdentity(range),
+                                              blockedExtent)))
+                return WalkResult::interrupt();
               OpBuilder nestedBuilder(range);
               Value offset = nestedBuilder.create<BinaryOp>(range.getLoc(), nestedBuilder.getIndexType(),
                   blocked.getStart(), blocked.getLogicalStart(), BinaryOperator::Subtract);
@@ -567,7 +569,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                   range, nestedBuilder.create<SplatOp>(range.getLoc(), type, range.getLogicalStop()), ComparePredicate::Lt);
               controlTails[range] = nestedBuilder.create<BinaryOp>(range.getLoc(), predicateType(type),
                   lower, upper, BinaryOperator::LogicalAnd);
-              return;
+              return WalkResult::advance();
             }
             // Helper-local ranges are complete physical values too.  When a
             // structured producer is replayed for a wider ownership fragment,
@@ -581,7 +583,10 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
             range->setOperand(1, blocked.getExtent());
             if (coveredItsLocalDomain)
               range->setOperand(4, blocked.getExtent());
+            return WalkResult::advance();
           });
+          if (walked.wasInterrupted())
+            return failure();
         }
     if (!controlTails.empty() && failed(addTailValidity(kernel, controlTails,
                                                        /*includeStores=*/false)))

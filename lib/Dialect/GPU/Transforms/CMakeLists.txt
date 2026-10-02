@@ -37,6 +37,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Passes.cpp
   ValueMaterialization.cpp
   ValueRelations.cpp
+  SchemaMutation.cpp
   Traversal.cpp
   PhysicalParameters.cpp
   ProgramInterface.cpp

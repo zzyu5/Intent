@@ -2388,11 +2388,12 @@ LogicalResult PointwiseRewrite::chooseOwnership() {
       // dimension a fragment parameter; once ownership selects the actual
       // lane axes, that provisional parameter must not remain in live value
       // types or the provider tuning surface.
-      retargetSourceExtent(
-          range.getResult(),
-          PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
-                         range.getDerived()},
-          unitExtent);
+      if (failed(retargetSourceExtent(
+              range.getResult(),
+              PhysicalSourceAxis{range.getSourceId(), range.getSourceAxis(),
+                                 range.getDerived()},
+              unitExtent)))
+        return failure();
     }
   }
 

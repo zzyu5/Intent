@@ -1449,8 +1449,9 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
       // A free axis introduced by a typed broadcast has no coordinate range of
       // its own.  Its dimension identity is nevertheless exact, so project
       // only this value flow onto the already selected ownership extent.
-      retargetDimensionExtent(source, dimension,
-                              selectedParameterExtent(*parameter));
+      if (failed(retargetDimensionExtent(source, dimension,
+                                        selectedParameterExtent(*parameter))))
+        return failure();
       if (fullCoverage)
         return reduce.emitOpError(
                    "reduction full-coverage free axis has no coordinate range for tail validity")
@@ -1475,16 +1476,19 @@ LogicalResult bindReductionFreeAxes(ReduceOp reduce, func::FuncOp kernel) {
              << ", source_axis=" << sourceAxis.sourceAxis
              << ", dimension=" << dimension;
     for (MakeRangeOp range : ranges.roots) {
-      if (projectedOwnership)
-        retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
-                             selectedParameterExtent(*parameter));
-      else
-        retargetDimensionExtent(range.getResult(), dimension,
-                                selectedParameterExtent(*parameter));
+      LogicalResult retargeted =
+          projectedOwnership
+              ? retargetSourceExtent(range.getResult(), sourceAxisIdentity(range),
+                                     selectedParameterExtent(*parameter))
+              : retargetDimensionExtent(range.getResult(), dimension,
+                                        selectedParameterExtent(*parameter));
+      if (failed(retargeted))
+        return failure();
     }
-    if (projectedOwnership)
-      retargetSourceExtent(source, sourceAxis,
-                           selectedParameterExtent(*parameter));
+    if (projectedOwnership &&
+        failed(retargetSourceExtent(source, sourceAxis,
+                                    selectedParameterExtent(*parameter))))
+      return failure();
     if (fullCoverage &&
         failed(bindFullCoverageDimension(kernel, dimension,
                                          parameterValue(kernel, *parameter))))
