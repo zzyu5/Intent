@@ -1,5 +1,5 @@
 #include "Intent/Target/Weft/IR/Program.h"
-#include "Intent/Target/Weft/IR/HostScalar.h"
+#include "Intent/Target/Weft/Serialization/HostSource.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -99,7 +99,7 @@ LogicalResult verifyProgram(ModuleOp program) {
   if (failed(mlir::verify(program))) return failure();
   auto modules = getProgramModules(program);
   if (failed(modules) || failed(cpu::verifyCPUProgram(modules->host, cpu::CPUProgramStage::Realized))) return failure();
-  if (failed(verifyHostScalarOperations(modules->host))) return failure();
+  if (failed(verifyHostSourceProgram(modules->host))) return failure();
   if (!modules->host->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities"))
     return modules->host.emitError("Weft host requires CPU capabilities");
 

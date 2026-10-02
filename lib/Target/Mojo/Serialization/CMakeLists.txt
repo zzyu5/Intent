@@ -9,8 +9,10 @@ add_mlir_library(MLIRIntentMojoSerialization
   PARTIAL_SOURCES_INTENDED
 
   LINK_LIBS PUBLIC
-  MLIRIntentCPUTransforms
+  MLIRIntentCPUAnalysis
+  MLIRIntentCPUDialect
   MLIRIntentNativeABI
+  MLIRIntentNativeSourceSerialization
   MLIRIntentMojoScalarSerialization
   MLIRArithDialect
   MLIRFuncDialect

@@ -549,6 +549,17 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
       if (!physical || physical.getElementType() != storageType(element) || physical.getShape() != tensor.getShape() ||
           physical.getMemorySpaceAsInt() != 0)
         return function.emitError("DSA view disagrees with its physical entry ABI");
+      SmallVector<int64_t> expectedStrides(tensor.getRank(), ShapedType::kDynamic);
+      auto constraints = view.getConstraints();
+      if (constraints.getHasStrides())
+        for (auto [axis, constraint] : llvm::enumerate(constraints.getStrides()))
+          if (auto fixed = dyn_cast<IntegerAttr>(constraint))
+            expectedStrides[axis] = fixed.getInt();
+      SmallVector<int64_t> strides;
+      int64_t offset;
+      if (failed(physical.getStridesAndOffset(strides, offset)) || offset != 0 ||
+          strides != expectedStrides)
+        return function.emitError("DSA public memory layout disagrees with its bound stride contract");
     } else {
       if (!logical.isF32() && !logical.isIndex() && !logical.isInteger(64) &&
           !logical.isInteger(32) && !logical.isInteger(1))
@@ -630,7 +641,7 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
         op->emitError("shared storage requires cooperative execution");
         return WalkResult::interrupt();
       }
-      if (!type.hasStaticShape() || type.getRank() != 2 ||
+      if (!type.hasStaticShape() || type.getRank() != 2 || !type.getLayout().isIdentity() ||
           (type.getMemorySpaceAsInt() != nramSpace && type.getMemorySpaceAsInt() != matrixSpace &&
            type.getMemorySpaceAsInt() != sharedSpace)) {
         op->emitError("local allocation requires bounded shape and storage ownership");

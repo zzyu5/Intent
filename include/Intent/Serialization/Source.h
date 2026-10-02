@@ -10,6 +10,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
@@ -53,6 +54,7 @@ protected:
   llvm::DenseMap<mlir::Value, std::string> values;
   unsigned indent = 0;
   unsigned counter = 0;
+  uint64_t emittedLines = 0;
   bool failed = false;
 
 private:

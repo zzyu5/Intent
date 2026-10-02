@@ -1,8 +1,9 @@
 #include "Intent/Target/BangC/Passes.h"
 #include "Scalar.h"
+#include "Surface.h"
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "Intent/Serialization/NativeABI.h"
-#include "Intent/Serialization/Source.h"
+#include "Intent/Serialization/NativeSource.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -18,10 +19,22 @@ namespace intent::bangc {
 namespace {
 #include "../Runtime/TileImplementations.inc"
 std::string ctype(Type type) { return scalarType(type)->name; }
-class Serializer : public SourceEmitter {
+class Serializer : public NativeSourceEmitter {
 public:
   Serializer(func::FuncOp function, llvm::raw_ostream &output)
-      : SourceEmitter(output, 2), function(function) {}
+      : NativeSourceEmitter(output, NativeSourceSyntax::C), function(function) {}
+  static const OperationEmitters<Serializer> &nativeEmitters();
+  std::string nativeType(Type type) override {
+    if (auto memory = dyn_cast<MemRefType>(type))
+      return ctype(memory.getElementType()) + " *";
+    return ctype(type);
+  }
+  std::string offsetPointer(StringRef base, StringRef offset) override {
+    return "(" + base.str() + " + (" + offset.str() + "))";
+  }
+  std::string pointerAsIndex(StringRef base) override {
+    return "reinterpret_cast<int64_t>(" + base.str() + ")";
+  }
   LogicalResult emit(llvm::json::Object &metadata) {
     auto options = readCompileOptions(function);
     if (mlir::failed(options)) return failure();
@@ -45,12 +58,22 @@ public:
     auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
     for (const NativeSlot &slot : nativeABI->slots) {
       std::string name = slot.name();
+      Value argument = function.getArgument(slot.parameter);
+      reserveName(name);
       call.push_back(name);
       if (slot.role == NativeSlotRole::Pointer) {
         auto view = getPublicView(interface, slot.parameter);
         signature.push_back((view.getAccess() == 0 ? "const " : "") + ctype(slot.element) + " *" + name);
+        if (mlir::failed(bindEntryMemory(argument, name))) return failure();
       } else signature.push_back(ctype(slot.carrier) + " " + name);
-      if (!slot.axis) values[function.getArgument(slot.parameter)] = name;
+      if (slot.role == NativeSlotRole::Extent) {
+        auto &size = memories.find(argument)->second.sizes[*slot.axis];
+        if (size.empty()) size = name;
+      } else if (slot.role == NativeSlotRole::Stride) {
+        auto &stride = memories.find(argument)->second.strides[*slot.axis];
+        if (stride.empty()) stride = name;
+      } else if (slot.role == NativeSlotRole::Scalar)
+        SourceEmitter::bind(argument, name);
     }
     llvm::json::Array fullExtents;
     for (int64_t value : function->getAttrOfType<DenseI64ArrayAttr>("intent_dsa.full_extent_dimensions").asArrayRef())
@@ -71,7 +94,9 @@ public:
     if (bytes("bangc.nram_bytes")) line("__nram__ __attribute__((aligned(128))) unsigned char local_nram[" + std::to_string(bytes("bangc.nram_bytes")) + "];", 1);
     if (bytes("bangc.wram_bytes")) line("__wram__ __attribute__((aligned(128))) unsigned char local_wram[" + std::to_string(bytes("bangc.wram_bytes")) + "];", 1);
     if (bytes("bangc.sram_bytes")) line("__mlu_shared__ __attribute__((aligned(128))) unsigned char group_sram[" + std::to_string(bytes("bangc.sram_bytes")) + "];", 1);
-    if (mlir::failed(block(function.front(), 1))) return failure();
+    indent = 1;
+    if (mlir::failed(emitNativeBlock(function.front()))) return failure();
+    indent = 0;
     output << "}\n\nextern \"C\" int intent_launch(void *stream";
     if (!signature.empty()) output << ", " << llvm::join(signature, ", ");
     auto group = function->getAttrOfType<IntegerAttr>("intent_dsa.group_width");
@@ -82,7 +107,9 @@ public:
     return failure(hasFailed());
   }
 private:
-  std::string name(Value value) { return valueString(value); }
+  std::string name(Value value) {
+    return isa<MemRefType>(value.getType()) ? memoryPointer(value) : valueString(value);
+  }
   std::string bind(Value value) {
     std::string result = newName();
     SourceEmitter::bind(value, result);
@@ -93,103 +120,59 @@ private:
     auto type = cast<MemRefType>(value.getType());
     return ctype(type.getElementType()) + ", " + std::to_string(type.getDimSize(0)) + ", " + std::to_string(type.getDimSize(1));
   }
-  LogicalResult block(Block &body, unsigned depth) {
-    for (Operation &op : body) if (mlir::failed(operation(&op, depth))) return failure();
-    return success();
-  }
-  LogicalResult operation(Operation *op, unsigned depth) {
+  LogicalResult emitNativeOperation(Operation *op) override {
     if (isa<func::ReturnOp, scf::YieldOp>(op)) return success();
+    if (nativeEmitters().contains(op)) return nativeEmitters().emit(op, *this);
     if (auto sync = dyn_cast<dsa::SynchronizeOp>(op)) {
-      line(sync.getLocalOnly() ? "intent_sync_local();" : "__sync();", depth); return success();
+      line(sync.getLocalOnly() ? "intent_sync_local();" : "__sync();"); return success();
     }
-    if (isa<dsa::GroupSynchronizeOp>(op)) { line("__sync(); __sync_cluster();", depth); return success(); }
-    if (auto branch = dyn_cast<scf::IfOp>(op)) {
-      if (branch.getNumResults()) return op->emitError("BANG C conditional results must be materialized");
-      line("if (" + name(branch.getCondition()) + ") {", depth);
-      if (mlir::failed(block(branch.getThenRegion().front(), depth + 1))) return failure();
-      if (!branch.getElseRegion().empty()) {
-        line("} else {", depth);
-        if (mlir::failed(block(branch.getElseRegion().front(), depth + 1))) return failure();
-      }
-      line("}", depth); return success();
-    }
-    if (auto loop = dyn_cast<scf::WhileOp>(op)) {
-      if (loop.getNumResults() || loop.getNumOperands()) return op->emitError("BANG C while state must be materialized");
-      line("while (true) {", depth);
-      if (mlir::failed(block(loop.getBefore().front(), depth + 1)) || mlir::failed(block(loop.getAfter().front(), depth + 1))) return failure();
-      line("}", depth); return success();
-    }
-    if (auto condition = dyn_cast<scf::ConditionOp>(op)) {
-      if (!condition.getArgs().empty()) return op->emitError("BANG C condition state must be materialized");
-      line("if (!(" + name(condition.getCondition()) + ")) break;", depth); return success();
-    }
-    if (auto loop = dyn_cast<scf::ForOp>(op)) {
-      if (loop.getNumResults()) return op->emitError("BANG C serialization requires materialized loop state");
-      std::string iv = bind(loop.getInductionVar());
-      line("for (int64_t " + iv + " = " + name(loop.getLowerBound()) + "; " + iv + " < " + name(loop.getUpperBound()) +
-           "; " + iv + " += " + name(loop.getStep()) + ") {", depth);
-      if (mlir::failed(block(*loop.getBody(), depth + 1))) return failure();
-      line("}", depth); return success();
-    }
-    if (auto allocation = dyn_cast<memref::AllocaOp>(op)) {
-      auto type = allocation.getType();
-      std::string buffer = type.getMemorySpaceAsInt() == dsa::matrixSpace ? "local_wram" :
-          type.getMemorySpaceAsInt() == dsa::sharedSpace ? "group_sram" : "local_nram";
-      line(ctype(type.getElementType()) + " *" + bind(allocation.getResult()) + " = reinterpret_cast<" +
-          ctype(type.getElementType()) + " *>(" + buffer + " + " +
-          std::to_string(op->getAttrOfType<IntegerAttr>("bangc.offset").getInt()) + ");", depth);
-      return success();
-    }
-    if (auto view = dyn_cast<memref::ReinterpretCastOp>(op)) {
-      line(ctype(view.getType().getElementType()) + " *" + bind(view.getResult()) + " = " + name(view.getSource()) + ";", depth);
-      return success();
-    }
+    if (isa<dsa::GroupSynchronizeOp>(op)) { line("__sync(); __sync_cluster();"); return success(); }
     if (auto load = dyn_cast<dsa::LoadTileOp>(op)) {
       bool local = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
       bool shared = cast<MemRefType>(load.getSource().getType()).getMemorySpaceAsInt() == dsa::sharedSpace;
       line(std::string(local ? "intent_load_local_tile<" : "intent_load_tile<") + shape(load.getOutput()) +
           (shared ? (load.getAsynchronous() ? ", true, true" : ", false, true") : (load.getAsynchronous() ? ", true" : "")) + ">(" + name(load.getOutput()) + ", " + name(load.getSource()) +
           ", " + name(load.getOffset()) + ", " + name(load.getRowStride()) + ", " + name(load.getColumnStride()) +
-          ", " + name(load.getRows()) + ", " + name(load.getColumns()) + ");", depth); return success();
+          ", " + name(load.getRows()) + ", " + name(load.getColumns()) + ");"); return success();
     }
     if (auto stage = dyn_cast<dsa::StageTileOp>(op)) {
       line("intent_stage_tile<" + shape(stage.getOutput()) + ">(" + name(stage.getOutput()) + ", " +
           name(stage.getSource()) + ", " + name(stage.getOffset()) + ", " + name(stage.getRowStride()) + ", " +
-          name(stage.getColumnStride()) + ", " + name(stage.getRows()) + ", " + name(stage.getColumns()) + ");", depth);
+          name(stage.getColumnStride()) + ", " + name(stage.getRows()) + ", " + name(stage.getColumns()) + ");");
       return success();
     }
     if (auto plan = dyn_cast<dsa::GatherPlanOp>(op)) {
       line("intent_prepare_gather_runs<" + count(plan.getRowOffsets()) + ">(" + name(plan.getRowOffsets()) + ", " +
-          name(plan.getRows()) + ", " + name(plan.getOutput()) + ", " + name(plan.getLaneIndices()) + ");", depth);
+          name(plan.getRows()) + ", " + name(plan.getOutput()) + ", " + name(plan.getLaneIndices()) + ");");
       return success();
     }
     if (auto gather = dyn_cast<dsa::GatherRowsOp>(op)) {
       line(std::string(gather.getPlan() ? "intent_gather_runs<" : "intent_gather_rows<") + shape(gather.getOutput()) + ">(" + name(gather.getOutput()) + ", " +
           name(gather.getSource()) + ", " + name(gather.getRowOffsets()) + ", " + name(gather.getColumnStride()) +
           ", " + name(gather.getRows()) + ", " + name(gather.getColumns()) +
-          (gather.getPlan() ? ", " + name(gather.getPlan()) : "") + ");", depth); return success();
+          (gather.getPlan() ? ", " + name(gather.getPlan()) : "") + ");"); return success();
     }
     if (auto gather = dyn_cast<dsa::GroupGatherRowsOp>(op)) {
       line("intent_group_gather_rows<" + shape(gather.getOutput()) + ">(" + name(gather.getOutput()) + ", " +
           name(gather.getSource()) + ", " + name(gather.getRowOffsets()) + ", " + name(gather.getPlan()) + ", " +
           name(gather.getSharedData()) + ", " + name(gather.getSharedMetadata()) + ", " +
-          name(gather.getRows()) + ", " + name(gather.getLane()) + ");", depth);
+          name(gather.getRows()) + ", " + name(gather.getLane()) + ");");
       return success();
     }
     if (auto store = dyn_cast<dsa::StoreTileOp>(op)) {
       bool local = cast<MemRefType>(store.getDestination().getType()).getMemorySpaceAsInt() == dsa::nramSpace;
       line(std::string(local ? "intent_store_local_tile<" : "intent_store_tile<") + shape(store.getInput()) + ">(" + name(store.getDestination()) + ", " + name(store.getInput()) +
           ", " + name(store.getOffset()) + ", " + name(store.getRowStride()) + ", " + name(store.getColumnStride()) +
-          ", " + name(store.getRows()) + ", " + name(store.getColumns()) + ");", depth); return success();
+          ", " + name(store.getRows()) + ", " + name(store.getColumns()) + ");"); return success();
     }
     if (auto iota = dyn_cast<dsa::IotaOp>(op)) {
-      line("intent_iota_local<" + count(iota.getOutput()) + ">(" + name(iota.getOutput()) + ");", depth);
+      line("intent_iota_local<" + count(iota.getOutput()) + ">(" + name(iota.getOutput()) + ");");
       return success();
     }
     if (auto broadcast = dyn_cast<dsa::BroadcastRowsOp>(op)) {
       line("intent_broadcast_rows<" + shape(broadcast.getOutput()) + ">(" + name(broadcast.getOutput()) + ", " +
           name(broadcast.getInput()) + ", " + name(broadcast.getScratch()) + ", " + name(broadcast.getOffset()) + ", " +
-          name(broadcast.getRows()) + ", " + name(broadcast.getColumns()) + ");", depth);
+          name(broadcast.getRows()) + ", " + name(broadcast.getColumns()) + ");");
       return success();
     }
     if (auto layout = dyn_cast<dsa::IndexLayoutOp>(op)) {
@@ -197,12 +180,12 @@ private:
       std::string width = std::to_string(output.getDimSize(1));
       std::string dst = "reinterpret_cast<uint32_t *>(" + name(layout.getOutput()) + ")";
       if (layout.getInput().getType().isInteger(64)) {
-        line("__bang_write_value(" + dst + ", " + width + ", uint32_t(" + name(layout.getInput()) + "));", depth);
-        line("__bang_write_value(" + dst + " + " + width + ", " + width + ", uint32_t(uint64_t(" + name(layout.getInput()) + ") >> 32));", depth);
+        line("__bang_write_value(" + dst + ", " + width + ", uint32_t(" + name(layout.getInput()) + "));");
+        line("__bang_write_value(" + dst + " + " + width + ", " + width + ", uint32_t(uint64_t(" + name(layout.getInput()) + ") >> 32));");
       } else {
         bool split = cast<MemRefType>(layout.getInput().getType()).getElementType().isInteger(64);
         line("__bang_transpose(" + dst + ", reinterpret_cast<const uint32_t *>(" + name(layout.getInput()) + "), " +
-             (split ? width + ", 2" : "2, " + width) + ");", depth);
+             (split ? width + ", 2" : "2, " + width) + ");");
       }
       return success();
     }
@@ -214,31 +197,31 @@ private:
       if (shift) {
         std::string amount = std::to_string(binary.getRhs().getDefiningOp<arith::ConstantIntOp>().value());
         line(std::string(binary.getKind() == BinaryOperator::LeftShift ? "intent_index_shl<" : "intent_index_sar<") +
-             width + ", " + amount + ">(" + dst + ", " + lhs + ");", depth);
+             width + ", " + amount + ">(" + dst + ", " + lhs + ");");
       } else {
         StringRef kind = binary.getKind() == BinaryOperator::Add ? "add" : binary.getKind() == BinaryOperator::Subtract ? "sub" : "mul";
         std::string rhs = isa<MemRefType>(binary.getRhs().getType()) ?
             "reinterpret_cast<const uint32_t *>(" + name(binary.getRhs()) + ")" : name(binary.getRhs());
-        line("intent_index_" + kind.str() + "<" + width + ">(" + dst + ", " + lhs + ", " + rhs + ");", depth);
+        line("intent_index_" + kind.str() + "<" + width + ">(" + dst + ", " + lhs + ", " + rhs + ");");
       }
       return success();
     }
     if (auto fill = dyn_cast<dsa::FillOp>(op)) {
       if (fill.getValue().getType().isF16() || fill.getValue().getType().isF32())
-        line("__bang_write_value(" + name(fill.getOutput()) + ", " + count(fill.getOutput()) + ", " + name(fill.getValue()) + ");", depth);
-      else line("intent_fill_local<" + ctype(fill.getValue().getType()) + ", " + count(fill.getOutput()) + ">(" + name(fill.getOutput()) + ", " + name(fill.getValue()) + ");", depth);
+        line("__bang_write_value(" + name(fill.getOutput()) + ", " + count(fill.getOutput()) + ", " + name(fill.getValue()) + ");");
+      else line("intent_fill_local<" + ctype(fill.getValue().getType()) + ", " + count(fill.getOutput()) + ">(" + name(fill.getOutput()) + ", " + name(fill.getValue()) + ");");
       return success();
     }
     if (auto select = dyn_cast<dsa::SelectOp>(op)) {
       if (Value scratch = select.getScratch()) {
         line("intent_select_bits<" + count(select.getOutput()) + ", " + std::to_string(cast<MemRefType>(scratch.getType()).getDimSize(1)) + ">(" +
             name(select.getOutput()) + ", " + name(select.getCondition()) + ", " + name(select.getTrueValue()) + ", " +
-            name(select.getFalseValue()) + ", " + name(scratch) + ");", depth);
+            name(select.getFalseValue()) + ", " + name(scratch) + ");");
         return success();
       }
       line("intent_select_local<" + ctype(cast<MemRefType>(select.getOutput().getType()).getElementType()) + ", " +
           count(select.getOutput()) + ">(" + name(select.getOutput()) + ", " + name(select.getCondition()) + ", " +
-          name(select.getTrueValue()) + ", " + name(select.getFalseValue()) + ");", depth); return success();
+          name(select.getTrueValue()) + ", " + name(select.getFalseValue()) + ");"); return success();
     }
     if (auto prepare = dyn_cast<dsa::PrepareMatrixViewOp>(op)) {
       auto output = cast<MemRefType>(prepare.getOutput().getType());
@@ -248,12 +231,12 @@ private:
           std::to_string(input.getDimSize(0)) + ", " + std::to_string(input.getDimSize(1)) + ">(" + name(prepare.getOutput()) + ", " + name(prepare.getSource()) +
           ", " + name(prepare.getInputSlice()) + ", " + name(prepare.getTransposedSlice()) + ", " +
           name(prepare.getOffset()) + ", " + name(prepare.getRowStride()) + ", " + name(prepare.getColumnStride()) +
-          ", " + name(prepare.getColumns()) + ");", depth);
+          ", " + name(prepare.getColumns()) + ");");
       return success();
     }
     if (auto transpose = dyn_cast<dsa::TransposeOp>(op)) {
       line("intent_transpose_tile<" + shape(transpose.getInput()) + ">(" + name(transpose.getOutput()) + ", " +
-          name(transpose.getInput()) + ", " + name(transpose.getRows()) + ", " + name(transpose.getColumns()) + ");", depth);
+          name(transpose.getInput()) + ", " + name(transpose.getRows()) + ", " + name(transpose.getColumns()) + ");");
       return success();
     }
     if (auto compare = dyn_cast<dsa::CompareRangeOp>(op)) {
@@ -261,7 +244,7 @@ private:
       line("intent_compare_range<" + std::to_string(type.getDimSize(0)) + ", " +
           std::to_string(type.getDimSize(1)) + ">(" + name(compare.getOutput()) + ", " +
           name(compare.getRowCoordinates()) + ", " + name(compare.getRows()) + ", " +
-          std::to_string(compare.getBaseAttr().getInt()) + "LL);", depth);
+          std::to_string(compare.getBaseAttr().getInt()) + "LL);");
       return success();
     }
     if (auto compare = dyn_cast<dsa::CompareRampOp>(op)) {
@@ -269,12 +252,12 @@ private:
       line("intent_compare_ramp<" + std::to_string(type.getDimSize(0)) + ", " +
           std::to_string(type.getDimSize(1)) + ">(" + name(compare.getOutput()) + ", " +
           (compare.getScratch() ? name(compare.getScratch()) : "nullptr") + ", " + name(compare.getRowBegin()) + ", " +
-          std::to_string(compare.getBaseAttr().getInt()) + "LL);", depth);
+          std::to_string(compare.getBaseAttr().getInt()) + "LL);");
       return success();
     }
     if (auto masked = dyn_cast<dsa::MaskedFillOp>(op)) {
       line("intent_masked_fill<" + count(masked.getOutput()) + ">(" + name(masked.getOutput()) + ", " +
-          name(masked.getInput()) + ", " + name(masked.getMask()) + ", " + name(masked.getValue()) + ");", depth);
+          name(masked.getInput()) + ", " + name(masked.getMask()) + ", " + name(masked.getValue()) + ");");
       return success();
     }
     if (auto compare = dyn_cast<dsa::CompareOp>(op)) {
@@ -282,26 +265,17 @@ private:
         auto workspace = cast<MemRefType>(compare.getScratch().getType());
         line("intent_compare_i64<" + count(compare.getOutput()) + ", " + std::to_string(workspace.getDimSize(1)) +
             ", " + std::to_string(static_cast<unsigned>(compare.getPredicate())) + ">(" + name(compare.getOutput()) +
-            ", " + name(compare.getLhs()) + ", " + name(compare.getRhs()) + ", " + name(compare.getScratch()) + ");", depth);
+            ", " + name(compare.getLhs()) + ", " + name(compare.getRhs()) + ", " + name(compare.getScratch()) + ");");
         return success();
       }
       auto callee = op->getAttrOfType<StringAttr>("bangc.callee");
       if (!callee) return op->emitError("comparison requires a selected BANG C primitive");
       line(callee.getValue().str() + "(" + count(compare.getOutput()) + ", " + name(compare.getOutput()) + ", " +
-          name(compare.getLhs()) + ", " + name(compare.getRhs()) + ");", depth);
+          name(compare.getLhs()) + ", " + name(compare.getRhs()) + ");");
       return success();
     }
     if (auto store = dyn_cast<dsa::StoreScalarOp>(op)) {
-      line(name(store.getDestination()) + "[" + name(store.getOffset()) + "] = " + name(store.getValue()) + ";", depth); return success();
-    }
-    if (auto store = dyn_cast<memref::StoreOp>(op)) {
-      auto type = cast<MemRefType>(store.getMemref().getType());
-      line("intent_write_local(" + name(store.getMemref()) + " + " + name(store.getIndices()[0]) + " * " + std::to_string(type.getDimSize(1)) +
-          " + " + name(store.getIndices()[1]) + ", " + name(store.getValue()) + ");", depth); return success();
-    }
-    if (auto copy = dyn_cast<memref::CopyOp>(op)) {
-      line("intent_copy_local<" + ctype(cast<MemRefType>(copy.getSource().getType()).getElementType()) + ", " +
-          count(copy.getSource()) + ">(" + name(copy.getTarget()) + ", " + name(copy.getSource()) + ");", depth); return success();
+      line(name(store.getDestination()) + "[" + name(store.getOffset()) + "] = " + name(store.getValue()) + ";"); return success();
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
       if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
@@ -310,14 +284,14 @@ private:
         line("intent_binary_rows<" + ctype(type.getElementType()) + ", " +
             std::to_string(type.getDimSize(0)) + ", " + std::to_string(type.getDimSize(1)) + ", " +
             std::to_string(static_cast<int>(binary.getKind())) + ">(" + name(binary.getOutput()) + ", " +
-            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");");
         return success();
       }
       if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
           implementation && implementation.getValue() == "reciprocal_f32_ftz") {
         line("intent_reciprocal_ftz<" + count(binary.getOutput()) + ", " +
             std::to_string(cast<MemRefType>(binary.getScratch().getType()).getDimSize(1)) + ">(" +
-            name(binary.getOutput()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");", depth);
+            name(binary.getOutput()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");");
         return success();
       }
       if (binary.getScratch()) {
@@ -325,24 +299,24 @@ private:
         line("intent_numeric_extrema<" + ctype(workspace.getElementType()) + ", " + count(binary.getOutput()) +
             ", " + std::to_string(workspace.getNumElements()) + ", " +
             (binary.getKind() == BinaryOperator::MaximumNum ? "true" : "false") + ">(" + name(binary.getOutput()) +
-            ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");", depth);
+            ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");");
         return success();
       }
       if (cast<MemRefType>(binary.getOutput().getType()).getElementType().isInteger(64)) {
         auto callee = op->getAttrOfType<StringAttr>("bangc.callee");
         if (!callee) return op->emitError("unbound BANG integer tile operation");
         line(callee.getValue().str() + "(" + count(binary.getOutput()) + ", " + name(binary.getOutput()) + ", " +
-            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+            name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");");
         return success();
       }
       if (binary.getKind() == BinaryOperator::TrueDivide) {
         if (op->getAttrOfType<StringAttr>("bangc.implementation").getValue() == "divide_f32") {
           line("intent_divide_f32<" + count(binary.getOutput()) + ", " + (binary.getApproximate() ? "true" : "false") + ", " +
-              (binary.getFlushToZero() ? "true" : "false") + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+              (binary.getFlushToZero() ? "true" : "false") + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");");
           return success();
         }
         line("intent_divide_local<" + ctype(cast<MemRefType>(binary.getOutput().getType()).getElementType()) + ", " +
-            count(binary.getOutput()) + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");", depth);
+            count(binary.getOutput()) + ">(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ");");
         return success();
       }
       std::string intrinsic;
@@ -359,7 +333,7 @@ private:
       if (!isa<MemRefType>(binary.getRhs().getType())) intrinsic += "_scalar";
       if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) intrinsic = callee.getValue().str();
       line(intrinsic + "(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " +
-          name(binary.getRhs()) + ", " + count(binary.getOutput()) + ");", depth); return success();
+          name(binary.getRhs()) + ", " + count(binary.getOutput()) + ");"); return success();
     }
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
       if (Value scratch = unary.getScratch()) {
@@ -367,22 +341,22 @@ private:
           line("intent_exp_f32_tile<" + count(unary.getOutput()) + ", " +
               std::to_string(cast<MemRefType>(scratch.getType()).getDimSize(1)) +
               (unary.getKind() == UnaryOperator::Exp2 ? ", true>(" : ">(") +
-              name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");", depth);
+              name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");");
           return success();
         }
         line("intent_exp2_ftz_tile<" + count(unary.getOutput()) + ", " + count(scratch) +
             (unary->hasAttr("bangc.input_non_subnormal") ? ", true>(" : ">(") +
-            name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");", depth);
+            name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + name(scratch) + ");");
         return success();
       }
       if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) {
-        line(callee.getValue().str() + "(" + count(unary.getOutput()) + ", " + name(unary.getOutput()) + ", " + name(unary.getInput()) + ");", depth);
+        line(callee.getValue().str() + "(" + count(unary.getOutput()) + ", " + name(unary.getOutput()) + ", " + name(unary.getInput()) + ");");
         return success();
       }
       if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
           implementation && implementation.getValue() == "exp2_f32") {
         line("intent_exp2_tile<" + count(unary.getOutput()) + ", " + (unary.getFlushToZero() ? "true" : "false") + ">(" +
-            name(unary.getOutput()) + ", " + name(unary.getInput()) + ");", depth);
+            name(unary.getOutput()) + ", " + name(unary.getInput()) + ");");
         return success();
       }
       std::string intrinsic;
@@ -390,31 +364,31 @@ private:
       case UnaryOperator::Abs: intrinsic = "__bang_abs"; break;
       case UnaryOperator::Negate:
         line("__bang_mul_scalar(" + name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " +
-            ctype(cast<MemRefType>(unary.getInput().getType()).getElementType()) + "(-1), " + count(unary.getOutput()) + ");", depth); return success();
+            ctype(cast<MemRefType>(unary.getInput().getType()).getElementType()) + "(-1), " + count(unary.getOutput()) + ");"); return success();
       default: return op->emitError("unbound BANG unary operation");
       }
-      line(intrinsic + "(" + name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + count(unary.getOutput()) + ");", depth); return success();
+      line(intrinsic + "(" + name(unary.getOutput()) + ", " + name(unary.getInput()) + ", " + count(unary.getOutput()) + ");"); return success();
     }
     if (auto castOp = dyn_cast<dsa::CastOp>(op)) {
       if (auto callee = op->getAttrOfType<StringAttr>("bangc.callee")) {
-        line(callee.getValue().str() + "(" + count(castOp.getOutput()) + ", " + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
+        line(callee.getValue().str() + "(" + count(castOp.getOutput()) + ", " + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");");
         return success();
       }
       auto from = cast<MemRefType>(castOp.getInput().getType()).getElementType();
       auto to = cast<MemRefType>(castOp.getOutput().getType()).getElementType();
       if (from == to) line("__memcpy(" + name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ", " +
-          count(castOp.getOutput()) + " * sizeof(" + ctype(to) + "), NRAM2NRAM);", depth);
+          count(castOp.getOutput()) + " * sizeof(" + ctype(to) + "), NRAM2NRAM);");
       else if (from.isInteger(1) && to.isF32())
         line("intent_bool_to_f32_tile<" + count(castOp.getOutput()) + ">(" + name(castOp.getOutput()) + ", " +
-            name(castOp.getInput()) + ");", depth);
+            name(castOp.getInput()) + ");");
       else if ((from.isF16() && to.isF32()) || (from.isF32() && to.isF16()))
         line(std::string(to.isF32() ? "__bang_half2float(" : "__bang_float2half_rn(") + name(castOp.getOutput()) + ", " +
-            name(castOp.getInput()) + ", " + count(castOp.getOutput()) + ");", depth);
+            name(castOp.getInput()) + ", " + count(castOp.getOutput()) + ");");
       else if ((from.isBF16() && to.isF32()) || (from.isF32() && to.isBF16()))
         line(std::string(to.isF32() ? "intent_bf16_to_f32_tile<" : "intent_f32_to_bf16_tile<") + count(castOp.getOutput()) + ">(" +
-            name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
+            name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");");
       else line("intent_cast_local<" + ctype(from) + ", " + ctype(to) + ", " + count(castOp.getOutput()) + ">(" +
-          name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");", depth);
+          name(castOp.getOutput()) + ", " + name(castOp.getInput()) + ");");
       return success();
     }
     if (auto reduce = dyn_cast<dsa::ReduceOp>(op)) {
@@ -423,13 +397,13 @@ private:
         line("intent_reduce_half_extrema<" + std::to_string(input.getDimSize(0)) + ", " +
             std::to_string(input.getDimSize(1)) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
             name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
-            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");");
         return success();
       }
       if (reduce.getAxis() == 0) {
         line("intent_reduce_rows<" + std::to_string(cast<MemRefType>(reduce.getInput().getType()).getDimSize(1)) + ">(" +
             name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
-            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");");
         return success();
       }
       if (input.getDimSize(0) > 1) {
@@ -438,7 +412,7 @@ private:
           line("intent_reduce_row_tiles<" + std::to_string(input.getDimSize(0)) + ", " +
               std::to_string(input.getDimSize(1)) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
               name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
-              name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+              name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");");
           return success();
         }
         std::string helper = reduce.getKind() == BinaryOperator::Add ? "intent_reduce_row_sums<" : "intent_reduce_row_extrema<";
@@ -446,38 +420,38 @@ private:
         line(helper + std::to_string(input.getDimSize(0)) + ", " +
             std::to_string(input.getDimSize(1)) + kind + ">(" + name(reduce.getOutput()) + ", " +
             name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
-            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth);
+            name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");");
         return success();
       }
       line("intent_reduce<" + count(reduce.getInput()) + ", " + std::to_string(static_cast<int>(reduce.getKind())) + ">(" +
           name(reduce.getOutput()) + ", " + name(reduce.getInput()) + ", " + name(reduce.getScratch()) + ", " +
-          name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");", depth); return success();
+          name(reduce.getCount()) + ", " + name(reduce.getIdentity()) + ");"); return success();
     }
     if (auto divide = dyn_cast<dsa::DivideRNOp>(op)) {
       line("intent_divide_rn<" + count(divide.getOutput()) + ", " +
           std::to_string(cast<MemRefType>(divide.getScratch().getType()).getDimSize(1)) + ">(" +
           name(divide.getOutput()) + ", " + name(divide.getLhs()) + ", " + name(divide.getRhs()) + ", " +
-          name(divide.getScratch()) + ", " + name(divide.getLaneIndices()) + ");", depth);
+          name(divide.getScratch()) + ", " + name(divide.getLaneIndices()) + ");");
       return success();
     }
     if (auto divide = dyn_cast<dsa::DivideCastOp>(op)) {
       line("intent_divide_cast_f16<" + count(divide.getOutput()) + ">(" +
           name(divide.getOutput()) + ", " + name(divide.getLhs()) + ", " + name(divide.getRhs()) + ", " +
           name(divide.getQuotient()) + ", " + name(divide.getBounds()) + ", " + name(divide.getAccepted()) + ", " +
-          name(divide.getNarrowBounds()) + ", " + name(divide.getLaneIndices()) + ");", depth); return success();
+          name(divide.getNarrowBounds()) + ", " + name(divide.getLaneIndices()) + ");"); return success();
     }
     if (auto prepare = dyn_cast<dsa::PrepareMatrixOp>(op)) {
       line("intent_prepare_matrix<" + shape(prepare.getOutput()) + ", " + (prepare.getInputTransposed() ? "true" : "false") + ">(" +
           name(prepare.getOutput()) + ", " + name(prepare.getInput()) + ", " +
           (prepare.getScratch() ? name(prepare.getScratch()) : "nullptr") + ", " +
-          (prepare.getReshaped() ? name(prepare.getReshaped()) : "nullptr") + ");", depth); return success();
+          (prepare.getReshaped() ? name(prepare.getReshaped()) : "nullptr") + ");"); return success();
     }
     if (auto matrix = dyn_cast<dsa::MatrixTileOp>(op)) {
       auto a = cast<MemRefType>(matrix.getLhs().getType()), c = cast<MemRefType>(matrix.getAccumulator().getType());
       line("intent_matmul<" + ctype(a.getElementType()) + ", " + std::to_string(a.getDimSize(0)) + ", " +
           std::to_string(a.getDimSize(1)) + ", " + std::to_string(c.getDimSize(1)) +
           (matrix.getAccumulate() ? "" : ", false") + ">(" + name(matrix.getAccumulator()) + ", " +
-          name(matrix.getLhs()) + ", " + name(matrix.getRhs()) + ");", depth); return success();
+          name(matrix.getLhs()) + ", " + name(matrix.getRhs()) + ");"); return success();
     }
     std::string expression;
     if (isa<dsa::TaskIdOp>(op)) expression = "taskId";
@@ -486,16 +460,8 @@ private:
     else if (isa<dsa::GroupCountOp>(op)) expression = "taskDimY";
     else if (isa<dsa::LocalIdOp>(op)) expression = "taskIdX";
     else if (isa<dsa::IsMemoryCoreOp>(op)) expression = "__is_mpu()";
-    else if (auto stride = dyn_cast<dsa::StrideOp>(op)) expression = name(stride.getSource()) + "_s" + std::to_string(stride.getAxis());
-    else if (auto dim = dyn_cast<memref::DimOp>(op)) {
-      auto axis = dim.getConstantIndex();
-      if (!axis) return op->emitError("BANG C requires a bound view dimension axis");
-      expression = name(dim.getSource()) + "_d" + std::to_string(*axis);
-    } else if (auto scalar = dyn_cast<dsa::LoadScalarOp>(op)) expression = name(scalar.getSource()) + "[" + name(scalar.getOffset()) + "]";
-    else if (auto scalar = dyn_cast<memref::LoadOp>(op)) {
-      auto type = cast<MemRefType>(scalar.getMemref().getType());
-      expression = "intent_read_local(" + name(scalar.getMemref()) + " + " + name(scalar.getIndices()[0]) + " * " + std::to_string(type.getDimSize(1)) + " + " + name(scalar.getIndices()[1]) + ")";
-    } else if (isStandardScalarOperation(op)) {
+    else if (auto scalar = dyn_cast<dsa::LoadScalarOp>(op)) expression = name(scalar.getSource()) + "[" + name(scalar.getOffset()) + "]";
+    else if (isStandardScalarOperation(op)) {
       SmallVector<std::string> operands;
       for (Value value : op->getOperands()) operands.push_back(name(value));
       auto scalar = emitScalar(op, operands);
@@ -503,13 +469,113 @@ private:
       expression = std::move(*scalar);
     }
     if (expression.empty() || op->getNumResults() != 1) return op->emitError("operation has no BANG C spelling");
-    line(ctype(op->getResult(0).getType()) + " " + bind(op->getResult(0)) + " = " + expression + ";", depth);
+    line(ctype(op->getResult(0).getType()) + " " + bind(op->getResult(0)) + " = " + expression + ";");
     return success();
   }
   func::FuncOp function;
   SmallVector<std::string> signature, call;
 };
+
+const OperationEmitters<Serializer> &Serializer::nativeEmitters() {
+  static const auto handlers = [] {
+    OperationEmitters<Serializer> table;
+    auto metadataCheck = [](Operation *operation) {
+      return NativeSourceEmitter::metadataEmitters().verify(operation);
+    };
+    auto metadataEmit = [](Operation *operation, Serializer &out) {
+      return NativeSourceEmitter::metadataEmitters().emit(operation, out);
+    };
+    table.add<memref::DimOp>(metadataCheck, metadataEmit);
+    table.add<memref::ReinterpretCastOp>(metadataCheck, metadataEmit);
+    auto controlCheck = [](Operation *operation) -> LogicalResult {
+      if (operation->getNumResults())
+        return operation->emitOpError("BANG C control results require explicit state storage");
+      if (auto loop = dyn_cast<scf::WhileOp>(operation)) {
+        auto condition = cast<scf::ConditionOp>(loop.getBefore().front().getTerminator());
+        if (loop.getNumOperands() || !condition.getArgs().empty())
+          return loop.emitOpError("BANG C while state requires explicit state storage");
+      }
+      return NativeSourceEmitter::controlEmitters().verify(operation);
+    };
+    auto controlEmit = [](Operation *operation, Serializer &out) {
+      return NativeSourceEmitter::controlEmitters().emit(operation, out);
+    };
+    table.add<scf::ForOp>(controlCheck, controlEmit);
+    table.add<scf::IfOp>(controlCheck, controlEmit);
+    table.add<scf::WhileOp>(controlCheck, controlEmit);
+    table.add<memref::AllocaOp>([](memref::AllocaOp allocation) -> LogicalResult {
+      if (mlir::failed(verifyNativeAllocation(allocation, true))) return failure();
+      auto space = allocation.getType().getMemorySpaceAsInt();
+      if (space != dsa::nramSpace && space != dsa::matrixSpace && space != dsa::sharedSpace)
+        return allocation.emitOpError("BANG C allocation requires bound NRAM, WRAM, or SRAM storage");
+      if (!allocation->getAttrOfType<IntegerAttr>("bangc.offset") ||
+          !allocation->getAttrOfType<IntegerAttr>("bangc.allocation_bytes"))
+        return allocation.emitOpError("BANG C allocation requires completed storage binding");
+      return success();
+    }, [](memref::AllocaOp allocation, Serializer &out) {
+      auto type = allocation.getType();
+      std::string buffer = type.getMemorySpaceAsInt() == dsa::matrixSpace ? "local_wram" :
+          type.getMemorySpaceAsInt() == dsa::sharedSpace ? "group_sram" : "local_nram";
+      std::string pointer = out.newName();
+      out.line(out.nativeType(type) + pointer + " = reinterpret_cast<" + out.nativeType(type) +
+          ">(" + buffer + " + " +
+          std::to_string(allocation->getAttrOfType<IntegerAttr>("bangc.offset").getInt()) + ");");
+      out.memories[allocation.getResult()] = out.allocationDescriptor(type, pointer, {});
+      return success();
+    });
+    auto localAccess = [](Operation *operation, Value memory) -> LogicalResult {
+      auto type = cast<MemRefType>(memory.getType());
+      if (mlir::failed(verifyNativeMemoryType(operation, type))) return failure();
+      if (type.getMemorySpaceAsInt() != dsa::nramSpace)
+        return operation->emitOpError("BANG C scalar memref access requires NRAM storage; other spaces require their explicit DSA access operation");
+      return success();
+    };
+    table.add<memref::LoadOp>([=](memref::LoadOp load) {
+      return localAccess(load, load.getMemref());
+    }, [](memref::LoadOp load, Serializer &out) {
+      out.bindExpression(load.getResult(), "intent_read_local(" +
+          out.memoryPointer(load.getMemref(), load.getIndices()) + ")");
+      return success();
+    });
+    table.add<memref::StoreOp>([=](memref::StoreOp store) {
+      return localAccess(store, store.getMemref());
+    }, [](memref::StoreOp store, Serializer &out) {
+      out.line("intent_write_local(" + out.memoryPointer(store.getMemref(), store.getIndices()) +
+          ", " + out.valueString(store.getValue()) + ");");
+      return success();
+    });
+    table.add<memref::CopyOp>([=](memref::CopyOp copy) -> LogicalResult {
+      for (Value memory : {copy.getSource(), copy.getTarget()}) {
+        if (mlir::failed(localAccess(copy, memory))) return failure();
+        auto type = cast<MemRefType>(memory.getType());
+        if (!type.hasStaticShape() || !type.getLayout().isIdentity())
+          return copy.emitOpError("BANG C local copy requires static contiguous source and destination views");
+      }
+      return success();
+    }, [](memref::CopyOp copy, Serializer &out) {
+      out.line("intent_copy_local<" + ctype(cast<MemRefType>(copy.getSource().getType()).getElementType()) +
+          ", " + out.count(copy.getSource()) + ">(" + out.memoryPointer(copy.getTarget()) +
+          ", " + out.memoryPointer(copy.getSource()) + ");");
+      return success();
+    });
+    table.add<dsa::StrideOp>([](dsa::StrideOp stride) {
+      return verifyNativeMemoryType(stride, cast<MemRefType>(stride.getSource().getType()));
+    }, [](dsa::StrideOp stride, Serializer &out) {
+      out.SourceEmitter::bind(stride.getResult(), out.memories.at(stride.getSource()).strides[stride.getAxis()]);
+      return success();
+    });
+    return table;
+  }();
+  return handlers;
 }
+}
+
+std::optional<LogicalResult> verifyNativeSourceOperation(Operation *operation) {
+  const auto &table = Serializer::nativeEmitters();
+  if (!table.contains(operation)) return std::nullopt;
+  return table.verify(operation);
+}
+
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
   if (mlir::failed(verifyProgram(module))) return failure();
   llvm::raw_string_ostream output(source);

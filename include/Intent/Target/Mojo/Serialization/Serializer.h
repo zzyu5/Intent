@@ -5,6 +5,8 @@
 #include <string>
 
 namespace intent::mojo {
+mlir::LogicalResult verifySourceOperation(mlir::Operation *operation);
+mlir::LogicalResult verifySourceProgram(mlir::ModuleOp module);
 mlir::LogicalResult serializeProgram(mlir::ModuleOp module, std::string &source,
                                     std::string &metadata);
 }

@@ -1,6 +1,6 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Legalize.h"
-#include "Intent/Target/Mojo/Serialization/Scalar.h"
+#include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Bufferization.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -13,7 +13,6 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
-#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -24,11 +23,6 @@ namespace {
 
 bool directAtomicAdd(Type element) {
   return element.isF32() || element.isF64() || element.isSignlessInteger(32) || element.isSignlessInteger(64);
-}
-
-bool supportedType(Type type) {
-  if (auto memory = dyn_cast<MemRefType>(type)) type = memory.getElementType();
-  return supportsScalarType(type);
 }
 
 bool needsFloatingPointEnvironment(Operation *scope) {
@@ -86,54 +80,6 @@ void promotePrivateScratch(func::FuncOp function, int64_t budget) {
     allocation.erase();
     budget -= *facts.bytes + alignment - 1;
   }
-}
-
-LogicalResult checkSurface(ModuleOp module) {
-  bool invalid = false;
-  module.walk([&](Operation *operation) {
-    if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, cpu::TaskYieldOp>(operation)) return;
-    if (isStandardScalarOperation(operation)) {
-      invalid |= failed(verifyScalar(operation));
-      return;
-    }
-    bool supported = isa<memref::DimOp,
-        memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp,
-        memref::ExtractStridedMetadataOp, memref::ExtractAlignedPointerAsIndexOp,
-        memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
-        vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::FromElementsOp, vector::ShuffleOp, vector::StepOp,
-        vector::ExtractElementOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
-        cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp,
-        cpu::InvokeOp>(operation);
-    supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
-    supported &= llvm::all_of(operation->getResultTypes(), supportedType);
-    if (auto dimension = dyn_cast<memref::DimOp>(operation))
-      supported &= dimension.getConstantIndex().has_value();
-    if (auto stack = dyn_cast<memref::AllocaOp>(operation))
-      supported &= stack.getType().hasStaticShape();
-    if (auto prefetch = dyn_cast<memref::PrefetchOp>(operation))
-      supported &= !prefetch.getIsWrite() && prefetch.getLocalityHint() == 3 && prefetch.getIsDataCache();
-    if (auto call = dyn_cast<func::CallOp>(operation)) {
-      auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
-          call, call.getCalleeAttr());
-      supported = callee && callee.isExternal() &&
-                  callee->hasAttr("cpu.external_runtime") &&
-                  llvm::all_of(call->getOperandTypes(), supportedType) &&
-                  llvm::all_of(call->getResultTypes(), supportedType);
-    }
-    if (isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation)) {
-      Type element = cast<MemRefType>(operation->getOperand(0).getType()).getElementType();
-      supported &= directAtomicAdd(element) || element.isF16() || element.isBF16();
-      if (auto rmw = dyn_cast<cpu::AtomicRMWOp>(operation))
-        supported &= directAtomicAdd(element) && rmw.getKind() == AtomicRMWKind::Add;
-    }
-    if (!supported) {
-      operation->emitError("current operation/type has no supported Mojo CPU surface form: ")
-          << operation->getName() << "; operands=" << operation->getOperandTypes()
-          << "; results=" << operation->getResultTypes();
-      invalid = true;
-    }
-  });
-  return failure(invalid);
 }
 
 LogicalResult expandAtomicUpdates(ModuleOp module) {
@@ -295,7 +241,7 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
       if (needsFloatingPointEnvironment(dispatch)) scopes.push_back(&dispatch.getBody().front());
     });
   }
-  if (scopes.empty()) return checkSurface(module);
+  if (scopes.empty()) return verifySourceProgram(module);
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
   auto enter = builder.create<func::FuncOp>(module.getLoc(), "intent_cpu_enter_ieee",
@@ -311,7 +257,7 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
     builder.setInsertionPoint(scope->getTerminator());
     builder.create<func::CallOp>(module.getLoc(), leave, ValueRange{previous});
   }
-  return checkSurface(module);
+  return verifySourceProgram(module);
 }
 
 }

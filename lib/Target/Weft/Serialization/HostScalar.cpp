@@ -1,4 +1,4 @@
-#include "Intent/Target/Weft/IR/HostScalar.h"
+#include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "Intent/Serialization/ScalarEmitters.h"
 
 using namespace mlir;
@@ -32,28 +32,4 @@ FailureOr<std::string> emitHostScalar(Operation *operation, ArrayRef<std::string
 }
 LogicalResult verifyHostScalar(Operation *operation) { return emitters().verify(operation); }
 
-LogicalResult verifyHostScalarOperations(Operation *scope) {
-  auto checkType = [](Type type) {
-    if (auto memory = dyn_cast<MemRefType>(type)) type = memory.getElementType();
-    return hostScalarType(type).has_value();
-  };
-  auto walk = scope->walk([&](Operation *operation) {
-    for (Type type : llvm::concat<Type>(operation->getOperandTypes(), operation->getResultTypes()))
-      if (!checkType(type)) {
-        operation->emitError("type has no native host C representation: ") << type;
-        return WalkResult::interrupt();
-      }
-    for (Region &region : operation->getRegions())
-      for (Block &block : region)
-        for (Type type : block.getArgumentTypes())
-          if (!checkType(type)) {
-            operation->emitError("block argument has no native host C representation: ") << type;
-            return WalkResult::interrupt();
-          }
-    if (isStandardScalarOperation(operation) && failed(verifyHostScalar(operation)))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
-  });
-  return failure(walk.wasInterrupted());
-}
 } // namespace intent::weft_provider

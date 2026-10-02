@@ -370,6 +370,32 @@ renderer 同时用于无输出的支持检查。C 家族共用整数宽度、除
 Mojo 保留自己的 SIMD 语法，BANG C 保留 bf16 存储载体转换。
 合法的未实现表达明确报错，不通过默认表达式继续生成源码。
 
+标准原生内存与控制流由
+[NativeSourceEmitter](include/Intent/Serialization/NativeSource.h) 共同翻译，
+Mojo、Weft host 和 BANG C 直接消费当前 `memref` 与 `scf`：
+
+- `metadataEmitters` 处理 dim、cast、subview、reinterpret 和 metadata/pointer extraction。
+  Subview 相对当前 view 合成 offset/strides；reinterpret 相对 storage base 替换元数据。
+- `controlEmitters` 处理 for、if、while 的 scalar 与完整 descriptor 传递。
+  多值赋值先保存全部源分量，再写目的分量，保留交换状态和循环退出值。
+- `memoryPointer` 使用 descriptor 的 offset、索引和真实 strides；释放仍使用 base。
+  `bindEntryMemory` 读取当前类型，动态尺寸与 strides 从现有 NativeABI slots 绑定。
+
+这些对象只保存源码表达式，不选择 tiling、bufferization、layout 或 lifetime。
+Target 保留指针语法、分配、SIMD/atomic、DMA 与任务派发。
+Mojo 的 [serializer](lib/Target/Mojo/Serialization/Serializer.cpp)、Weft 的
+[HostSource](lib/Target/Weft/Serialization/HostSource.cpp) 和 BANG C 的
+[serializer](lib/Target/BangC/Serialization/Serializer.cpp) 为原生内存操作登记实际 check+emit；
+对应的 terminal 支持检查消费同一张表。新增内存形式应同时给出受支持的 layout、dtype
+和 memory space，不能只把操作名加进 verifier，也不能在发射时把任意 memref 当二维连续 NRAM。
+
+DSA 公共 memref 的 layout 同样表达真实 stride 约束；未知 strides 保持动态，
+不以 identity layout 代替 ABI 事实。共同 emitter 支持某种 view/control，不代表 DSA
+的 alias/lifetime 分析已经支持它；family verifier 继续负责自己的执行合法性。
+这与 LLVM 20 的 `MemRefToLLVM.cpp::ReinterpretCastOpLowering` 和
+`LLVMCommon/Pattern.cpp::getStridedElementPtr` 将 descriptor 语义集中处理的边界一致。
+Intent 保留当前动态 strided source 能力，不引入只适用于静态 identity memref 的终端路线。
+
 职责参考：本地 TileLang `src/cuda/codegen/codegen_cuda.h:23–65` 与
 `src/backend/common/codegen/codegen_c_host.h:45–86` 复用公共 codegen 并覆写目标能力；
 Intent 在相同职责边界共享遍历与语言状态，GPU 原生 collective/layout 仍交给
@@ -764,7 +790,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 |---|---|---|
 | 值优化与存储物化 | [Bufferization.h](include/Intent/Dialect/CPU/Transforms/Bufferization.h) | `bufferizeValues` 完整关闭值程序；原生接口负责 alias、in-place、copy 与 ownership，不用未建模操作兜底 |
 | 均匀存储内容 | [UniformValues.h](include/Intent/Dialect/CPU/Analysis/UniformValues.h) | `UniformMemoryAnalysis` 为普通折叠与 region predicate 共享读取、view 归一和 effect 失效；多输出先在同一输入快照求值，再同时发布结果 |
-| 原生控制流描述符 | [MemoryDescriptor.h](include/Intent/Serialization/MemoryDescriptor.h) | Mojo 与 Weft host 共同传递 base、offset、sizes、strides；释放读取 allocation base，serializer 不决定生命周期 |
+| 原生内存与控制流翻译 | [NativeSource.h](include/Intent/Serialization/NativeSource.h) | Mojo、Weft host 与 BANG C 共同处理标准 descriptor、视图、地址和 SCF 传递；目标保留分配与访存 API，serializer 不决定生命周期 |
 | Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
 | Weft task 局部存储 | [TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
 | 外层与局部参数 | [Configuration.h](include/Intent/Dialect/CPU/Transforms/Configuration.h) | 外层 task/block 参数与 implementation 的 local binding 分开，不通过完整 Passes.h 获取配置类型 |

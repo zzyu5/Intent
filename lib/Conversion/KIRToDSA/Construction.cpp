@@ -53,7 +53,6 @@ LogicalResult Construction::lower(func::FuncOp source) {
       SmallVector<int64_t> specialized(tensor.getShape());
       for (int64_t axis = 0; axis < tensor.getRank(); ++axis)
         if (auto found = fixedDimensions.find(shape.getDimensions()[axis]); found != fixedDimensions.end()) specialized[axis] = found->second;
-      arguments.push_back(MemRefType::get(specialized, tensor.getElementType()));
       auto constraints = view.getConstraints();
       if (auto binding = strideBindings ? strideBindings.getAs<DenseI64ArrayAttr>(name.getValue()) : DenseI64ArrayAttr()) {
         if (binding.size() != tensor.getRank()) return source.emitError("DSA stride binding rank mismatch for ") << name;
@@ -69,6 +68,13 @@ LogicalResult Construction::lower(func::FuncOp source) {
             constraints.getAlias(), constraints.getNoalias());
         boundStrideNames.insert(name.getValue());
       }
+      SmallVector<int64_t> physicalStrides(tensor.getRank(), ShapedType::kDynamic);
+      if (constraints.getHasStrides())
+        for (auto [axis, constraint] : llvm::enumerate(constraints.getStrides()))
+          if (auto fixed = dyn_cast<IntegerAttr>(constraint))
+            physicalStrides[axis] = fixed.getInt();
+      arguments.push_back(MemRefType::get(specialized, tensor.getElementType(),
+          StridedLayoutAttr::get(b.getContext(), 0, physicalStrides)));
       auto compiledTensor = RankedTensorType::get(specialized, tensor.getElementType(), shape);
       auto compiledView = intent::ViewType::get(b.getContext(), compiledTensor, view.getAccess(), constraints);
       interface[sourceArguments.size()] = PublicParameterAttr::get(b.getContext(), name, compiledView);

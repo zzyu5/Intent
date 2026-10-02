@@ -41,6 +41,7 @@ std::string SourceEmitter::newName(llvm::StringRef prefix) {
 void SourceEmitter::line(const llvm::Twine &text, unsigned explicitIndent) {
   unsigned level = explicitIndent == ~0U ? indent : explicitIndent;
   output.indent(level * indentationWidth) << text << '\n';
+  ++emittedLines;
 }
 
 LogicalResult SourceEmitter::failedResult(Operation *operation,

@@ -1,5 +1,6 @@
 #include "PassDetail.h"
 #include "../Serialization/Scalar.h"
+#include "../Serialization/Surface.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -73,14 +74,15 @@ LogicalResult verifySurfaceOperations(func::FuncOp function) {
           }
     if (isStandardScalarOperation(op))
       return failed(verifyScalar(op)) ? WalkResult::interrupt() : WalkResult::advance();
+    if (auto native = verifyNativeSourceOperation(op))
+      return failed(*native) ? WalkResult::interrupt() : WalkResult::advance();
     if (!isa<dsa::SynchronizeOp, dsa::GroupSynchronizeOp, dsa::GroupIdOp, dsa::GroupCountOp, dsa::LocalIdOp,
-             dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::StrideOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
+             dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
              dsa::LoadTileOp, dsa::GatherPlanOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::StoreTileOp, dsa::FillOp, dsa::IotaOp,
              dsa::IndexLayoutOp, dsa::IndexBinaryOp, dsa::BroadcastRowsOp, dsa::TransposeOp, dsa::SelectOp, dsa::MaskedFillOp, dsa::UnaryOp, dsa::BinaryOp,
              dsa::CastOp, dsa::CompareOp, dsa::CompareRangeOp, dsa::CompareRampOp, dsa::DivideCastOp, dsa::DivideRNOp, dsa::ReduceOp,
              dsa::PrepareMatrixOp, dsa::PrepareMatrixViewOp, dsa::MatrixTileOp,
-             memref::DimOp, memref::AllocaOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp, memref::CopyOp,
-             scf::ForOp, scf::WhileOp, scf::IfOp, scf::ConditionOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(op)) {
+             scf::ConditionOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(op)) {
       op->emitError("operation is outside the bound BANG C surface"); return WalkResult::interrupt();
     }
     return WalkResult::advance();
