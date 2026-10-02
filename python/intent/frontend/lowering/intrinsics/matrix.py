@@ -9,7 +9,7 @@ from intent.language import DTypeCategory
 from ..ast.model import ShapeDimension, SparseFormatSpec
 from ..shape_construction import ShapeBuilder
 from .common import bind_declared_call, require_dtype, require_static_bool, require_static_int
-from .structured import _scaled_format, emit_contract, emit_scaled_contract, emit_sparse_contract
+from .contractions import parse_scaled_format, emit_contract, emit_scaled_contract, emit_sparse_contract
 
 
 def lower_matrix_intrinsic(lowerer, name: str, node: ast.Call):
@@ -22,8 +22,8 @@ def lower_matrix_intrinsic(lowerer, name: str, node: ast.Call):
         values = tuple(_tensor(lowerer, bound[key]) for key in ("lhs", "lhs_scale", "rhs", "rhs_scale"))
         group = require_static_int(lowerer, bound["group_size"])
         return emit_scaled_contract(
-            lowerer, *values, _scaled_format(lowerer, bound["lhs_format"]),
-            _scaled_format(lowerer, bound["rhs_format"]), group, group,
+            lowerer, *values, parse_scaled_format(lowerer, bound["lhs_format"]),
+            parse_scaled_format(lowerer, bound["rhs_format"]), group, group,
             ((1, 0), (2, 1)), (), require_dtype(lowerer, bound["acc_dtype"]), node,
         )
     if name == "sparse_matmul":

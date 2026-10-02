@@ -32,7 +32,7 @@ from ..ast.model import StaticTuple
 from .common import bind_call
 from .common import lower_shape
 from .common import require_dtype
-from .structured import _builtin_combine_region
+from .callbacks import builtin_combine_region
 
 if TYPE_CHECKING:
     from ..ast.context import FunctionLowerer
@@ -164,7 +164,7 @@ def _scatter(lowerer: FunctionLowerer, node: ast.Call, *, reduce: bool) -> Stati
         if getattr(combine, "name", None) != "add":
             lowerer.error(bound["combine"], "scatter_reduce currently requires the typed I.add combine")
         regions = (
-            _builtin_combine_region(
+            builtin_combine_region(
                 lowerer,
                 (ScalarType(destination.type.dtype),),
                 BinaryOperator.ADD,
