@@ -17,7 +17,7 @@ grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.487456,0.414952,0.444008,0
 moe_alignment,T4096-top2-E64,0.040976,0.037072,0.024928,0.904725,0.608356,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.067568,0.056368,0.056416,0.834241,0.834951,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.878456,0.576672,0.707456,0.656461,0.805340,pass,pass,Intent target=triton; source corpus=cutile.,
-rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.064160,0.063584,0.064512,0.991022,1.005486,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入
+rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.064648,0.063584,0.096920,0.983542,1.499196,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入；Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理
 gelu,8192x4096-fp16-tanh,0.050768,0.069560,0.051672,1.370154,1.017806,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.226864,0.150120,0.138680,0.661718,0.611291,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.049624,0.049800,0.049528,1.003547,0.998065,pass,pass,Intent target=triton; source corpus=cutile. 同算法；NaN 传播方式不同,同算法；NaN 传播方式不同

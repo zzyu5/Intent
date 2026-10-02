@@ -604,6 +604,13 @@ host metadata binding，不依赖某个比较 SSA 值仍然存活。
 候选绑定。条件集合不依赖遍历顺序，候选行仍保留原顺序。普通分支内 primitive assertion
 留在原分支。Serializer 只导出当前 attributes，不识别 `cf.assert` 的比较形状。
 
+Triton contraction 的展开元素上限由 [Values.cpp](lib/Target/Triton/Transforms/Values.cpp)
+中的 `contractionExpansionRequirement` 与 form 选择共用当前 operand shapes，进入同一
+候选条件收集器。已选展开形式读取实际 constexpr 分支条件；数据相关分支不能免除
+原生编译合法性。未选分支逐个条件化 shape 因子，避免无用乘积先溢出；native dot
+不会无条件承担展开张量的预算。扩展这类 provider form 时，在这里闭合条件，不向
+serializer 或 runtime 另加 assertion 判定路径。
+
 参数改名、替换和改域通过现有 mutation owner 同时维护 requirements；失效的是候选行，
 不能顺便丢弃条件。Verifier 检查参数和 metadata 引用；改变控制域的变换必须证明条件
 仍适用，不能把分支约束无条件合并。分析的 `Unknown` 保留给 invocation 绑定，
@@ -740,7 +747,7 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
 | Provider 的 JIT、调优和发射 | [runtime/triton/program.py](python/intent/runtime/triton/program.py)、[runtime/cutile/program.py](python/intent/runtime/cutile/program.py) | 消费 `BoundInvocation` 与本 provider 的已解析合同，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
 | 原生资源与候选观察 | [runtime/diagnostics.py](python/intent/runtime/diagnostics.py) | 不可变 `NativeObservation` 保存实际调用、已选配置、SDK 返回值与失败；不持有 tensor，不参与候选策略 |
-| PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `TorchOutputInference` 能力注册 CPU/CUDA opaque 调用；GPU 与 Mojo CPU 支持只读 In/scalar 和 fresh Out，backward 由作者注册 |
+| PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `PublicInterface` 与 `TorchOutputInference` 注册 CPU/CUDA opaque 调用；InOut 进入 mutation schema，Out 为 fresh 返回；functional backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
 
 新增 GPU provider 时，先让 legalization 交付可独立验证的当前程序，再导出共同 interface 与必要 provider facts，实现上述 provider 调用接口，并由 `ResolvedTarget.materialize` 接入。不要复制 serializer 中的 Python host 模板，也不要让 framework adapter 自己猜输出或解析生成源码。CPU、DSA 可以保留自己的 ABI/buffer 类型；共同 `ArtifactRuntime` 协议不要求它们采用 GPU 的 grid、workspace 或 tensor binder。
@@ -774,7 +781,20 @@ shape 必须由输入或公共声明中的静态维度确定；涉及 `Out` 的�
 是 Python 的唯一解释器，`NativeABI.read` 同时检查 slots 和 requirements，保存、加载
 与 materialize 都消费这份事实。修改后端支持范围时先改 IR 的合法性与导出，不能只删
 runtime 检查，也不能从 provider 名字推断所有输入必须 contiguous。
-其中 `check_geometry` 只检查 shape/stride，Mojo fake 通过 `torch._check` 复用；
+
+Native 调优保存范围由 [NativeABI.trial_regions](python/intent/runtime/native.py) 从
+InOut 的实际 pointer、extent slots 和物理 pointee 字节宽度导出。Mojo 与 Weft 的
+native benchmark wrappers 共用这份范围事实，保留各自语言的计时与内存拼写；每次
+repetition 在计时前恢复输入，计时一次完整入口，完成后恢复调用方状态。当前 CPU
+入口只允许只读 In 使用 strided layout，InOut 的连续性来自已声明的入口合同。
+
+Weft 的 `prepare` 只绑定 storage，不缓存其中的数据；`choose` 和 `benchmark`
+开始时才捕获当前 InOut 内容，并在正常或异常退出时恢复。这样，同一 prepared call
+之前的真实更新或 prepare 后的调用方更新不会被旧快照覆盖。只读 view 不清零，
+accepted alias 关系和原始 pointers 保持不变；显式 `prepare` 测量回调也在这次状态
+恢复边界内。候选集合、试跑次数与选优策略仍归各 provider，不能用 snapshot helper
+改变它们。
+入口要求的 `check_geometry` 只检查 shape/stride，Mojo fake 通过 `torch._check` 复用；
 `check_storage` 与 `check_pair` 检查真实地址及跨度，只用于 concrete binding。
 Mojo 的空指针 ABI 限制、BANG C 设备/队列/整行 tile 资格和 Weft 的调用线程
 affinity、stack、RVV/VLEN 检查继续留在各自 runtime。
@@ -829,6 +849,17 @@ unavailable reason。Mojo native artifact 命中取实际库加载结果，Weft 
 
 PyTorch fake 通过 runtime 的 `infer_outputs` 调用同一个公共 binder，使用 symbolic
 关系断言，既不读取 data pointer，也不创建 GPU workspace 或执行 native code。
+`as_torch_op` 从实际输入位置生成 `Tensor(aN!)` 与 `mutates_args`，保持 `run` 的
+返回合同：只有 `InOut` 的 kernel 返回 `None`，混合 `InOut/Out` 只返回新分配的
+`Out`。该 adapter 的 mutable 调用要求被写入输入与其它输入不共享 Torch storage；
+concrete 与 fake 使用同一 storage-identity 查询检查，不要求 source 注解
+`noalias=True`，只读输入之间仍可 alias。该限制属于 PyTorch functionalization
+接入；普通 artifact 调用的 alias 合同不变。Torch 本身无法识别的、由不同外部
+StorageImpl 包装的同一地址不在此桥接保证内。
+PyTorch 自动处理声明 mutation 的版本计数与图内 functionalization，Intent 不重建
+这一过程。Mutable custom operator 不支持 `register_autograd`；优化器/显式状态更新
+与需要作者 backward 的 functional operator 分开注册，遵守 PyTorch 的 grad-mode
+规则，不由 adapter 隐式切换 `no_grad`。
 [softmax_forward_backward.py](examples/softmax_forward_backward.py) 展示两个已编译
 artifacts 注册为 forward/backward operators，作者通过 `register_autograd` 保存并
 传递张量；同一份 host 组织可选择 Triton、cuTile 或 Mojo CPU。
