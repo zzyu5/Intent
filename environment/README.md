@@ -1,24 +1,28 @@
 # Installation
 
-The public setup uses Linux and Python 3.10–3.12. One installer selects the backend dependencies and installs either an existing Intent wheel or a package built from source. Python MLIR bindings are not needed. GPU execution requires an appropriate NVIDIA driver; CPU and MLU toolchains are selected explicitly below. Installation, successful compilation, and numerical correctness are separate checks.
+The public setup uses Linux and Python 3.10–3.12. Install an Intent wheel, then use the installed `intent setup` command to add one backend's Python dependencies. The source checkout also provides a virtual-environment bootstrap. Python MLIR bindings are not needed. GPU execution requires an appropriate NVIDIA driver; CPU and MLU toolchains are selected explicitly below. Installation, successful compilation, and numerical correctness are separate checks.
 
 ## Install an existing wheel
 
-Set `INTENT_WHEEL` to the actual path of a built `.whl` file, preserving its filename. From the checkout:
+Set `INTENT_WHEEL` to the actual path of a built `.whl` file, preserving its filename. No checkout or LLVM/MLIR SDK is needed:
 
 ```bash
-python3 environment/install.py --backend triton \
-  --venv .venv-triton --wheel "$INTENT_WHEEL"
+python3 -m venv .venv-triton
 source .venv-triton/bin/activate
+python -m pip install "${INTENT_WHEEL}[manual]"
+intent setup --target triton
 intent doctor --target triton
-python examples/softmax.py
 ```
 
 This route does not inspect SDK paths, build C++, or install MLIR bindings. The wheel includes `intent-compile`, `intent-opt`, their shared profiles, the language manual, and the tools' non-system ELF dependencies. The binaries find their libraries through relative `$ORIGIN` paths. Third-party copyright/license files and a library-to-notice listing are installed under `intent/_bin/third-party/`.
 
 These are local Linux platform wheels. They require a compatible host architecture, glibc, libstdc++, libgcc, and selected backend environment; bundling does not make a binary built against a newer system work on an older one. No manylinux compatibility or public release is implied. For an environment whose backend dependencies are already installed, `python -m pip install "${INTENT_WHEEL}[manual]"` installs the package directly without a checkout.
 
-For compiler/KIR tools and the MCP servers alone, the same wheel installation needs no provider SDK or tensor framework. Run `intent doctor --json` to check the installed compiler and its KIR output stage. Add a selected backend's dependencies when you need its runtime; a base compiler check does not establish device or kernel support.
+For compiler/KIR tools and the MCP servers alone, omit `intent setup`: the wheel installation needs no provider SDK or tensor framework. Run `intent doctor --json` to check the installed compiler and its KIR output stage. Add a selected backend's dependencies when you need its runtime; a base compiler check does not establish device or kernel support.
+
+`intent setup --target cutile` selects the public cuTile dependency route. Setup invokes pip in the Python environment containing that `intent` command, with the package's own dependency declarations. It does not install drivers, external CPU/MLU compilers, or probe a device. Follow it with `intent doctor --target BACKEND` and the target options for your deployment. `--torch-index-url` selects another wheel index for the same declared PyTorch release; `--json` returns installation status while pip output goes to stderr. Use separate virtual environments for different GPU routes.
+
+From a checkout, `python3 environment/install.py --backend triton --venv .venv-triton --wheel "$INTENT_WHEEL"` combines venv creation, wheel installation, the installed setup command and doctor. The checkout's bootstrap does not maintain a second dependency installation path. After installation, [the public softmax example](../examples/softmax.py) demonstrates a complete kernel invocation.
 
 ## Source build prerequisites
 
@@ -30,8 +34,8 @@ Use a separate virtual environment for each public GPU route. The dependency dec
 
 | Backend | Python runtime route | External requirements and current scope |
 |---|---|---|
-| `triton` | CUDA PyTorch 2.10.0, [triton.txt](triton.txt) | NVIDIA driver; callable GPU artifacts |
-| `cutile` | CUDA PyTorch 2.10.0, [cutile-runtime.txt](cutile-runtime.txt) | NVIDIA driver compatible with the selected CUDA toolkit; callable GPU artifacts |
+| `triton` | CUDA PyTorch 2.10.0, Triton 3.6.0, NumPy 1.26.4 | NVIDIA driver; callable GPU artifacts |
+| `cutile` | CUDA PyTorch 2.10.0, cuTile 1.6.0, CUDA toolkit 13.3.1; see [dependency declarations](../python/intent/tools/backends.py) | NVIDIA driver compatible with the selected CUDA toolkit; callable GPU artifacts |
 | `mojo` | CPU PyTorch 2.10.0 | Existing Mojo compiler, Linux x86-64 with AVX2/AVX512; callable CPU artifacts |
 | `weft` | No additional tensor framework for source generation | Intent compiler built with Weft; public `WeftTarget` generates canonical Weft source, native execution requires its deployment/toolchain |
 | `bangc` | Native buffer interface uses the Python standard library | Existing NeuWare SDK and MLU370 implementation; execution requires an actual compatible MLU device |
@@ -61,8 +65,8 @@ The public cuTile route uses cuda-tile 1.6 and CUDA toolkit 13.3.1. The older [c
 The common installer:
 
 1. Creates or reuses the chosen virtual environment, without adding the caller's `PYTHONPATH` or user site packages.
-2. Installs only the selected backend's Python dependencies.
-3. Installs the selected wheel, or builds `intent-compile` and `intent-opt` and packages their runtime libraries and notices.
+2. Installs the selected wheel, or builds `intent-compile` and `intent-opt` and packages their runtime libraries and notices.
+3. Calls the installed `intent setup` to install only the selected backend's Python dependencies.
 4. Queries the installed compiler and checks the selected backend. The public CLI and both MCP entry points are included.
 
 For another build SDK location, supply `--mlir-dir` and `--llvm-dir`, or set `INTENT_MLIR_DIR` and `INTENT_LLVM_DIR`. Add `--wheel "$INTENT_WHEEL"` to install an existing wheel instead; SDK/build flags are then unnecessary and rejected. `--torch-index-url` overrides the selected route's wheel index for the same PyTorch release; check the [PyTorch installation combinations](https://pytorch.org/get-started/previous-versions/).

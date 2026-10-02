@@ -3,30 +3,32 @@
 BACKENDS = {
     "triton": {
         "target": "TritonTarget", "modules": ("torch", "triton"),
-        "requirements": "triton.txt", "torch": "2.10.0",
+        "requirements": ("triton==3.6.0", "numpy==1.26.4"), "torch": "2.10.0",
         "torch_index": "https://download.pytorch.org/whl/cu130",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and CUDA-capable PyTorch",
     },
     "cutile": {
         "target": "CuTileTarget", "modules": ("torch", "cuda.tile", "cuda.tile.tune"),
-        "requirements": "cutile-runtime.txt", "torch": "2.10.0",
+        "requirements": ("triton==3.6.0", "numpy==1.26.4",
+                         "cuda-toolkit[tileiras,nvvm,nvcc]==13.3.1", "cuda-tile==1.6.0"),
+        "torch": "2.10.0",
         "torch_index": "https://download.pytorch.org/whl/cu130",
         "python_max": (3, 12), "toolchain": "NVIDIA driver and the CUDA tile compiler",
     },
     "mojo": {
         "target": "MojoTarget", "modules": ("torch",),
-        "requirements": None, "torch": "2.10.0",
+        "requirements": (), "torch": "2.10.0",
         "torch_index": "https://download.pytorch.org/whl/cpu",
         "python_max": (3, 12), "toolchain": "An explicitly installed Mojo compiler; Linux x86-64 AVX2/AVX512",
     },
     "weft": {
         "target": "WeftTarget", "modules": (),
-        "requirements": None, "torch": None, "torch_index": None,
+        "requirements": (), "torch": None, "torch_index": None,
         "python_max": (3, 12), "toolchain": "An Intent compiler built with Weft; public generation requires explicit vector_bits and workers",
     },
     "bangc": {
         "target": "BangCTarget", "modules": (),
-        "requirements": None, "torch": None, "torch_index": None,
+        "requirements": (), "torch": None, "torch_index": None,
         "python_max": (3, 12), "toolchain": "An explicitly installed NeuWare SDK and MLU370 runtime",
     },
 }

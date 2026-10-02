@@ -106,6 +106,7 @@ def main() -> None:
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     env.pop("INTENT_COMPILER", None)
+    env.pop("INTENT_OPTIMIZER", None)
     env["PYTHONNOUSERSITE"] = "1"
     env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(args.jobs)
     if not destination.exists():
@@ -116,11 +117,6 @@ def main() -> None:
     if not (3, 10) <= tuple(interpreter) <= selected["python_max"]:
         parser.error("the public backend dependency routes currently require Python 3.10–3.12")
     run(python, "-m", "pip", "install", "--upgrade", "pip", env=env)
-    if selected["torch"] is not None:
-        run(python, "-m", "pip", "install", f"torch=={selected['torch']}", "--index-url",
-            args.torch_index_url or selected["torch_index"], env=env)
-    if selected["requirements"] is not None:
-        run(python, "-m", "pip", "install", "-r", REPOSITORY / "environment" / selected["requirements"], env=env)
     if args.wheel is not None:
         run(python, "-m", "pip", "install", str(args.wheel) + "[manual]", env=env)
     else:
@@ -132,6 +128,10 @@ def main() -> None:
             "--config-settings=cmake.define.MLIR_DIR=" + str(args.mlir_dir),
             "--config-settings=cmake.define.LLVM_DIR=" + str(args.llvm_dir),
             "--config-settings=build-dir=" + str(build), *extra_cmake, env=env)
+    command = [str(destination / "bin/intent"), "setup", "--target", args.backend]
+    if args.torch_index_url:
+        command.extend(("--torch-index-url", args.torch_index_url))
+    run(*command, env=env)
     print(f"Installed {args.backend}. Activate: source {shlex.quote(str(destination / 'bin/activate'))}")
     if args.backend == "weft":
         run(python, "-c", "import sys; from intent.compiler.toolchain import compiler_info; "

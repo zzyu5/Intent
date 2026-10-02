@@ -1,6 +1,0 @@
-# Public runtime route: install CUDA torch 2.10.0 first.
-# The separate cutile.txt preserves the historical experiment environment.
-triton==3.6.0
-numpy==1.26.4
-cuda-toolkit[tileiras,nvvm,nvcc]==13.3.1
-cuda-tile==1.6.0

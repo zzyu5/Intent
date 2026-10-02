@@ -24,7 +24,7 @@ def _assignments(parser, values: list[str]) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect an Intent environment, compile a kernel or transform existing IR")
+    parser = argparse.ArgumentParser(description="Set up an Intent environment, inspect its tools, compile a kernel or transform existing IR")
     commands = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (("doctor", "Check the base compiler, or selected backend dependencies and target facts"),
                             ("compile", "Compile a Python file:kernel or importable.module:kernel"),
@@ -69,13 +69,21 @@ def main() -> None:
     describe_parser = commands.add_parser("describe", help="Discover installed public API and target fields without probing SDKs or devices")
     describe_parser.add_argument("--target", choices=BACKENDS)
     describe_parser.add_argument("--json", action="store_true")
+    setup_parser = commands.add_parser("setup", help="Install one backend's Python dependencies in this Python environment")
+    setup_parser.add_argument("--target", choices=BACKENDS, required=True)
+    setup_parser.add_argument("--torch-index-url", help="Override the selected route's PyTorch wheel index")
+    setup_parser.add_argument("--json", action="store_true")
     read_parser = commands.add_parser("read-artifact", help="Read an explicit source, IR, metadata or log file without execution")
     read_parser.add_argument("path")
     read_parser.add_argument("--offset", type=int, default=0, help="Unicode character offset")
     read_parser.add_argument("--limit", type=int, default=16000, help="Maximum characters, from 1 to 64000")
     read_parser.add_argument("--json", action="store_true")
     arguments = parser.parse_args()
-    if arguments.command == "describe":
+    if arguments.command == "setup":
+        from .installation import setup_backend
+
+        result = setup_backend(arguments.target, torch_index_url=arguments.torch_index_url)
+    elif arguments.command == "describe":
         result = describe(arguments.target)
     elif arguments.command == "read-artifact":
         result = read_artifact(arguments.path, offset=arguments.offset, limit=arguments.limit)
@@ -119,6 +127,11 @@ def main() -> None:
                                      options=compile_options or None)
     if arguments.json or arguments.command == "describe":
         print(json.dumps(result, indent=2))
+    elif arguments.command == "setup":
+        print(f"{arguments.target}: {result['status']} in {result['python']}")
+        if "diagnostic" in result:
+            print(result["diagnostic"]["message"], file=sys.stderr)
+        print(result["scope"])
     elif arguments.command == "doctor":
         print(f"{arguments.target or 'base compiler'}: {result['status']}")
         for check in result["checks"]:
