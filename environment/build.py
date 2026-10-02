@@ -209,7 +209,16 @@ def main() -> None:
     run(installed / "bin/python", "-m", "pip", "install", str(wheel) + "[manual]",
         cwd=work, env=runtime_env)
     intent = installed / "bin/intent"
-    run(intent, "doctor", "--json", cwd=work, env=runtime_env, output=work / "doctor.json")
+    diagnosis = json.loads(run(intent, "doctor", "--json", cwd=work, env=runtime_env,
+                               output=work / "doctor.json"))
+    compiler = next(check["detail"] for check in diagnosis["checks"]
+                    if check["category"] == "compiler")
+    for provider in compiler["providers"].values():
+        for filename in provider["profiles"]:
+            resource = Path(filename).resolve(strict=True)
+            resource.relative_to(installed)
+            if not resource.is_file() or resource.stat().st_size == 0:
+                raise ValueError(f"The installed compiler resource is missing or empty: {resource}")
     run(intent, "describe", "--json", cwd=work, env=runtime_env, output=work / "describe.json")
     run(installed / "bin/intent-manual", cwd=work, env=runtime_env)
     run(installed / "bin/intent-compiler-mcp", cwd=work, env=runtime_env)
