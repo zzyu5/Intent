@@ -3,6 +3,7 @@
 #include "Views.h"
 #include "TaskInterface.h"
 #include "Quantization.h"
+#include "Reductions.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
@@ -1062,6 +1063,24 @@ private:
     return result;
   }
 
+  FailureOr<Value> reductionContribution(Block &body,
+                                         const NativeReduction &native,
+                                         IRMapping &mapping) {
+    for (Operation &operation : body.without_terminator()) {
+      if (&operation == native.combine) continue;
+      for (Value operand : operation.getOperands())
+        if (!mapping.contains(operand))
+          return operation.emitError("Weft reduction scalar capture has no current value binding"), failure();
+      auto value = expression(&operation, mapping);
+      if (failed(value)) return failure();
+      mapping.map(operation.getResult(0), *value);
+    }
+    Value contribution = mapping.lookupOrNull(native.contribution);
+    if (!contribution)
+      return native.combine->emitError("Weft reduction contribution has no current value binding"), failure();
+    return contribution;
+  }
+
   LogicalResult generic(linalg::GenericOp operation) {
     if (operation.getOutputs().size() != 1 || operation.getNumResults())
       return operation.emitError("Weft CPU legalization requires one buffer-semantics result");
@@ -1113,40 +1132,18 @@ private:
     }
     if (!reductions.empty()) {
       Value accumulator = body.getArguments().back();
-      auto combine = body.getTerminator()->getOperand(0).getDefiningOp();
-      if (!combine || !accumulator.hasOneUse() || combine->getNumOperands() != 2 ||
-          !llvm::is_contained(combine->getOperands(), accumulator))
-        return operation.emitError("Weft structured reduction requires a closed accumulator combine");
-      StringRef kind;
-      if (isa<arith::AddFOp, arith::AddIOp>(combine)) kind = "add";
-      else if (isa<arith::MaximumFOp>(combine)) kind = "maximum";
-      else if (isa<arith::MinimumFOp>(combine)) kind = "minimum";
-      else if (isa<arith::MaxNumFOp>(combine)) kind = "max";
-      else if (isa<arith::MinNumFOp>(combine)) kind = "min";
-      else if (isa<arith::OrIOp>(combine) && accumulator.getType().isInteger(1)) kind = "or";
-      else if (isa<arith::AndIOp>(combine) && accumulator.getType().isInteger(1)) kind = "and";
-      else return operation.emitError("Weft reduction combine is not implemented");
-      if (kind == "add" && isa<FloatType>(accumulator.getType())) {
-        auto order = operation->getAttrOfType<cpu::ReductionOrderAttr>("intent_cpu.reduction_order");
-        // The selected Weft reduction may combine vector streams lane-wise
-        // before vfredusum; adjacent reassociation alone does not permit it.
-        if (!order || !order.getElementPermutation())
-          return operation.emitError("Weft native floating-add reduction requires element-permutation permission");
-      }
-      for (Operation &nested : body.without_terminator()) {
-        if (&nested == combine) continue;
-        auto value = expression(&nested, mapping);
-        if (failed(value)) return failure();
-        mapping.map(nested.getResult(0), *value);
-      }
-      Value contribution = mapping.lookup(combine->getOperand(combine->getOperand(0) == accumulator ? 1 : 0));
-      auto ids = axes(contribution.getType());
+      auto order = operation->getAttrOfType<cpu::ReductionOrderAttr>("intent_cpu.reduction_order");
+      auto native = queryNativeReduction(operation, body, accumulator, order);
+      if (failed(native)) return failure();
+      auto contribution = reductionContribution(body, *native, mapping);
+      if (failed(contribution)) return failure();
+      auto ids = axes((*contribution).getType());
       auto position = llvm::find(ids, loopAxes[reductions[0]]);
       if (position == ids.end()) return operation.emitError("Weft reduction lost its current logical axis relation");
-      auto reduced = reduceValue(operation.getLoc(), contribution, position - ids.begin(), kind);
+      auto reduced = reduceValue(operation.getLoc(), *contribution, position - ids.begin(), native->kind);
       auto initial = read(destination);
       if (failed(reduced) || failed(initial)) return failure();
-      auto result = binary(operation.getLoc(), *initial, *reduced, kind);
+      auto result = binary(operation.getLoc(), *initial, *reduced, native->kind);
       if (failed(result)) return failure();
       return write(destination, *result);
     }
@@ -1163,21 +1160,9 @@ private:
 
   LogicalResult reduction(cpu::ReduceOp operation) {
     Block &body = operation.getCombine().front();
-    Operation *combine = body.getTerminator()->getOperand(0).getDefiningOp();
-    auto initial = operation.getInitial().getDefiningOp<arith::ConstantOp>();
-    auto identity = initial ? dyn_cast<FloatAttr>(initial.getValue()) : FloatAttr();
-    bool additive = combine && isa<arith::AddFOp>(combine);
-    bool maximum = combine && isa<arith::MaxNumFOp>(combine);
-    Value accumulator = body.getArgument(0);
-    if (!operation.getOrder().getAdjacentReassociation() || (!additive && !maximum) ||
-        !identity || !accumulator.hasOneUse() ||
-        !llvm::is_contained(combine->getOperands(), accumulator) ||
-        (additive && !identity.getValue().isZero()) ||
-        (maximum && !(identity.getValue().isInfinity() && identity.getValue().isNegative())))
-      return operation.emitError("Weft reduction requires a closed additive/maximumNumber identity and accumulator combine");
-    if (additive && !operation.getOrder().getElementPermutation())
-      return operation.emitError("Weft native floating-add reduction requires element-permutation permission");
-    IRMapping mapping;
+    auto native = queryNativeReduction(operation, body, body.getArgument(0), operation.getOrder());
+    if (failed(native)) return failure();
+    IRMapping mapping = values;
     SmallVector<int64_t> loopAxes(cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue().getNumDims());
     for (int64_t &axis : loopAxes) axis = nextAxis++;
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
@@ -1185,24 +1170,16 @@ private:
       if (failed(value)) return failure();
       mapping.map(body.getArgument(number + 1), *value);
     }
-    for (Operation &nested : body.without_terminator()) {
-      if (&nested == combine) continue;
-      auto value = expression(&nested, mapping);
-      if (failed(value)) return failure();
-      mapping.map(nested.getResult(0), *value);
-    }
-    Value contribution = mapping.lookup(combine->getOperand(0) == accumulator
-        ? combine->getOperand(1) : combine->getOperand(0));
-    if (shape(contribution.getType()).size() != 1)
+    auto contribution = reductionContribution(body, *native, mapping);
+    if (failed(contribution)) return failure();
+    if (shape((*contribution).getType()).size() != 1)
       return operation.emitError("Weft reduction requires one retained logical input axis");
-    Value result = b.create<wk::ReduceOp>(operation.getLoc(), operation.getResult().getType(), contribution,
-        additive ? "add" : "max", 0);
-    if (maximum) {
-      auto seeded = binary(operation.getLoc(), values.lookup(operation.getInitial()), result, "max");
-      if (failed(seeded)) return failure();
-      result = *seeded;
-    }
-    values.map(operation.getResult(), result);
+    auto reduced = reduceValue(operation.getLoc(), *contribution, 0, native->kind);
+    auto initial = read(operation.getInitial());
+    if (failed(reduced) || failed(initial)) return failure();
+    auto result = binary(operation.getLoc(), *initial, *reduced, native->kind);
+    if (failed(result)) return failure();
+    values.map(operation.getResult(), *result);
     return success();
   }
 

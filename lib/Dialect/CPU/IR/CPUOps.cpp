@@ -69,7 +69,8 @@ LogicalResult ReduceOp::verify() {
     auto memory = dyn_cast<MemRefType>(input.getType());
     Type element = memory ? memory.getElementType() : input.getType();
     auto map = dyn_cast<AffineMapAttr>(getIndexingMaps()[number]);
-    if (!map || map.getValue().getNumDims() != 1 || map.getValue().getNumSymbols() ||
+    if (!isa<FloatType, IntegerType, IndexType>(element) || !map ||
+        map.getValue().getNumDims() != 1 || map.getValue().getNumSymbols() ||
         map.getValue().getNumResults() != (memory ? memory.getRank() : 0) ||
         block.getArgument(number + 1).getType() != element)
       return emitOpError("reduction input map or scalar combine type is incomplete");
@@ -82,8 +83,14 @@ LogicalResult ReduceOp::verify() {
   if (!yield || yield.getValue().getType() != getResult().getType())
     return emitOpError("combine must yield its accumulator dtype");
   for (Operation &operation : block.without_terminator())
-    if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
-      return emitOpError("combine must be a closed pure scalar expression");
+    if (operation.getNumRegions() || !isMemoryEffectFree(&operation) ||
+        !llvm::all_of(operation.getOperandTypes(), [](Type type) {
+          return isa<FloatType, IntegerType, IndexType>(type);
+        }) ||
+        !llvm::all_of(operation.getResultTypes(), [](Type type) {
+          return isa<FloatType, IntegerType, IndexType>(type);
+        }))
+      return emitOpError("combine must be a pure scalar expression");
   return success();
 }
 

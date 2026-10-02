@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentWeftTransforms
   Passes.cpp
   Implementations.cpp
   Quantization.cpp
+  Reductions.cpp
   TaskInterface.cpp
   TaskLowering.cpp
   Views.cpp

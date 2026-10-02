@@ -33,17 +33,18 @@ def IntentCPU_TaskYieldOp : IntentCPU_Op<"task_yield", [Pure, Terminator]> {
 def IntentCPU_ReduceOp : IntentCPU_Op<"reduce", [SingleBlock,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "One-axis reduction with explicit scalar combine and numerical ordering permissions";
-  let arguments = (ins Index:$extent, AnyFloat:$initial,
+  let arguments = (ins Index:$extent,
+    AnyTypeOf<[AnyFloat, AnyInteger, Index]>:$initial,
     Variadic<AnyType>:$inputs, ArrayAttr:$indexingMaps,
     IntentCPU_ReductionOrderAttr:$order);
-  let results = (outs AnyFloat:$result);
+  let results = (outs AnyTypeOf<[AnyFloat, AnyInteger, Index]>:$result);
   let regions = (region AnyRegion:$combine);
   let hasVerifier = 1;
 }
 
 def IntentCPU_YieldOp : IntentCPU_Op<"yield", [Pure, Terminator,
     HasParent<"ReduceOp">]> {
-  let arguments = (ins AnyFloat:$value);
+  let arguments = (ins AnyTypeOf<[AnyFloat, AnyInteger, Index]>:$value);
 }
 
 def IntentCPU_ScanOp : IntentCPU_Op<"scan", [SingleBlock, IsolatedFromAbove, AttrSizedOperandSegments,

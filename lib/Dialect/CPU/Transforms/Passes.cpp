@@ -80,7 +80,8 @@ public:
       auto function = *functions.begin();
       if (failed(normalizeContractionSources(function)) || failed(normalizeContractions(function)) ||
           failed(realizeSliceScans(function)) || failed(foldUniformComputations(function)) ||
-          failed(fuseStructuredComputations(function))) return failure();
+          failed(fuseStructuredComputations(function)) ||
+          failed(normalizeScalarReductions(function))) return failure();
       return runPipeline(cleanup, module);
     };
     if (failed(finishGroup(module, getArgument(), transform()))) signalPassFailure();

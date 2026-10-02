@@ -961,47 +961,11 @@ private:
   }
 
   LogicalResult reduce(ReduceOp operation) {
-    auto first = dyn_cast<MemRefType>(flattened(operation.getSources().front()).front().getType());
-    if (operation.getSources().size() != 1 || operation.getIdentities().size() != 1 ||
-        operation.getCaptures().size() != 0 || operation.getAxes().size() != 1 ||
-        cast<IntegerAttr>(operation.getAxes()[0]).getInt() != 0 ||
-        !first || first.getRank() != 1 || !first.getElementType().isF32())
-      return structuredReduction(operation);
-    Value input = values.lookup(operation.getSources().front());
-    auto type = dyn_cast<MemRefType>(input.getType());
-    if (!type || type.getRank() != 1)
-      return operation.emitError("CPU reduction currently requires a rank-one source");
-    Value initial = values.lookup(operation.getIdentities().front());
-    Location loc = operation.getLoc();
-    Value extent = builder.create<memref::DimOp>(loc, input, 0);
-    auto reduction = builder.create<cpu::ReduceOp>(loc, initial.getType(),
-        extent, initial, ValueRange{input},
-        builder.getArrayAttr({AffineMapAttr::get(builder.getMultiDimIdentityMap(1))}),
-        cpu::ReductionOrderAttr::get(builder.getContext(), true, true));
-    Block *body = &reduction.getCombine().emplaceBlock();
-    body->addArgument(initial.getType(), loc);
-    body->addArgument(type.getElementType(), loc);
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToStart(body);
-      Block &combine = operation.getCombine().front();
-      auto schema = cast<StructuredOpInterface>(operation.getOperation());
-      values.map(schema.getCombineLhs().front(), body->getArgument(0));
-      values.map(schema.getCombineRhs().front(), body->getArgument(1));
-      for (Operation &nested : combine.without_terminator())
-        if (failed(lowerOperation(&nested))) return failure();
-      Value result = values.lookup(combine.getTerminator()->getOperand(0));
-      builder.create<cpu::YieldOp>(loc, result);
-    }
-    values.map(operation.getResults()[0], reduction.getResult());
-    return success();
-  }
-
-  LogicalResult structuredReduction(ReduceOp operation) {
     Block &combine = operation.getCombine().front();
     for (Operation &nested : combine.without_terminator())
-      if (!isa<ConstantOp, BinaryOp, UnaryOp, CompareOp, SelectOp, MaskOp, CastOp,
-               MakeRecordOp, MakeTupleOp, ExtractOp>(nested))
+      if (!isa<ConstantOp, BinaryOp, UnaryOp, CompareOp, SelectOp, MaskOp,
+               CastOp, BitcastOp, MakeRecordOp, MakeTupleOp, ExtractOp,
+               AssumeInBoundsOp>(nested))
         return nested.emitError("CPU tensor reduction requires a pointwise combine; non-pointwise summary reduction is not implemented");
     auto sources = flattened(operation.getSources());
     auto identities = flattened(operation.getIdentities());

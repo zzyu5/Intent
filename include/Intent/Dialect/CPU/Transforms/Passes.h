@@ -32,6 +32,7 @@ void buildCPUPipeline(mlir::OpPassManager &manager, const CPUCompilationOptions 
 
 void registerCPUPasses();
 mlir::LogicalResult normalizeContractions(mlir::func::FuncOp function);
+mlir::LogicalResult normalizeScalarReductions(mlir::func::FuncOp function);
 mlir::LogicalResult materializeCPUConfigurations(
     mlir::ModuleOp module, const ImplementationRegistry &implementations,
     llvm::StringRef defaults, llvm::StringRef overrides);

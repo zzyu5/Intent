@@ -12,6 +12,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   FuseReductionTraversals.cpp
   BlockContractions.cpp
   NormalizeContractions.cpp
+  NormalizeReductions.cpp
   ContractionSources.cpp
   BlockStructuredComputations.cpp
   RealizeRegions.cpp
