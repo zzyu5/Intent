@@ -1,6 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.173768,0.186736,0.930554,pass,
-dense_gemm,M4096-N14336-K4096-fp16,2.094848,2.083472,1.005460,pass,
+fused_softmax,8192x8192-fp16,0.175664,0.187560,0.936575,pass,
+dense_gemm,M4096-N14336-K4096-fp16,2.096912,2.085616,1.005416,pass,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.392760,4.608792,0.953126,pass,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.731240,2.764144,0.988096,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.086288,0.089864,0.960207,pass,
