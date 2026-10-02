@@ -65,6 +65,17 @@ Lowering 的共同构造能力有明确入口：
 | dimension 来源、整数 shape 关系与 domain bounds | [shapes.py](python/intent/frontend/lowering/shapes.py) | 查询当前 typed graph；只 intern 确切整数表达式与维度身份，不决定物理 blocking |
 | shape 类型、extent operands 与属性构造 | [shape_construction.py](python/intent/frontend/lowering/shape_construction.py) | 广播、显式 shape 与 outer 共用同一维度对象和操作数位置；调用方决定 SSA 来源，不让 serializer 补齐关系 |
 
+Structured intrinsic 的分派在 [structured.py](python/intent/frontend/lowering/intrinsics/structured.py)，具体构造按语义族组织：
+
+| 私有模块 | 修改入口与职责 |
+|---|---|
+| [callbacks.py](python/intent/frontend/lowering/intrinsics/callbacks.py) | pure helper/combine 的参数、显式 capture、identity 与 product 重建；collectives、region 操作和内存归约直接复用 |
+| [collectives.py](python/intent/frontend/lowering/intrinsics/collectives.py) | reduce、argmax、scan、histogram 的类型检查与 KIR 构造 |
+| [region_operations.py](python/intent/frontend/lowering/intrinsics/region_operations.py) | region fold/scan 的 slice schema、summary 和结果 extent |
+| [contractions.py](python/intent/frontend/lowering/intrinsics/contractions.py) | dense/scaled/sparse contraction 的轴配对、格式与 KIR 构造；matrix shorthand 直接复用同一 emitter |
+
+新增语义规则放入对应族；共用的 callback 构造放 `callbacks.py`，而非通过 dispatcher 导入 helper。这些模块都消费已有 lowering context，不另存类型、作用域或编译配置。
+
 职责参考是 Triton 的 `python/triton/compiler/code_generator.py:129–148`（子 region 的作用域恢复）和 `:300–322`（typed builder 与 semantic 层）。Intent 对应上表中的 scope 和 [MlirBuilder](python/intent/frontend/mlir/builder.py)，但把 MLIR 原生操作放在独立 compiler 进程中，因此 Python 安装不需要匹配 ABI 的 MLIR bindings。
 
 Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构验证、合法 region 归一、输出 canonical 验证在同一 pass 中闭合，之后才建立 canonical analyses。它同时服务 `intent-compile` 和 `intent-opt`。新的跨目标 KIR 规范化放在 [lib/Transforms/](lib/Transforms/)，需要满足相应语言合同；GPU/CPU 的物理变换继续留在各自 family。
@@ -336,6 +347,21 @@ GPU 的私有 [ConstructionSchema](lib/Conversion/KIRToGPU/ConstructionSchema.h)
 后续 GPU passes 只读当前 GPU IR。CPU 的 memref/linalg 构造和 DSA 的
 local-memory/workset 构造保留各自实现；共同轴映射不决定它们的 storage 或 task。
 
+GPU construction 的公开入口在 [KIRToGPU.cpp](lib/Conversion/KIRToGPU/KIRToGPU.cpp)。实现文件位于同一目录，按构造对象分工：
+
+| 私有模块 | 修改入口与职责 |
+|---|---|
+| [KernelConstruction.cpp](lib/Conversion/KIRToGPU/KernelConstruction.cpp)、[KernelABI.cpp](lib/Conversion/KIRToGPU/KernelABI.cpp) | 完整 kernel/workset/launch 构造与公共参数到物理 ABI 的连接 |
+| [Types.cpp](lib/Conversion/KIRToGPU/Types.cpp) | scalar、fragment 与 product 的类型、轴身份及 extent 投影 |
+| [RegionLowering.cpp](lib/Conversion/KIRToGPU/RegionLowering.cpp) | 单一 typed dispatch、region 递归、value 映射与 origin 传递 |
+| [Coordinates.cpp](lib/Conversion/KIRToGPU/Coordinates.cpp) | domain、subregion、range 与 index SSA 构造 |
+| [AccessCoordinates.cpp](lib/Conversion/KIRToGPU/AccessCoordinates.cpp)、[AccessRelations.cpp](lib/Conversion/KIRToGPU/AccessRelations.cpp) | 访问坐标、结果 schema、操作数投影及 validity |
+| [Memory.cpp](lib/Conversion/KIRToGPU/Memory.cpp) | buffer、读写、gather/scatter 与 atomic 操作构造 |
+| [Values.cpp](lib/Conversion/KIRToGPU/Values.cpp) | pointwise、reshape/broadcast 与 product 值构造 |
+| [Structured.cpp](lib/Conversion/KIRToGPU/Structured.cpp)、[Control.cpp](lib/Conversion/KIRToGPU/Control.cpp) | structured helper/collective/contraction 与显式控制 region |
+
+私有 [Construction.h](lib/Conversion/KIRToGPU/Construction.h) 只声明跨文件接口和 `ScalarRegionLowering` 的词法状态。各操作构造共享同一个 builder、value/dimension/parameter 映射与 canonical analysis；子 region 仅在原词法边界派生上下文。新增操作在对应实现文件中处理，并接入唯一 dispatch，不创建平行的 lowering 路径。
+
 构造 region 时用 `StructuredOpInterface::getRegionArgumentRelations` 查询
 当前 block signature 的输入来源；`getValueRelations` 还包含 yield/result 边，
 要求整个 operation 构造完成。两者共用入边定义，不能为了提前分析而制造占位 yield。
@@ -462,7 +488,7 @@ terminator 与 CFG branch 接口，以真实 `OpOperand` 槽连接 `BlockArgumen
 不替消费者决定可达性、重放资格或循环归约语义；produced 值、未知转发和尚未完成的
 terminator 通过 `complete=false` 表达。结果只在当前 IR 未改动期间有效。
 [ResourceAlias](lib/Dialect/GPU/Analysis/ResourceAlias.cpp) 与
-[PhysicalProgram](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 共用这些边，
+[范围来源](lib/Dialect/GPU/Analysis/RangeProvenance.cpp)、[重放分析](lib/Dialect/GPU/Analysis/Replay.cpp) 共用这些边，
 不各自计算 For/While 的 operand 偏移。
 
 职责对照：Triton 的 `include/triton/Dialect/Triton/IR/TritonOps.td:761–818`
@@ -489,7 +515,7 @@ Unary、binary、compare、select、cast、broadcast、transpose 和 reshape 的
 需要分解一个多轴乘积而没有足够关系时，查询失败，不猜测某个维度的除法。
 关系只在当前改写内使用；修改 operands、types 或 reassociation 后重新查询。
 
-[PhysicalProgram](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 使用轴组追踪范围；
+[RangeProvenance](lib/Dialect/GPU/Analysis/RangeProvenance.cpp) 使用轴组追踪范围；
 [ValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp) 负责关系工作队列，
 通过 [SchemaMutation](include/Intent/Dialect/GPU/Transforms/SchemaMutation.h)
 执行三类改写：`closeSchemaBoundary` 从当前 producer 闭合 product、控制和 structured
@@ -629,6 +655,19 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
 | predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
 
+`PhysicalProgramAnalysis` 的公开查询仍通过 [PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) 使用；维护查询算法时进入以下实现文件：
+
+| 分析实现 | 职责 |
+|---|---|
+| [PhysicalProgram.cpp](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) | 分析上下文、program/resource ownership 与 structured/control source 查询 |
+| [ScalarExpressions.cpp](lib/Dialect/GPU/Analysis/ScalarExpressions.cpp)、[IndexBounds.cpp](lib/Dialect/GPU/Analysis/IndexBounds.cpp) | physical parameter/launch 表达式、scalar 表达式归一、相等关系与 index 上下界 |
+| [CoordinateRanges.cpp](lib/Dialect/GPU/Analysis/CoordinateRanges.cpp)、[RangeProvenance.cpp](lib/Dialect/GPU/Analysis/RangeProvenance.cpp) | 坐标范围及跨 value/control-flow 的范围来源 |
+| [AxisRealization.cpp](lib/Dialect/GPU/Analysis/AxisRealization.cpp) | 物理轴实现、来源轴与派生 extent |
+| [Replay.cpp](lib/Dialect/GPU/Analysis/Replay.cpp) | 坐标和值的可重放性、读取快照与 effect 资格 |
+| [AccessRelations.cpp](lib/Dialect/GPU/Analysis/AccessRelations.cpp)、[AccessBounds.cpp](lib/Dialect/GPU/Analysis/AccessBounds.cpp) | 访问轴关系、有效性与资源边界证明 |
+
+这些文件实现同一个分析对象，`unrestrictedRangeCache` 仍随该对象生存和失效；拆分不产生新的缓存 owner。相邻私有头只连接实际共用的 helper，不供 transforms/provider 绕过公开查询接口。
+
 资源查询的职责可对照本地 Triton `lib/Analysis/Alias.cpp:36–45`：真实 allocation
 建立根，view 与 select 传播可能来源。Intent 的
 [ResourceAlias.cpp](lib/Dialect/GPU/Analysis/ResourceAlias.cpp) 面向共同 GPU 的
@@ -648,6 +687,19 @@ Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/ProgramGrid.cpp) 先读取
 收缩计算的完整入口在 [RealizeContractionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp)。同目录下 `ContractionSources` 负责合法的 source 规范化，`ContractionAnalysis` 负责轴与范围查询，`ContractionValues` 负责 replay，`ContractionProjection` 负责结果关系，`ContractionTraversal` 与 `ContractionBlocking` 形成具体循环与 ownership。普通与 scaled contraction 共用能成立的判定和构造机制，各自的 dtype、scale 与 packing 条件留在相应实现。Provider 只通过 [Contraction.h](include/Intent/Dialect/GPU/Transforms/Contraction.h) 调用必要的形状规范化与查询，不接管 shared blocking。
 
 [ContractionTraversal](lib/Dialect/GPU/Transforms/ContractionTraversal.cpp) 保留完整 retained result 的原始 contraction：完整物理 extent 属于已有 tile 候选域且不超过所选 tile，reduction 也已具备原生执行条件时，直接使用原 shape、读快照和 accumulator，避免分片与拼回；其它情况保留分片与 padding 路径。这是 current IR 的完整分支，不由 serializer 根据运行时 shape 猜测。
+
+普通归约的完整入口和策略次序在 [RealizeReductionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp)。相邻私有模块分别承担具体机制：
+
+| 私有模块 | 修改入口与职责 |
+|---|---|
+| [ReductionAnalysis.cpp](lib/Dialect/GPU/Transforms/ReductionAnalysis.cpp) | source/root/extent 与 retained source 的只读资格查询 |
+| [ReductionParameters.cpp](lib/Dialect/GPU/Transforms/ReductionParameters.cpp) | reduction 参数选择与 free-axis 绑定 |
+| [ReductionValues.cpp](lib/Dialect/GPU/Transforms/ReductionValues.cpp) | identity、typed combine 克隆与 value schema 投影 |
+| [ReductionCoverage.cpp](lib/Dialect/GPU/Transforms/ReductionCoverage.cpp) | static padding、完整 coverage 与 tail neutralization |
+| [ReductionDecomposition.cpp](lib/Dialect/GPU/Transforms/ReductionDecomposition.cpp) | 多轴归约的分解和关系维护 |
+| [ReductionTraversal.cpp](lib/Dialect/GPU/Transforms/ReductionTraversal.cpp) | runtime chunk loop、nested hoist 与条件内归约 |
+
+这些机制由同一公开 driver 调用，不是新 pass；driver 保留策略选择和改写后的 worklist 刷新。`SourcePlan` 只是一次改写读取的当前 SSA 事实，不能成为独立持久计划。跨变换需要复用的范围证明、replay 和参数生命周期仍使用上表中的共同接口。
 
 Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise.h) 使用以下机制：
 
