@@ -2,6 +2,7 @@
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/IR/WeftAttrs.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "TaskABI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -50,6 +51,8 @@ FailureOr<llvm::json::Array> serializeTasks(ModuleOp program) {
 } // namespace
 
 LogicalResult serializeProgram(ModuleOp program, std::string &source, std::string &metadata) {
+  auto options = readCompileOptions(program);
+  if (failed(options)) return failure();
   if (failed(verifyProgram(program))) return failure();
   auto modules = getProgramModules(program);
   if (failed(modules)) return failure();
@@ -81,6 +84,7 @@ LogicalResult serializeProgram(ModuleOp program, std::string &source, std::strin
   llvm::raw_string_ostream metadataStream(metadata);
   metadataStream << llvm::json::Value(llvm::json::Object{{"kind", "weft-generation"},
       {"provider", "weft"}, {"entry_name", candidates.front().getName()},
+      {"compile_options", serializeCompileOptions(*options)},
       {"target", llvm::json::Object{
           {"family", "cpu"}, {"vector_bits", capabilities.getVectorBits()},
           {"workers", capabilities.getWorkers()},

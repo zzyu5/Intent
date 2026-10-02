@@ -557,7 +557,7 @@ FailureOr<uint64_t> blockedDimension(Attribute attribute) {
 
 bool hasBlockedDimension(func::FuncOp kernel, uint64_t dimension) {
   bool found = false;
-  kernel.walk([&](DelinearizeOp mapping) {
+  kernel.walk([&](ExecutionGroupOp mapping) {
     for (Attribute extent : mapping.getLaunchExtents()) {
       FailureOr<uint64_t> blocked = blockedDimension(extent);
       found |= succeeded(blocked) && *blocked == dimension;

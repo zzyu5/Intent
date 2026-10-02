@@ -62,13 +62,16 @@ def IntentGPU_BufferType : TypeDef<IntentGPU_Dialect, "Buffer"> {
     "uint64_t":$instance,
     "uint64_t":$owner,
     "::intent::gpu::BufferInitializationAttr":$initialization,
-    "::intent::gpu::BufferLifetimeAttr":$lifetime,
-    "uint32_t":$visibility,
-    "bool":$workspace
+    "uint32_t":$visibility
   );
   let assemblyFormat =
-      "`<` $elementType `,` $shape `,` $scope `,` $instance `,` $owner `,` $initialization `,` $lifetime `,` $visibility `,` $workspace `>`";
+      "`<` $elementType `,` $shape `,` $scope `,` $instance `,` $owner `,` $initialization `,` $visibility `>`";
   let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    bool isInvocationWorkspace() const {
+      return getScope().getValue() == BufferScope::InvocationWorkspace;
+    }
+  }];
 }
 
 def IntentGPU_RecordType : TypeDef<IntentGPU_Dialect, "Record"> {

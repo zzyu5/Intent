@@ -71,6 +71,43 @@ Native `intent-normalize-kernel` 是 KIR 规范化的完整入口：输入结构
 
 只检查既有作者程序时，可用 `intent.compile_ir(definition)` 或 `intent compile path/to/program.py:kernel --stage kir --json`；这个阶段无需 target、后端 SDK 或设备。`--stage shared --target …` 输出共享物理 IR，默认 `provider` 阶段输出 provider IR、source 和 metadata。`intent-compile --compiler-info` 查询当前二进制实际编入的 providers；它不证明外部 provider 编译器或设备可用。
 
+### 编译许可与优化开关
+
+`compile`、`generate`、`compile_ir` 和 `compile_shared_gpu` 接受同一个
+[`intent.CompileOptions`](python/intent/compiler/options.py)：
+
+```python
+options = intent.CompileOptions(
+    numerics="source", online_reduction=True, optimization_remarks=False,
+)
+program = intent.generate(definition, target=target, options=options)
+```
+
+`source` 是默认数值合同，已包含语言允许的 FMA、局部融合和普通并行 reduce，
+不承诺 bitwise 一致。`relaxed_normalization` 额外允许特定 normalized-summary
+分段重标定及低精度 weight cast 参考变化；调用方必须保证 valid score 有限，
+以及所有实际参与加权 contraction 的 value 有限，包括乘以零权重的 value。
+具体许可、masked access 和空域边界见[数值规格 §5.6](doc/dsl/types-numerics-and-effects.md#56-编译调用的数值许可)。
+`online_reduction=False` 禁用这一可选改写；设为 `True` 不授予额外数值权限，
+也不保证采用该改写。`optimization_remarks=True` 输出编译决策诊断，不改变数值许可。
+CLI 的对应参数是 `--numerics`、`--online-reduction true|false`、
+`--optimization-remarks true|false`；compiler MCP 的 `compile` 使用同名 `options` 字段。
+
+[Compiler.cpp](lib/Compiler/Compiler.cpp) 将选项绑定为模块的 typed
+`intent.compile_options`；[CompileOptions.h](include/Intent/Dialect/Intent/IR/CompileOptions.h)
+提供统一读取和 metadata 导出。Pass 从当前 IR 读取权限，provider serializer
+导出 `metadata.compile_options`，`GeneratedProgram.compile_options` 读取并验证它。
+选项进入原编译调用和缓存身份，保存、恢复与 materialize 保留原 policy。
+
+[OnlineSummary.cpp](lib/Dialect/GPU/Transforms/OnlineSummary.cpp) 从当前
+contraction、权重、max/sum 和坐标投影识别 normalized summary；record helper
+通过字段适配复用这份证明。新增规则不要依赖可被合法 fold 消除的 record、extract
+或同类型 cast。相同 SSA 来源也不够：reshape/broadcast 后的 reference 必须仍对应
+每个归约行的保留轴。[RealizeOnlineReduction.cpp](lib/Dialect/GPU/Transforms/RealizeOnlineReduction.cpp)
+再检查数值权限、重放与 dominance，并完成实际改写。
+Shared IR 续编译沿用已绑定的 policy，`generate_from_ir` 不提供重选入口；
+需要改变许可时，从原作者程序重新编译，不能由 runtime fast-math 覆盖。
+
 ### 编译调度与独立 IR 工具
 
 [Compiler.h](include/Intent/Compiler/Compiler.h) 的请求和结果是原生编译入口。
@@ -345,6 +382,8 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 需要的能力 | 接口 | 使用方式 |
 |---|---|---|
 | 当前 value/access 的坐标、范围和复用事实 | [Analysis/PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) | 只读 current IR；相关 def-use、类型或范围改变后重算 |
+| GPU 类型与形状属性自身的不变量 | [IR/TypeVerification.h](include/Intent/Dialect/GPU/IR/TypeVerification.h) | `verifyGPUTypeInvariants` 用 MLIR `AttrTypeWalker` 复用各类型/属性的 `verify`；完整 GPU verifier 在操作验证前调用，避免 release 构造绕过 checked constructor 后漏检 |
+| 执行组构造、重建与 provider 展开 | [Transforms/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
 | range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
@@ -356,6 +395,16 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 改写后的 value/access/aggregate 关系闭合 | [Transforms/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
 | predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
+
+共享 GPU 的 `ExecutionGroupOp`（[GPUOps.td](include/Intent/Dialect/GPU/IR/GPUOps.td)）
+拥有实际执行 body、坐标 block arguments、runtime/launch extents、coordinate roles
+及 segment 范围；mapping 和 traversal 改写维护这一个 owner。
+Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/ProgramGrid.cpp) 先读取它调整网格，
+再由 [Triton prepareTritonMemory](lib/Target/Triton/Transforms/Legalize.cpp)、
+[cuTile prepareProgram](lib/Target/CuTile/Transforms/Legalize.cpp)、
+[TileLang formNativeMemory](lib/Target/TileLang/Transforms/Legalize.cpp) 各自调用共同的
+`lowerExecutionGroups`，生成纯 `DelinearizeOp` 坐标计算并展开 body。
+正常编译与 shared IR 续编译使用同一入口；serializer 不保留或解释执行组。
 
 收缩计算的完整入口在 [RealizeContractionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp)。同目录下 `ContractionSources` 负责合法的 source 规范化，`ContractionAnalysis` 负责轴与范围查询，`ContractionValues` 负责 replay，`ContractionProjection` 负责结果关系，`ContractionTraversal` 与 `ContractionBlocking` 形成具体循环与 ownership。普通与 scaled contraction 共用能成立的判定和构造机制，各自的 dtype、scale 与 packing 条件留在相应实现。Provider 只通过 [Contraction.h](include/Intent/Dialect/GPU/Transforms/Contraction.h) 调用必要的形状规范化与查询，不接管 shared blocking。
 

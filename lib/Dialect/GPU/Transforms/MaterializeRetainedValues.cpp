@@ -46,8 +46,7 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
       BufferScopeAttr::get(kernel.getContext(), BufferScope::InvocationWorkspace),
       instance, owner,
       BufferInitializationAttr::get(kernel.getContext(), BufferInitialization::FirstWrite),
-      BufferLifetimeAttr::get(kernel.getContext(), BufferLifetime::Invocation),
-      /*visibility=*/1, /*workspace=*/true);
+      /*visibility=*/1);
   auto binding = ArgumentBindingAttr::get(kernel.getContext(),
       nextArgumentReference(kernel), ArgumentKind::Workspace,
       IntegerAttr{}, ArgumentRefAttr{}, IntegerAttr{}, IntegerAttr{});

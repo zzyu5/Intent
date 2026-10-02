@@ -3,6 +3,7 @@
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "Intent/Dialect/Intent/IR/IntentTypes.h"
 #include "Intent/Dialect/Intent/IR/Interface.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -25,6 +26,15 @@ using namespace intent;
 #include "Intent/Dialect/Intent/IR/IntentAttrs.cpp.inc"
 
 LogicalResult IntentDialect::verifyOperationAttribute(Operation *operation, NamedAttribute attribute) {
+  if (attribute.getName() == compileOptionsAttr) {
+    if (!isa<ModuleOp>(operation) || !isa<CompileOptionsAttr>(attribute.getValue()))
+      return operation->emitOpError("intent.compile_options requires a typed module policy");
+    if (auto parent = operation->getParentOfType<ModuleOp>())
+      if (Attribute inherited = parent->getAttr(compileOptionsAttr);
+          inherited && inherited != attribute.getValue())
+        return operation->emitOpError("nested program modules must preserve their parent's compile options");
+    return success();
+  }
   if (attribute.getName() != "intent.kind") return success();
   auto function = dyn_cast<func::FuncOp>(operation);
   if (!function || !isa<FunctionKindAttr>(attribute.getValue()))

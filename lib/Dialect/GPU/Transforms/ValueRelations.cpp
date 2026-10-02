@@ -1802,8 +1802,7 @@ static void retargetExtent(Value root, AxisSelector selects,
             buffer.getResult().setType(BufferType::get(
                 storage.getContext(), storage.getElementType(), initial.getShape(),
                 storage.getScope(), storage.getInstance(), storage.getOwner(),
-                storage.getInitialization(), storage.getLifetime(),
-                storage.getVisibility(), storage.getWorkspace()));
+                storage.getInitialization(), storage.getVisibility()));
             if (changed && previous != buffer.getResult().getType())
               changed(buffer.getResult(), previous);
           }
@@ -2053,7 +2052,7 @@ void eraseDeadPhysicalValues(func::FuncOp kernel) {
   do {
     changed = false;
     kernel.walk<WalkOrder::PostOrder>([&](Operation *operation) {
-      if (!operation->getBlock() || isa<DelinearizeOp>(operation) ||
+      if (!operation->getBlock() ||
           operation == kernel.getOperation() || !operation->getNumResults() ||
           !llvm::all_of(operation->getResults(),
                         [](Value value) { return value.use_empty(); }))

@@ -15,6 +15,12 @@ Pass的成立依据是它改变了当前program，并保持可验证不变量；
 
 不允许kernel-name、op-count、whole-region template或provider字符串驱动shared policy。
 
+编译调用的有效许可和可选控制由 module 的 `intent.compile_options` 保存：`numerics` 为 `source` 或 `relaxed_normalization`，`onlineReduction` 决定是否考虑普通 normalized summary 的 online 改写，`optimizationRemarks` 决定是否输出采用/拒绝原因。默认绑定为 `source/true/false`。该属性随 construction、分支克隆和 provider 容器传递；物理 IR 续编译读取已有属性，不能无声替换或补入另一套默认许可。Provider metadata 的 `compile_options` 与它一致，编译缓存消费实际选项。
+
+Online transformation 先检查当前 summary/轴关系、数值许可、identity、dtype 和 replay/effect 条件，再创建执行结构；开关不跳过验证或其它必需 lowering。当前额外模式的实现域为 f32 score、maximum、mass/moment accumulation，以及同 dtype 的 f16/bf16/f32 weight/value operands；不匹配时保留普通分块路径。这是优化实现的资格，不收紧 DSL 允许的 dtype。有限值前置条件与允许的具体舍入变化由[数值规格 §5.6](../dsl/types-numerics-and-effects.md#56-编译调用的数值许可)定义。
+
+可选 remark 说明已采用、关闭、缺数值许可或不满足当前实现条件，并定位到当前操作；它不是执行计划。额外许可在没有对应优化的 execution family 上可以保持未使用，不能据此改变该 family 的运算。
+
 ## 2. Analysis 分层
 
 ### 2.1 Canonical analyses
@@ -138,7 +144,7 @@ Serializer只遍历已legalized current program并发出provider source。它不
 
 ## 4. Semantic-preserving rewrites
 
-Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允许的等价实现。例如：
+Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics与编译调用明确数值许可允许的实现。例如：
 
 - 合并pure producer与consumer；
 - rematerialize pure value；
@@ -147,6 +153,7 @@ Physical IR可以与KIR op graph不同，但变化必须属于KIR semantics允�
 - 按DSL局部乘法归约规则将符合条件的浮点乘积sum规范化为contract；
 - flatten/permutation paired contract axes；
 - 创建blocking loops与fragment accumulators；
+- 在明确的 normalized summary 数值许可及适用条件下形成 online 分段重标定；
 - 从coordinate predicate证明all-true/all-false/mixed ranges，删除identity-only physical traversal或冗余summary validity；
 - 把exact read→write关系映射成bulk transfer；
 - 将program instances group、swizzle或grid-stride遍历。

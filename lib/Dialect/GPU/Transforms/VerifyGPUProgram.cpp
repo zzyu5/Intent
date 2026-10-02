@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "Intent/Dialect/GPU/IR/TypeVerification.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -50,7 +51,7 @@ void collectTypeExpressions(Type type,
 bool hasObservableEffect(Operation *operation) {
   if (auto store = dyn_cast<StoreOp>(operation))
     if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
-        buffer && buffer.getWorkspace() && !store->hasAttr(originAttr))
+        buffer && buffer.isInvocationWorkspace() && !store->hasAttr(originAttr))
       return false;
   auto access = dyn_cast<AccessOpInterface>(operation);
   return access && access.writesMemory();
@@ -124,14 +125,8 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
       result = failure();
       return WalkResult::interrupt();
     }
-    bool lifetimeMatches =
-        (type.getScope().getValue() == BufferScope::ProgramPrivate &&
-         type.getLifetime().getValue() == BufferLifetime::Program) ||
-        (type.getScope().getValue() == BufferScope::IterationPrivate &&
-         type.getLifetime().getValue() == BufferLifetime::Iteration);
-    if (!lifetimeMatches) {
-      buffer.emitOpError(
-          "physical buffer allocation scope and dynamic lifetime disagree");
+    if (type.isInvocationWorkspace()) {
+      buffer.emitOpError("invocation workspace must be a kernel argument");
       result = failure();
       return WalkResult::interrupt();
     }
@@ -147,9 +142,7 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
     auto buffer = dyn_cast<BufferType>(argument.getType());
     if (!buffer)
       continue;
-    if (!buffer.getWorkspace() ||
-        buffer.getScope().getValue() != BufferScope::InvocationWorkspace ||
-        buffer.getLifetime().getValue() != BufferLifetime::Invocation ||
+    if (!buffer.isInvocationWorkspace() ||
         buffer.getInitialization().getValue() != BufferInitialization::FirstWrite ||
         !instances.insert(buffer.getInstance()).second)
       return kernel.emitError(
@@ -172,6 +165,8 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
 } // namespace
 
 LogicalResult verifyGPUProgram(ModuleOp module) {
+  if (failed(verifyGPUTypeInvariants(module.getOperation())))
+    return failure();
   if (failed(mlir::verify(module.getOperation())))
     return failure();
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
@@ -220,7 +215,6 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     if (failed(verifyExpressionSymbols(kernel, expression, parameterNames)))
       return failure();
 
-  bool hasProgramId = false;
   llvm::DenseSet<int64_t> expectedEffectOrigins;
   for (Attribute origin : expectedEffects) {
     auto node = dyn_cast<IntegerAttr>(origin);
@@ -231,7 +225,6 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   }
   llvm::DenseSet<int64_t> actualEffectOrigins;
   llvm::DenseMap<int64_t, SmallVector<Operation *>> effectDefinitions;
-  llvm::DenseSet<int64_t> programAxes;
   llvm::DenseMap<int64_t, std::pair<PhysicalExprAttr, PhysicalExprAttr>>
       executionGroups;
   PhysicalProgramAnalysis physicalAnalysis(kernel);
@@ -271,33 +264,22 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       }
     }
     if (auto program = dyn_cast<ProgramIdOp>(operation)) {
-      if (program.getAxis() >= static_cast<uint64_t>(gridRank) ||
-          !programAxes.insert(program.getAxis()).second) {
-        operation->emitOpError("program coordinate is outside or duplicated in the current grid");
+      if (program.getAxis() >= static_cast<uint64_t>(gridRank)) {
+        operation->emitOpError("program coordinate is outside the current grid");
         return WalkResult::interrupt();
       }
-      hasProgramId = true;
     }
-    Attribute groupAttribute = operation->getAttr(executionGroupAttr);
-    Attribute offsetAttribute = operation->getAttr(segmentOffsetAttr);
-    Attribute lengthAttribute = operation->getAttr(segmentLengthAttr);
-    if (groupAttribute || offsetAttribute || lengthAttribute) {
-      auto group = dyn_cast_or_null<IntegerAttr>(groupAttribute);
-      auto offset = dyn_cast_or_null<PhysicalExprAttr>(offsetAttribute);
-      auto length = dyn_cast_or_null<PhysicalExprAttr>(lengthAttribute);
-      if (!group || group.getInt() < 0 || !offset || !length) {
-        operation->emitOpError(
-            "physical execution segment requires typed group, offset and length together");
-        return WalkResult::interrupt();
-      }
+    if (auto group = dyn_cast<ExecutionGroupOp>(operation)) {
+      auto offset = group.getSegmentOffset();
+      auto length = group.getSegmentLength();
       if (failed(verifyExpressionSymbols(operation, offset, parameterNames)) ||
           failed(verifyExpressionSymbols(operation, length, parameterNames)))
         return WalkResult::interrupt();
       auto [entry, inserted] = executionGroups.try_emplace(
-          group.getInt(), std::make_pair(offset, length));
-      if (!inserted && entry->second != std::make_pair(offset, length)) {
+          group.getGroupId(), std::make_pair(offset, length));
+      if (!inserted) {
         operation->emitOpError(
-            "one physical execution group has conflicting segment bounds");
+            "physical execution group identity is duplicated");
         return WalkResult::interrupt();
       }
     }
@@ -385,21 +367,10 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
   });
   if (result.wasInterrupted())
     return failure();
-  for (int64_t group = 0;
-       group < static_cast<int64_t>(executionGroups.size()); ++group)
-    if (!executionGroups.contains(group))
-      return kernel.emitError(
-          "physical execution group identities must be dense from zero");
-  if (!hasProgramId || programAxes.size() != static_cast<size_t>(gridRank) ||
-      executionGroups.empty() ||
-      actualEffectOrigins != expectedEffectOrigins) {
+  if (actualEffectOrigins != expectedEffectOrigins) {
     InFlightDiagnostic diagnostic = kernel.emitError(
-        "physical kernel program mapping/effect coverage is incomplete");
-    diagnostic << "; has_program_id=" << hasProgramId
-               << "; program_axes=" << programAxes.size()
-               << "; grid_rank=" << gridRank
-               << "; execution_groups=" << executionGroups.size()
-               << "; expected_effect_origins=";
+        "physical kernel effect coverage is incomplete");
+    diagnostic << "; expected_effect_origins=";
     for (int64_t origin : expectedEffectOrigins)
       diagnostic << origin << ",";
     diagnostic << "; actual_effect_origins=";

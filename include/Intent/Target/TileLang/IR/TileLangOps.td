@@ -11,11 +11,6 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentTileLang_Op<string mnemonic, list<Trait> traits = []> :
     Op<IntentTileLang_Dialect, mnemonic, traits>;
 
-def IntentTileLang_LaunchConfigOp : IntentTileLang_Op<"launch_config", [Pure]> {
-  let arguments = (ins Index:$threads);
-  let hasVerifier = 1;
-}
-
 def IntentTileLang_PipelineOp : IntentTileLang_Op<"pipeline"> {
   let arguments = (ins Index:$stages);
   let regions = (region SizedRegion<1>:$body);
@@ -91,7 +86,9 @@ def IntentTileLang_YieldOp : IntentTileLang_Op<"yield", [Terminator]> {
   let hasVerifier = 1;
 }
 
-def IntentTileLang_BufferLoadOp : IntentTileLang_Op<"buffer_load", [Pure]> {
+def IntentTileLang_BufferLoadOp : IntentTileLang_Op<"buffer_load", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let arguments = (ins IntentTileLang_BufferValue:$buffer,
                        Variadic<Index>:$indices);
   let results = (outs IntentGPU_ScalarValue:$result);

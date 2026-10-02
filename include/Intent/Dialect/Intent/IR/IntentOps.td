@@ -62,7 +62,7 @@ def Intent_RegionEndOp : Intent_Op<"region_end", [Pure]> {
   let arguments = (ins Intent_IterationValue:$source);
   let results = (outs Index:$result);
 }
-def Intent_AssumeInBoundsOp : Intent_Op<"assume_in_bounds", [Pure]> {
+def Intent_AssumeInBoundsOp : Intent_Op<"assume_in_bounds"> {
   let arguments = (ins Intent_Value:$index, Intent_AddressableValue:$view,
                        I64Attr:$axis);
   let results = (outs);

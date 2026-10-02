@@ -8,6 +8,7 @@ include "Intent/Dialect/GPU/IR/AccessOpInterface.td"
 include "Intent/Dialect/Intent/IR/IntentAttrs.td"
 include "Intent/Interfaces/StructuredOpInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -74,12 +75,36 @@ def IntentGPU_WorksetCoordinateOp : IntentGPU_Op<"workset_coordinate", [Pure]> {
 }
 
 def IntentGPU_DelinearizeOp : IntentGPU_Op<"delinearize", [Pure]> {
-  let summary = "Row-major decoding of one physical program coordinate";
+  let summary = "Pure row-major coordinate decoding";
   let arguments = (ins Index:$linear,
-                       Variadic<Index>:$extents,
-                       ArrayAttr:$launch_extents);
+                       Variadic<Index>:$extents);
   let results = (outs Variadic<Index>:$coordinates);
   let hasVerifier = 1;
+}
+
+def IntentGPU_ExecutionGroupOp : IntentGPU_Op<"execution_group", [
+    RecursiveMemoryEffects,
+    SingleBlockImplicitTerminator<"ExecutionGroupYieldOp">,
+    DeclareOpInterfaceMethods<RegionBranchOpInterface>]> {
+  let summary = "One physical workset and its program-coordinate domain";
+  let arguments = (ins Index:$linear, Variadic<Index>:$extents,
+                       ArrayAttr:$launch_extents,
+                       DenseI64ArrayAttr:$coordinate_roles,
+                       I64Attr:$group_id,
+                       IntentGPU_PhysicalExpr:$segment_offset,
+                       IntentGPU_PhysicalExpr:$segment_length);
+  let regions = (region AnyRegion:$body);
+  let hasVerifier = 1;
+  let extraClassDeclaration = [{
+    ::mlir::Block::BlockArgListType getCoordinates() {
+      return getBody().front().getArguments();
+    }
+  }];
+}
+
+def IntentGPU_ExecutionGroupYieldOp : IntentGPU_Op<"execution_group_yield", [
+    Pure, Terminator, HasParent<"ExecutionGroupOp">, ReturnLike]> {
+  let arguments = (ins);
 }
 
 def IntentGPU_DimOp : IntentGPU_Op<"dim", [Pure]> {
@@ -127,6 +152,7 @@ def IntentGPU_BroadcastOp : IntentGPU_Op<"broadcast", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$value);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure]> {
@@ -145,6 +171,7 @@ def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure]> {
                        DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_CompareOp : IntentGPU_Op<"compare", [Pure]> {
@@ -160,18 +187,22 @@ def IntentGPU_SelectOp : IntentGPU_Op<"select", [Pure]> {
                        IntentGPU_DataValue:$false_value);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def IntentGPU_CastOp : IntentGPU_Op<"cast", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$value);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_BitcastOp : IntentGPU_Op<"bitcast", [Pure]> {
   let arguments = (ins IntentGPU_DataValue:$value);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_ReshapeOp : IntentGPU_Op<"reshape", [Pure]> {
@@ -179,6 +210,8 @@ def IntentGPU_ReshapeOp : IntentGPU_Op<"reshape", [Pure]> {
                        ArrayAttr:$reassociation);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def IntentGPU_TransposeOp : IntentGPU_Op<"transpose", [Pure]> {
@@ -186,6 +219,8 @@ def IntentGPU_TransposeOp : IntentGPU_Op<"transpose", [Pure]> {
                        DenseI64ArrayAttr:$permutation);
   let results = (outs IntentGPU_FragmentValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def IntentGPU_JoinOp : IntentGPU_Op<"join", [Pure]> {
@@ -200,12 +235,14 @@ def IntentGPU_MakeRecordOp : IntentGPU_Op<"make_record", [Pure]> {
   let arguments = (ins Variadic<IntentGPU_DataValue>:$fields);
   let results = (outs IntentGPU_RecordValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_ExtractOp : IntentGPU_Op<"extract", [Pure]> {
   let arguments = (ins IntentGPU_RecordValue:$record, I64Attr:$field);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def IntentGPU_LoadOp : IntentGPU_ReadOp<"load", "Load", "getResourceMutable()", [
@@ -229,7 +266,7 @@ def IntentGPU_GatherOp : IntentGPU_ReadOp<"gather", "Gather", "getSourceMutable(
   let results = (outs IntentGPU_DataValue:$result);
 }
 
-def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds", [Pure]> {
+def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds"> {
   let arguments = (ins IntentGPU_DataValue:$index,
                        IntentGPU_ResourceValue:$resource,
                        I64Attr:$axis);
@@ -447,7 +484,9 @@ def IntentGPU_ScatterReduceOp : IntentGPU_AccessOp<"scatter_reduce", "ScatterRed
 
 def IntentGPU_AtomicLoadOp : IntentGPU_AccessOp<"atomic_load", "AtomicLoad", "getResourceMutable()",
     "::mlir::MutableOperandRange(getOperation(), 0, 0)", "getResult().getType()", 0, [
-    AttrSizedOperandSegments, MemoryEffects<[MemRead]>
+    // Write conservatively represents atomic synchronization/observation, not
+    // a payload write; ordinary load CSE must not merge atomic observations.
+    AttrSizedOperandSegments, MemoryEffects<[MemRead, MemWrite]>
   ]> {
   let arguments = (ins IntentGPU_ResourceValue:$resource,
                        Variadic<IntentGPU_DataValue>:$coordinates,

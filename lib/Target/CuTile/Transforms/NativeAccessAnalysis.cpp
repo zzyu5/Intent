@@ -2,6 +2,7 @@
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -332,23 +333,45 @@ bool isBlockedWorksetOrigin(Value value, Value block, int64_t dimension) {
     coordinate = multiply.getLhs();
   else
     return false;
-  auto result = dyn_cast<OpResult>(coordinate);
-  auto mapping =
-      result ? dyn_cast<gpu::DelinearizeOp>(result.getOwner())
-             : gpu::DelinearizeOp();
-  if (!mapping || result.getResultNumber() >= mapping.getLaunchExtents().size())
+  auto mapping = gpu::queryDecodedCoordinate(coordinate);
+  if (!mapping || mapping->axis >= mapping->extents.size())
     return false;
-  Attribute launchExtent = mapping.getLaunchExtents()[result.getResultNumber()];
-  FailureOr<uint64_t> blocked = gpu::blockedDimension(launchExtent);
-  auto expression = dyn_cast<gpu::PhysicalExprAttr>(launchExtent);
-  if (failed(blocked) || *blocked != static_cast<uint64_t>(dimension) ||
-      !expression || expression.getOperands().size() != 2)
-    return false;
-  auto parameterExpression =
-      dyn_cast<gpu::PhysicalExprAttr>(expression.getOperands()[1]);
+  auto expression = gpu::queryLaunchExpression(mapping->extents[mapping->axis]);
   auto parameter = block.getDefiningOp<gpu::ParameterOp>();
-  return parameterExpression && parameter &&
-         parameterExpression.getParameterReference() == parameter.getReference();
+  if (!expression || !parameter || expression.getOperands().size() != 2)
+    return false;
+  auto isBlock = [&](gpu::PhysicalExprAttr operand) {
+    return operand.getKind() == gpu::PhysicalExprKind::Parameter &&
+           operand.getParameterReference() == parameter.getReference();
+  };
+  auto isDimension = [&](gpu::PhysicalExprAttr operand) {
+    return operand.getKind() == gpu::PhysicalExprKind::Dimension &&
+           operand.getValue() == dimension;
+  };
+  auto numerator = cast<gpu::PhysicalExprAttr>(expression.getOperands()[0]);
+  auto denominator = cast<gpu::PhysicalExprAttr>(expression.getOperands()[1]);
+  if (!isBlock(denominator)) return false;
+  if (expression.getKind() == gpu::PhysicalExprKind::CeilDiv)
+    return isDimension(numerator);
+  // Ownership formation spells the runtime tile count as (D + (P - 1)) // P.
+  // Read that current SSA relation after execution-group lowering, rather than
+  // attaching the old launch schema to a pure coordinate calculation.
+  if (expression.getKind() != gpu::PhysicalExprKind::FloorDiv ||
+      numerator.getKind() != gpu::PhysicalExprKind::Add ||
+      numerator.getOperands().size() != 2)
+    return false;
+  auto adjusted = [&](gpu::PhysicalExprAttr logical,
+                      gpu::PhysicalExprAttr padding) {
+    return isDimension(logical) &&
+           padding.getKind() == gpu::PhysicalExprKind::Subtract &&
+           padding.getOperands().size() == 2 &&
+           isBlock(cast<gpu::PhysicalExprAttr>(padding.getOperands()[0])) &&
+           gpu::constantPhysicalExpression(
+               cast<gpu::PhysicalExprAttr>(padding.getOperands()[1])) == 1;
+  };
+  auto lhs = cast<gpu::PhysicalExprAttr>(numerator.getOperands()[0]);
+  auto rhs = cast<gpu::PhysicalExprAttr>(numerator.getOperands()[1]);
+  return adjusted(lhs, rhs) || adjusted(rhs, lhs);
 }
 
 std::optional<int64_t> constantTileOrigin(gpu::MakeRangeOp range,

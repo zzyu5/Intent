@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
@@ -95,6 +96,8 @@ llvm::json::Value serializeExpression(PhysicalExprAttr expression) {
 FailureOr<llvm::json::Object> serializeInterface(
     func::FuncOp kernel, StringRef provider,
     llvm::function_ref<std::string(Value)> kernelName) {
+  auto options = readCompileOptions(kernel);
+  if (failed(options)) return failure();
   auto facts = ProgramInterface::read(kernel);
   if (failed(facts))
     return failure();
@@ -233,6 +236,7 @@ FailureOr<llvm::json::Object> serializeInterface(
       {"configurations", std::move(*configs)},
       {"resource_bounds", std::move(bounds)}};
   return llvm::json::Object{{"provider", provider},
+                            {"compile_options", serializeCompileOptions(*options)},
                             {"entry_name", kernel.getName()},
                             {"target", std::move(target)},
                             {"interface", std::move(*publicInterface)},

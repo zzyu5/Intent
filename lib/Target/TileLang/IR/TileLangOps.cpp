@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -90,13 +91,26 @@ bool hasNoStaticQuotientConflict(Attribute quotientAttribute,
 
 } // namespace
 
-LogicalResult LaunchConfigOp::verify() {
-  auto parameter = getThreads().getDefiningOp<gpu::ParameterOp>();
-  if (!parameter ||
-      parameter.getDeclaration().getRole() !=
-          gpu::ParameterRole::ProviderThreads)
-    return emitOpError("threads must be an explicit TileLang provider parameter");
-  return success();
+FailureOr<gpu::ParameterAttr> queryThreadParameter(func::FuncOp kernel) {
+  auto declarations = kernel->getAttrOfType<ArrayAttr>(gpu::parametersAttr);
+  if (!declarations)
+    return kernel.emitError("TileLang launch requires kernel parameter declarations"), failure();
+  gpu::ParameterAttr threads;
+  for (Attribute attribute : declarations) {
+    auto parameter = dyn_cast<gpu::ParameterAttr>(attribute);
+    if (!parameter)
+      return kernel.emitError("TileLang launch has an invalid parameter declaration"), failure();
+    if (parameter.getRole() != gpu::ParameterRole::ProviderThreads) continue;
+    if (threads)
+      return kernel.emitError("TileLang launch requires exactly one thread parameter"), failure();
+    if (!parameter.isExtent() || parameter.getPhase() != gpu::ConfigurationBindingPhase::Provider ||
+        parameter.getCategory() != gpu::ParameterCategory::Provider)
+      return kernel.emitError("TileLang thread declaration must be a provider index parameter"), failure();
+    threads = parameter;
+  }
+  if (!threads)
+    return kernel.emitError("TileLang launch has no thread parameter"), failure();
+  return threads;
 }
 
 LogicalResult PipelineOp::verify() {
@@ -240,6 +254,11 @@ LogicalResult BufferLoadOp::verify() {
                  getResult().getType() == buffer.getElementType()
              ? success()
              : emitOpError("indices/result do not match the TileLang buffer");
+}
+
+void BufferLoadOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Read::get());
 }
 
 LogicalResult BufferStoreOp::verify() {

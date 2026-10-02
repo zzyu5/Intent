@@ -12,11 +12,19 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 
 #define GET_OP_CLASSES
 #include "Intent/Dialect/GPU/IR/GPUOps.h.inc"
 
 namespace intent::gpu {
+
+struct DecodedCoordinate {
+  mlir::Value linear;
+  mlir::ValueRange extents;
+  unsigned axis;
+};
+std::optional<DecodedCoordinate> queryDecodedCoordinate(mlir::Value value);
 
 mlir::FailureOr<mlir::ArrayAttr>
 inferReshapeReassociation(FragmentType source, FragmentType result,

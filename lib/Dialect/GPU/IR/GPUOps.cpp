@@ -515,22 +515,51 @@ LogicalResult WorksetCoordinateOp::verify() {
 }
 
 LogicalResult DelinearizeOp::verify() {
-  if (getExtents().empty() || getExtents().size() != getCoordinates().size() ||
-      getLaunchExtents().size() != getExtents().size())
+  if (getExtents().empty() || getExtents().size() != getCoordinates().size())
     return emitOpError(
-        "delinearization requires one runtime and launch extent per coordinate");
+        "delinearization requires one runtime extent per coordinate");
+  return success();
+}
+
+std::optional<DecodedCoordinate> queryDecodedCoordinate(Value value) {
+  if (auto argument = dyn_cast<BlockArgument>(value))
+    if (auto group = dyn_cast<ExecutionGroupOp>(argument.getOwner()->getParentOp()))
+      return DecodedCoordinate{group.getLinear(), group.getExtents(),
+                               argument.getArgNumber()};
+  if (auto result = dyn_cast<OpResult>(value))
+    if (auto decode = dyn_cast<DelinearizeOp>(result.getOwner()))
+      return DecodedCoordinate{decode.getLinear(), decode.getExtents(),
+                               result.getResultNumber()};
+  return std::nullopt;
+}
+
+void ExecutionGroupOp::getSuccessorRegions(
+    RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {
+  if (point.isParent())
+    regions.emplace_back(&getBody());
+  else
+    regions.emplace_back();
+}
+
+LogicalResult ExecutionGroupOp::verify() {
+  if (getBody().empty() || !llvm::hasSingleElement(getBody()))
+    return emitOpError("requires one execution block");
+  if (getExtents().empty() || getExtents().size() != getCoordinates().size() ||
+      getLaunchExtents().size() != getExtents().size() ||
+      getCoordinateRoles().size() != getExtents().size())
+    return emitOpError("requires one runtime extent, launch extent, role and block argument per coordinate");
+  for (BlockArgument coordinate : getCoordinates())
+    if (!coordinate.getType().isIndex())
+      return emitOpError("execution coordinates must have index type");
   for (Attribute extent : getLaunchExtents())
     if (!isa<PhysicalExprAttr>(extent))
-      return emitOpError("delinearization launch extents must be typed expressions");
-  if (auto roles = (*this)->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
-    if (static_cast<size_t>(roles.size()) != getCoordinates().size())
-      return emitOpError(
-          "delinearization requires one physical role per coordinate");
-    for (int64_t role : roles.asArrayRef())
-      if (role < static_cast<int64_t>(CoordinateRole::Unspecified) ||
-          role > static_cast<int64_t>(CoordinateRole::IndirectTraversal))
-        return emitOpError("delinearization coordinate role is invalid");
-  }
+      return emitOpError("launch extents must be typed expressions");
+  for (int64_t role : getCoordinateRoles())
+    if (role < static_cast<int64_t>(CoordinateRole::Unspecified) ||
+        role > static_cast<int64_t>(CoordinateRole::IndirectTraversal))
+      return emitOpError("coordinate role is invalid");
+  if (getGroupId() < 0)
+    return emitOpError("requires a nonnegative execution group identity");
   return success();
 }
 
@@ -1435,7 +1464,7 @@ LogicalResult RandomBitsOp::verify() {
 
 LogicalResult BufferOp::verify() {
   auto type = getResult().getType();
-  if (type.getWorkspace())
+  if (type.isInvocationWorkspace())
     return emitOpError(
         "invocation workspace must be an explicit hidden ABI resource");
   if ((type.getInitialization().getValue() ==

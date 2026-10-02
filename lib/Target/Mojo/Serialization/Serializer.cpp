@@ -1,6 +1,7 @@
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Serialization/NativeABI.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -585,6 +586,8 @@ private:
 }
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
+  auto options = readCompileOptions(module);
+  if (failed(options)) return failure();
   if (failed(cpu::verifyCPUProgram(module, true))) return failure();
   llvm::raw_string_ostream output(source);
   output << "from std.ffi import external_call\n"
@@ -599,6 +602,7 @@ LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string
   llvm::json::Object interface;
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   interface["provider"] = "mojo";
+  interface["compile_options"] = serializeCompileOptions(*options);
   interface["target"] = llvm::json::Object{
       {"family", "cpu"}, {"vector_bits", capabilities.getVectorBits()},
       {"workers", capabilities.getWorkers()},

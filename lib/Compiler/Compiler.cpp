@@ -52,6 +52,9 @@ llvm::json::Object information() {
           {"outputs", llvm::json::Object{{"kir", llvm::json::Array{"ir"}},
               {"shared", llvm::json::Array{"ir"}},
               {"provider", llvm::json::Array{"ir", "source", "metadata"}}}},
+          {"compile_options", llvm::json::Object{
+              {"numerics", llvm::json::Array{"source", "relaxed_normalization"}},
+              {"online_reduction", true}, {"optimization_remarks", false}}},
           {"failure_stages", std::move(failureStages)}};
 }
 
@@ -64,6 +67,25 @@ Result compile(OwningOpRef<ModuleOp> module, const Request &request) {
     result.failure = sharedInput ? Failure::SharedPipeline : Failure::KernelIR;
     return result;
   }
+  auto existing = (*result.module)->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr);
+  if ((*result.module)->hasAttr(compileOptionsAttr) && !existing) {
+    result.module->emitError("intent.compile_options must use its typed policy attribute");
+    result.failure = Failure::Invocation;
+    return result;
+  }
+  auto selected = existing;
+  if (request.options || (!sharedInput && !existing)) {
+    CompilationOptions options = request.options.value_or(CompilationOptions{});
+    selected = CompileOptionsAttr::get(result.module->getContext(), options.numerics,
+                                      options.onlineReduction, options.optimizationRemarks);
+  }
+  if (!selected || (sharedInput && request.options && selected != existing) ||
+      (existing && request.options && selected != existing)) {
+    result.module->emitError("compilation options must agree with the policy already bound in the input IR");
+    result.failure = Failure::Invocation;
+    return result;
+  }
+  (*result.module)->setAttr(compileOptionsAttr, selected);
   if (sharedInput && (request.stopAfter == Stage::Kernel || !request.tuningConfig.empty())) {
     result.module->emitError("shared input requires shared/provider output and cannot reload tuning profiles");
     result.failure = Failure::Invocation;

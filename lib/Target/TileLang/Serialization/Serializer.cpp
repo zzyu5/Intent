@@ -205,17 +205,14 @@ private:
       failed = true;
       return;
     }
-    auto launches = kernel.getBody().front().getOps<LaunchConfigOp>();
-    if (!llvm::hasSingleElement(launches)) {
-      kernel.emitError(
-          "terminal TileLang program has no unique top-level launch configuration");
+    auto threads = queryThreadParameter(kernel);
+    if (mlir::failed(threads)) {
       failed = true;
       return;
     }
-    auto launch = *launches.begin();
     line("with T.Kernel(" +
              expressionString(cast<gpu::PhysicalExprAttr>(space[0])) +
-             ", threads=" + valueString(launch.getThreads()) + ") as pid0:",
+             ", threads=" + threads->getName().getValue().str() + ") as pid0:",
          2);
     indent = 3;
     if (hasApproximateMath)
@@ -310,8 +307,6 @@ private:
     } else if (auto extract = dyn_cast<gpu::ExtractOp>(operation)) {
       assign(extract.getResult(), valueString(extract.getRecord()) + "[" +
                                       std::to_string(extract.getField()) + "]");
-    } else if (isa<LaunchConfigOp>(operation)) {
-      return;
     } else if (auto allocation = dyn_cast<AllocOp>(operation)) {
       auto type = allocation.getResult().getType();
       std::string function =

@@ -2,7 +2,9 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   GPUDialect.cpp
   ProgramInterface.cpp
   PhysicalExpressions.cpp
+  TypeVerification.cpp
   GPUOps.cpp
+  Canonicalization.cpp
   AccessOpInterface.cpp
 
   DEPENDS
@@ -14,6 +16,8 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   MLIRIntentStructuredOpInterface
   MLIRInferTypeOpInterface
   MLIRFuncDialect
+  MLIRArithDialect
+  MLIRControlFlowInterfaces
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRSupport

@@ -646,8 +646,6 @@ LogicalResult predicateScalarControl(ModuleOp module) {
   kernel->walk<WalkOrder::PostOrder>(
       [&](scf::IfOp conditional) { conditionals.push_back(conditional); });
   for (scf::IfOp conditional : conditionals) {
-    if (conditional->hasAttr(executionGroupAttr))
-      continue;
     if (!conditional.getNumResults()) {
       bool emptyElse = conditional.getElseRegion().empty() ||
           conditional.getElseRegion().front().without_terminator().empty();

@@ -361,9 +361,11 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
 FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
                                        PhysicalProgramAnalysis &analysis) {
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
+  auto group = dyn_cast<ExecutionGroupOp>(scan->getParentOp());
   if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
       scan.getCaptures().size() || scan.getAxis() != 0 || scan.getReverse() ||
-      scan->getBlock() != &kernel.front() || !type || type.getShape().size() != 1)
+      !group || group->getBlock() != &kernel.front() ||
+      !type || type.getShape().size() != 1)
     return false;
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   if (!llvm::all_of(space, [](Attribute attribute) {

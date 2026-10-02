@@ -122,61 +122,112 @@ bool isRecordField(Value value, BlockArgument record, unsigned field) {
   return extract && extract.getRecord() == record && extract.getField() == field;
 }
 
-} // namespace
+bool sameProjectedValue(Value lhs, Value rhs) {
+  if (lhs == rhs)
+    return true;
+  if (lhs.getType() != rhs.getType())
+    return false;
+  auto left = lhs.getDefiningOp<BroadcastOp>();
+  auto right = rhs.getDefiningOp<BroadcastOp>();
+  return left && right && sameProjectedValue(left.getValue(), right.getValue());
+}
 
-FailureOr<OnlineSummaryStructure>
-matchOnlineSummaryStructure(MakeRecordOp record) {
-  if (!record || record.getFields().size() != 4)
+using SummaryAxes = SmallVector<std::optional<unsigned>>;
+
+FailureOr<SummaryAxes> summaryProjection(Value value, Value summary) {
+  auto output = dyn_cast<FragmentType>(value.getType());
+  if (!output)
     return failure();
+  if (value == summary) {
+    SummaryAxes axes;
+    for (unsigned axis = 0; axis < output.getShape().size(); ++axis)
+      axes.push_back(axis);
+    return axes;
+  }
+  if (auto select = value.getDefiningOp<SelectOp>();
+      select && isBooleanConstant(select.getCondition(), true) &&
+      isZero(select.getFalseValue()))
+    return summaryProjection(select.getTrueValue(), summary);
+  if (auto broadcast = value.getDefiningOp<BroadcastOp>()) {
+    auto input = dyn_cast<FragmentType>(broadcast.getValue().getType());
+    auto projection = queryAxisProjection(input, output);
+    auto source = summaryProjection(broadcast.getValue(), summary);
+    if (!projection.isExact() || failed(source))
+      return failure();
+    SummaryAxes axes;
+    for (auto axis : projection.targetToSource)
+      axes.push_back(axis ? (*source)[*axis] : std::nullopt);
+    return axes;
+  }
+  auto reshape = value.getDefiningOp<ReshapeOp>();
+  if (!reshape)
+    return failure();
+  auto source = summaryProjection(reshape.getValue(), summary);
+  if (failed(source))
+    return failure();
+  unsigned sourceRank = 0, resultRank = 0;
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    sourceRank += group.getSourceAxes().size();
+    resultRank += group.getResultAxes().size();
+  }
+  unsigned sourcePrefix = source->size() - sourceRank;
+  unsigned resultPrefix = output.getShape().size() - resultRank;
+  if (sourcePrefix != resultPrefix)
+    return failure();
+  SummaryAxes axes(output.getShape().size());
+  for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+    axes[axis] = (*source)[axis];
+  for (Attribute attribute : reshape.getReassociation()) {
+    auto group = cast<ReshapeGroupAttr>(attribute);
+    if (group.getSourceAxes().size() == 1 &&
+        group.getResultAxes().size() == 1) {
+      axes[resultPrefix + group.getResultAxes()[0]] =
+          (*source)[sourcePrefix + group.getSourceAxes()[0]];
+      continue;
+    }
+    // Inserting, dropping or regrouping axes that do not index the summary
+    // does not change its reference. A flattened summary axis needs a more
+    // general coordinate proof and is deliberately left unchanged here.
+    for (int64_t axis : group.getSourceAxes().asArrayRef())
+      if ((*source)[sourcePrefix + axis])
+        return failure();
+  }
+  return axes;
+}
 
-  SmallVector<std::pair<unsigned, ReduceOp>> validityCandidates;
-  SmallVector<std::pair<unsigned, ReduceOp>> massCandidates;
-  SmallVector<std::pair<unsigned, SelectOp>> maximumCandidates;
-  SmallVector<std::pair<unsigned, ContractOp>> momentCandidates;
-  SmallVector<SelectOp> momentGuards;
-  for (auto [index, field] : llvm::enumerate(record.getFields())) {
-    field = stripProjection(field);
-    if (auto reduce = field.getDefiningOp<ReduceOp>()) {
-      auto resultType = reduce.getNumResults() == 1
-                            ? dyn_cast<FragmentType>(reduce.getResult(0).getType())
-                            : FragmentType();
-      if (isSingleBinaryReduction(reduce, BinaryOperator::LogicalOr) &&
-          resultType && resultType.getElementType().isInteger(1))
-        validityCandidates.emplace_back(index, reduce);
-      if (isSingleBinaryReduction(reduce, BinaryOperator::Add))
-        massCandidates.emplace_back(index, reduce);
-      continue;
-    }
-    if (auto select = field.getDefiningOp<SelectOp>()) {
-      auto reduce = select.getTrueValue().getDefiningOp<ReduceOp>();
-      if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum) ||
-          isSingleBinaryReduction(reduce, BinaryOperator::MaximumNum))
-        maximumCandidates.emplace_back(index, select);
-      auto contract = stripProjection(select.getTrueValue()).getDefiningOp<ContractOp>();
-      if (contract && isZero(select.getFalseValue())) {
-        momentCandidates.emplace_back(index, contract);
-        momentGuards.push_back(select);
-      }
-      continue;
-    }
-    if (auto contract = field.getDefiningOp<ContractOp>()) {
-      momentCandidates.emplace_back(index, contract);
-      momentGuards.push_back({});
+bool hasReductionReference(Value reference, Value summary, unsigned axis) {
+  auto projection = summaryProjection(reference, summary);
+  if (failed(projection) || axis >= projection->size())
+    return false;
+  unsigned kept = 0;
+  for (auto [position, source] : llvm::enumerate(*projection)) {
+    if (position == axis) {
+      if (source)
+        return false;
+    } else if (!source || *source != kept++) {
+      return false;
     }
   }
-  if (validityCandidates.size() != 1 || massCandidates.size() != 1 ||
-      maximumCandidates.size() != 1 || momentCandidates.size() != 1)
-    return failure();
+  return kept == cast<FragmentType>(summary.getType()).getShape().size();
+}
 
-  auto [validityField, validity] = validityCandidates.front();
-  auto [maximumField, maximumOrEmpty] = maximumCandidates.front();
-  auto [massField, mass] = massCandidates.front();
-  auto [momentField, moment] = momentCandidates.front();
-  SelectOp momentOrEmpty = momentGuards.front();
+FailureOr<NormalizedSummaryStructure> matchSummaryComponents(
+    ReduceOp validity, SelectOp maximumOrEmpty, ReduceOp mass,
+    ContractOp moment, SelectOp momentOrEmpty = {}) {
+  if (!isSingleBinaryReduction(validity, BinaryOperator::LogicalOr) ||
+      !isSingleBinaryReduction(mass, BinaryOperator::Add) || !maximumOrEmpty)
+    return failure();
+  auto validityType = dyn_cast<FragmentType>(validity.getResult(0).getType());
+  if (!validityType || !validityType.getElementType().isInteger(1))
+    return failure();
+  auto maximum = maximumOrEmpty.getTrueValue().getDefiningOp<ReduceOp>();
+  if (!isSingleBinaryReduction(maximum, BinaryOperator::Maximum) &&
+      !isSingleBinaryReduction(maximum, BinaryOperator::MaximumNum))
+    return failure();
   if (momentOrEmpty &&
       !isProjectedFrom(momentOrEmpty.getCondition(), validity.getResult(0)))
     return failure();
-  auto maximum = maximumOrEmpty.getTrueValue().getDefiningOp<ReduceOp>();
   Value memberValidity = validity.getSources().front();
   if (maximumOrEmpty.getCondition() != validity.getResult(0) ||
       !isZero(maximumOrEmpty.getFalseValue()) ||
@@ -185,14 +236,16 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
     return failure();
 
   auto maskedScore = maximum.getSources().front().getDefiningOp<SelectOp>();
-  if (!maskedScore || maskedScore.getCondition() != memberValidity ||
+  if (!maskedScore ||
+      !sameProjectedValue(maskedScore.getCondition(), memberValidity) ||
       !isNegativeInfinity(maskedScore.getFalseValue()))
     return failure();
   Value score = maskedScore.getTrueValue();
 
   Value probabilityValue = mass.getSources().front();
   auto probability = probabilityValue.getDefiningOp<SelectOp>();
-  if (!probability || probability.getCondition() != memberValidity ||
+  if (!probability ||
+      !sameProjectedValue(probability.getCondition(), memberValidity) ||
       !isZero(probability.getFalseValue()))
     return failure();
   auto exponential = probability.getTrueValue().getDefiningOp<UnaryOp>();
@@ -207,7 +260,8 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
     return failure();
 
   auto probabilityCast = moment.getLhs().getDefiningOp<CastOp>();
-  if (!probabilityCast || probabilityCast.getValue() != probabilityValue ||
+  Value weightSource = probabilityCast ? probabilityCast.getValue() : moment.getLhs();
+  if (weightSource != probabilityValue ||
       !isZero(moment.getAccumulator()) ||
       moment.getLhsReductionAxes().size() != 1 ||
       moment.getRhsReductionAxes().size() != 1)
@@ -219,7 +273,9 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
   if (rawReductionAxis < 0 || rawValueReductionAxis < 0)
     return failure();
   unsigned reductionAxis = static_cast<unsigned>(rawReductionAxis);
-  if (validity.getAxes() != maximum.getAxes() ||
+  if (!hasReductionReference(shift.getRhs(), maximumOrEmpty.getResult(),
+                             reductionAxis) ||
+      validity.getAxes() != maximum.getAxes() ||
       validity.getAxes() != mass.getAxes() ||
       moment.getLhsReductionAxes().front() !=
           static_cast<int64_t>(reductionAxis) ||
@@ -233,16 +289,16 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
   unsigned valueReductionAxis = static_cast<unsigned>(rawValueReductionAxis);
 
   auto scoreType = dyn_cast<FragmentType>(score.getType());
-  auto validityType = dyn_cast<FragmentType>(memberValidity.getType());
+  auto memberType = dyn_cast<FragmentType>(memberValidity.getType());
   auto valueType = dyn_cast<FragmentType>(values.getType());
-  if (!scoreType || !validityType || !valueType ||
+  if (!scoreType || !memberType || !valueType ||
       reductionAxis >= scoreType.getShape().size() ||
-      reductionAxis >= validityType.getShape().size() ||
+      reductionAxis >= memberType.getShape().size() ||
       valueReductionAxis >= valueType.getShape().size())
     return failure();
   FailureOr<AxisMapAttr> scoreMap = queryAxisMap(scoreType, reductionAxis);
   FailureOr<AxisMapAttr> validityMap =
-      queryAxisMap(validityType, reductionAxis);
+      queryAxisMap(memberType, reductionAxis);
   FailureOr<AxisMapAttr> valueMap =
       queryAxisMap(valueType, valueReductionAxis);
   if (failed(scoreMap) || failed(validityMap) || failed(valueMap))
@@ -252,14 +308,96 @@ matchOnlineSummaryStructure(MakeRecordOp record) {
       !(sourceAxisIdentity(*valueMap) == traversal))
     return failure();
 
-  return OnlineSummaryStructure{
-      record,          validity,       maximum,
-      mass,            moment,         maximumOrEmpty,
-      maskedScore,     probability,    probabilityCast,
-      exponential,     memberValidity, score,
-      values,          validityField,  maximumField,
-      massField,       momentField,    reductionAxis,
-      valueReductionAxis, traversal, momentOrEmpty};
+  return NormalizedSummaryStructure{
+      validity, maximum, mass, moment, maximumOrEmpty, maskedScore,
+      probability, probabilityCast, exponential, memberValidity, score, values,
+      reductionAxis, valueReductionAxis, traversal, momentOrEmpty};
+}
+
+} // namespace
+
+FailureOr<OnlineSummaryStructure>
+matchOnlineSummaryStructure(MakeRecordOp record) {
+  if (!record || record.getFields().size() != 4)
+    return failure();
+  SmallVector<std::pair<unsigned, ReduceOp>> validityCandidates;
+  SmallVector<std::pair<unsigned, ReduceOp>> massCandidates;
+  SmallVector<std::pair<unsigned, SelectOp>> maximumCandidates;
+  SmallVector<std::pair<unsigned, ContractOp>> momentCandidates;
+  SmallVector<SelectOp> momentGuards;
+  for (auto [index, field] : llvm::enumerate(record.getFields())) {
+    field = stripProjection(field);
+    if (auto reduce = field.getDefiningOp<ReduceOp>()) {
+      if (isSingleBinaryReduction(reduce, BinaryOperator::LogicalOr))
+        validityCandidates.emplace_back(index, reduce);
+      if (isSingleBinaryReduction(reduce, BinaryOperator::Add))
+        massCandidates.emplace_back(index, reduce);
+    } else if (auto select = field.getDefiningOp<SelectOp>()) {
+      auto reduce = select.getTrueValue().getDefiningOp<ReduceOp>();
+      if (isSingleBinaryReduction(reduce, BinaryOperator::Maximum) ||
+          isSingleBinaryReduction(reduce, BinaryOperator::MaximumNum))
+        maximumCandidates.emplace_back(index, select);
+      auto contract = stripProjection(select.getTrueValue()).getDefiningOp<ContractOp>();
+      if (contract && isZero(select.getFalseValue())) {
+        momentCandidates.emplace_back(index, contract);
+        momentGuards.push_back(select);
+      }
+    } else if (auto contract = field.getDefiningOp<ContractOp>()) {
+      momentCandidates.emplace_back(index, contract);
+      momentGuards.push_back({});
+    }
+  }
+  if (validityCandidates.size() != 1 || massCandidates.size() != 1 ||
+      maximumCandidates.size() != 1 || momentCandidates.size() != 1)
+    return failure();
+  auto [validityField, validity] = validityCandidates.front();
+  auto [maximumField, maximum] = maximumCandidates.front();
+  auto [massField, mass] = massCandidates.front();
+  auto [momentField, moment] = momentCandidates.front();
+  auto summary = matchSummaryComponents(validity, maximum, mass, moment,
+                                        momentGuards.front());
+  if (failed(summary))
+    return failure();
+  return OnlineSummaryStructure{std::move(*summary), record, validityField,
+                                maximumField, massField, momentField};
+}
+
+FailureOr<NormalizedSummaryStructure>
+matchNormalizedSummaryStructure(ContractOp moment) {
+  auto probabilityCast = moment.getLhs().getDefiningOp<CastOp>();
+  Value weights = probabilityCast ? probabilityCast.getValue() : moment.getLhs();
+  auto probability = weights.getDefiningOp<SelectOp>();
+  auto exponential = probability
+      ? probability.getTrueValue().getDefiningOp<UnaryOp>() : UnaryOp{};
+  auto shift = exponential
+      ? exponential.getInput().getDefiningOp<BinaryOp>() : BinaryOp{};
+  if (!shift || shift.getOperatorKind() != BinaryOperator::Subtract)
+    return failure();
+  Value reference = shift.getRhs();
+  while (Operation *producer = reference.getDefiningOp()) {
+    if (auto select = dyn_cast<SelectOp>(producer);
+        select && isBooleanConstant(select.getCondition(), true) &&
+        isZero(select.getFalseValue())) {
+      reference = select.getTrueValue();
+      continue;
+    }
+    Value projected = stripProjection(reference);
+    if (projected == reference)
+      break;
+    reference = projected;
+  }
+  auto maximum = reference.getDefiningOp<SelectOp>();
+  auto validity = maximum
+      ? maximum.getCondition().getDefiningOp<ReduceOp>() : ReduceOp{};
+  SmallVector<ReduceOp> masses;
+  for (Operation *user : probability.getResult().getUsers())
+    if (auto reduce = dyn_cast<ReduceOp>(user);
+        isSingleBinaryReduction(reduce, BinaryOperator::Add) &&
+        reduce.getSources().front() == probability.getResult())
+      masses.push_back(reduce);
+  if (masses.size() != 1)
+    return failure();
+  return matchSummaryComponents(validity, maximum, masses.front(), moment);
 }
 
 FailureOr<OnlineSummaryMerge>

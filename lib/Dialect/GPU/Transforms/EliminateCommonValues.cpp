@@ -7,9 +7,13 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
+#include "mlir/Transforms/CSE.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -17,62 +21,6 @@ using namespace mlir;
 
 namespace intent::gpu {
 namespace {
-
-bool isSingletonInsertion(ReshapeOp reshape) {
-  auto source = cast<FragmentType>(reshape.getValue().getType());
-  auto target = cast<FragmentType>(reshape.getResult().getType());
-  if (source.getShape().size() >= target.getShape().size())
-    return false;
-  for (Attribute attribute : reshape.getReassociation()) {
-    auto group = cast<ReshapeGroupAttr>(attribute);
-    if (group.getResultAxes().empty() || group.getSourceAxes().size() > 1 ||
-        (!group.getSourceAxes().empty() && group.getResultAxes().size() != 1))
-      return false;
-  }
-  auto projection = queryBroadcastProjection(source, target);
-  if (!projection.isExact())
-    return false;
-  unsigned nextSource = 0;
-  for (auto [axis, mapped] : llvm::enumerate(projection.targetToSource)) {
-    if (mapped) {
-      if (*mapped != nextSource++ ||
-          source.getShape()[*mapped] != target.getShape()[axis])
-        return false;
-    } else {
-      auto extent = cast<PhysicalExprAttr>(target.getShape()[axis]);
-      if (extent.getKind() != PhysicalExprKind::Constant ||
-          extent.getValue() != 1)
-        return false;
-    }
-  }
-  return nextSource == source.getShape().size();
-}
-
-bool foldConstantDivision(Operation &operation) {
-  auto binary = dyn_cast<BinaryOp>(operation);
-  if (!binary || binary.getOperatorKind() != BinaryOperator::TrueDivide ||
-      binary.getApproximate() || binary.getFlushToZero())
-    return false;
-  auto type = dyn_cast<FloatType>(binary.getResult().getType());
-  auto lhs = binary.getLhs().getDefiningOp<arith::ConstantOp>();
-  auto rhs = binary.getRhs().getDefiningOp<arith::ConstantOp>();
-  if (!type || !lhs || !rhs)
-    return false;
-  auto left = dyn_cast<FloatAttr>(lhs.getValue());
-  auto right = dyn_cast<FloatAttr>(rhs.getValue());
-  if (!left || !right || left.getType() != type || right.getType() != type)
-    return false;
-  auto quotient = left.getValue();
-  quotient.divide(right.getValue(), llvm::APFloat::rmNearestTiesToEven);
-  OpBuilder builder(binary);
-  auto constant = builder.create<arith::ConstantOp>(
-      binary.getLoc(), type, FloatAttr::get(type, quotient));
-  if (Attribute origin = binary->getAttr(originAttr))
-    constant->setAttr(originAttr, origin);
-  binary.getResult().replaceAllUsesWith(constant);
-  binary.erase();
-  return true;
-}
 
 std::optional<llvm::APFloat>
 widenedConstantReciprocal(const llvm::APFloat &divisor) {
@@ -122,90 +70,6 @@ bool foldConstantSelection(SelectOp select) {
   select.getResult().replaceAllUsesWith(selected);
   select.erase();
   return true;
-}
-
-void combineNestedSelections(SelectOp select) {
-  if (!select)
-    return;
-  bool changed;
-  do {
-    changed = false;
-    for (unsigned arm = 0; arm < 2; ++arm) {
-      auto inner = select->getOperand(arm + 1).getDefiningOp<SelectOp>();
-      Value otherwise = select->getOperand(2 - arm);
-      if (!inner || !inner->hasOneUse())
-        continue;
-      bool inverted = inner.getTrueValue() == otherwise;
-      if (!inverted && inner.getFalseValue() != otherwise)
-        continue;
-      OpBuilder builder(select);
-      Location location = select.getLoc();
-      Type predicateType = select.getCondition().getType();
-      Value outerCondition = select.getCondition();
-      Value innerCondition = inner.getCondition();
-      if (arm)
-        outerCondition = builder.create<UnaryOp>(
-            location, predicateType, outerCondition, UnaryOperator::Not);
-      if (inverted)
-        innerCondition = builder.create<UnaryOp>(
-            location, predicateType, innerCondition, UnaryOperator::Not);
-      Value inactive = builder.create<arith::ConstantOp>(
-          location, builder.getBoolAttr(false));
-      if (auto fragment = dyn_cast<FragmentType>(predicateType))
-        inactive = builder.create<SplatOp>(location, fragment, inactive);
-      // Keep short-circuit selection: an inactive inner condition must not
-      // become observable merely because nested value selects were combined.
-      Value active = builder.create<SelectOp>(
-          location, predicateType, outerCondition, innerCondition, inactive);
-      select->setOperand(0, active);
-      select->setOperand(1, inverted ? inner.getFalseValue()
-                                     : inner.getTrueValue());
-      select->setOperand(2, otherwise);
-      changed = true;
-      break;
-    }
-  } while (changed);
-}
-
-void eliminateInBlock(Block &block) {
-  llvm::DenseMap<OperationName, SmallVector<Operation *>> available;
-  for (Operation &operation : llvm::make_early_inc_range(block)) {
-    for (Region &region : operation.getRegions())
-      for (Block &nested : region)
-        eliminateInBlock(nested);
-    if (foldConstantDivision(operation))
-      continue;
-    if (foldConstantSelection(dyn_cast<SelectOp>(operation)))
-      continue;
-    combineNestedSelections(dyn_cast<SelectOp>(operation));
-    if (auto reshape = dyn_cast<ReshapeOp>(operation);
-        reshape && reshape.getValue().getType() == reshape.getResult().getType()) {
-      reshape.getResult().replaceAllUsesWith(reshape.getValue());
-      reshape.erase();
-      continue;
-    }
-    if (isa<DelinearizeOp>(operation) ||
-        operation.getNumRegions() != 0 ||
-        operation.getNumResults() == 0 || !isMemoryEffectFree(&operation) ||
-        !isPhysicalReplayNode(&operation, PhysicalReplayScope::ValueGraph,
-                              /*allowAccesses=*/false))
-      continue;
-    auto &candidates = available[operation.getName()];
-    Operation *equivalent = nullptr;
-    for (Operation *candidate : candidates)
-      if (OperationEquivalence::isEquivalentTo(
-              candidate, &operation, OperationEquivalence::exactValueMatch,
-              nullptr, OperationEquivalence::IgnoreLocations)) {
-        equivalent = candidate;
-        break;
-      }
-    if (!equivalent) {
-      candidates.push_back(&operation);
-      continue;
-    }
-    operation.replaceAllUsesWith(equivalent->getResults());
-    operation.erase();
-  }
 }
 
 } // namespace
@@ -330,16 +194,12 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   if (failed(kernel))
     return failure();
   foldScalarIntegerValues(*kernel);
-  kernel->walk([&](ReshapeOp reshape) {
-    if (!isSingletonInsertion(reshape))
-      return;
-    OpBuilder builder(reshape);
-    auto broadcast = builder.create<BroadcastOp>(
-        reshape.getLoc(), reshape.getResult().getType(), reshape.getValue());
-    broadcast->setDiscardableAttrs(llvm::to_vector(reshape->getDiscardableAttrs()));
-    reshape.getResult().replaceAllUsesWith(broadcast.getResult());
-    reshape.erase();
-  });
+  RewritePatternSet patterns(module.getContext());
+  ReshapeOp::getCanonicalizationPatterns(patterns, module.getContext());
+  TransposeOp::getCanonicalizationPatterns(patterns, module.getContext());
+  SelectOp::getCanonicalizationPatterns(patterns, module.getContext());
+  if (failed(applyPatternsAndFoldGreedily(*kernel, std::move(patterns))))
+    return kernel->emitError("local value canonicalization did not converge");
   kernel->walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) {
     moveLoopInvariantCode(
         loop.getLoopRegions(),
@@ -351,8 +211,9 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
         },
         [&](Operation *operation, Region *) { loop.moveOutOfLoop(operation); });
   });
-  for (Block &block : kernel->getBody())
-    eliminateInBlock(block);
+  IRRewriter rewriter(module.getContext());
+  DominanceInfo dominance(*kernel);
+  eliminateCommonSubExpressions(rewriter, dominance, kernel->getOperation());
   return success();
 }
 

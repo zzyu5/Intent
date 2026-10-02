@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
@@ -229,7 +230,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
 
   ProgramSegment segment = queryContractionProgramSegment(
       kernel, contract, ProgramMappingScope::Dominating);
-  DelinearizeOp mapping = segment.mapping;
+  ExecutionGroupOp mapping = segment.mapping;
   if (!mapping)
     return unhandled("contract is not dominated by the current program mapping");
   ArrayAttr programSpace = segment.space;
@@ -403,11 +404,10 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     rowExpression = rowRangeExtent;
   if (columnRangeExtent)
     columnExpression = columnRangeExtent;
-  SmallVector<Type> mappingTypes(mapping.getResultTypes());
-  SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
+  SmallVector<int64_t> coordinateRoles(mapping.getCoordinates().size(), -1);
   if (auto existing =
-          mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr))
-    if (existing.size() == mapping.getNumResults())
+          mapping.getCoordinateRolesAttr())
+    if (existing.size() == mapping.getCoordinates().size())
       llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
   auto bindMappingAxis = [&](FailureOr<unsigned> existing, Value extent,
                              PhysicalExprAttr launchExtent,
@@ -421,7 +421,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       axis = mappingExtents.size();
       mappingExtents.push_back(extent);
       launchExtents.push_back(launchExtent);
-      mappingTypes.push_back(mapBuilder.getIndexType());
       coordinateRoles.push_back(-1);
     }
     coordinateRoles[axis] = static_cast<int64_t>(role);
@@ -441,24 +440,17 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       binaryExpression(context, PhysicalExprKind::CeilDiv, columnExpression,
                        unitN),
       CoordinateRole::ContractionN);
-  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
-      location, mappingTypes, mapping.getLinear(), mappingExtents,
-      mapBuilder.getArrayAttr(launchExtents));
-  expandedMapping->setAttr(
-      coordinateRolesAttr,
-      DenseI64ArrayAttr::get(context, coordinateRoles));
-  for (StringRef attribute : {executionGroupAttr, segmentOffsetAttr})
-    if (Attribute value = mapping->getAttr(attribute))
-      expandedMapping->setAttr(attribute, value);
   segmentLength = cast<PhysicalExprAttr>(launchExtents.front());
   for (Attribute extent : llvm::drop_begin(launchExtents))
     segmentLength = binaryExpression(context, PhysicalExprKind::Multiply,
                                      segmentLength,
                                      cast<PhysicalExprAttr>(extent));
-  expandedMapping->setAttr(segmentLengthAttr, segmentLength);
+  auto expandedMapping = rebuildExecutionGroup(
+      mapBuilder, mapping, mappingExtents, mapBuilder.getArrayAttr(launchExtents),
+      mapBuilder.getDenseI64ArrayAttr(coordinateRoles), segmentLength);
   for (auto [oldCoordinate, newCoordinate] : llvm::zip(
            mapping.getCoordinates(),
-           expandedMapping.getCoordinates().take_front(mapping.getNumResults())))
+           expandedMapping.getCoordinates().take_front(mapping.getCoordinates().size())))
     oldCoordinate.replaceAllUsesWith(newCoordinate);
   Value rowTile = runtimeRowTraversal
                       ? Value()
@@ -1089,7 +1081,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
 
   ProgramSegment segment = queryContractionProgramSegment(
       kernel, contract, ProgramMappingScope::SameBlock);
-  DelinearizeOp mapping = segment.mapping;
+  ExecutionGroupOp mapping = segment.mapping;
   PhysicalExprAttr segmentLength = segment.length;
   if (!segment.isComplete())
     return reject("requires one complete current program segment");
@@ -1216,11 +1208,10 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       cast<ViewType>(rhsLoad.getResource().getType())
           .getLayout()
           .getExtents()[columnResourceAxis]);
-  SmallVector<Type> mappingTypes(mapping.getResultTypes());
-  SmallVector<int64_t> coordinateRoles(mapping.getNumResults(), -1);
+  SmallVector<int64_t> coordinateRoles(mapping.getCoordinates().size(), -1);
   if (auto existing =
-          mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr))
-    if (existing.size() == mapping.getNumResults())
+          mapping.getCoordinateRolesAttr())
+    if (existing.size() == mapping.getCoordinates().size())
       llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
   auto bindMappingAxis = [&](FailureOr<unsigned> existing, Value extent,
                              PhysicalExprAttr launchExtent,
@@ -1234,7 +1225,6 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       axis = mappingExtents.size();
       mappingExtents.push_back(extent);
       launchExtents.push_back(launchExtent);
-      mappingTypes.push_back(mapBuilder.getIndexType());
       coordinateRoles.push_back(-1);
     }
     coordinateRoles[axis] = static_cast<int64_t>(role);
@@ -1250,24 +1240,17 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       binaryExpression(context, PhysicalExprKind::CeilDiv, columnExpression,
                        unitN),
       CoordinateRole::ContractionN);
-  auto expandedMapping = mapBuilder.create<DelinearizeOp>(
-      location, mappingTypes, mapping.getLinear(), mappingExtents,
-      mapBuilder.getArrayAttr(launchExtents));
-  expandedMapping->setAttr(
-      coordinateRolesAttr,
-      DenseI64ArrayAttr::get(context, coordinateRoles));
-  for (StringRef attribute : {executionGroupAttr, segmentOffsetAttr})
-    if (Attribute value = mapping->getAttr(attribute))
-      expandedMapping->setAttr(attribute, value);
   segmentLength = cast<PhysicalExprAttr>(launchExtents.front());
   for (Attribute extent : llvm::drop_begin(launchExtents))
     segmentLength = binaryExpression(context, PhysicalExprKind::Multiply,
                                      segmentLength,
                                      cast<PhysicalExprAttr>(extent));
-  expandedMapping->setAttr(segmentLengthAttr, segmentLength);
+  auto expandedMapping = rebuildExecutionGroup(
+      mapBuilder, mapping, mappingExtents, mapBuilder.getArrayAttr(launchExtents),
+      mapBuilder.getDenseI64ArrayAttr(coordinateRoles), segmentLength);
   for (auto [oldCoordinate, newCoordinate] : llvm::zip(
            mapping.getCoordinates(),
-           expandedMapping.getCoordinates().take_front(mapping.getNumResults())))
+           expandedMapping.getCoordinates().take_front(mapping.getCoordinates().size())))
     oldCoordinate.replaceAllUsesWith(newCoordinate);
   Value rowTile = expandedMapping.getCoordinates()[rowMappingAxis];
   Value columnTile = expandedMapping.getCoordinates()[columnMappingAxis];

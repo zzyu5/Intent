@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 
 #include "Intent/Analysis/CanonicalKernel.h"
@@ -4189,10 +4190,6 @@ private:
           allocation.scope == LogicalBufferScope::ProgramPrivate
               ? gpu::BufferScope::ProgramPrivate
               : gpu::BufferScope::IterationPrivate;
-      gpu::BufferLifetime lifetime =
-          allocation.scope == LogicalBufferScope::ProgramPrivate
-              ? gpu::BufferLifetime::Program
-              : gpu::BufferLifetime::Iteration;
       auto physicalType = gpu::BufferType::get(
           operation->getContext(), tensor.getElementType(), builder.getArrayAttr(shape),
           gpu::BufferScopeAttr::get(operation->getContext(), scope),
@@ -4200,8 +4197,7 @@ private:
           /*owner=*/1,
           gpu::BufferInitializationAttr::get(
               operation->getContext(), gpu::BufferInitialization::FirstWrite),
-          gpu::BufferLifetimeAttr::get(operation->getContext(), lifetime),
-          /*visibility=*/0, /*workspace=*/false);
+          /*visibility=*/0);
       Value initial;
       if (buffer.getInitial()) {
         FailureOr<Value> lowered =
@@ -5491,48 +5487,42 @@ LogicalResult constructGPUProgram(ModuleOp module,
     Value segmentEnd = createBinary(builder, function.getLoc(),
                                     builder.getIndexType(), runtimeOffset,
                                     runtimeLength, BinaryOperator::Add);
-    if (worksets.size() == 1) {
+    auto lowerGroup = [&](OpBuilder &nested, Value linear) -> LogicalResult {
       SmallVector<Attribute> launchExtents(workset.launchExtents.begin(),
                                            workset.launchExtents.end());
       Location worksetLocation = workset.singleton ? function.getLoc()
                                                    : workset.operation.getLoc();
-      auto decoded = builder.create<gpu::DelinearizeOp>(
-          worksetLocation,
-          SmallVector<Type>(runtimeExtents.size(), builder.getIndexType()), pid,
-          runtimeExtents, builder.getArrayAttr(launchExtents));
-      decoded->setAttr(gpu::executionGroupAttr,
-                       builder.getI64IntegerAttr(groupIndex));
-      decoded->setAttr(gpu::segmentOffsetAttr, launchOffset);
-      decoded->setAttr(gpu::segmentLengthAttr, workset.launchLength);
-      if (!workset.singleton)
-        decoded->setAttr(
-            gpu::coordinateRolesAttr,
-            DenseI64ArrayAttr::get(
-                context,
-                SmallVector<int64_t>(
-                    decoded.getNumResults(),
-                    static_cast<int64_t>(gpu::CoordinateRole::Workset))));
+      auto group = gpu::createExecutionGroup(
+          nested, worksetLocation, linear, runtimeExtents,
+          nested.getArrayAttr(launchExtents), nested.getDenseI64ArrayAttr(
+              SmallVector<int64_t>(runtimeExtents.size(), static_cast<int64_t>(
+                  workset.singleton ? gpu::CoordinateRole::Unspecified
+                                    : gpu::CoordinateRole::Workset))),
+          groupIndex, launchOffset, workset.launchLength);
+      OpBuilder body = OpBuilder::atBlockBegin(&group.getBody().front());
       auto childValues = rootLowering.mapping();
       Block &sourceBlock = *workset.body;
       for (auto [axis, localCoordinate] :
-           llvm::enumerate(decoded.getCoordinates())) {
+           llvm::enumerate(group.getCoordinates())) {
         if (workset.singleton)
           break;
-        Value scaled = createBinary(builder, worksetLocation,
-                                    builder.getIndexType(), localCoordinate,
+        Value scaled = createBinary(body, worksetLocation,
+                                    body.getIndexType(), localCoordinate,
                                     steps[axis], BinaryOperator::Multiply);
-        Value coordinate = createBinary(builder, worksetLocation,
-                                        builder.getIndexType(), starts[axis],
+        Value coordinate = createBinary(body, worksetLocation,
+                                        body.getIndexType(), starts[axis],
                                         scaled, BinaryOperator::Add);
         childValues[workset.coordinateArguments[axis]] = formWorksetCoordinate(
-            builder, worksetLocation, workset.axes[axis].source, coordinate, steps[axis],
+            body, worksetLocation, workset.axes[axis].source, coordinate, steps[axis],
             axis);
       }
-      ScalarRegionLowering lowering(builder, std::move(childValues),
+      ScalarRegionLowering lowering(body, std::move(childValues),
                                     sourceArguments, dimensionValues,
                                     parameterValues, canonicalAnalysis, physical);
-      if (failed(lowering.lowerWorksetBlock(sourceBlock)))
-        return failure();
+      return lowering.lowerWorksetBlock(sourceBlock);
+    };
+    if (worksets.size() == 1) {
+      if (failed(lowerGroup(builder, pid))) return failure();
       runtimeOffset = segmentEnd;
       launchOffset = binaryExpression(context, PhysicalExprKind::Add,
                                       launchOffset, workset.launchLength);
@@ -5553,51 +5543,12 @@ LogicalResult constructGPUProgram(ModuleOp module,
         [&](OpBuilder &nested, Location location) {
           Value local = createBinary(nested, location, nested.getIndexType(), pid,
                                      runtimeOffset, BinaryOperator::Subtract);
-          SmallVector<Attribute> launchExtents(workset.launchExtents.begin(),
-                                               workset.launchExtents.end());
-          auto decoded = nested.create<gpu::DelinearizeOp>(
-              location,
-              SmallVector<Type>(runtimeExtents.size(), nested.getIndexType()),
-              local, runtimeExtents,
-              nested.getArrayAttr(launchExtents));
-          if (!workset.singleton)
-            decoded->setAttr(
-                gpu::coordinateRolesAttr,
-                DenseI64ArrayAttr::get(
-                    context,
-                    SmallVector<int64_t>(
-                        decoded.getNumResults(),
-                        static_cast<int64_t>(gpu::CoordinateRole::Workset))));
-          auto childValues = rootLowering.mapping();
-          Block &sourceBlock = *workset.body;
-          for (auto [axis, localCoordinate] :
-               llvm::enumerate(decoded.getCoordinates())) {
-            if (workset.singleton)
-              break;
-            Value scaled = createBinary(nested, location, nested.getIndexType(),
-                                        localCoordinate, steps[axis],
-                                        BinaryOperator::Multiply);
-            Value coordinate = createBinary(nested, location, nested.getIndexType(),
-                                            starts[axis], scaled,
-                                            BinaryOperator::Add);
-            childValues[workset.coordinateArguments[axis]] =
-                formWorksetCoordinate(nested, location, workset.axes[axis].source,
-                                      coordinate, steps[axis], axis);
-          }
-          ScalarRegionLowering lowering(nested, std::move(childValues),
-                                        sourceArguments, dimensionValues,
-                                        parameterValues, canonicalAnalysis,
-                                        physical);
-          if (failed(lowering.lowerWorksetBlock(sourceBlock))) {
+          if (failed(lowerGroup(nested, local))) {
             dispatchLoweringFailed = true;
             return;
           }
           nested.create<scf::YieldOp>(location);
         });
-    dispatch->setAttr(gpu::executionGroupAttr,
-                      builder.getI64IntegerAttr(groupIndex));
-    dispatch->setAttr(gpu::segmentOffsetAttr, launchOffset);
-    dispatch->setAttr(gpu::segmentLengthAttr, workset.launchLength);
     runtimeOffset = segmentEnd;
     launchOffset = binaryExpression(context, PhysicalExprKind::Add, launchOffset,
                                     workset.launchLength);

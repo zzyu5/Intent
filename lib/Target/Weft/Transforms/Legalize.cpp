@@ -1,4 +1,5 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/IR/WeftDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
@@ -24,11 +25,14 @@ LogicalResult legalizeProgram(ModuleOp program) {
   auto cpuProgram = ModuleOp::create(program.getLoc(), hostModuleName);
   auto output = ModuleOp::create(program.getLoc(), deviceModuleName);
   auto containerName = program.getSymNameAttr();
+  auto options = readCompileOptions(program);
+  if (failed(options)) return failure();
   cpuProgram->setAttrs(program->getAttrDictionary());
   cpuProgram.setSymName(hostModuleName);
   cpuProgram.getBodyRegion().takeBody(program.getBodyRegion());
   program.getBodyRegion().emplaceBlock();
   program->setAttrs(DictionaryAttr::get(program.getContext()));
+  program->setAttr(compileOptionsAttr, *options);
   if (containerName) program.setSymNameAttr(containerName);
   program.getBody()->push_back(cpuProgram);
   program.getBody()->push_back(output);

@@ -26,7 +26,7 @@ LogicalResult verifyPureYieldSchema(Operation *owner, Region &region,
   if (!llvm::equal(terminator.getOperandTypes(), yielded))
     return owner->emitOpError("structured region yield schema is not canonical");
   WalkResult walk = region.walk([&](Operation *nested) {
-    if (isa<YieldOp>(nested))
+    if (isa<YieldOp, AssumeInBoundsOp>(nested))
       return WalkResult::advance();
     if (isa<RandomBitsOp, BufferOp, ViewLoadOp, ViewStoreOp, BufferLoadOp,
             BufferStoreOp, ScatterUniqueOp, ScatterReduceOp, AtomicLoadOp,

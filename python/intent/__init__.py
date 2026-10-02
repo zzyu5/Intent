@@ -5,6 +5,7 @@ from .api import KernelDefinition
 from .api import fn
 from .api import kernel
 from .compiler import CompilationStageError
+from .compiler import CompileOptions
 from .compiler import compile
 from .compiler import compile_ir
 from .compiler import compile_shared_gpu
@@ -33,6 +34,7 @@ __all__ = [
     "KernelDefinition",
     "LanguageUseError",
     "CompilationStageError",
+    "CompileOptions",
     "fn",
     "kernel",
     "compile",

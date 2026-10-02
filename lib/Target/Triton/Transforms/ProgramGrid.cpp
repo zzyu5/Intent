@@ -28,7 +28,7 @@ bool dependsOn(Value value, Value root,
 }
 
 FailureOr<SmallVector<unsigned>>
-writeEffectProgramOrder(func::FuncOp kernel, gpu::DelinearizeOp mapping) {
+writeEffectProgramOrder(func::FuncOp kernel, gpu::ExecutionGroupOp mapping) {
   const unsigned rank = mapping.getCoordinates().size();
   SmallVector<std::optional<int64_t>> resourceAxes(rank);
   bool sawStore = false;
@@ -100,13 +100,13 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  SmallVector<gpu::DelinearizeOp> mappings;
+  SmallVector<gpu::ExecutionGroupOp> mappings;
   kernel.walk(
-      [&](gpu::DelinearizeOp mapping) { mappings.push_back(mapping); });
+      [&](gpu::ExecutionGroupOp mapping) { mappings.push_back(mapping); });
   if (mappings.size() != 1)
     return success();
 
-  gpu::DelinearizeOp mapping = mappings.front();
+  gpu::ExecutionGroupOp mapping = mappings.front();
   if (mapping.getCoordinates().empty() ||
       mapping.getCoordinates().size() > 3)
     return success();
@@ -116,9 +116,8 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
 
   const unsigned rank = mapping.getCoordinates().size();
   SmallVector<unsigned> programOrder;
-  auto roles =
-      mapping->getAttrOfType<DenseI64ArrayAttr>(gpu::coordinateRolesAttr);
-  if (roles && roles.size() != rank)
+  ArrayRef<int64_t> roles = mapping.getCoordinateRoles();
+  if (roles.size() != rank)
     return mapping.emitOpError(
         "Triton program-grid legalization requires one role per coordinate");
   const int64_t workset =
@@ -136,17 +135,17 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
   const int64_t indirectTraversal =
       static_cast<int64_t>(gpu::CoordinateRole::IndirectTraversal);
   const bool hasRowOwnership =
-      roles && llvm::is_contained(roles.asArrayRef(), contractionM);
+      llvm::is_contained(roles, contractionM);
   const bool hasWorkerTraversal =
-      roles && llvm::is_contained(roles.asArrayRef(), traversalWorker);
+      llvm::is_contained(roles, traversalWorker);
   const bool hasIndirectTraversal =
-      roles && llvm::is_contained(roles.asArrayRef(), indirectTraversal);
+      llvm::is_contained(roles, indirectTraversal);
   const bool hasTiledWorkset =
-      roles && llvm::is_contained(roles.asArrayRef(), tiledWorkset);
+      llvm::is_contained(roles, tiledWorkset);
   const bool hasWorkset =
-      roles && llvm::is_contained(roles.asArrayRef(), workset);
+      llvm::is_contained(roles, workset);
   const bool hasPointwiseOwnership =
-      roles && llvm::is_contained(roles.asArrayRef(), pointwiseOwnership);
+      llvm::is_contained(roles, pointwiseOwnership);
 
   if (hasWorkerTraversal) {
     for (unsigned axis = 0; axis < rank; ++axis)
@@ -158,7 +157,7 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     for (unsigned axis = 0; axis < rank; ++axis)
       if (!llvm::is_contained(programOrder, axis))
         programOrder.push_back(axis);
-  } else if (hasRowOwnership || !roles) {
+  } else if (hasRowOwnership) {
     for (unsigned axis = 0; axis < rank; ++axis)
       programOrder.push_back(axis);
   } else if (hasIndirectTraversal) {
@@ -235,11 +234,9 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
     coordinates[axis] = builder.create<gpu::ProgramIdOp>(
         mapping.getLoc(), builder.getIndexType(), coordinateToProgram[axis]);
 
-  // Preserve the shared DelinearizeOp as the execution-group carrier.  The
-  // provider grid only changes how the original row-major linear program id is
-  // obtained: reconstruct that id from the permuted Triton grid coordinates,
-  // then let the existing mapping continue to define runtime workset
-  // coordinates, segment coverage and all mapping attributes.
+  // The group keeps its original coordinates and execution body. Reconstruct
+  // its row-major linear id from the permuted Triton grid; provider preparation
+  // later expands the group through the common coordinate lowering.
   Value linear = coordinates.front();
   for (unsigned axis = 1; axis < rank; ++axis) {
     linear = builder.create<gpu::BinaryOp>(
@@ -250,7 +247,7 @@ LogicalResult legalizeProgramGrid(ModuleOp module) {
         mapping.getLoc(), builder.getIndexType(), linear, coordinates[axis],
         BinaryOperator::Add);
   }
-  mapping->setOperand(0, linear);
+  mapping.getLinearMutable().assign(linear);
   if (linearProgram->use_empty())
     linearProgram.erase();
   return success();

@@ -7,6 +7,7 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "PassDetail.h"
 #include "mlir/IR/Verifier.h"
@@ -60,7 +61,7 @@ FailureOr<gpu::ParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
     return kernel.emitError("TileLang configuration requires GPU capabilities"), failure();
   auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space)) return failure();
-  bool sawThreads = false;
+  if (failed(queryThreadParameter(kernel))) return failure();
   for (gpu::ParameterAttr domain : space->declarations()) {
     if (!domain.isExtent())
       return kernel.emitError("TileLang parameters must have index type"), failure();
@@ -69,7 +70,6 @@ FailureOr<gpu::ParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
     if (role != gpu::ParameterRole::ProviderThreads &&
         role != gpu::ParameterRole::ProviderStages)
       return kernel.emitError("TileLang program contains a foreign provider parameter"), failure();
-    sawThreads |= role == gpu::ParameterRole::ProviderThreads;
     for (int64_t value : domain.getCandidates().asArrayRef())
       if (role == gpu::ParameterRole::ProviderThreads
               ? !isLegalThreadCount(value, capabilities)
@@ -78,8 +78,6 @@ FailureOr<gpu::ParameterSpace> readConfigurationDomains(func::FuncOp kernel) {
                    << "; parameter=" << domain.getName() << "; value=" << value,
                failure();
   }
-  if (!sawThreads)
-    return kernel.emitError("TileLang provider parameter domains have no thread binding"), failure();
   return *space;
 }
 
@@ -413,7 +411,7 @@ bool supportsThreads(func::FuncOp kernel, int64_t threads) {
 
 } // namespace
 
-LogicalResult materializeLaunchConfiguration(
+LogicalResult declareThreadParameter(
     func::FuncOp kernel, const gpu::TuningProfiles &profiles) {
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
@@ -441,23 +439,7 @@ LogicalResult materializeLaunchConfiguration(
       gpu::ParameterCategory::Provider, 0, candidates);
   if (failed(threads))
     return failure();
-  SmallVector<LaunchConfigOp> configs;
-  kernel.getBody().front().walk(
-      [&](LaunchConfigOp config) { configs.push_back(config); });
-  if (configs.size() > 1)
-    return kernel.emitError(
-        "TileLang provider program has duplicate launch configurations");
-  if (!configs.empty()) {
-    auto declaration = gpu::queryParameter(configs.front().getThreads());
-    return declaration && declaration.getReference() == *threads
-               ? success()
-               : configs.front().emitOpError(
-                     "uses a conflicting TileLang thread parameter");
-  }
-  OpBuilder builder(&kernel.front(), kernel.front().begin());
-  auto value = gpu::materializeParameter(builder, kernel.getLoc(), *threads);
-  builder.create<LaunchConfigOp>(kernel.getLoc(), value.getResult());
-  return success();
+  return success(succeeded(queryThreadParameter(kernel)));
 }
 
 LogicalResult verifyTileLangProgram(ModuleOp module) {
@@ -477,7 +459,8 @@ LogicalResult verifyTileLangProgram(ModuleOp module) {
 }
 
 LogicalResult formNativeMemory(ModuleOp module) {
-  if (failed(gpu::verifyGPUProgram(module)))
+  if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(gpu::lowerExecutionGroups(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   return failed(kernel) ? failure() : bufferizeGPUProgram(*kernel);
@@ -487,7 +470,7 @@ LogicalResult configureNativeProgram(ModuleOp module) {
   auto profiles = gpu::TuningProfiles::from(module);
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(profiles) || failed(kernel) ||
-      failed(materializeLaunchConfiguration(*kernel, *profiles)) ||
+      failed(declareThreadParameter(*kernel, *profiles)) ||
       failed(formPipelines(*kernel, *profiles)))
     return failure();
   return materializeLegalConfigurations(*kernel);

@@ -374,7 +374,7 @@ static LogicalResult promoteBufferValuesImpl(ModuleOp module) {
   for (BufferOp buffer : buffers) {
     auto type = buffer.getResult().getType();
     if (type.getScope().getValue() != BufferScope::ProgramPrivate ||
-        type.getWorkspace() || type.getShape().empty())
+        type.isInvocationWorkspace() || type.getShape().empty())
       continue;
     unsigned words = type.getElementType().isIndex()
                          ? 2

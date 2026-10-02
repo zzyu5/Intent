@@ -699,7 +699,9 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   if (!originalType || originalType.getShape().size() != 1)
     return range.emitOpError(
         "reuse-sensitive pointwise traversal requires one physical source axis");
-  PhysicalExprAttr chunkExtent = boundedTraversalChunk(chunk, range);
+  auto boundedChunk = boundedTraversalChunk(chunk, range);
+  if (failed(boundedChunk)) return failure();
+  PhysicalExprAttr chunkExtent = *boundedChunk;
   SmallVector<Attribute> blockedMappings(originalType.getAxisMaps().begin(),
                                          originalType.getAxisMaps().end());
   if (accessDependentSubregion) {

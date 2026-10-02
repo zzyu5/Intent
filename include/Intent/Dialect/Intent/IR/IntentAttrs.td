@@ -17,6 +17,19 @@ class Intent_I32EnumAttr<string mnemonic, Intent_I32Enum enumInfo>
   let assemblyFormat = "`<` $value `>`";
 }
 
+def Intent_NumericsMode : Intent_I32Enum<"NumericsMode", "Compilation numerical permissions", [
+  I32EnumAttrCase<"Source", 0, "source">,
+  I32EnumAttrCase<"RelaxedNormalization", 1, "relaxed_normalization">
+]>;
+
+def Intent_CompileOptionsAttr : AttrDef<Intent_Dialect, "CompileOptions"> {
+  let mnemonic = "compile_options";
+  let summary = "Bound numerical permissions and optional optimization controls";
+  let parameters = (ins EnumParameter<Intent_NumericsMode>:$numerics,
+      "bool":$onlineReduction, "bool":$optimizationRemarks);
+  let assemblyFormat = "`<` $numerics `,` $onlineReduction `,` $optimizationRemarks `>`";
+}
+
 def Intent_UnaryOperator : Intent_I32Enum<"UnaryOperator",
     "Canonical unary arithmetic semantics", [
       I32EnumAttrCase<"Negate", 0, "negate">,

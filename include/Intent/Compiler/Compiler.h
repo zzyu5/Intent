@@ -2,6 +2,7 @@
 #define INTENT_COMPILER_COMPILER_H
 
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "llvm/Support/JSON.h"
@@ -33,6 +34,12 @@ struct DSAOptions {
   std::string shapes = "{}", strides = "{}";
 };
 
+struct CompilationOptions {
+  NumericsMode numerics = NumericsMode::Source;
+  bool onlineReduction = true;
+  bool optimizationRemarks = false;
+};
+
 /// Compile-call inputs. Algorithms and execution decisions remain in the IR.
 struct Request {
   std::optional<Provider> provider;
@@ -43,6 +50,7 @@ struct Request {
   DSAOptions dsa;
   std::string profileDirectory;
   std::string tuningConfig;
+  std::optional<CompilationOptions> options;
 };
 
 /// Owns the current module that produced source/metadata, including typed

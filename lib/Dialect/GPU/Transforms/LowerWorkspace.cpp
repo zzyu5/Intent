@@ -56,8 +56,7 @@ LogicalResult materializeProgramBuffers(ModuleOp module) {
   }
   for (BufferOp buffer : buffers) {
     auto type = buffer.getResult().getType();
-    if (type.getScope().getValue() != BufferScope::ProgramPrivate ||
-        type.getLifetime().getValue() != BufferLifetime::Program)
+    if (type.getScope().getValue() != BufferScope::ProgramPrivate)
       return buffer.emitOpError(
           "mutable buffer requires program-private storage with program lifetime");
     if (buffer.getInitialValue())
@@ -130,11 +129,9 @@ LogicalResult lowerInvocationWorkspaces(ModuleOp module) {
   OpBuilder builder(kernel.getContext());
   for (BlockArgument workspace : workspaces) {
     auto buffer = cast<BufferType>(workspace.getType());
-    if (!buffer.getWorkspace() ||
-        buffer.getScope().getValue() != BufferScope::InvocationWorkspace ||
+    if (!buffer.isInvocationWorkspace() ||
         buffer.getInitialization().getValue() !=
-            BufferInitialization::FirstWrite ||
-        buffer.getLifetime().getValue() != BufferLifetime::Invocation)
+            BufferInitialization::FirstWrite)
       return kernel.emitError(
           "requires an invocation workspace with explicit first writes");
 

@@ -10,6 +10,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
@@ -665,7 +666,8 @@ LogicalResult verifyCuTileProgram(ModuleOp module) {
 }
 
 LogicalResult prepareProgram(ModuleOp module) {
-  if (failed(gpu::verifyGPUProgram(module)))
+  if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(gpu::lowerExecutionGroups(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))

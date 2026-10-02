@@ -1,6 +1,7 @@
 #include "Legalization.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "mlir/IR/Verifier.h"
@@ -10,6 +11,9 @@ using namespace mlir;
 namespace intent::triton {
 
 LogicalResult prepareTritonMemory(ModuleOp module) {
+  if (failed(gpu::verifyGPUProgram(module)) ||
+      failed(gpu::lowerExecutionGroups(module)))
+    return failure();
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();

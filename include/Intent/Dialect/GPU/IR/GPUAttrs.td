@@ -42,15 +42,6 @@ def IntentGPU_BufferInitialization : IntentGPU_I32Enum<
 def IntentGPU_BufferInitializationAttr : IntentGPU_I32EnumAttr<
     "buffer_initialization", IntentGPU_BufferInitialization>;
 
-def IntentGPU_BufferLifetime : IntentGPU_I32Enum<
-    "BufferLifetime", "Dynamic lifetime of one physical allocation instance", [
-      I32EnumAttrCase<"Program", 0, "program">,
-      I32EnumAttrCase<"Iteration", 1, "iteration">,
-      I32EnumAttrCase<"Invocation", 2, "invocation">
-    ]>;
-def IntentGPU_BufferLifetimeAttr : IntentGPU_I32EnumAttr<
-    "buffer_lifetime", IntentGPU_BufferLifetime>;
-
 def IntentGPU_ParameterRefAttr : AttrDef<IntentGPU_Dialect, "ParameterRef"> {
   let mnemonic = "parameter_ref";
   let summary = "A reference to one kernel-owned compile-time declaration";

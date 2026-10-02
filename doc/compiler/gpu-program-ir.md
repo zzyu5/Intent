@@ -31,6 +31,10 @@ Program space定义有限physical program instances。IR显式表示：
 
 Program space可以是任意logical rank；provider legalization负责flatten或映射到目标surface允许的grid rank。Mapping必须是一等IR关系，不能由serializer根据axis role或result shape重建。Runtime extents只能依赖launch-visible ABI scalars与shape relations；需要读取device data才能确定长度的ragged/member domain必须留在program body内，除非KIR本身已提供可直接用于launch的mapping。
 
+每个workset由`execution_group` region持有实际执行体。其operands保存当前linear program coordinate与runtime extents，typed attributes保存对应launch extents、coordinate roles和segment identity/bounds；region arguments是按这些extents作row-major解码的index coordinates。外部dispatch guard仍是显式structured control，group本身不增加launch或barrier，也不改变body中的effects。修改mapping必须同时重绑region arguments与其执行体。
+
+Provider入口在形成native grid后统一展开execution groups：region arguments替换为纯`delinearize`的结果，body原位展开。`delinearize`只表示`linear`和`extents`的数学解码，不保存launch、segment或ownership事实；普通CSE/DCE可合并或删除它，不需要无use保活规则。
+
 Program coordinates只存在于physical IR，不回流成DSL/KIR values。
 
 ### 3.1 LaunchExpr

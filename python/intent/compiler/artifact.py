@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
+from .options import CompileOptions
 
 if TYPE_CHECKING:
     from intent.runtime import CompiledArtifact, PublicInterface
@@ -50,7 +51,17 @@ class GeneratedProgram:
     _binding: ResolvedTarget | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        self.compile_options
         self.interface
+
+    @property
+    def compile_options(self) -> CompileOptions:
+        """Read the saved numerical permissions and optimization controls.
+
+        Loading or materializing preserves this policy; it does not replace it
+        with the current compiler's defaults or a runtime fast-math setting.
+        """
+        return CompileOptions.read(self.metadata["compile_options"])
 
     @property
     def target(self) -> CompilationTarget:
@@ -88,6 +99,7 @@ class GeneratedProgram:
 
         path = Path(directory).expanduser().absolute()
         try:
+            self.compile_options
             self.interface
             if path.exists():
                 raise FileExistsError(f"generated program destination already exists: {path}")
@@ -142,6 +154,7 @@ class GeneratedProgram:
         from .toolchain import CompilationStageError
 
         try:
+            self.compile_options
             self.interface
             binding = target.resolve() if target is not None else self._binding
             if binding is None:

@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1053,8 +1054,81 @@ private:
       if (failed(input))
         return failure();
       result = *input;
-    } else if (isa<gpu::ReshapeOp, gpu::TransposeOp>(producer)) {
-      FailureOr<Value> input = recurse(producer->getOperand(0));
+    } else if (auto reshape = dyn_cast<gpu::ReshapeOp>(producer)) {
+      auto inputType = dyn_cast<gpu::FragmentType>(reshape.getValue().getType());
+      if (!inputType)
+        return owner->emitOpError("TileLang reshape requires a physical fragment input");
+      auto resultIndices = indicesFor(builder, source, target, targetIndices, owner);
+      if (failed(resultIndices)) return failure();
+      unsigned sourceRank = 0, resultRank = 0;
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<gpu::ReshapeGroupAttr>(attribute);
+        for (int64_t axis : group.getSourceAxes().asArrayRef())
+          sourceRank = std::max(sourceRank, static_cast<unsigned>(axis + 1));
+        for (int64_t axis : group.getResultAxes().asArrayRef())
+          resultRank = std::max(resultRank, static_cast<unsigned>(axis + 1));
+      }
+      if (sourceRank > inputType.getShape().size() || resultRank > source.getShape().size())
+        return owner->emitOpError("TileLang reshape relation exceeds its fragment rank");
+      unsigned sourcePrefix = inputType.getShape().size() - sourceRank;
+      unsigned resultPrefix = source.getShape().size() - resultRank;
+      if (sourcePrefix != resultPrefix)
+        return owner->emitOpError("TileLang reshape has mismatched retained prefix axes");
+      SmallVector<Value> inputIndices(inputType.getShape().size());
+      for (unsigned axis = 0; axis < sourcePrefix; ++axis)
+        inputIndices[axis] = (*resultIndices)[axis];
+      auto extent = [&](gpu::FragmentType type, unsigned axis) -> Value {
+        auto expression = cast<gpu::PhysicalExprAttr>(type.getShape()[axis]);
+        if (auto constant = gpu::constantPhysicalExpression(expression))
+          return builder.create<arith::ConstantIndexOp>(owner->getLoc(), *constant);
+        return builder.create<gpu::PhysicalExprOp>(owner->getLoc(), builder.getIndexType(), expression);
+      };
+      auto calculate = [&](Value left, Value right, BinaryOperator kind) -> Value {
+        return builder.create<gpu::BinaryOp>(owner->getLoc(), builder.getIndexType(), left, right, kind);
+      };
+      for (Attribute attribute : reshape.getReassociation()) {
+        auto group = cast<gpu::ReshapeGroupAttr>(attribute);
+        auto sourceAxes = group.getSourceAxes().asArrayRef();
+        auto resultAxes = group.getResultAxes().asArrayRef();
+        if (sourceAxes.size() == 1 && resultAxes.size() == 1) {
+          inputIndices[sourcePrefix + sourceAxes.front()] = (*resultIndices)[resultPrefix + resultAxes.front()];
+          continue;
+        }
+        Value ordinal = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 0);
+        for (int64_t axis : resultAxes) {
+          ordinal = calculate(ordinal, extent(source, resultPrefix + axis), BinaryOperator::Multiply);
+          ordinal = calculate(ordinal, (*resultIndices)[resultPrefix + axis], BinaryOperator::Add);
+        }
+        for (int64_t axis : llvm::reverse(sourceAxes)) {
+          unsigned position = sourcePrefix + axis;
+          if (axis == sourceAxes.front()) {
+            inputIndices[position] = ordinal;
+            continue;
+          }
+          Value divisor = extent(inputType, position);
+          Value one = builder.create<arith::ConstantIndexOp>(owner->getLoc(), 1);
+          divisor = calculate(divisor, one, BinaryOperator::Maximum);
+          inputIndices[position] = calculate(ordinal, divisor, BinaryOperator::Remainder);
+          ordinal = calculate(ordinal, divisor, BinaryOperator::FloorDivide);
+        }
+      }
+      if (llvm::any_of(inputIndices, [](Value index) { return !index; }))
+        return owner->emitOpError("TileLang reshape does not map every source coordinate");
+      DenseMap<Value, Value> projectedMemo;
+      FailureOr<Value> input = scalarize(reshape.getValue(), inputType, inputIndices,
+                                         builder, owner, projectedMemo, preferSourceGraph);
+      if (failed(input)) return failure();
+      result = *input;
+    } else if (auto transpose = dyn_cast<gpu::TransposeOp>(producer)) {
+      auto inputType = cast<gpu::FragmentType>(transpose.getValue().getType());
+      auto resultIndices = indicesFor(builder, source, target, targetIndices, owner);
+      if (failed(resultIndices)) return failure();
+      SmallVector<Value> inputIndices(inputType.getShape().size());
+      for (auto [axis, inputAxis] : llvm::enumerate(transpose.getPermutation()))
+        inputIndices[inputAxis] = (*resultIndices)[axis];
+      DenseMap<Value, Value> projectedMemo;
+      FailureOr<Value> input = scalarize(transpose.getValue(), inputType, inputIndices,
+                                         builder, owner, projectedMemo, preferSourceGraph);
       if (failed(input))
         return failure();
       result = *input;

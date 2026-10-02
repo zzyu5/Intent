@@ -1,6 +1,7 @@
 #include "Intent/Compiler/Compiler.h"
 #include "Intent/Compiler/Registration.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/Timing.h"
@@ -8,6 +9,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace {
@@ -57,6 +59,12 @@ int main(int argc, char **argv) {
   llvm::cl::opt<std::string> metadataOutputFilename("metadata-output", llvm::cl::init(""));
   llvm::cl::opt<std::string> tuningConfigFilename("tuning-config", llvm::cl::init(""),
       llvm::cl::desc("JSON overrides of declared shared/provider profile families"));
+  llvm::cl::opt<std::string> numerics("numerics", llvm::cl::init("source"),
+      llvm::cl::desc("Numerical permissions: source or relaxed_normalization (finite active score/value precondition)"));
+  llvm::cl::opt<bool> onlineReduction("online-reduction", llvm::cl::init(true),
+      llvm::cl::desc("Enable eligible online normalized reductions"));
+  llvm::cl::opt<bool> optimizationRemarks("optimization-remarks", llvm::cl::init(false),
+      llvm::cl::desc("Explain online reduction selection and rejection"));
   llvm::cl::opt<int64_t> cpuVectorBits("cpu-vector-bits", llvm::cl::init(0));
   llvm::cl::opt<int64_t> cpuWorkers("cpu-workers", llvm::cl::init(0));
   llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
@@ -90,6 +98,15 @@ int main(int argc, char **argv) {
     return exitCode(Failure::Invocation);
   }
   intent::compiler::Request request;
+  if (numerics.getNumOccurrences() || onlineReduction.getNumOccurrences() ||
+      optimizationRemarks.getNumOccurrences()) {
+    auto mode = intent::symbolizeNumericsMode(numerics);
+    if (!mode) {
+      llvm::errs() << "--numerics must be source or relaxed_normalization\n";
+      return exitCode(Failure::Invocation);
+    }
+    request.options = intent::compiler::CompilationOptions{*mode, onlineReduction, optimizationRemarks};
+  }
   if (inputStage == "shared") request.inputStage = intent::compiler::InputStage::Shared;
   else if (inputStage != "kir") {
     llvm::errs() << "--input-stage must be kir or shared\n";
@@ -130,7 +147,9 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   intent::compiler::registerDialects(registry);
   mlir::MLIRContext context(registry);
-  auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, &context);
+  llvm::SourceMgr sourceManager;
+  mlir::SourceMgrDiagnosticHandler diagnostics(sourceManager, &context);
+  auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFilename, sourceManager, &context);
   auto result = intent::compiler::compile(std::move(module), request);
   if (result.failure != Failure::None) return exitCode(result.failure);
   if (!writeFile(irOutputFilename, [&](llvm::raw_ostream &output) {

@@ -146,6 +146,18 @@ Compiler保持operand/result dtype、输入精度、数值cast、循环迭代顺
 
 Operation显式规定的独立舍入边界优先于本节，例如[量化计算](quantized-operations.md)中每条record内的`R32`序列；不得跨过这些边界形成FMA。
 
+### 5.6 编译调用的数值许可
+
+编译调用的 `CompileOptions.numerics` 默认为 `source`：保留本文已有的普通浮点、FMA、局部融合及各 structured operation 的合同。它不要求逐操作 bitwise 相同，也不自动增加其它重结合权限。
+
+`relaxed_normalization` 是显式选择的额外许可，仅针对同一成员域上由 validity、maximum、指数权重之和及加权 contraction 构成的 normalized summary。它允许沿该域连续分段，以局部 maximum 计算权重，再用最大值差的指数缩放并合并部分 mass/moment。该许可包括低精度 weight cast 的归一化参考从全域 maximum 改为分段 maximum，以及相应部分累加和重缩放带来的有限精度差异。
+
+选择此模式的调用方必须保证：valid member 的 score 均为有限值；所有实际参与加权 contraction 的 value 元素均为有限值，包括权重为零仍参与乘法的元素。真正未发生的 masked memory access 不新增该要求。编译器不额外读取输入或插入运行时 finite 检查；违反前置条件的输入不在该模式的数值保证内。`source` 模式没有这一额外前置条件。
+
+在此前提下，允许上述具体重组产生的舍入、下溢及中间溢出差异；不承诺与全域归一化后的低精度权重逐元素相同。空成员域和全 inactive 域仍产生原 summary identity，member 集合、结果坐标、外部 effects、ABI 和声明的 accumulator/result dtype 必须保持。该模式不授权其它普通表达式的任意重结合，不引入 TF32、FTZ 或未声明的近似数学，也不跨越量化格式独立规定的舍入边界。
+
+数值许可与优化选择分开：`online_reduction=False` 只禁用这项可选改写，不改变 source 操作的定义；启用也不保证一定采用。作者显式提供 `region_fold/region_scan` 的 summarize/combine 仍按第 6 节合同实现，不依赖此额外模式。
+
 ## 6. Reduce 与 scan 数值语义
 
 Generic reduce是并行归约。作者选择该operation，即声明combine具有结合、交换及identity中立的算法合同；compiler可以选择parenthesization与element permutation，不保证logical source order或ordinary left fold。对于floating-point，这项许可接受并行归约树与重排带来的finite-precision差异，不要求combine逐bit满足实数代数等式；它不改变输入成员、声明的accumulator/result dtype、NaN/tie规则或effects，也不授权未声明的TF32、FTZ或其它近似。

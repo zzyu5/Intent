@@ -54,7 +54,7 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
       // Compiler-created retained storage may be reused sequentially by the
       // original points. Its allocation has not been widened to lane slices.
       if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
-          buffer && buffer.getWorkspace())
+          buffer && buffer.isInvocationWorkspace())
         return false;
       if (!data(store.getValue().getType()) ||
           !llvm::all_of(store.getCoordinates(), [&](Value value) {
@@ -125,10 +125,11 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
     auto buffer = store.getResource().getDefiningOp<BufferOp>();
     auto type = dyn_cast<BufferType>(store.getResource().getType());
     auto view = dyn_cast<ViewType>(store.getResource().getType());
-    bool privateBuffer = buffer && buffer->getBlock() == &kernel.front() &&
-        type && !type.getWorkspace() &&
-        type.getScope().getValue() == BufferScope::ProgramPrivate &&
-        type.getLifetime().getValue() == BufferLifetime::Program;
+    auto group = buffer ? dyn_cast<ExecutionGroupOp>(buffer->getParentOp())
+                        : ExecutionGroupOp{};
+    bool privateBuffer = group && group->getBlock() == &kernel.front() &&
+        buffer->getBlock() == &group.getBody().front() && type &&
+        type.getScope().getValue() == BufferScope::ProgramPrivate;
     if (!privateBuffer && !view) {
       independent = false;
       return;

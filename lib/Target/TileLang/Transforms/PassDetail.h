@@ -12,7 +12,7 @@ mlir::LogicalResult formNativeMemory(mlir::ModuleOp module);
 mlir::LogicalResult configureNativeProgram(mlir::ModuleOp module);
 mlir::LogicalResult finalizeNativeProgram(mlir::ModuleOp module);
 
-mlir::LogicalResult materializeLaunchConfiguration(
+mlir::LogicalResult declareThreadParameter(
     mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles);
 mlir::LogicalResult bufferizeGPUProgram(mlir::func::FuncOp kernel);
 mlir::LogicalResult formPipelines(mlir::func::FuncOp kernel,

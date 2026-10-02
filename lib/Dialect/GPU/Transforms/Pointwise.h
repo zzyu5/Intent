@@ -61,7 +61,7 @@ StructuredRangeUses classifyStructuredRanges(
     func::FuncOp kernel, ArrayRef<MakeRangeOp> allRanges,
     const llvm::SmallPtrSetImpl<Operation *> &laneReductions);
 FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute);
-FailureOr<MappingCoordinates> readMappingCoordinates(func::FuncOp kernel, DelinearizeOp mapping);
+FailureOr<MappingCoordinates> readMappingCoordinates(func::FuncOp kernel, ExecutionGroupOp mapping);
 
 void inheritRangeAuthority(Operation *target, MakeRangeOp source);
 uint32_t physicalElementBitWidth(Type type);
@@ -273,7 +273,7 @@ private:
   llvm::SmallPtrSet<Operation *, 16> reductionCaptureWritebackRanges, boundedWritebackRanges;
   llvm::SmallPtrSet<Operation *, 16> forcedContractionRanges, forcedReductionRanges;
   llvm::MapVector<Attribute, SmallVector<StoreOp>> effectLocalStores;
-  DelinearizeOp mapping;
+  ExecutionGroupOp mapping;
   uint32_t pointwiseElementBitWidth = 0;
   llvm::SmallDenseSet<PhysicalSourceAxis> ownershipSources, directOwnershipSources;
   struct RangeBinding {

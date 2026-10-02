@@ -1,4 +1,5 @@
 #include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Interfaces/StructuredOpInterface.h"
 #include "Intent/Analysis/RegionSemantics.h"
@@ -1806,7 +1807,7 @@ private:
         hasOutput = true;
       } else if (auto load = dyn_cast<ViewLoadOp>(op)) {
         if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
-      } else if (!isMemoryEffectFree(&op)) return false;
+      } else if (!isMemoryEffectFree(&op) && !isa<AssumeInBoundsOp>(op)) return false;
       if (isa<ScanOp, RegionFoldOp, RegionScanOp, ForOp, WhileOp, IfOp, ParallelOp, ReshapeOp, JoinOp>(op)) return false;
       for (Type type : op.getResultTypes()) {
         SmallVector<Type> fields; leaves(type, fields);
@@ -2165,7 +2166,7 @@ private:
         return type ? cast<TensorShapeAttr>(type.getEncoding()).getDimensions().asArrayRef() : ArrayRef<int64_t>();
       };
       if (isa<ForOp, WhileOp, IfOp, ScanOp, BufferLoadOp, BufferStoreOp>(op)) independent = false;
-      if (!op->hasTrait<OpTrait::IsTerminator>() && !isa<ViewLoadOp, ViewStoreOp>(op) &&
+      if (!op->hasTrait<OpTrait::IsTerminator>() && !isa<ViewLoadOp, ViewStoreOp, AssumeInBoundsOp>(op) &&
           !isMemoryEffectFree(op)) independent = false;
       for (Type result : op->getResultTypes()) {
         SmallVector<Type> fields; leaves(result, fields);
@@ -2315,7 +2316,7 @@ private:
           return region->emitError("DSA streamed region outputs require consumers in the same workset"), failure();
         if (!consumers.insert(user).second) continue;
         bool write = isa<ViewStoreOp, ScatterUniqueOp>(user);
-        if (!write && (!isMemoryEffectFree(user) || user->getNumRegions()))
+        if (!write && ((!isMemoryEffectFree(user) && !isa<AssumeInBoundsOp>(user)) || user->getNumRegions()))
           return user->emitError("DSA streamed region consumer requires a pure position-preserving computation"), failure();
         if (isa<ReshapeOp, JoinOp>(user))
           return user->emitError("DSA streamed region consumer needs an explicit position mapping"), failure();
@@ -2378,7 +2379,7 @@ private:
     }
     if (!ordered.empty()) {
       for (Operation *between = region->getNextNode(); between != ordered.back(); between = between->getNextNode()) {
-        if (consumers.contains(between) || isMemoryEffectFree(between)) continue;
+        if (consumers.contains(between) || isMemoryEffectFree(between) || isa<AssumeInBoundsOp>(between)) continue;
         if (auto load = dyn_cast<ViewLoadOp>(between))
           if (cast<ViewType>(load.getSource().getType()).getAccess() == 0) continue;
         return between->emitError("DSA streaming output cannot cross an observable access"), failure();
@@ -3773,6 +3774,9 @@ LogicalResult lowerCanonicalKIRToDSA(ModuleOp module, dsa::ConfigurationAttr con
   CanonicalKernelAnalysis analysis(module);
   if (failed(analysis.verify())) return failure();
   OwningOpRef<ModuleOp> physical = ModuleOp::create(module.getLoc());
+  auto options = readCompileOptions(module);
+  if (failed(options)) return failure();
+  (*physical)->setAttr(compileOptionsAttr, *options);
   Construction construction(module, *physical, configuration, shapes, strides);
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (failed(construction.lower(function))) return failure();

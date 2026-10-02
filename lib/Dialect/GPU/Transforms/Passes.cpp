@@ -278,8 +278,10 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
   if (!space || space.size() != 1 ||
       constantPhysicalExpression(cast<PhysicalExprAttr>(space[0])) != 1)
     return {};
-  auto conditional = dyn_cast_or_null<scf::IfOp>(
+  auto group = dyn_cast_or_null<ExecutionGroupOp>(
       kernel.front().getTerminator()->getPrevNode());
+  auto conditional = group ? dyn_cast_or_null<scf::IfOp>(
+      group.getBody().front().getTerminator()->getPrevNode()) : scf::IfOp();
   if (!conditional || conditional.getElseRegion().empty() ||
       !conditional->use_empty() ||
       !isLaunchUniformScalar(conditional.getCondition(), kernel))
@@ -310,8 +312,12 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
   WalkResult eligible = kernel.walk([&](Operation *operation) {
     if (operation == kernel || operation == conditional)
       return WalkResult::advance();
-    if (isa<DelinearizeOp>(operation))
+    if (isa<ExecutionGroupOp>(operation)) {
       ++mappings;
+      return WalkResult::advance();
+    }
+    if (isa<ExecutionGroupYieldOp, AssumeInBoundsOp>(operation))
+      return WalkResult::advance();
     if (auto store = dyn_cast<StoreOp>(operation)) {
       if (!isa<ViewType>(store.getResource().getType()))
         return WalkResult::interrupt();
@@ -401,10 +407,10 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     bool separateResources =
         function.getFunctionType() != kernel.getFunctionType();
     function.walk([&](BufferOp) { separateResources = true; });
-    function.walk([&](DelinearizeOp mapping) {
+    function.walk([&](ExecutionGroupOp mapping) {
       separateResources |=
           space.size() != 1 ||
-          mapping->getAttr(segmentLengthAttr) != space[0];
+          mapping.getSegmentLength() != space[0];
     });
     if (separateResources)
       return false;
@@ -487,9 +493,6 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     active = builder.create<BinaryOp>(
         location, builder.getI1Type(), active, selected, BinaryOperator::LogicalAnd);
     auto dispatch = builder.create<scf::IfOp>(location, active, false);
-    dispatch->setAttr(executionGroupAttr, builder.getI64IntegerAttr(index));
-    dispatch->setAttr(segmentOffsetAttr, offset);
-    dispatch->setAttr(segmentLengthAttr, length);
     OpBuilder nested = OpBuilder::atBlockBegin(&dispatch.getThenRegion().front());
     Value local = nested.create<BinaryOp>(
         location, builder.getIndexType(), program, begin, BinaryOperator::Subtract);
@@ -499,12 +502,10 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
         continue;
       }
       Operation *cloned = nested.clone(operation, mapping);
-      cloned->walk([&](Operation *operation) {
-        if (operation->hasAttr(executionGroupAttr)) {
-          operation->setAttr(executionGroupAttr, builder.getI64IntegerAttr(index));
-          operation->setAttr(segmentOffsetAttr, offset);
-          operation->setAttr(segmentLengthAttr, length);
-        }
+      cloned->walk([&](ExecutionGroupOp group) {
+        group.setGroupId(index);
+        group.setSegmentOffsetAttr(offset);
+        group.setSegmentLengthAttr(length);
       });
     }
     offset = index == 0 ? length

@@ -24,7 +24,7 @@ bool isTileLangScalarType(Type type) {
 }
 
 bool isAllowed(Operation *operation) {
-  return isa<LaunchConfigOp, PipelineOp, ParallelOp, YieldOp, AllocOp, ClearOp,
+  return isa<PipelineOp, ParallelOp, YieldOp, AllocOp, ClearOp,
              FillOp, SyncOp, CopyInOp, CopyOutOp, CastCopyOutOp, BufferLoadOp,
              BufferStoreOp,
              ViewLoadOp, ViewStoreOp, ReduceOp, ScanOp, GemmOp, SparseGemmOp,
@@ -47,15 +47,7 @@ LogicalResult verifyTileLangKernel(func::FuncOp kernel) {
   if (!space || space.size() != 1)
     return kernel.emitError(
         "TileLang provider currently requires one explicit linear program space");
-  auto topLevelLaunches = kernel.getBody().front().getOps<LaunchConfigOp>();
-  if (!llvm::hasSingleElement(topLevelLaunches))
-    return kernel.emitError(
-        "TileLang provider program requires one top-level launch configuration");
-  unsigned launchConfigs = 0;
-  kernel.walk([&](LaunchConfigOp) { ++launchConfigs; });
-  if (launchConfigs != 1)
-    return kernel.emitError(
-        "TileLang provider program contains a nested launch configuration");
+  if (failed(queryThreadParameter(kernel))) return failure();
   WalkResult result = kernel.walk([&](Operation *operation) {
     if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
         unary && unary.getOperatorKind() == UnaryOperator::Lgamma) {

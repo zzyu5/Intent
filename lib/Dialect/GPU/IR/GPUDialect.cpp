@@ -745,27 +745,17 @@ LogicalResult RangeType::verify(function_ref<InFlightDiagnostic()> emitError,
 LogicalResult BufferType::verify(
     function_ref<InFlightDiagnostic()> emitError, Type elementType,
     ArrayAttr shape, BufferScopeAttr scope, uint64_t instance, uint64_t owner,
-    BufferInitializationAttr initialization, BufferLifetimeAttr lifetime,
-    uint32_t visibility, bool workspace) {
+    BufferInitializationAttr initialization, uint32_t visibility) {
   if (!elementType || !shape || shape.empty() || !scope || instance == 0 ||
-      owner == 0 || !initialization || !lifetime || visibility > 2)
+      owner == 0 || !initialization || visibility > 2)
     return emitError() << "physical buffer schema is incomplete";
+  if (scope.getValue() != BufferScope::ProgramPrivate &&
+      scope.getValue() != BufferScope::IterationPrivate &&
+      scope.getValue() != BufferScope::InvocationWorkspace)
+    return emitError() << "physical buffer has an unknown allocation scope";
   for (Attribute extent : shape)
     if (!mlir::isa<PhysicalExprAttr>(extent))
       return emitError() << "buffer extents must be typed physical expressions";
-  if (workspace !=
-      (scope.getValue() == BufferScope::InvocationWorkspace))
-    return emitError() << "workspace flag and invocation scope disagree";
-  bool lifetimeMatches =
-      (scope.getValue() == BufferScope::ProgramPrivate &&
-       lifetime.getValue() == BufferLifetime::Program) ||
-      (scope.getValue() == BufferScope::IterationPrivate &&
-       lifetime.getValue() == BufferLifetime::Iteration) ||
-      (scope.getValue() == BufferScope::InvocationWorkspace &&
-       lifetime.getValue() == BufferLifetime::Invocation);
-  if (!lifetimeMatches)
-    return emitError()
-           << "physical buffer allocation scope and lifetime disagree";
   return success();
 }
 

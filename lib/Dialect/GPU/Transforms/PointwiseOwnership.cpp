@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Pointwise.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/Predication.h"
@@ -1423,8 +1424,8 @@ LogicalResult PointwiseRewrite::liftWorksets() {
 
 
 LogicalResult PointwiseRewrite::prepareAxisRelations(bool preserveReductionPositions) {
-  SmallVector<DelinearizeOp> mappings;
-  kernel.walk([&](DelinearizeOp mapping) { mappings.push_back(mapping); });
+  SmallVector<ExecutionGroupOp> mappings;
+  kernel.walk([&](ExecutionGroupOp mapping) { mappings.push_back(mapping); });
   if (mappings.size() != 1)
     return kernel.emitError(
         "dynamic pointwise blocking requires one explicit execution workset");
@@ -1463,7 +1464,7 @@ LogicalResult PointwiseRewrite::prepareAxisRelations(bool preserveReductionPosit
   // projection; conflating them would discard a real physical decision.
 
   if (auto roles =
-          mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)) {
+          mapping.getCoordinateRolesAttr()) {
     SmallVector<int64_t> updatedRoles(roles.asArrayRef());
     kernel.walk([&](WorksetCoordinateOp coordinate) {
       auto axis = coordinate->getAttrOfType<IntegerAttr>(worksetAxisAttr);
@@ -1497,8 +1498,8 @@ LogicalResult PointwiseRewrite::prepareAxisRelations(bool preserveReductionPosit
           indirect ? CoordinateRole::IndirectTraversal
                    : CoordinateRole::Workset);
     });
-    mapping->setAttr(coordinateRolesAttr,
-                     DenseI64ArrayAttr::get(module.getContext(), updatedRoles));
+    mapping.setCoordinateRolesAttr(
+        DenseI64ArrayAttr::get(module.getContext(), updatedRoles));
   }
 
   kernel.walk([&](RegionFoldOp fold) {
@@ -2693,7 +2694,6 @@ LogicalResult PointwiseRewrite::mapOwnership() {
   SmallVector<Value> runtimeExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
-  SmallVector<Type> coordinateTypes(mapping.getResultTypes());
   auto existing = readMappingCoordinates(kernel, mapping);
   if (failed(existing)) return failure();
   tileCoordinates = existing->tiles;
@@ -2826,7 +2826,6 @@ LogicalResult PointwiseRewrite::mapOwnership() {
         reusableUnitAxis.reset();
     } else {
       runtimeExtents.push_back(tiles);
-      coordinateTypes.push_back(mappingBuilder.getIndexType());
       launchExtents.push_back(launch);
       appendedCoordinates.push_back(axisKey);
     }
@@ -2834,15 +2833,12 @@ LogicalResult PointwiseRewrite::mapOwnership() {
   }
 
   if (mappingChanged) {
-    auto replacement = mappingBuilder.create<DelinearizeOp>(
-        mapping.getLoc(), coordinateTypes, mapping.getLinear(), runtimeExtents,
-        mappingBuilder.getArrayAttr(launchExtents));
     SmallVector<int64_t> coordinateRoles(
-        replacement.getNumResults(),
+        runtimeExtents.size(),
         static_cast<int64_t>(CoordinateRole::Unspecified));
     if (auto existing =
-            mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr))
-      if (existing.size() == mapping.getNumResults())
+            mapping.getCoordinateRolesAttr())
+      if (existing.size() == mapping.getCoordinates().size())
         llvm::copy(existing.asArrayRef(), coordinateRoles.begin());
     auto ownershipRole = [&](Attribute axis) {
       auto contraction = contractionCoordinateRoles.find(axis);
@@ -2860,17 +2856,20 @@ LogicalResult PointwiseRewrite::mapOwnership() {
         coordinateRoles[axis] =
             static_cast<int64_t>(ownershipRole(axisKey));
     }
-    unsigned appendedAxis = mapping.getNumResults();
+    unsigned appendedAxis = mapping.getCoordinates().size();
     for (Attribute axisKey : appendedCoordinates) {
       coordinateRoles[appendedAxis++] =
           static_cast<int64_t>(ownershipRole(axisKey));
     }
-    replacement->setAttr(
-        coordinateRolesAttr,
-        DenseI64ArrayAttr::get(module.getContext(), coordinateRoles));
-    for (StringRef attribute : {executionGroupAttr, segmentOffsetAttr})
-      if (Attribute value = mapping->getAttr(attribute))
-        replacement->setAttr(attribute, value);
+    PhysicalExprAttr total = cast<PhysicalExprAttr>(launchExtents.front());
+    for (Attribute extent : llvm::drop_begin(launchExtents))
+      total = binaryExpression(module.getContext(), PhysicalExprKind::Multiply,
+                               total, cast<PhysicalExprAttr>(extent));
+    auto replacement = rebuildExecutionGroup(
+        mappingBuilder, mapping, runtimeExtents,
+        mappingBuilder.getArrayAttr(launchExtents),
+        mappingBuilder.getDenseI64ArrayAttr(coordinateRoles), total);
+    mappingBuilder.setInsertionPointToStart(&replacement.getBody().front());
     for (auto [axis, pair] : llvm::enumerate(llvm::zip(
              mapping.getCoordinates(),
              replacement.getCoordinates().take_front(
@@ -2902,11 +2901,6 @@ LogicalResult PointwiseRewrite::mapOwnership() {
     unsigned extra = mapping.getCoordinates().size();
     for (Attribute axisKey : appendedCoordinates)
       tileCoordinates[axisKey] = replacement.getCoordinates()[extra++];
-    PhysicalExprAttr total = cast<PhysicalExprAttr>(launchExtents.front());
-    for (Attribute extent : llvm::drop_begin(launchExtents))
-      total = binaryExpression(module.getContext(), PhysicalExprKind::Multiply,
-                               total, cast<PhysicalExprAttr>(extent));
-    replacement->setAttr(segmentLengthAttr, total);
     mapping.erase();
     mapping = replacement;
     kernel->setAttr(programSpaceAttr,

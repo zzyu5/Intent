@@ -266,7 +266,7 @@ LogicalResult verifyProgramInterface(func::FuncOp kernel) {
     } else if (binding.getKind() == ArgumentKind::Workspace) {
       auto buffer = dyn_cast<BufferType>(type);
       auto view = dyn_cast<ViewType>(type);
-      if ((!buffer || !buffer.getWorkspace()) && (!view || view.getAccess() != 2))
+      if ((!buffer || !buffer.isInvocationWorkspace()) && (!view || view.getAccess() != 2))
         return kernel.emitError("workspace binding requires a workspace buffer or lowered physical view");
       auto shape = view ? view.getLayout().getExtents() : buffer.getShape();
       for (Attribute attribute : shape)

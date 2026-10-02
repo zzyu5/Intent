@@ -58,29 +58,16 @@ bool operandsNeedPhysicalRealization(Operation *operation, ValueRange fragments,
 ProgramSegment queryContractionProgramSegment(func::FuncOp kernel,
                                               Operation *operation,
                                               ProgramMappingScope scope) {
-  DelinearizeOp mapping;
-  if (scope == ProgramMappingScope::SameBlock) {
-    for (Operation &candidate : *operation->getBlock()) {
-      auto coordinate = dyn_cast<DelinearizeOp>(candidate);
-      if (coordinate && coordinate.getLinear().getDefiningOp<ProgramIdOp>() &&
-          coordinate->isBeforeInBlock(operation))
-        mapping = coordinate;
-    }
-  } else {
-    DominanceInfo dominance(kernel);
-    kernel.walk([&](DelinearizeOp candidate) {
-      if (!candidate.getLinear().getDefiningOp<ProgramIdOp>() ||
-          !dominance.dominates(candidate.getOperation(), operation))
-        return;
-      if (!mapping ||
-          dominance.dominates(mapping.getOperation(), candidate.getOperation()))
-        mapping = candidate;
-    });
-  }
+  auto mapping = operation->getParentOfType<ExecutionGroupOp>();
+  if (mapping &&
+      (!mapping.getLinear().getDefiningOp<ProgramIdOp>() ||
+       (scope == ProgramMappingScope::SameBlock &&
+        operation->getBlock() != &mapping.getBody().front())))
+    mapping = {};
   return {mapping, kernel->getAttrOfType<ArrayAttr>(programSpaceAttr),
-          mapping ? mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr)
+          mapping ? mapping.getSegmentOffset()
                   : PhysicalExprAttr(),
-          mapping ? mapping->getAttrOfType<PhysicalExprAttr>(segmentLengthAttr)
+          mapping ? mapping.getSegmentLength()
                   : PhysicalExprAttr()};
 }
 
@@ -215,10 +202,10 @@ bool containsSource(Value value, PhysicalSourceAxis source) {
   return queryFragmentAxis(value.getType(), source).isExact();
 }
 
-FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping) {
+FailureOr<unsigned> mappingAxisForScalar(Value value, ExecutionGroupOp mapping) {
   auto roles =
-      mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr);
-  if (!roles || roles.size() != mapping.getNumResults())
+      mapping.getCoordinateRolesAttr();
+  if (!roles || roles.size() != mapping.getCoordinates().size())
     return failure();
   const int64_t pointwiseOwnership =
       static_cast<int64_t>(CoordinateRole::PointwiseOwnership);

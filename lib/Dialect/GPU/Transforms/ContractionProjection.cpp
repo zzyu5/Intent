@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -46,15 +47,15 @@ static void transposeClonedLoop(scf::ForOp loop);
 void pruneContractionProgramCoordinates(func::FuncOp kernel) {
   // A reduction can consume a provisional pointwise axis. Once its old value
   // graph is gone, that unused axis must not multiply the output workset.
-  SmallVector<DelinearizeOp> mappings;
-  kernel.walk([&](DelinearizeOp mapping) { mappings.push_back(mapping); });
-  for (DelinearizeOp mapping : mappings) {
-    auto roles = mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr);
+  SmallVector<ExecutionGroupOp> mappings;
+  kernel.walk([&](ExecutionGroupOp mapping) { mappings.push_back(mapping); });
+  for (ExecutionGroupOp mapping : mappings) {
+    auto roles = mapping.getCoordinateRolesAttr();
     auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-    auto offset = mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr);
-    auto length = mapping->getAttrOfType<PhysicalExprAttr>(segmentLengthAttr);
+    auto offset = mapping.getSegmentOffset();
+    auto length = mapping.getSegmentLength();
     auto program = mapping.getLinear().getDefiningOp<ProgramIdOp>();
-    if (!roles || roles.size() != mapping.getNumResults() ||
+    if (!roles || roles.size() != mapping.getCoordinates().size() ||
         !llvm::is_contained(roles.asArrayRef(),
                             static_cast<int64_t>(CoordinateRole::ContractionM)) ||
         !llvm::is_contained(roles.asArrayRef(),
@@ -80,21 +81,16 @@ void pruneContractionProgramCoordinates(func::FuncOp kernel) {
       retainedRoles.push_back(roles[axis]);
       retainedCoordinates.push_back(coordinate);
     }
-    if (types.size() == mapping.getNumResults())
+    if (types.size() == mapping.getCoordinates().size())
       continue;
     OpBuilder builder(mapping);
-    auto compact = builder.create<DelinearizeOp>(
-        mapping.getLoc(), types, mapping.getLinear(), extents,
-        builder.getArrayAttr(launch));
-    compact->setAttrs(mapping->getAttrs());
-    compact.setLaunchExtentsAttr(builder.getArrayAttr(launch));
-    compact->setAttr(coordinateRolesAttr,
-                     builder.getDenseI64ArrayAttr(retainedRoles));
     length = cast<PhysicalExprAttr>(launch.front());
     for (Attribute extent : llvm::drop_begin(launch))
       length = binaryExpression(kernel.getContext(), PhysicalExprKind::Multiply,
                                 length, cast<PhysicalExprAttr>(extent));
-    compact->setAttr(segmentLengthAttr, length);
+    auto compact = rebuildExecutionGroup(
+        builder, mapping, extents, builder.getArrayAttr(launch),
+        builder.getDenseI64ArrayAttr(retainedRoles), length);
     kernel->setAttr(programSpaceAttr, builder.getArrayAttr({length}));
     for (auto [old, current] :
          llvm::zip(retainedCoordinates, compact.getCoordinates()))

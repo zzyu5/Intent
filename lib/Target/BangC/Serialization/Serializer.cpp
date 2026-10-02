@@ -1,6 +1,7 @@
 #include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "Intent/Serialization/NativeABI.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -27,6 +28,8 @@ class Serializer {
 public:
   Serializer(func::FuncOp function, llvm::raw_ostream &output) : function(function), out(output) {}
   LogicalResult emit(llvm::json::Object &metadata) {
+    auto options = readCompileOptions(function);
+    if (failed(options)) return failure();
     auto interface = getPublicInterface(function);
     auto publicMetadata = serializePublicInterface(function, interface);
     if (failed(publicMetadata)) return failure();
@@ -52,6 +55,7 @@ public:
     for (int64_t value : function->getAttrOfType<DenseI64ArrayAttr>("intent_dsa.full_extent_dimensions").asArrayRef())
       fullExtents.push_back(value);
     metadata = llvm::json::Object{{"provider", "bangc"}, {"entry_name", function.getName()},
+        {"compile_options", serializeCompileOptions(*options)},
         {"interface", std::move(*publicMetadata)}, {"entry", "intent_launch"},
         {"target", llvm::json::Object{{"family", "dsa"}, {"architecture", "mtp_372"},
             {"tile", config.getTile()}, {"tasks", config.getTasks()},

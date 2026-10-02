@@ -61,7 +61,7 @@ void schedule(Block &block) {
   for (StoreOp store : stores) {
     auto buffer = dyn_cast<BufferType>(store.getResource().getType());
     if (!buffer || buffer.getScope().getValue() != BufferScope::ProgramPrivate ||
-        buffer.getWorkspace())
+        buffer.isInvocationWorkspace())
       continue;
     Operation *last = lastPayloadUse(store);
     if (!isa<scf::ForOp, scf::IfOp>(last))

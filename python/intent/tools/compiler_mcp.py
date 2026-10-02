@@ -26,7 +26,8 @@ def main() -> None:
                       target_options: dict | None = None, constexprs: dict | None = None,
                       compiler: str | None = None, tuning_config: str | None = None,
                       materialize: bool = False, stage: str = "provider",
-                      target_facts: dict | None = None, export_directory: str | None = None) -> dict:
+                      target_facts: dict | None = None, export_directory: str | None = None,
+                      options: dict | None = None) -> dict:
         """Compile an existing .py file and report stages/artifacts.
 
         stage='kir' needs no target, provider SDK or device. 'shared' and
@@ -35,6 +36,15 @@ def main() -> None:
         generation. export_directory saves source, final IR and metadata for a
         later host; target_options select the local runtime if materializing.
         The file's ordinary top-level Python host code executes normally.
+        options accepts numerics ('source' or 'relaxed_normalization'),
+        online_reduction (bool), and optimization_remarks (bool). Source includes
+        the language's FMA/reduction permissions, not bitwise reproducibility.
+        Relaxed normalization permits normalized-summary rescaling and movement
+        of low-precision weight casts. Valid-member scores and all values entering
+        the moment contraction must be finite, including zero-weight terms;
+        zero times infinity is not an inactive access. Masked accesses keep fills.
+        It can change rounding/underflow/overflow but does not enable global fast
+        math or FTZ. The online switch controls optimization, not permission.
         """
         path = Path(program_path).expanduser().resolve(strict=True)
         if not path.is_file() or path.suffix != ".py":
@@ -44,7 +54,8 @@ def main() -> None:
         return compile_request(str(path), kernel, target, target_options=target_options,
                                constexprs=constexprs, compiler=compiler,
                                tuning_config=tuning_config, materialize=materialize, stage=stage,
-                               target_facts=target_facts, export_directory=export_directory)
+                               target_facts=target_facts, export_directory=export_directory,
+                               options=options)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def generate_from_ir(ir_file: str, name: str, target: str,
@@ -57,7 +68,8 @@ def main() -> None:
         The whole module is compiled; name does not select a kernel. Callable
         entries and candidates are determined by the IR and its metadata.
         Shared input retains its physical program/configuration and must agree
-        with the selected target's capabilities. This does not launch a kernel.
+        with the selected target's capabilities. Its compile options are preserved
+        from IR, not reselected by this tool. This does not launch a kernel.
         """
         return generate_ir_request(ir_file, name, target, input_stage=input_stage,
                                    target_options=target_options, compiler=compiler,

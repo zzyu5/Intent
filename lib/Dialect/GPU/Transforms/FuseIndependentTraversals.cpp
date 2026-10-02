@@ -110,7 +110,6 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
   }
   if (first->getBlock() != second->getBlock() ||
       !first->isBeforeInBlock(second) ||
-      first->hasAttr(executionGroupAttr) || second->hasAttr(executionGroupAttr) ||
       !sameBound(first.getLowerBound(), second.getLowerBound(), tuples) ||
       !sameBound(first.getUpperBound(), second.getUpperBound(), tuples) ||
       !sameBound(first.getStep(), second.getStep(), tuples))

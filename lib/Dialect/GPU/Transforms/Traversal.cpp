@@ -30,7 +30,8 @@ using namespace mlir;
 
 namespace intent::gpu {
 
-PhysicalExprAttr boundedTraversalChunk(ParameterAttr chunk, MakeRangeOp range) {
+FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
+                                                 MakeRangeOp range) {
   auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
                         StringRef symbol = {}, ArrayRef<Attribute> operands = {}) {
     return PhysicalExprAttr::get(chunk.getContext(), kind,
@@ -56,6 +57,49 @@ PhysicalExprAttr boundedTraversalChunk(ParameterAttr chunk, MakeRangeOp range) {
   auto bounded = expression(PhysicalExprKind::Minimum, 0, {},
                             {positive, expression(PhysicalExprKind::Constant, maximum)});
   auto padded = expression(PhysicalExprKind::NextPowerOfTwo, 0, {}, {bounded});
+  if (!isCompileTimePhysicalExpr(padded)) {
+    // Coverage is bound before candidate selection and cannot depend on another
+    // parameter. A deferred parameter's coverageBound is only its required size,
+    // not the value selected from its domain, so substituting that bound would
+    // change this capacity. Leave optional clipping unused in this case.
+    AttrTypeWalker dependencies;
+    dependencies.addWalk([](ParameterRefAttr) { return WalkResult::interrupt(); });
+    if (dependencies.walk(bounded).wasInterrupted()) return extent;
+    auto kernel = range->getParentOfType<func::FuncOp>();
+    ParameterAttr capacityParameter;
+    // Host-dependent capacity is bound once before candidate selection. Keep
+    // runtime dimensions out of fragment types, without duplicating the host
+    // evaluator or baking a particular invocation into the shared program.
+    SmallVector<int64_t> candidates;
+    for (int64_t candidate = 1; candidate < maximum; candidate *= 2)
+      candidates.push_back(candidate);
+    candidates.push_back(llvm::PowerOf2Ceil(static_cast<uint64_t>(maximum)));
+    for (Attribute attribute : getParameterDeclarations(kernel)) {
+      auto declaration = cast<ParameterAttr>(attribute);
+      if (declaration.isDeferred() &&
+          declaration.getCategory() == ParameterCategory::Coverage &&
+          declaration.getBinding().getCoverageBound() == bounded &&
+          llvm::equal(declaration.getCandidates().asArrayRef(), candidates)) {
+        capacityParameter = declaration;
+        break;
+      }
+    }
+    if (!capacityParameter) {
+      std::string stem = (chunk.getName().getValue() + "_CAPACITY").str();
+      std::string name = stem;
+      for (unsigned suffix = 1; lookupParameter(kernel, StringAttr::get(kernel.getContext(), name)); ++suffix)
+        name = stem + "_" + std::to_string(suffix);
+      auto binding = ParameterBindingAttr::get(kernel.getContext(), {}, {},
+                                               bounded, {}, false, false);
+      auto reference = getOrCreatePhysicalParameter(kernel, name,
+          ParameterRole::FullCoverage, ParameterCategory::Coverage,
+          /*elementBitWidth=*/0, candidates, binding);
+      if (failed(reference)) return failure();
+      capacityParameter = lookupParameter(kernel, *reference);
+    }
+    padded = expression(PhysicalExprKind::Parameter, 0,
+                        capacityParameter.getName().getValue());
+  }
   return expression(PhysicalExprKind::Minimum, 0, {}, {extent, padded});
 }
 

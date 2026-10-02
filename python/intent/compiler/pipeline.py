@@ -9,6 +9,7 @@ from intent.targets.base import Target, SourceTarget, ResolvedTarget
 from intent.targets.specification import CompilationTarget, require_matching_target
 
 from .artifact import CompiledIR, GeneratedProgram, OptimizedIR
+from .options import CompileOptions, compilation_arguments
 from .toolchain import CompilationStageError
 from .toolchain import CompilerStage
 from .toolchain import run_compiler
@@ -22,12 +23,14 @@ def compile(
     compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
+    options: CompileOptions | None = None,
 ) -> CompiledArtifact:
     kernel_mlir = _capture(definition, constexprs)
     resolved, binding = _resolve(target)
     if binding is None:
         raise NotImplementedError("This target only generates source; use intent.generate, not intent.compile")
-    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__, binding=binding)
+    program = _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__,
+                               binding=binding, compile_options=options)
     return program.materialize()
 
 
@@ -38,10 +41,12 @@ def generate(
     compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
+    options: CompileOptions | None = None,
 ) -> GeneratedProgram:
     kernel_mlir = _capture(definition, constexprs)
     resolved, binding = _resolve(target)
-    return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__, binding=binding)
+    return _generate_source(kernel_mlir, resolved, compiler, tuning_config, definition.__name__,
+                            binding=binding, compile_options=options)
 
 
 def generate_from_ir(
@@ -58,7 +63,8 @@ def generate_from_ir(
     inferred from the text. This compiles the whole module: callable entries and
     candidates come from its IR and metadata, and name does not select a kernel.
     Shared input retains its existing physical
-    program and configuration. The native compiler checks that its capabilities
+    program, configuration and compile options. Compile options are not reselected
+    by this API. The native compiler checks that its capabilities
     agree with the selected target, without reconstructing or retuning that IR.
     The returned program uses the usual materialize() path and does not launch.
     """
@@ -80,6 +86,7 @@ def compile_ir(
     compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
+    options: CompileOptions | None = None,
 ) -> CompiledIR:
     """Compile a definition to verified KIR or shared physical IR.
 
@@ -90,6 +97,7 @@ def compile_ir(
     Both return IR and its cache directory without materialization or launch;
     use ``generate`` for provider source and its invocation metadata.
     """
+    policy_arguments = compilation_arguments(options)
     selected = CompilerStage(stage)
     if selected is CompilerStage.PROVIDER:
         raise ValueError("compile_ir supports 'kir' and 'shared'; use generate for provider source")
@@ -100,11 +108,11 @@ def compile_ir(
         raise ValueError("shared IR compilation requires a target")
     kernel_mlir = _capture(definition, constexprs)
     if selected is CompilerStage.KIR:
-        options, role = (), "Intent compiler"
+        arguments, role = policy_arguments, "Intent compiler"
     else:
         resolved, _ = _resolve(target)
-        options, role = _options(resolved, tuning_config), resolved.compiler_role
-    output = run_compiler(compiler, kernel_mlir, options, role, stage=selected)
+        arguments, role = _options(resolved, tuning_config) + policy_arguments, resolved.compiler_role
+    output = run_compiler(compiler, kernel_mlir, arguments, role, stage=selected)
     return CompiledIR(selected.value, output.ir, output.directory)
 
 
@@ -135,8 +143,9 @@ def _options(resolved: CompilationTarget, tuning_config: str | Path | None) -> t
 
 
 def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name,
-                     *, input_stage: str | None = None, binding: ResolvedTarget | None = None) -> GeneratedProgram:
-    options = _options(resolved, tuning_config)
+                     *, input_stage: str | None = None, binding: ResolvedTarget | None = None,
+                     compile_options: CompileOptions | None = None) -> GeneratedProgram:
+    options = _options(resolved, tuning_config) + compilation_arguments(compile_options)
     if input_stage is not None:
         options += (f"--input-stage={input_stage}",)
     output = run_compiler(
@@ -148,6 +157,8 @@ def _generate_source(kernel_mlir, resolved, compiler, tuning_config, entry_name,
     try:
         program = GeneratedProgram(output.source, output.ir, output.metadata, output.directory, entry_name, binding)
         require_matching_target(program.target, resolved)
+        if compile_options is not None and program.compile_options != compile_options:
+            raise ValueError("compiler output does not preserve the requested compile options")
     except (KeyError, TypeError, ValueError, NotImplementedError) as error:
         raise CompilationStageError("compiler_output", str(error), cache_directory=output.directory) from error
     return program
@@ -160,10 +171,11 @@ def compile_shared_gpu(
     compiler: str | Path | None = None,
     constexprs: dict[str, object] | None = None,
     tuning_config: str | Path | None = None,
+    options: CompileOptions | None = None,
 ) -> str:
     return compile_ir(
         definition, stage="shared", target=target, compiler=compiler,
-        constexprs=constexprs, tuning_config=tuning_config,
+        constexprs=constexprs, tuning_config=tuning_config, options=options,
     ).ir
 
 

@@ -1165,7 +1165,7 @@ FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute) {
 }
 
 
-FailureOr<MappingCoordinates> readMappingCoordinates(func::FuncOp kernel, DelinearizeOp mapping) {
+FailureOr<MappingCoordinates> readMappingCoordinates(func::FuncOp kernel, ExecutionGroupOp mapping) {
   MappingCoordinates result;
   for (auto [axis, extent] : llvm::enumerate(mapping.getLaunchExtents())) {
     FailureOr<Attribute> mapped = mappingAxis(kernel, extent);

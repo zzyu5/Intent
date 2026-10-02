@@ -34,8 +34,6 @@ inline constexpr llvm::StringLiteral capabilitiesAttr =
 inline constexpr llvm::StringLiteral programSpaceAttr =
     "intent_gpu.program_space";
 inline constexpr llvm::StringLiteral gridRankAttr = "intent_gpu.grid_rank";
-inline constexpr llvm::StringLiteral coordinateRolesAttr =
-    "intent_gpu.coordinate_roles";
 inline constexpr llvm::StringLiteral originAttr = "intent_gpu.origin";
 inline constexpr llvm::StringLiteral effectOriginsAttr =
     "intent_gpu.effect_origins";
@@ -49,12 +47,6 @@ inline constexpr llvm::StringLiteral worksetCoordinateRangeAttr =
     "intent_gpu.workset_coordinate_range";
 inline constexpr llvm::StringLiteral worksetAxisAttr =
     "intent_gpu.workset_axis";
-inline constexpr llvm::StringLiteral executionGroupAttr =
-    "intent_gpu.execution_group";
-inline constexpr llvm::StringLiteral segmentOffsetAttr =
-    "intent_gpu.segment_offset";
-inline constexpr llvm::StringLiteral segmentLengthAttr =
-    "intent_gpu.segment_length";
 inline constexpr llvm::StringLiteral reductionSourcesAttr =
     "intent_gpu.reduction_sources";
 inline constexpr llvm::StringLiteral independentIterationAttr =

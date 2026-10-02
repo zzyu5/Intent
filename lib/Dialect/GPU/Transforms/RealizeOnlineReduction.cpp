@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 
 #include "OnlineSummary.h"
 
@@ -14,16 +15,17 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Dominance.h"
 
 using namespace mlir;
 
 namespace intent::gpu {
 namespace {
 
-struct OnlineSummaryPattern : OnlineSummaryStructure {
-  OnlineSummaryPattern(OnlineSummaryStructure structure, MakeRangeOp authority,
+struct OnlineSummaryPattern : NormalizedSummaryStructure {
+  OnlineSummaryPattern(NormalizedSummaryStructure structure, MakeRangeOp authority,
                        SmallVector<MakeRangeOp> ranges)
-      : OnlineSummaryStructure(std::move(structure)), authority(authority),
+      : NormalizedSummaryStructure(std::move(structure)), authority(authority),
         ranges(std::move(ranges)) {}
 
   MakeRangeOp authority;
@@ -76,14 +78,24 @@ Value scalarValue(Value value) {
   return {};
 }
 
-FailureOr<OnlineSummaryPattern> matchOnlineSummary(MakeRecordOp record,
-                                                   func::FuncOp kernel) {
-  if (record->getBlock() != &kernel.getBody().front())
+FailureOr<OnlineSummaryPattern> matchOnlineSummary(ContractOp moment,
+                                                   func::FuncOp kernel,
+                                                   StringRef &reason) {
+  auto group = dyn_cast<ExecutionGroupOp>(moment->getParentOp());
+  if (!group || group->getBlock() != &kernel.front() ||
+      moment->getBlock() != &group.getBody().front())
     return failure();
-  FailureOr<OnlineSummaryStructure> summary =
-      matchOnlineSummaryStructure(record);
+  FailureOr<NormalizedSummaryStructure> summary =
+      matchNormalizedSummaryStructure(moment);
   if (failed(summary))
     return failure();
+  DominanceInfo dominance(kernel);
+  if (!llvm::all_of(summary->mass.getResult(0).getUsers(), [&](Operation *user) {
+        return dominance.dominates(moment.getOperation(), user);
+      })) {
+    reason = "mass is consumed before the complete normalized summary is available";
+    return failure();
+  }
 
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<MakeRangeOp> ranges;
@@ -94,8 +106,10 @@ FailureOr<OnlineSummaryPattern> matchOnlineSummary(MakeRecordOp record,
         std::pair<Value, unsigned>{summary->values,
                                    summary->valueReductionAxis}}) {
     PhysicalRangeFact fact = analysis.axisRanges(value, axis);
-    if (fact.roots.empty())
+    if (fact.roots.empty()) {
+      reason = "source axes have no exact current physical range";
       return failure();
+    }
     for (MakeRangeOp range : fact.roots)
       if (!llvm::is_contained(ranges, range))
         ranges.push_back(range);
@@ -105,19 +119,41 @@ FailureOr<OnlineSummaryPattern> matchOnlineSummary(MakeRecordOp record,
       !llvm::all_of(ranges, [&](MakeRangeOp range) {
         return sourceAxisIdentity(range) == summary->traversal &&
                isUnitStepRange(range);
-      }))
+      })) {
+    reason = "sources do not share a unit-step lockstep traversal";
     return failure();
+  }
   for (Value value :
        {summary->memberValidity, summary->score, summary->values})
     if (!analysis
              .replayability(value, summary->traversal,
                             PhysicalReplayScope::ValueGraph,
                             /*allowAccesses=*/true)
-             .isReplayable())
+             .isReplayable()) {
+      reason = "source graph cannot be replayed with the same coordinates and read effects";
       return failure();
+    }
 
   return OnlineSummaryPattern(std::move(*summary), lockstep.authority,
                               std::move(ranges));
+}
+
+std::optional<StringRef> unsupportedNumerics(OnlineSummaryPattern &pattern) {
+  auto element = [](Value value) { return cast<FragmentType>(value.getType()).getElementType(); };
+  if (!element(pattern.score).isF32() ||
+      !element(pattern.maximum.getResult(0)).isF32() ||
+      !element(pattern.mass.getResult(0)).isF32() ||
+      !element(pattern.moment.getResult()).isF32())
+    return "requires f32 scores, maximum, mass and moment accumulation";
+  Type weight = element(pattern.moment.getLhs());
+  if ((!weight.isF16() && !weight.isBF16() && !weight.isF32()) ||
+      element(pattern.values) != weight)
+    return "requires matching f16, bf16 or f32 weight/value operands";
+  auto identity = scalarValue(pattern.mass.getIdentities().front()).getDefiningOp<arith::ConstantOp>();
+  auto zero = identity ? dyn_cast<FloatAttr>(identity.getValue()) : FloatAttr{};
+  if (!zero || !zero.getValue().isZero())
+    return "requires an additive-zero mass identity";
+  return std::nullopt;
 }
 
 LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
@@ -135,22 +171,25 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
       ParameterCategory::Reduction,
       scoreType.getElementType().getIntOrFloatBitWidth(), candidates);
   if (failed(chunkReference))
-    return pattern.record.emitOpError(
+    return pattern.moment.emitOpError(
         "online reduction has no physical traversal parameter");
+  auto declaration = lookupParameter(kernel, *chunkReference);
+  auto binding = declaration.getBinding().withSource(PhysicalSourceAttr::get(
+      kernel.getContext(), pattern.traversal.sourceId,
+      pattern.traversal.sourceAxis, pattern.traversal.derived));
   if (FailureOr<int64_t> dimension = queryRangeDimension(pattern.authority);
       succeeded(dimension))
-    if (failed(updateParameter(kernel,
-            lookupParameter(kernel, *chunkReference).withBinding(
-                lookupParameter(kernel, *chunkReference).getBinding().withDimension(
-                    IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *dimension))))))
-      return failure();
+    binding = binding.withDimension(IntegerAttr::get(
+        IntegerType::get(kernel.getContext(), 64), *dimension));
+  if (failed(updateParameter(kernel, declaration.withBinding(binding))))
+    return failure();
   OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
-  auto chunk = materializeParameter(parameterBuilder, pattern.record.getLoc(), *chunkReference);
+  auto chunk = materializeParameter(parameterBuilder, pattern.moment.getLoc(), *chunkReference);
   PhysicalExprAttr chunkExtent = parameterExpression(
-      pattern.record.getContext(), chunkReference->getName().getValue());
+      pattern.moment.getContext(), chunkReference->getName().getValue());
 
-  OpBuilder builder(pattern.record);
-  Location location = pattern.record.getLoc();
+  OpBuilder builder(pattern.moment);
+  Location location = pattern.moment.getLoc();
   Value validIdentity = pattern.validity.getIdentities().front();
   Value maximumIdentity = builder.create<SplatOp>(
       location, pattern.maximum.getResult(0).getType(),
@@ -272,7 +311,7 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
             pattern.moment.getRhsBatchAxes());
         if (Attribute origin = pattern.moment->getAttr(originAttr))
           chunkMoment.getDefiningOp()->setAttr(originAttr, origin);
-        if (pattern.momentOrEmpty) {
+        {
           Value rowValidity = nested.create<BroadcastOp>(
               nestedLocation,
               withElementType(cast<FragmentType>(chunkMoment.getType()),
@@ -297,8 +336,11 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
             currentMaximum);
 
         auto scale = [&](Value present, Value previousMaximum) {
+          Value finiteReference = nested.create<SelectOp>(
+              nestedLocation, previousMaximum.getType(), present,
+              previousMaximum, combinedMaximum);
           Value delta = nested.create<BinaryOp>(
-              nestedLocation, carries[1].getType(), previousMaximum,
+              nestedLocation, carries[1].getType(), finiteReference,
               combinedMaximum, BinaryOperator::Subtract);
           Value exponential = nested.create<UnaryOp>(
               nestedLocation, carries[1].getType(), delta,
@@ -342,24 +384,32 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
       });
   if (bodyFailed) {
     loop.erase();
-    return pattern.record.emitOpError(
+    return pattern.moment.emitOpError(
                "online reduction could not form one physical traversal: ")
            << bodyFailure;
   }
-  if (Attribute origin = pattern.record->getAttr(originAttr))
+  if (Attribute origin = pattern.moment->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
   loop->setAttr(
       reductionSourcesAttr,
       builder.getArrayAttr({PhysicalSourceAttr::get(
-          pattern.record.getContext(), pattern.traversal.sourceId,
+          pattern.moment.getContext(), pattern.traversal.sourceId,
           pattern.traversal.sourceAxis, pattern.traversal.derived)}));
   Value finalMaximum = builder.create<SelectOp>(
       location, pattern.maximumOrEmpty.getResult().getType(),
       loop.getResult(0), loop.getResult(1), maximumIdentity);
-  pattern.record->setOperand(pattern.validityField, loop.getResult(0));
-  pattern.record->setOperand(pattern.maximumField, finalMaximum);
-  pattern.record->setOperand(pattern.massField, loop.getResult(2));
-  pattern.record->setOperand(pattern.momentField, loop.getResult(3));
+  // Earlier users retain the original value graph. Only uses dominated by the
+  // completed summary are redirected; the source graph then dies naturally
+  // when its remaining uses are only its own reductions and contraction.
+  DominanceInfo dominance(kernel);
+  for (auto [original, replacement] :
+       {std::pair<Value, Value>{pattern.validity.getResult(0), loop.getResult(0)},
+        {pattern.maximumOrEmpty.getResult(), finalMaximum},
+        {pattern.mass.getResult(0), loop.getResult(2)},
+        {pattern.moment.getResult(), loop.getResult(3)}})
+    original.replaceUsesWithIf(replacement, [&](OpOperand &use) {
+      return dominance.dominates(replacement, use.getOwner());
+    });
   eraseDeadPhysicalValues(kernel);
   return success();
 }
@@ -367,21 +417,49 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
 } // namespace
 
 static LogicalResult realizeOnlineReductionsImpl(ModuleOp module) {
+  auto options = readCompileOptions(module);
+  if (failed(options)) return failure();
+  if (!options->getOnlineReduction()) {
+    if (options->getOptimizationRemarks())
+      emitRemark(module.getLoc(), "online-reduction: disabled by compile options");
+    return success();
+  }
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
-  SmallVector<MakeRecordOp> records;
-  kernel.walk([&](MakeRecordOp record) { records.push_back(record); });
-  for (MakeRecordOp record : records) {
-    if (!record->getBlock())
-      continue;
+  SmallVector<ContractOp> moments;
+  kernel.walk([&](ContractOp moment) { moments.push_back(moment); });
+  // A rewrite can erase other producers. Restart discovery from current SSA
+  // after each successful rewrite rather than keeping stale operation handles.
+  for (size_t index = 0; index < moments.size(); ++index) {
+    ContractOp moment = moments[index];
+    StringRef reason;
     FailureOr<OnlineSummaryPattern> pattern =
-        matchOnlineSummary(record, kernel);
-    if (failed(pattern))
+        matchOnlineSummary(moment, kernel, reason);
+    if (failed(pattern)) {
+      if (options->getOptimizationRemarks() && !reason.empty())
+        emitRemark(moment.getLoc()) << "online-reduction: not applied; " << reason;
       continue;
+    }
+    if (options->getNumerics() != NumericsMode::RelaxedNormalization) {
+      if (options->getOptimizationRemarks())
+        emitRemark(moment.getLoc(), "online-reduction: not applied; source contract does not permit changing the normalization reference before the weight cast");
+      continue;
+    }
+    if (auto reason = unsupportedNumerics(*pattern)) {
+      if (options->getOptimizationRemarks())
+        emitRemark(moment.getLoc()) << "online-reduction: not applied; " << *reason;
+      continue;
+    }
+    Location location = moment.getLoc();
     if (failed(realizeOnlineSummary(*pattern, kernel)))
       return failure();
+    if (options->getOptimizationRemarks())
+      emitRemark(location, "online-reduction: applied under relaxed_normalization; valid scores and every value operand participating in the moment contraction must be finite");
+    moments.clear();
+    kernel.walk([&](ContractOp current) { moments.push_back(current); });
+    index = static_cast<size_t>(-1);
   }
   return success();
 }

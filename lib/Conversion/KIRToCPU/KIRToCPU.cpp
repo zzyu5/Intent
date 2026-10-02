@@ -1,4 +1,5 @@
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
@@ -2020,6 +2021,9 @@ LogicalResult lowerCanonicalKIRToCPU(ModuleOp module, CPUEntryLayout entryLayout
   CanonicalKernelAnalysis analysis(module);
   if (failed(analysis.verify())) return failure();
   auto physical = OwningOpRef<ModuleOp>(ModuleOp::create(module.getLoc()));
+  auto options = readCompileOptions(module);
+  if (failed(options)) return failure();
+  (*physical)->setAttr(compileOptionsAttr, *options);
   Construction construction(module, *physical, entryLayout);
   unsigned count = 0;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {

@@ -8,8 +8,7 @@
 
 namespace intent::gpu {
 
-struct OnlineSummaryStructure {
-  MakeRecordOp record;
+struct NormalizedSummaryStructure {
   ReduceOp validity;
   ReduceOp maximum;
   ReduceOp mass;
@@ -22,14 +21,18 @@ struct OnlineSummaryStructure {
   mlir::Value memberValidity;
   mlir::Value score;
   mlir::Value values;
-  unsigned validityField;
-  unsigned maximumField;
-  unsigned massField;
-  unsigned momentField;
   unsigned reductionAxis;
   unsigned valueReductionAxis;
   PhysicalSourceAxis traversal;
   SelectOp momentOrEmpty;
+};
+
+struct OnlineSummaryStructure : NormalizedSummaryStructure {
+  MakeRecordOp record;
+  unsigned validityField;
+  unsigned maximumField;
+  unsigned massField;
+  unsigned momentField;
 };
 
 struct OnlineSummaryMerge {
@@ -43,6 +46,9 @@ struct OnlineSummaryMerge {
 
 mlir::FailureOr<OnlineSummaryStructure>
 matchOnlineSummaryStructure(MakeRecordOp record);
+
+mlir::FailureOr<NormalizedSummaryStructure>
+matchNormalizedSummaryStructure(ContractOp moment);
 
 mlir::FailureOr<OnlineSummaryMerge>
 matchOnlineSummaryMerge(mlir::Region &region,

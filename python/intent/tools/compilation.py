@@ -107,7 +107,8 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
                     target_options: dict | None = None, constexprs: dict | None = None,
                     compiler: str | None = None, tuning_config: str | None = None,
                     materialize: bool = False, stage: str = "provider",
-                    target_facts: dict | None = None, export_directory: str | None = None) -> dict:
+                    target_facts: dict | None = None, export_directory: str | None = None,
+                    options: dict | None = None) -> dict:
     """Compile an existing definition without invoking its kernel.
 
     Loading the Python module executes its ordinary top-level host code. Native
@@ -120,6 +121,12 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
     transcript = io.StringIO()
     result = {"program": program, "kernel": kernel, "target": target, "requested_stage": stage}
     try:
+        compile_options = None
+        if options is not None:
+            if not isinstance(options, dict):
+                raise TypeError("options must be a compile options object")
+            compile_options = intent.CompileOptions(**options)
+            result["requested_compile_options"] = asdict(compile_options)
         selected_stage = CompilerStage(stage)
         if selected_stage is CompilerStage.KIR:
             if target is not None or target_options or target_facts is not None or tuning_config is not None or materialize:
@@ -143,7 +150,8 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
             current_stage = "compilation"
             if selected_stage is CompilerStage.PROVIDER:
                 generated = intent.generate(definition, target=selected, compiler=compiler,
-                                            constexprs=constexprs, tuning_config=tuning_config)
+                                            constexprs=constexprs, tuning_config=tuning_config,
+                                            options=compile_options)
                 if materialize:
                     current_stage = "generated_source_materialization"
                 runtime_target = make_target(target, dict(target_options or {})) if materialize and target_facts is not None else None
@@ -152,7 +160,8 @@ def compile_request(program: str, kernel: str, target: str | None = None, *,
             else:
                 lowered = intent.compile_ir(definition, stage=selected_stage.value,
                                             target=selected, compiler=compiler,
-                                            constexprs=constexprs, tuning_config=tuning_config)
+                                            constexprs=constexprs, tuning_config=tuning_config,
+                                            options=compile_options)
                 result.update(status="lowered", cache_directory=str(lowered.cache_directory),
                               files=_files(lowered.cache_directory))
             result["tool_invoked_kernel"] = False

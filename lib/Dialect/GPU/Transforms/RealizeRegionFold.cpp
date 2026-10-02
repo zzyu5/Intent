@@ -1025,7 +1025,7 @@ FailureOr<Value> coRealizeOnlineRegion(
   Value probabilityZero =
       summaryValue(plan.summary.probability.getFalseValue());
   Value probabilityCast =
-      summaryValue(plan.summary.probabilityCast.getResult());
+      summaryValue(plan.summary.moment.getLhs());
   Value mass = summaryValue(plan.summary.mass.getResult(0));
   Value moment = summaryValue(plan.summary.moment.getResult());
   Value combinedMaximum = mergeValue(plan.merge.combinedMaximum);
@@ -1117,10 +1117,15 @@ FailureOr<Value> coRealizeOnlineRegion(
 
   ReduceOp directMass = cloneReductionWithSource(
       builder, location, mappedMass, directProbability);
-  auto directProbabilityCast = builder.create<CastOp>(
-      location, probabilityCast.getType(), directProbability);
-  if (Attribute origin = plan.summary.probabilityCast->getAttr(originAttr))
-    directProbabilityCast->setAttr(originAttr, origin);
+  Value directProbabilityCast = directProbability;
+  if (directProbability.getType() != probabilityCast.getType()) {
+    auto converted = builder.create<CastOp>(
+        location, probabilityCast.getType(), directProbability);
+    if (plan.summary.probabilityCast)
+      if (Attribute origin = plan.summary.probabilityCast->getAttr(originAttr))
+        converted->setAttr(originAttr, origin);
+    directProbabilityCast = converted.getResult();
+  }
   auto mappedRecord = mergedRecord.getDefiningOp<MakeRecordOp>();
   if (!mappedRecord)
     return failure();

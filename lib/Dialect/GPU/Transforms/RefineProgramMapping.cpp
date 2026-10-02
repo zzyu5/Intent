@@ -22,7 +22,7 @@ PhysicalExprAttr parameterExpression(ParameterRefAttr reference) {
       reference, ArrayAttr::get(reference.getContext(), {}));
 }
 
-void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
+void preserveBoundedTileOrigins(func::FuncOp kernel, ExecutionGroupOp mapping) {
   kernel.walk([&](MakeRangeOp range) {
     if (range->hasAttr(sourceSubregionAttr) || !isUnitStepRange(range))
       return;
@@ -69,7 +69,7 @@ void preserveBoundedTileOrigins(func::FuncOp kernel, DelinearizeOp mapping) {
 }
 
 LogicalResult realizeGroupedContractionMapping(
-    ModuleOp module, func::FuncOp kernel, DelinearizeOp mapping,
+    ModuleOp module, func::FuncOp kernel, ExecutionGroupOp mapping,
     DenseI64ArrayAttr roles) {
   const int64_t contractionM =
       static_cast<int64_t>(CoordinateRole::ContractionM);
@@ -106,7 +106,7 @@ LogicalResult realizeGroupedContractionMapping(
   Value groupSize = materializeParameter(parameterBuilder, mapping.getLoc(), *group);
 
   OpBuilder builder(mapping);
-  builder.setInsertionPointAfter(mapping);
+  builder.setInsertionPointToStart(&mapping.getBody().front());
   llvm::SmallPtrSet<Operation *, 16> swizzleOperations;
   auto binary = [&](Value lhs, Value rhs, BinaryOperator kind) {
     auto operation = builder.create<BinaryOp>(mapping.getLoc(),
@@ -153,16 +153,16 @@ LogicalResult refineProgramMapping(ModuleOp module) {
     return failure();
   func::FuncOp kernel = *physicalKernel;
 
-  SmallVector<DelinearizeOp> mappings;
-  kernel.walk([&](DelinearizeOp mapping) { mappings.push_back(mapping); });
+  SmallVector<ExecutionGroupOp> mappings;
+  kernel.walk([&](ExecutionGroupOp mapping) { mappings.push_back(mapping); });
   if (mappings.size() != 1)
     return success();
-  DelinearizeOp mapping = mappings.front();
+  ExecutionGroupOp mapping = mappings.front();
   if (mapping->getBlock() != &kernel.getBody().front())
     return success();
 
   auto roles =
-      mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr);
+      mapping.getCoordinateRolesAttr();
   if (!roles || static_cast<size_t>(roles.size()) !=
                     mapping.getCoordinates().size())
     return success();
@@ -193,9 +193,9 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   }
   auto programSpace = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   auto segmentOffset =
-      mapping->getAttrOfType<PhysicalExprAttr>(segmentOffsetAttr);
+      mapping.getSegmentOffset();
   auto segmentLength =
-      mapping->getAttrOfType<PhysicalExprAttr>(segmentLengthAttr);
+      mapping.getSegmentLength();
   if (!programSpace || programSpace.size() != 1 || !segmentOffset ||
       !segmentLength ||
       segmentOffset.getKind() !=
@@ -227,19 +227,6 @@ LogicalResult refineProgramMapping(ModuleOp module) {
   if (failed(resident)) return failure();
   auto residentWorkers = materializeParameter(parameterBuilder, mapping.getLoc(), *resident);
 
-  SmallVector<Operation *> taskBody;
-  for (Operation *operation = mapping.getOperation();
-       operation && !isa<func::ReturnOp>(operation);
-       operation = operation->getNextNode())
-    taskBody.push_back(operation);
-  if (taskBody.empty())
-    return mapping.emitOpError("persistent traversal has no physical task body");
-  auto terminator =
-      dyn_cast<func::ReturnOp>(kernel.getBody().front().getTerminator());
-  if (!terminator || terminator.getNumOperands() != 0)
-    return kernel.emitError(
-        "persistent traversal requires a void physical kernel terminator");
-
   OpBuilder builder(mapping);
   Value totalTasks = builder.create<PhysicalExprOp>(
       mapping.getLoc(), builder.getIndexType(), segmentLength);
@@ -247,9 +234,7 @@ LogicalResult refineProgramMapping(ModuleOp module) {
       mapping.getLoc(), program.getResult(), totalTasks,
       residentWorkers.getResult());
   mapping->setOperand(0, loop.getInductionVar());
-  Operation *yield = loop.getBody()->getTerminator();
-  for (Operation *operation : taskBody)
-    operation->moveBefore(yield);
+  mapping->moveBefore(loop.getBody()->getTerminator());
 
   PhysicalExprAttr residentExtent = parameterExpression(*resident);
   auto boundedResidentExtent = PhysicalExprAttr::get(

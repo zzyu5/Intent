@@ -49,6 +49,48 @@ PhysicalExprAttr expression(MLIRContext *context, PhysicalExprKind kind,
       ArrayAttr::get(context, operands));
 }
 
+FailureOr<ParameterAttr> selectReductionChunk(
+    func::FuncOp kernel, PhysicalSourceAxis source, MakeRangeOp range,
+    ParameterRole role, unsigned elementBitWidth, StringRef name,
+    ArrayRef<int64_t> candidates) {
+  auto sourceBinding = PhysicalSourceAttr::get(
+      kernel.getContext(), source.sourceId, source.sourceAxis, source.derived);
+  IntegerAttr dimension;
+  if (auto identity = queryRangeDimension(range); succeeded(identity))
+    dimension = IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *identity);
+  ParameterAttr existing;
+  for (Attribute attribute : getParameterDeclarations(kernel)) {
+    auto declaration = cast<ParameterAttr>(attribute);
+    auto binding = declaration.getBinding();
+    if (!declaration.isExtent() || declaration.isDeferred() ||
+        declaration.getRole() != role ||
+        declaration.getCategory() != ParameterCategory::Reduction ||
+        binding.getSource() != sourceBinding ||
+        (dimension && binding.getDimension() && dimension != binding.getDimension()))
+      continue;
+    if (existing)
+      return range.emitOpError("reduction traversal has multiple physical chunk declarations"), failure();
+    existing = declaration;
+  }
+  // Different projections of one traversal can have different physical extents.
+  // The existing source binding owns its domain even when this projection has no
+  // parameter in its shape. Keep the widest consumer in the resource metadata.
+  auto binding = existing ? existing.getBinding()
+      : ParameterBindingAttr::get(kernel.getContext(), dimension, sourceBinding,
+                                  {}, {}, false, false);
+  auto reference = getOrCreatePhysicalParameter(
+      kernel, existing ? existing.getName().getValue() : name, role,
+      ParameterCategory::Reduction, elementBitWidth,
+      existing ? existing.getCandidates().asArrayRef() : candidates, binding);
+  if (failed(reference)) return failure();
+  auto declaration = lookupParameter(kernel, *reference);
+  if (dimension && !declaration.getBinding().getDimension()) {
+    declaration = declaration.withBinding(declaration.getBinding().withDimension(dimension));
+    if (failed(updateParameter(kernel, declaration))) return failure();
+  }
+  return declaration;
+}
+
 Value parameterValue(func::FuncOp kernel, ParameterAttr declaration) {
   OpBuilder entry(&kernel.front(), kernel.front().begin());
   return materializeParameter(entry, kernel.getLoc(), declaration.getReference());
@@ -871,14 +913,14 @@ FailureOr<ParameterAttr> parameterForOwnedRange(func::FuncOp kernel,
     if (queryParameter(multiply.getLhs()) == *parameter) coordinate = multiply.getRhs();
     else if (queryParameter(multiply.getRhs()) == *parameter) coordinate = multiply.getLhs();
   }
-  auto result = dyn_cast_or_null<OpResult>(coordinate);
-  auto mapping = result ? dyn_cast<DelinearizeOp>(result.getOwner())
-                        : DelinearizeOp();
+  auto result = dyn_cast_or_null<BlockArgument>(coordinate);
+  auto mapping = result ? dyn_cast<ExecutionGroupOp>(result.getOwner()->getParentOp())
+                        : ExecutionGroupOp();
   auto roles = mapping
-                   ? mapping->getAttrOfType<DenseI64ArrayAttr>(coordinateRolesAttr)
+                   ? mapping.getCoordinateRolesAttr()
                    : DenseI64ArrayAttr();
-  if (!roles || result.getResultNumber() >= roles.size() ||
-      roles[result.getResultNumber()] !=
+  if (!roles || result.getArgNumber() >= roles.size() ||
+      roles[result.getArgNumber()] !=
           static_cast<int64_t>(CoordinateRole::PointwiseOwnership))
     return failure();
   return *parameter;
@@ -2128,21 +2170,14 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         cast<FragmentType>(reduce.getSources().front().getType());
     if (queryFragmentAxes(firstSource, plans.front().sourceIdentity).size() > 1)
       name += ("_F" + Twine(outerAxis)).str();
-    auto reference = getOrCreatePhysicalParameter(
-        kernel, name, ParameterRole::ReductionOuter,
-        ParameterCategory::Reduction,
-        firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
-    if (failed(reference))
+    auto selected = selectReductionChunk(
+        kernel, sourceAxisIdentity(master->range), master->range,
+        ParameterRole::ReductionOuter,
+        firstSource.getElementType().getIntOrFloatBitWidth(), name, candidates);
+    if (failed(selected))
       return reduce.emitOpError(
           "multi-axis outer reduction has no physical chunk parameter");
-    outerChunk = lookupParameter(kernel, *reference);
-    if (FailureOr<int64_t> dimension =
-            queryRangeDimension(master->range);
-        succeeded(dimension)) {
-      outerChunk = outerChunk.withBinding(outerChunk.getBinding().withDimension(
-          IntegerAttr::get(IntegerType::get(reduce.getContext(), 64), *dimension)));
-      if (failed(updateParameter(kernel, outerChunk))) return failure();
-    }
+    outerChunk = *selected;
     outerSliceExtent = expression(
         reduce.getContext(), PhysicalExprKind::Parameter, 0,
         outerChunk.getName().getValue());
@@ -2676,25 +2711,20 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
         });
         name += ("_E" + Twine(padded)).str();
       }
-    auto reference = getOrCreatePhysicalParameter(
-        kernel, name, reductionRole, ParameterCategory::Reduction,
-        firstSource.getElementType().getIntOrFloatBitWidth(), candidates);
-    if (succeeded(reference)) {
-      chunk = lookupParameter(kernel, *reference);
-      if (FailureOr<int64_t> dimension = queryRangeDimension(firstRange);
-          succeeded(dimension)) {
-        chunk = chunk.withBinding(chunk.getBinding().withDimension(
-            IntegerAttr::get(IntegerType::get(chunk.getContext(), 64), *dimension)));
-        if (failed(updateParameter(kernel, chunk))) return failure();
-      }
-    }
+    auto selected = selectReductionChunk(
+        kernel, sourcePlans.front().sourceIdentity, firstRange, reductionRole,
+        firstSource.getElementType().getIntOrFloatBitWidth(), name, candidates);
+    if (failed(selected)) return failure();
+    chunk = *selected;
   }
   if (!chunk)
     return reduce.emitOpError(
                "reduction blocking has no unique physical parameter relation")
            << "; source=" << sourcePlans.front().source.getType()
            << "; axis=" << sourcePlans.front().reductionAxis;
-  PhysicalExprAttr chunkExtent = boundedTraversalChunk(chunk, firstRange);
+  auto boundedChunk = boundedTraversalChunk(chunk, firstRange);
+  if (failed(boundedChunk)) return failure();
+  PhysicalExprAttr chunkExtent = *boundedChunk;
 
   SmallVector<FragmentType> blockedSourceTypes;
   for (const SourcePlan &plan : sourcePlans) {

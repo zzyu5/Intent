@@ -763,11 +763,10 @@ IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
 bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
   if (!value || depth >= 32)
     return false;
-  if (auto result = dyn_cast<OpResult>(value))
-    if (auto mapping = dyn_cast<DelinearizeOp>(result.getOwner()))
-      return mapping.getExtents()[result.getResultNumber()] == extent &&
-             valueKnownNonNegative(mapping.getLinear(), depth + 1) &&
-             llvm::all_of(mapping.getExtents(), [&](Value bound) {
+  if (auto mapping = queryDecodedCoordinate(value))
+      return mapping->extents[mapping->axis] == extent &&
+             valueKnownNonNegative(mapping->linear, depth + 1) &&
+             llvm::all_of(mapping->extents, [&](Value bound) {
                return valueKnownNonNegative(bound, depth + 1);
              });
   auto multiply = value.getDefiningOp<BinaryOp>();
@@ -844,9 +843,9 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
     return llvm::all_of(
         parameter.getCandidates().asArrayRef(),
         [](int64_t candidate) { return candidate >= 0; });
-  if (auto delinearize = value.getDefiningOp<DelinearizeOp>())
-    return valueKnownNonNegative(delinearize.getLinear(), depth + 1) &&
-           llvm::all_of(delinearize.getExtents(), [&](Value extent) {
+  if (auto coordinate = queryDecodedCoordinate(value))
+    return valueKnownNonNegative(coordinate->linear, depth + 1) &&
+           llvm::all_of(coordinate->extents, [&](Value extent) {
              return valueKnownNonNegative(extent, depth + 1);
            });
   if (value.getDefiningOp<DimOp>())
@@ -1414,14 +1413,18 @@ bool isExclusiveProgramRange(MakeRangeOp range, func::FuncOp kernel) {
     coordinate = stripScalarIdentity(multiply.getRhs());
   else if (sameScalarExpression(multiply.getRhs(), extent))
     coordinate = stripScalarIdentity(multiply.getLhs());
-  auto delinearize = coordinate ? coordinate.getDefiningOp<DelinearizeOp>() : DelinearizeOp();
-  if (!delinearize || delinearize.getNumResults() != 1 ||
-      delinearize.getLaunchExtents().size() != 1)
+  auto argument = dyn_cast_or_null<BlockArgument>(coordinate);
+  auto group = argument ? dyn_cast<ExecutionGroupOp>(argument.getOwner()->getParentOp())
+                        : ExecutionGroupOp();
+  auto decoded = coordinate ? queryDecodedCoordinate(coordinate) : std::nullopt;
+  if (!decoded || decoded->extents.size() != 1)
     return false;
-  auto program = delinearize.getLinear().getDefiningOp<ProgramIdOp>();
+  auto program = decoded->linear.getDefiningOp<ProgramIdOp>();
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  auto launchExtent = group ? cast<PhysicalExprAttr>(group.getLaunchExtents()[0])
+                           : queryLaunchExpression(decoded->extents[0]);
   if (!program || program.getAxis() != 0 || !space || space.empty() ||
-      space[0] != delinearize.getLaunchExtents()[0])
+      space[0] != launchExtent)
     return false;
   for (Attribute attribute : space.getValue().drop_front()) {
     auto expression = cast<PhysicalExprAttr>(attribute);
@@ -2142,15 +2145,14 @@ IndexBounds queryIndexBounds(Value value) {
             0, schema.getReference(), ArrayAttr::get(current.getContext(), {}))};
       return {};
     }
-    if (auto result = dyn_cast<OpResult>(current))
-      if (auto mapping = dyn_cast<DelinearizeOp>(result.getOwner())) {
-        if (!valueKnownNonNegative(mapping.getLinear()) ||
-            !llvm::all_of(mapping.getExtents(), [](Value extent) {
+    if (auto mapping = queryDecodedCoordinate(current)) {
+        if (!valueKnownNonNegative(mapping->linear) ||
+            !llvm::all_of(mapping->extents, [](Value extent) {
               return valueKnownNonNegative(extent);
             }))
           return {};
         Value extent = stripScalarIdentity(
-            mapping.getExtents()[result.getResultNumber()]);
+            mapping->extents[mapping->axis]);
         if (std::optional<int64_t> constant = integerConstant(extent))
           return {true, expression(PhysicalExprKind::Constant,
                                    std::max<int64_t>(*constant - 1, 0))};
@@ -4972,7 +4974,7 @@ bool haveDisjointPrivateBufferAccesses(Operation *lhs, Operation *rhs) {
     return false;
   auto buffer = dyn_cast<BufferType>(left.resource.getType());
   if (!buffer || buffer.getScope().getValue() != BufferScope::ProgramPrivate ||
-      buffer.getWorkspace() || !left.resource.getDefiningOp<BufferOp>())
+      buffer.isInvocationWorkspace() || !left.resource.getDefiningOp<BufferOp>())
     return false;
   if (left.resource != right.resource)
     return true;

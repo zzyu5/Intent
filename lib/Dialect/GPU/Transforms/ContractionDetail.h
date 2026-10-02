@@ -26,7 +26,7 @@ struct StorePath {
 enum class ProgramMappingScope { SameBlock, Dominating };
 
 struct ProgramSegment {
-  DelinearizeOp mapping;
+  ExecutionGroupOp mapping;
   ArrayAttr space;
   PhysicalExprAttr offset, length;
 
@@ -90,7 +90,7 @@ MakeRangeOp sourceRange(Value value);
 
 bool containsSource(Value value, PhysicalSourceAxis source);
 
-FailureOr<unsigned> mappingAxisForScalar(Value value, DelinearizeOp mapping);
+FailureOr<unsigned> mappingAxisForScalar(Value value, ExecutionGroupOp mapping);
 
 LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
                                        FailureOr<unsigned> mappingAxis,

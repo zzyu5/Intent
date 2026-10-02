@@ -39,6 +39,12 @@ def main() -> None:
     compile_parser.add_argument("program", metavar="PROGRAM:KERNEL")
     compile_parser.add_argument("--constexpr", action="append", default=[], metavar="NAME=JSON")
     compile_parser.add_argument("--tuning-config")
+    compile_parser.add_argument("--numerics", choices=("source", "relaxed_normalization"),
+                                help="Numerical permission: source retains the language contract; relaxed_normalization permits summary rescaling and requires finite valid scores and all values entering the moment contraction, including zero-weight terms")
+    compile_parser.add_argument("--online-reduction", choices=("true", "false"),
+                                help="Consider online reduction restructuring; enabling it does not grant numerical permission")
+    compile_parser.add_argument("--optimization-remarks", choices=("true", "false"),
+                                help="Emit optimization decision remarks into compiler diagnostics")
     compile_parser.add_argument("--stage", choices=("kir", "shared", "provider"), default="provider",
                                 help="Stop at verified KIR, shared physical IR, or generated provider source")
     compile_parser.add_argument("--materialize", action="store_true", help="Also create the callable; never launch the kernel")
@@ -85,11 +91,19 @@ def main() -> None:
             program, separator, kernel = arguments.program.rpartition(":")
             if not separator or not program:
                 parser.error("program must be a Python file:kernel or importable.module:kernel")
+            compile_options = {}
+            if arguments.numerics is not None:
+                compile_options["numerics"] = arguments.numerics
+            for name in ("online_reduction", "optimization_remarks"):
+                value = getattr(arguments, name)
+                if value is not None:
+                    compile_options[name] = value == "true"
             result = compile_request(program, kernel, arguments.target, target_options=options,
                                      constexprs=_assignments(parser, arguments.constexpr),
                                      compiler=arguments.compiler, tuning_config=arguments.tuning_config,
                                      materialize=arguments.materialize, stage=arguments.stage,
-                                     target_facts=facts, export_directory=arguments.export_directory)
+                                     target_facts=facts, export_directory=arguments.export_directory,
+                                     options=compile_options or None)
     if arguments.json:
         print(json.dumps(result, indent=2))
     elif arguments.command == "doctor":
