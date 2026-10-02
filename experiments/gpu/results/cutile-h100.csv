@@ -1,7 +1,7 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,1.683168,1.927568,1.775696,1.145202,1.054973,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,,,adapter_preparation_failed,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer","Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer"
-dense_gemm,M4096-N14336-K4096-fp16,1.563664,1.249840,1.347432,0.799302,0.861715,pass,pass,Intent target=triton; source corpus=cutile.,
+dense_gemm,M4096-N14336-K4096-fp16,1.581680,1.249840,1.349088,0.790198,0.852946,pass,pass,Intent target=triton; source corpus=cutile.,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,3.097600,3.486504,4.374440,1.125550,1.412203,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用预计算 block ownership,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.446112,0.050552,0.051344,0.114645,0.115092,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Mean/Rstd,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.139768,0.128016,0.130176,0.915918,0.931372,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
@@ -11,10 +11,10 @@ grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.108528,0.112416,0.109400,1.0
 swiglu,8192x14336-bf16,0.247600,0.242400,0.243904,0.978998,0.985073,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.006400,0.006272,0.006664,0.980000,1.041250,pass,pass,Intent target=triton; source corpus=cutile.,
 mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.580944,0.658064,0.767632,1.132749,1.321353,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
-batched_gemm,B32-M512-N512-K1024-bf16,0.044896,0.047680,0.066704,1.062010,1.485745,pass,pass,Intent target=triton; source corpus=cutile.,
+batched_gemm,B32-M512-N512-K1024-bf16,0.044384,0.047680,0.066800,1.074261,1.505047,pass,pass,Intent target=triton; source corpus=cutile.,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.706056,1.924848,2.072520,0.711311,0.765882,pass,pass,Intent target=triton; source corpus=cutile.,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.487456,0.414952,0.444008,0.851260,0.910868,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 host group shapes,同算法；source 使用 host group shapes
-moe_alignment,T4096-top2-E64,0.040000,0.037072,0.025000,0.926800,0.625000,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+moe_alignment,T4096-top2-E64,0.040272,0.037072,0.025032,0.920540,0.621573,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.067568,0.056368,0.056416,0.834241,0.834951,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.878456,0.576672,0.707456,0.656461,0.805340,pass,pass,Intent target=triton; source corpus=cutile.,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.064648,0.063584,0.096920,0.983542,1.499196,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入；Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理
@@ -33,6 +33,6 @@ splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.110408,0.149256,0.091184
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,5.229184,0.224408,0.678512,0.042915,0.129755,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.729584,0.575752,0.650808,0.789151,0.892026,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 的布局转换与辅助工作计入其调用时间,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.050608,0.049992,0.050064,0.987828,0.989251,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Rstd,同算法；source 额外写 Rstd
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.035496,1.315360,0.981072,1.270270,0.947442,pass,pass,Intent target=triton; source corpus=cutile.,
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,1.039616,1.315360,0.983712,1.265236,0.946226,pass,pass,Intent target=triton; source corpus=cutile.,
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.654648,0.170088,0.210736,0.259816,0.321907,pass,pass,Intent target=triton; source corpus=cutile. 同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
 nvfp4_quantize,8192x4096-block16-bf16,,,,,,source_provider_jit_or_initial_launch_failed,source_provider_jit_or_initial_launch_failed,"float4_e2m1fn is not supported on sm_90;   ""/home/kingdom/.cache/intentdsl/gpu-full-retest/repair-repo/experiments/gpu/baselines/cutile/tilegym/quantization/nvfp4/nvfp4_quantize.py"", line 122, col 29-49, in _nvfp4_quant_kernel:","float4_e2m1fn is not supported on sm_90;   ""/home/kingdom/.cache/intentdsl/gpu-full-retest/repair-repo/experiments/gpu/baselines/cutile/tilegym/quantization/nvfp4/nvfp4_quantize.py"", line 122, col 29-49, in _nvfp4_quant_kernel:"

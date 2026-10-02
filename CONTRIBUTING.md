@@ -428,11 +428,26 @@ While 的 condition 与 forwarded arguments 分组，MLIR 检查 region 间类�
 共同接口处理结构关系，各 family 继续选择自己的物理循环与存储。
 显式 capture 的 helper 使用 `IsolatedFromAbove`，不可从外层暗捕获 SSA 常量或 runtime 值。
 
+[Analysis/ControlFlow.h](include/Intent/Analysis/ControlFlow.h) 的
+`queryControlFlowIncoming` / `queryControlFlowOutgoing` 读取标准 region branch、
+terminator 与 CFG branch 接口，以真实 `OpOperand` 槽连接 `BlockArgument` 或
+`OpResult`。Entry、region transfer、exit、bypass 和 CFG branch 分别保留边的种类
+及来源/目标 region；同一 SSA 占两个初值或 yield 槽时不合并它们。查询返回结构边，
+不替消费者决定可达性、重放资格或循环归约语义；produced 值、未知转发和尚未完成的
+terminator 通过 `complete=false` 表达。结果只在当前 IR 未改动期间有效。
+[ResourceAlias](lib/Dialect/GPU/Analysis/ResourceAlias.cpp) 与
+[PhysicalProgram](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 共用这些边，
+不各自计算 For/While 的 operand 偏移。
+
 职责对照：Triton 的 `include/triton/Dialect/Triton/IR/TritonOps.td:761–818`
 在 reduce/scan 运算上声明 `InferTypeOpInterface` 与 region 验证；
 MLIR SCF 的 `SCFOps.td:136–148,953–958` 在循环上声明 region branch 接口。
 Intent 同样让运算提供自身结构，但保留显式 identity/capture、逻辑坐标与 region segmentation 合同；
 没有将这些语义交给 provider serializer 或框架名称推断。
+本地 Triton 的 `lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:1093–1114`
+按具体 use 槽查询控制后继，`:1127–1136` 反查目标的 incoming operand 槽。
+该 snapshot 使用更新的 MLIR mapping API；Intent 的共同查询在 MLIR 20 的标准
+forwarding ranges 上保持相同的位置语义。
 
 普通 GPU 值运算的坐标关系由
 [FragmentOpInterface](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) 提供。
@@ -449,9 +464,17 @@ Unary、binary、compare、select、cast、broadcast、transpose 和 reshape 的
 关系只在当前改写内使用；修改 operands、types 或 reassociation 后重新查询。
 
 [PhysicalProgram](lib/Dialect/GPU/Analysis/PhysicalProgram.cpp) 使用轴组追踪范围；
-[ValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp) 负责工作队列和 schema
-维护；[ValueMaterialization](lib/Dialect/GPU/Transforms/ValueMaterialization.cpp)
-与 region helper 展开使用它传递分段形状。Pointwise coverage、访问组合和
+[ValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp) 负责关系工作队列，
+通过 [SchemaMutation](include/Intent/Dialect/GPU/Transforms/SchemaMutation.h)
+执行三类改写：`closeSchemaBoundary` 从当前 producer 闭合 product、控制和 structured
+helper 的 schema；`projectSchemaBoundary` 将已选 schema 投影到对应 incoming 槽，
+不反向改写被多个组件共享的 seed SSA；`rewriteClonedPhysicalTypes` 先保存未改写源
+operation 的轴关系，统一改写 clone 的结果与 region formal 类型，再用实际 operands
+传递结果的轴关系。
+`retargetSourceExtent` / `retargetDimensionExtent` 返回 `LogicalResult`，调用方须将
+边界投影失败传回完整 transformation，不能继续报告成功。
+[ValueMaterialization](lib/Dialect/GPU/Transforms/ValueMaterialization.cpp)
+与 region helper 展开复用这些入口传递分段形状。Pointwise coverage、访问组合和
 online-summary 查询也消费相同的物理轴组，不能把逻辑 reshape 轴直接用作物理下标。
 Triton/cuTile 的局部资格判断也读同一关系。
 坐标对应不证明数值相等：cast 舍入、逻辑 singleton、effects 和可重放资格仍由
@@ -863,6 +886,25 @@ native kernel 仍用于后端 IR 收集，不成为公共调用结果。
 stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()` 不隐含同步。
 参数或其 shape/stride 改变时重新 prepare。enqueue、benchmark 等扩展仍归具体 provider。
 
+`prepared.compile()` 编译本次绑定下具备资格的 native 候选并返回 `None`，不调优、
+不执行 kernel，也不建立 prepared replay。GPU 将逐候选编译结果记入 observation；
+个别候选编译失败可保留为失败记录，全部失败则报告 native compilation 错误。
+后续 `launch()` 仍执行原候选选择与调用路径。Mojo、Weft 和 BANG C 已在
+materialization 编译其 native portfolio 或固定入口，此方法不重复编译。
+编译成功不代表数值正确或性能达标，`result()` 此时也只返回已绑定的输出容器。
+
+Triton 的 [program.py](python/intent/runtime/triton/program.py) 对各 eligible config
+调用底层 JIT function 的 `warmup`，保留本次参数、coverage、grid 与 native options；
+正式 launch 继续使用 SDK autotuner 和原试跑状态边界。本地参考
+`python/triton/runtime/jit.py:359–371` 明确区分 `warmup=True` 与下标调用的实际运行。
+cuTile 的 [CuTileCompilation](python/intent/runtime/cutile/compilation.py) 由 program
+拥有 kernel 变体及 native 编译结果；显式 compile 根据实际 signature、hints、架构和
+context 调用 SDK compiler，普通 JIT 的 kernel `_compile` 回调消费同一份结果。
+这个接入仍依赖 SDK 的私有编译接口；它不替换全局 `ct.launch` 或 `ct.kernel._compile`。
+SDK `exhaustive_search`、试跑和 winner cache 仍由原
+[CuTileProgram.launch](python/intent/runtime/cutile/program.py) 路径管理，
+不会把编译候选当作已选 winner。
+
 `prepared.inspect_configurations()` 直接使用本次绑定，返回每个声明候选的
 `ConfigurationAssessment`，不重新绑定、分配、编译、选优或计时。GPU 的 requirements
 及 Triton descriptor 实参资格与实际候选筛选共用一条判定路径；已知拒绝优先于未知
@@ -954,10 +996,11 @@ typed free/batch/reduction axes 形成，并恢复结果的原坐标映射。Tri
 Value schema 的闭合先查询 [ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h)：
 `queryElementwiseShapeSource` 描述 unary/cast/bitcast 的逐 lane 等形关系；
 `queryStructuredSchemaGroups` 按位置连接 region summary/state 的 producer、seed
-operand、helper formals、yield 与 result。正向刷新、反向 extent 传播和 value
-materialization 使用这些关系。不同 state 分量可复用同一个零值 SSA，仍是不同
-operand slot，不能仅按 SSA 相等合并 schema。这里闭合的是物理表示，不改变作者的
-combine/apply/emit、迭代次序或数值运算。
+operand、helper formals、yield 与 result。`ValueRelations` 的正向刷新与反向 extent
+传播、`SchemaMutation` 的边界改写和 value materialization 使用这些关系；普通控制
+边使用共同 `Analysis/ControlFlow` 查询。不同 state 分量可复用同一个零值 SSA，仍是
+不同 operand slot，不能仅按 SSA 相等合并 schema。这里闭合的是物理表示，不改变
+作者的 combine/apply/emit、迭代次序或数值运算。
 
 cuTile 的 [Analysis/Tuning.h](include/Intent/Target/CuTile/Analysis/Tuning.h) 从最终 provider IR 查询哪些 runtime scalar 必须按值区分调优结果。证明覆盖 SSA、类型/属性中的 ScalarABI 以及潜在的写后读依赖；索引、控制、形状、资源和未知用途保持区分，只有完整证明为数据用途时才移除其值。Serializer 消费这份只读结果，并保留 view、overlap、完整覆盖和 array-view eligibility 的实际事实；它不改变 scalar 的原生传参或候选执行。
 
