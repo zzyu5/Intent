@@ -11,6 +11,14 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
+void invalidateConfigurationRows(func::FuncOp kernel) {
+  auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+  if (!set) return;
+  kernel->setAttr(configurationsAttr, ConfigurationSetAttr::get(
+      kernel.getContext(), ConfigurationStage::Shared,
+      ArrayAttr::get(kernel.getContext(), {}), set.getRequirements()));
+}
+
 void invalidateConfigurations(func::FuncOp kernel, ParameterAttr before,
                               ParameterAttr after) {
   auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
@@ -18,7 +26,20 @@ void invalidateConfigurations(func::FuncOp kernel, ParameterAttr before,
   bool providerOnly = (!before || before.getPhase() == ConfigurationBindingPhase::Provider) &&
                       (!after || after.getPhase() == ConfigurationBindingPhase::Provider);
   if (!providerOnly || set.getStage() == ConfigurationStage::Complete)
-    kernel->removeAttr(configurationsAttr);
+    invalidateConfigurationRows(kernel);
+}
+
+void deduplicateRequirements(func::FuncOp kernel) {
+  auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+  if (!set) return;
+  llvm::DenseSet<Attribute> unique;
+  SmallVector<Attribute> retained;
+  for (Attribute requirement : set.getRequirements())
+    if (unique.insert(requirement).second) retained.push_back(requirement);
+  if (retained.size() != set.getRequirements().size())
+    kernel->setAttr(configurationsAttr, ConfigurationSetAttr::get(
+        kernel.getContext(), set.getStage(), set.getRows(),
+        ArrayAttr::get(kernel.getContext(), retained)));
 }
 
 LogicalResult verifyDeclaration(func::FuncOp kernel, ParameterAttr declaration) {
@@ -41,11 +62,15 @@ llvm::DenseSet<ParameterRefAttr> referencedParameters(func::FuncOp kernel) {
   walker.addWalk([&](ParameterRefAttr reference) { references.insert(reference); });
   kernel.walk([&](Operation *operation) {
     if (operation == kernel.getOperation()) {
-      // Declarations are not their own users, and rows are a derived binding
-      // set. A retained declaration's dependencies are reached below.
-      for (NamedAttribute attribute : operation->getAttrs())
-        if (attribute.getName() != parametersAttr && attribute.getName() != configurationsAttr)
+      // Rows do not keep a declaration alive. Requirements do: their extents
+      // must remain available even after all SSA parameter reads are folded.
+      // A retained declaration's dependencies are reached below.
+      for (NamedAttribute attribute : operation->getAttrs()) {
+        if (attribute.getName() == configurationsAttr)
+          walker.walk(cast<ConfigurationSetAttr>(attribute.getValue()).getRequirements());
+        else if (attribute.getName() != parametersAttr)
           walker.walk(attribute.getValue());
+      }
     } else {
       walker.walk(operation->getAttrDictionary());
     }
@@ -85,12 +110,27 @@ LogicalResult writeConfigurations(func::FuncOp kernel,
                                   ConfigurationStage stage) {
   auto space = ParameterSpace::read(kernel);
   if (failed(space)) return failure();
+  auto requirements = space->requirements();
+  if (failed(requirements)) return failure();
+  return writeConfigurations(kernel, rows, stage, *requirements);
+}
+
+LogicalResult writeConfigurations(
+    func::FuncOp kernel, ArrayRef<DictionaryAttr> rows, ConfigurationStage stage,
+    ArrayRef<ConfigurationRequirementAttr> requirements) {
+  auto space = ParameterSpace::read(kernel);
+  if (failed(space) || failed(space->verifyRequirements(requirements)))
+    return failure();
+  if (rows.empty())
+    return kernel.emitError("cannot publish an empty candidate set");
   for (DictionaryAttr row : rows)
     if (failed(space->verifyBindings(row, stage))) return failure();
   SmallVector<Attribute> encoded(rows.begin(), rows.end());
+  SmallVector<Attribute> encodedRequirements(requirements.begin(), requirements.end());
   auto set = ConfigurationSetAttr::getChecked(
       [&] { return kernel.emitError(); }, kernel.getContext(), stage,
-      ArrayAttr::get(kernel.getContext(), encoded));
+      ArrayAttr::get(kernel.getContext(), encoded),
+      ArrayAttr::get(kernel.getContext(), encodedRequirements));
   if (!set) return failure();
   kernel->setAttr(configurationsAttr, set);
   return success();
@@ -183,6 +223,8 @@ LogicalResult replaceParameter(func::FuncOp kernel, ParameterRefAttr previous,
     return reference == previous ? std::optional<Attribute>(replacement) : std::nullopt;
   });
   replacer.recursivelyReplaceElementsIn(kernel, true, false, true);
+  // Merging declarations can make two formerly distinct requirements equal.
+  deduplicateRequirements(kernel);
   return success();
 }
 
@@ -198,7 +240,7 @@ LogicalResult renameParameters(func::FuncOp kernel,
       return kernel.emitError("parameter rename must produce unique nonempty names");
     names.try_emplace(declaration.getName(), name);
   }
-  kernel->removeAttr(configurationsAttr);
+  invalidateConfigurationRows(kernel);
   AttrTypeReplacer replacer;
   replacer.addReplacement([&](ParameterAttr declaration) -> std::optional<Attribute> {
     auto found = names.find(declaration.getName());

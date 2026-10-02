@@ -7,6 +7,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from .interface import PublicInterface
+from .diagnostics import NativeObservation
 
 
 BackendIRCollector = Callable[[object], dict[str, str]]
@@ -91,6 +92,16 @@ class CompiledArtifact:
     cache_directory: Path | None = field(default=None, kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
     _backend_ir_kernel: object = field(default_factory=object, init=False, repr=False)
+    _observation: NativeObservation | None = field(default=None, init=False, repr=False)
+
+    @property
+    def observation(self) -> NativeObservation | None:
+        """Latest native invocation snapshot, or None before a provider reports one.
+
+        Reading it never compiles or launches. Resource fields come from the
+        provider; unavailable fields are explicit and are not Intent estimates.
+        """
+        return self._observation
 
     @property
     def entry(self) -> Callable[..., None]:

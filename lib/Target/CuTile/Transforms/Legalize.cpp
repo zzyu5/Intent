@@ -19,7 +19,6 @@
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -343,17 +342,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         operation->emitOpError("has a result type outside the cuTile surface");
         return WalkResult::interrupt();
       }
-    }
-    if (auto assertion = dyn_cast<cf::AssertOp>(operation)) {
-      auto comparison = assertion.getArg().getDefiningOp<gpu::CompareOp>();
-      if (assertion->getBlock() != &kernel.front() || !comparison ||
-          comparison.getPredicate() != ComparePredicate::Le ||
-          !comparison.getLhs().getDefiningOp<gpu::PhysicalExprOp>() ||
-          !comparison.getRhs().getDefiningOp<arith::ConstantIndexOp>()) {
-        assertion.emitOpError("cuTile resource assertion requires a constexpr physical bound");
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
     }
     if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, TileAtomicAddOp,
             ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
@@ -705,7 +693,16 @@ LogicalResult finalizeProgram(ModuleOp module) {
   kernel->walk([&](ReduceOp reduce) {
     reductionSources.push_back(reduce.getSources());
   });
-  gpu::materializeDeferredReductionBounds(*kernel, reductionSources);
+  auto requirements = gpu::collectReductionRequirements(*kernel, reductionSources,
+      gpu::ReductionRequirementScope::InvocationDependent);
+  auto parameters = gpu::ParameterSpace::read(*kernel);
+  if (failed(parameters)) return failure();
+  auto configurations = parameters->configurations(gpu::ConfigurationStage::Complete);
+  if (failed(configurations)) return failure();
+  auto accepted = gpu::filterConfigurationRequirements(*kernel, *configurations, requirements);
+  if (failed(accepted) || failed(gpu::writeConfigurations(*kernel, *accepted,
+          gpu::ConfigurationStage::Complete, requirements)))
+    return failure();
   if (failed(verifyCuTileProgram(module)))
     return failure();
   (*kernel)->setAttr(legalizedAttr, UnitAttr::get(module.getContext()));

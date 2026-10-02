@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Pointwise.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
@@ -408,40 +409,9 @@ std::optional<int64_t> estimatedFragmentRegisters(func::FuncOp kernel, Value val
   auto fragment = dyn_cast<FragmentType>(value.getType());
   if (!fragment || !isa<IntegerType, FloatType>(fragment.getElementType()))
     return std::nullopt;
-  PhysicalProgramAnalysis analysis(kernel);
   int64_t limit = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr).getRegistersPerUnit();
-  int64_t footprint = std::max(1u,
-      (fragment.getElementType().getIntOrFloatBitWidth() + 31) / 32);
-  for (auto [axis, attribute] : llvm::enumerate(fragment.getShape())) {
-    auto extent = cast<PhysicalExprAttr>(attribute);
-    int64_t minimum;
-    if (analysis.axisRealization(value, axis).constructionScalarSeed) {
-      auto range = queryExactLogicalRange(analysis.axisRanges(value, axis));
-      auto capacity = succeeded(range) ? queryLogicalRangeCapacity(*range)
-                                       : PhysicalExprAttr();
-      auto count = capacity ? constantPhysicalExpression(capacity) : std::nullopt;
-      if (!count || *count <= 0)
-        return std::nullopt;
-      // Construction starts runtime subregions with extent one. Their eventual
-      // complete fragments must cover the logical capacity, not that seed.
-      minimum = *count > limit ? limit + 1
-                              : llvm::PowerOf2Ceil(static_cast<uint64_t>(*count));
-    } else if (extent.getKind() == PhysicalExprKind::Constant) {
-      minimum = extent.getValue();
-    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
-      if (failed(parameter))
-        return std::nullopt;
-      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
-    } else {
-      return std::nullopt;
-    }
-    if (minimum <= 0)
-      return std::nullopt;
-    footprint = std::min<__int128>(static_cast<__int128>(footprint) * minimum,
-                                   static_cast<__int128>(limit) + 1);
-  }
-  return footprint;
+  return minimumFragmentRegisterFootprint(kernel, value, limit,
+      FragmentFootprintScope::FullScalarSeedCapacity);
 }
 
 bool containsTraversal(Value value, PhysicalSourceAxis source,

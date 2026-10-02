@@ -214,12 +214,39 @@ def IntentGPU_ConfigurationStage : IntentGPU_I32Enum<
       I32EnumAttrCase<"Complete", 1, "complete">
     ]>;
 
+def IntentGPU_ConfigurationRequirementKind : IntentGPU_I32Enum<
+    "ConfigurationRequirementKind", "What a candidate requirement establishes", [
+      I32EnumAttrCase<"Legality", 0, "legality">,
+      I32EnumAttrCase<"NominalBudget", 1, "nominal_budget">
+    ]>;
+
+def IntentGPU_ConfigurationRequirementMetric : IntentGPU_I32Enum<
+    "ConfigurationRequirementMetric", "Units of a structural candidate requirement", [
+      I32EnumAttrCase<"FragmentElements", 0, "fragment_elements">,
+      I32EnumAttrCase<"FragmentRegisterWords", 1, "fragment_register_words">
+    ]>;
+
+def IntentGPU_ConfigurationRequirementAttr : AttrDef<IntentGPU_Dialect, "ConfigurationRequirement"> {
+  let mnemonic = "configuration_requirement";
+  let summary = "An explicit usage <= limit condition on candidate bindings";
+  let parameters = (ins
+    EnumParameter<IntentGPU_ConfigurationRequirementKind>:$kind,
+    EnumParameter<IntentGPU_ConfigurationRequirementMetric>:$metric,
+    "::intent::gpu::PhysicalExprAttr":$usage,
+    "::intent::gpu::PhysicalExprAttr":$limit,
+    "::mlir::StringAttr":$message
+  );
+  let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
+}
+
 def IntentGPU_ConfigurationSetAttr : AttrDef<IntentGPU_Dialect, "ConfigurationSet"> {
   let mnemonic = "configurations";
   let summary = "Ordered candidate bindings for the current physical program";
   let parameters = (ins EnumParameter<IntentGPU_ConfigurationStage>:$stage,
-                        "::mlir::ArrayAttr":$rows);
-  let assemblyFormat = "`<` $stage `,` $rows `>`";
+                        "::mlir::ArrayAttr":$rows,
+                        "::mlir::ArrayAttr":$requirements);
+  let assemblyFormat = "`<` $stage `,` $rows `,` $requirements `>`";
   let genVerifyDecl = 1;
 }
 

@@ -9,12 +9,15 @@
 | `python examples/softmax.py --target triton` | 编译一次、传入 PyTorch tensor、分配声明的输出、定位编译产物 |
 | `python examples/softmax.py --target cutile` | 在独立 cuTile 环境中复用同一算法定义 |
 | `python examples/softmax.py --target triton --prepared` | 显式提供输出，准备一次调用，再分别执行 `launch()` 与 `result()` |
+| `python examples/softmax.py --target triton --inspect-native` | 执行后查看当前配置、候选状态与 SDK 实际提供的原生资源 |
 | `python examples/softmax.py --target triton --torch-compile` | 先普通调用同一算子完成 JIT/调优，再通过 opaque custom op 进入 `torch.compile(fullgraph=True)` |
 | `python examples/softmax_forward_backward.py --target triton` | 作者注册已有 backward，保存 forward 输出，用 `Tensor.backward(upstream)` 取得输入梯度 |
 | `python examples/softmax_forward_backward.py --target triton --torch-compile` | 同一 forward/backward 注册进入 PyTorch 图编译；两份 kernel 在捕获前完成首次 JIT/调优 |
 | `python examples/softmax_forward_backward.py --target mojo --torch-compile` | 同一作者 forward/backward 在 Mojo CPU runtime 上接入 PyTorch 图编译与 autograd |
 
 `artifact.run(...)` 省略声明的 `Out`，返回新分配的输出；显式调用 `artifact(...)` 保留全部 runtime 参数的声明顺序。`artifact.prepare(..., outputs=(...))` 接受相同输入和指定的 `Out`，准备过程不执行 kernel。返回的调用对象拥有这次参数绑定：`launch()` 执行，`result()` 取得输出容器而不执行或同步。零输出返回 `None`，单输出返回该值，多输出按声明顺序返回 tuple；`InOut` 始终由调用方传入。
+
+`--inspect-native` 读取 `artifact.observation`，也可与 `--prepared` 一起使用。资源带有来源、阶段和单位；SDK 未提供的值明确显示原因。快照不是 correctness 或 occupancy 结论，也不会为了观察额外执行 kernel。首次真实调用前该属性为 `None`。
 
 Forward/backward 示例复用既有的 `4096 × 4097`、f32 backward 定义。作者分别编译两个 kernels，把它们注册为 PyTorch custom ops，再通过 `register_autograd` 提供梯度公式：`setup_context` 保存 probabilities，backward 回调调用已注册的 backward op。普通 Python wrapper 决定这两个 kernels 的关系，compiler 不推导梯度或隐藏增加调用。这里只演示一阶梯度；更高阶梯度需要作者另行提供相应公式。
 

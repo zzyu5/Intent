@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Traversal.h"
@@ -224,6 +225,9 @@ bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
     return false;
   for (Operation *parent = loop->getParentOp(); parent != kernel;
        parent = parent->getParentOp()) {
+    if (auto group = dyn_cast<ExecutionGroupOp>(parent);
+        group && isSingletonExecutionGroup(group, kernel))
+      continue;
     auto branch = dyn_cast<scf::IfOp>(parent);
     if (!branch || !isLaunchUniformScalar(branch.getCondition(), kernel))
       return false;
@@ -384,7 +388,10 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
   auto enclosingLoop = store->getParentOfType<scf::ForOp>();
   for (Operation *parent = store->getParentOp(); parent != kernel;
        parent = parent->getParentOp()) {
-    if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+    if (auto group = dyn_cast<ExecutionGroupOp>(parent);
+        group && isSingletonExecutionGroup(group, kernel)) {
+      continue;
+    } else if (auto loop = dyn_cast<scf::ForOp>(parent)) {
       if (!hasLaunchUniformBounds(loop, kernel))
         return false;
     } else if (auto branch = dyn_cast<scf::IfOp>(parent)) {
@@ -874,28 +881,9 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   if (!dynamicCoverage &&
       full.getKind() != PhysicalExprKind::Constant)
     return false;
-  int64_t footprint = std::max(1u,
-      (payload.getElementType().getIntOrFloatBitWidth() + 31) / 32);
-  for (Attribute attribute : payload.getShape()) {
-    auto extent = cast<PhysicalExprAttr>(attribute);
-    int64_t minimum;
-    if (extent.getKind() == PhysicalExprKind::Constant) {
-      minimum = extent.getValue();
-    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
-      if (failed(parameter))
-        return false;
-      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
-    } else {
-      return false;
-    }
-    if (minimum <= 0)
-      return false;
-    footprint = std::min<__int128>(
-        static_cast<__int128>(footprint) * minimum,
-        static_cast<__int128>(capabilities.getRegistersPerUnit()) + 1);
-  }
-  if (!dynamicCoverage && footprint <= capabilities.getRegistersPerUnit())
+  auto footprint = minimumFragmentRegisterFootprint(kernel, source,
+      capabilities.getRegistersPerUnit(), FragmentFootprintScope::PhysicalShape);
+  if (!footprint || (!dynamicCoverage && *footprint <= capabilities.getRegistersPerUnit()))
     return false;
   Operation *definition = source.getDefiningOp();
   if (!definition)

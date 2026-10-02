@@ -115,6 +115,10 @@ std::optional<std::pair<int64_t, int64_t>>
 queryPositiveExtentBounds(PhysicalExprAttr extent, mlir::func::FuncOp kernel);
 bool isLaunchUniformScalar(mlir::Value value, mlir::func::FuncOp kernel);
 
+/// Prove one launch instance and a singleton execution-group coordinate domain.
+/// This does not establish legality for moving effects across surrounding control.
+bool isSingletonExecutionGroup(ExecutionGroupOp group, mlir::func::FuncOp kernel);
+
 /// Exact launch-visible integer expression from current scalar SSA. Device
 /// accesses, program coordinates and ordered carries are not launch leaves.
 PhysicalExprAttr queryLaunchExpression(mlir::Value value);

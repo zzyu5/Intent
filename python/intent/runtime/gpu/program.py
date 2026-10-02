@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..artifact import CompiledArtifact
+from ..diagnostics import NativeObservation
+from intent.compiler.toolchain import CompilationStageError
 from ..source import load_python_source
 from .interface import BoundInvocation, GPUInterface
 
@@ -14,6 +16,7 @@ from .interface import BoundInvocation, GPUInterface
 class LaunchResult:
     replay: Callable[[], object] | None
     kernel: object = None
+    observation: NativeObservation | None = None
 
 
 class Provider(Protocol):
@@ -29,6 +32,12 @@ class PreparedCall:
         self.program = program
         self.invocation = invocation
         self._launch: LaunchResult | None = None
+        self._observation: NativeObservation | None = None
+
+    @property
+    def observation(self) -> NativeObservation | None:
+        """This prepared call's latest native snapshot; reading does not execute."""
+        return self._observation
 
     @property
     def outputs(self) -> tuple:
@@ -48,12 +57,22 @@ class PreparedCall:
                 self._invoke()
 
     def _invoke(self):
-        if self._launch is None or self._launch.replay is None:
-            self._launch = self.program.provider.launch(self.invocation)
-        else:
-            self._launch.replay()
+        try:
+            if self._launch is None or self._launch.replay is None:
+                self._launch = self.program.provider.launch(self.invocation)
+            else:
+                self._launch.replay()
+        except CompilationStageError as error:
+            self._record_observation(error.observation)
+            raise
+        self._record_observation(self._launch.observation)
         if self.program.artifact is not None:
             self.program.artifact._capture_backend_ir(self._launch.kernel)
+
+    def _record_observation(self, observation):
+        self._observation = observation
+        if self.program.artifact is not None:
+            self.program.artifact._observation = observation
 
     __call__ = launch
 
@@ -99,7 +118,7 @@ def materialize_gpu_program(*, provider_name: str, provider_type, source: str,
         raise ValueError(f"{provider_name} runtime cannot load {metadata['provider']} metadata")
     interface = GPUInterface(metadata)
     namespace = load_python_source(target_name=provider_name, source=source, entry_name=entry_name)
-    provider = provider_type(interface, namespace, metadata[provider_name])
+    provider = provider_type(interface, namespace, metadata[provider_name], metadata["target"])
     program = GPUProgram(interface, provider, device)
     artifact = CompiledArtifact(source=source, mlir=module_text, device=device,
                                 runtime=program,

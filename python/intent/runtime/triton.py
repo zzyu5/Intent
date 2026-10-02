@@ -2,6 +2,8 @@ from .artifact import CompiledArtifact
 from .gpu.expressions import evaluate_shape, read_expressions
 from .gpu.program import LaunchResult, materialize_gpu_program
 from .tuning import TuningState
+from .diagnostics import CandidateRecorder, observation, resource, unavailable_resources
+from intent.compiler.toolchain import CompilationStageError
 
 
 class TuningHooks:
@@ -11,12 +13,17 @@ class TuningHooks:
         self.writable = writable
         self.readable = readable
         self.state = None
+        self.observe_trial = None
+        self._observed_arguments = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exception_type, exception, traceback):
-        self.finish()
+        try:
+            self.finish()
+        finally:
+            self._observed_arguments = None
 
     def finish(self) -> None:
         if self.state is None:
@@ -40,10 +47,20 @@ class TuningHooks:
         self.state.restore(self.readable)
 
     def after(self, arguments: dict, exception: Exception | None) -> None:
-        if exception is not None:
-            self.finish()
-        else:
-            self.state.restore(self.readable)
+        try:
+            # Triton reuses full_nargs through the warmup/measurement calls of a
+            # candidate. Capture the first completed trial and any failure, not
+            # one diagnostic record allocation on every timed callback.
+            if self.observe_trial is not None and (
+                exception is not None or arguments is not self._observed_arguments
+            ):
+                self._observed_arguments = arguments
+                self.observe_trial(arguments, exception)
+        finally:
+            if exception is not None:
+                self.finish()
+            else:
+                self.state.restore(self.readable)
 
 
 def _descriptor_allocator(size, alignment, stream):
@@ -56,12 +73,13 @@ def _descriptor_allocator(size, alignment, stream):
 
 
 class TritonProgram:
-    def __init__(self, interface, namespace: dict, facts: dict) -> None:
+    def __init__(self, interface, namespace: dict, facts: dict, target: dict) -> None:
         import triton
 
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
+        self.target = target
         self.descriptors = tuple({**entry,
                                   "shape": read_expressions(entry["shape"]),
                                   "strides": read_expressions(entry["strides"]),
@@ -86,12 +104,18 @@ class TritonProgram:
             kernel = triton.heuristics({entry["name"]: self._descriptor_hook(entry)
                                         for entry in self.descriptors})(kernel)
         options = {}
-        if facts["descriptor_choice"] is not None or self.configurations.resource_bounds:
+        if facts["descriptor_choice"] is not None or self.configurations.requirements:
             options["prune_configs_by"] = {"early_config_prune": self._prune}
         kernel = triton.autotune(configs=configs, key=facts["autotune_key"],
                                 pre_hook=self.hooks.before, post_hook=self.hooks.after,
                                 **options)(kernel)
         self.kernel = kernel
+
+    def _trial_configuration(self, arguments):
+        row = {name: arguments[name] for name in self.facts["kernel_parameters"]
+               if name not in self.configurations.coverage_names}
+        row.update((parameter, arguments[option]) for option, parameter in self.facts["native_options"].items())
+        return row
 
     def _context(self, arguments: dict) -> dict:
         values = self.interface.callback_values(arguments)
@@ -146,9 +170,10 @@ class TritonProgram:
                 and (stages <= 1 or elements * size % entry["pipeline_block_alignment"] == 0))
 
     def _prune(self, configs, named_args, **kwargs):
+        invocation_values = self._context({**named_args, **kwargs})
         retained = []
         for config in configs:
-            values = {**self._context({**named_args, **kwargs}), **self._config_rows[id(config)]}
+            values = {**invocation_values, **self._config_rows[id(config)]}
             choice = self.facts["descriptor_choice"]
             if choice is not None and values[choice["config"]]:
                 if not values[choice["eligibility"]] or not all(
@@ -157,6 +182,12 @@ class TritonProgram:
                     continue
             if self.configurations.within_resources(values):
                 retained.append(config)
+        if not retained:
+            self.configurations.candidates(invocation_values)
+            raise CompilationStageError(
+                "provider_eligibility",
+                "No Triton configuration satisfies the declared descriptor alignment and block-shape requirements",
+            )
         return retained
 
     def launch(self, invocation) -> LaunchResult:
@@ -174,19 +205,47 @@ class TritonProgram:
             values[choice["eligibility"]] = all(self._eligible(entry, values) for entry in self.descriptors)
         arguments = tuple(self.interface.native_value(name, values) for name in self.facts["kernel_arguments"])
         coverage = {name: values[name] for name in self.configurations.coverage_names}
+        recorder = CandidateRecorder()
+
+        def trial(arguments, error):
+            recorder.record(self._trial_configuration(arguments),
+                            "failed" if error is not None else "trial_completed", "provider_tuning", error)
 
         def grid(config):
             return evaluate_shape(self.interface.grid, {**values, **config})
 
         def invoke():
-            if self.facts["allocator"] is not None:
-                triton.set_allocator(_descriptor_allocator)
-            with self.hooks:
-                return self.kernel[grid](*arguments, **coverage,
-                                         enable_fp_fusion=True, enable_reflect_ftz=False)
+            previous = self.hooks.observe_trial
+            self.hooks.observe_trial = trial
+            try:
+                if self.facts["allocator"] is not None:
+                    triton.set_allocator(_descriptor_allocator)
+                with self.hooks:
+                    return self.kernel[grid](*arguments, **coverage,
+                                             enable_fp_fusion=True, enable_reflect_ftz=False)
+            except CompilationStageError:
+                raise
+            except Exception as error:
+                details = observation("triton", self.target, invocation, None,
+                    unavailable_resources("triton", "The invocation did not return a loaded native kernel"),
+                    recorder.snapshot(), stage="failed")
+                raise CompilationStageError("provider_invocation", str(error), observation=details) from error
+            finally:
+                self.hooks.observe_trial = previous
 
         compiled = invoke()
-        return LaunchResult(invoke, compiled)
+        # Triton's disk winner cache reconstructs Config objects. The selected
+        # binding, not Python object identity, must match the declared IR rows.
+        config = self._trial_configuration(self.kernel.best_config.all_kwargs())
+        if config not in self.configurations.rows:
+            raise CompilationStageError("provider_configuration",
+                                        "Triton selected a configuration absent from the generated program")
+        history = recorder.snapshot()
+        recorder.record(config, "selected", "provider_invocation")
+        details = observation("triton", self.target, invocation, config, _native_resources(compiled),
+                              recorder.snapshot(), history_unavailable=None if history else
+                              "No tuning trial callbacks occurred in this invocation; only the selected kernel was observed")
+        return LaunchResult(invoke, compiled, details)
 
     def tuning_configurations(self, invocation):
         return self.configurations.enumerate(invocation.values, self.configurations.rows)
@@ -199,6 +258,21 @@ def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
     if not result:
         raise RuntimeError("Triton compiled artifact exposes no textual backend IR")
     return result
+
+
+def _native_resources(kernel):
+    metadata = kernel.metadata
+    fields = (
+        ("registers_per_thread", getattr(kernel, "n_regs", None), "registers", "CompiledKernel.n_regs", "native_loading"),
+        # NVIDIA load_binary reports CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES / 4.
+        ("local_memory_words_per_thread", getattr(kernel, "n_spills", None), "32-bit words",
+         "CompiledKernel.n_spills (CUDA LOCAL_SIZE_BYTES / 4)", "native_loading"),
+        ("shared_memory_bytes", getattr(metadata, "shared", None), "bytes", "CompiledKernel.metadata.shared", "native_compilation"),
+        ("max_threads_per_block", getattr(kernel, "n_max_threads", None), "threads", "CompiledKernel.n_max_threads", "native_loading"),
+    )
+    return tuple(resource(name, value, unit, "triton." + source, stage,
+                          unavailable="The selected Triton compiled kernel does not expose this field")
+                 for name, value, unit, source, stage in fields)
 
 
 def materialize_triton_artifact(

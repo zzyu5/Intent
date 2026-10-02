@@ -450,7 +450,7 @@ KIR 的验证入口直接属于 operation，按合同分布在
 | 常量、大小关系与访问对齐 | [Analysis/IndexRelations.h](include/Intent/Dialect/GPU/Analysis/IndexRelations.h) | `IndexRelations` 共用于范围谓词、Triton descriptor 与 cuTile tile access；按 typed index 与回绕合同证明，不创建 guard 或选择原生 form |
 | 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `ParameterSpace::read` 读取 kernel 声明；不依赖 SSA 读取是否存在；改变声明后重读 |
 | fragment 结构资源估计 | [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h) | `FragmentResourceAnalysis` 缓存稳定 IR 的类型与参数使用关系；类型或 IR 改写后重建。估计不代替下层布局、寄存器分配和 occupancy |
-| specialization 后才能判定的资源约束 | [Transforms/Resources.h](include/Intent/Dialect/GPU/Transforms/Resources.h) | 将 deferred reduction bounds 写成当前 IR 的断言，供 Triton/cuTile 兑现；不是 analysis 中的隐藏改写 |
+| 静态与 specialization 后的候选条件 | [Transforms/Resources.h](include/Intent/Dialect/GPU/Transforms/Resources.h) | 从当前 IR 收集 typed requirements，静态筛选与 runtime 绑定求值使用同一条件；analysis 不隐藏改写 |
 | value projection、replay、validity 与显式常量 | [Transforms/ValueMaterialization.h](include/Intent/Dialect/GPU/Transforms/ValueMaterialization.h) | 传入当前 schema、source-axis 与 replay scope；由调用者决定合法的变换范围 |
 | 改写后的 value/access/aggregate 关系闭合 | [Transforms/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
@@ -490,7 +490,8 @@ Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlock
 当前函数只有一份 `intent_gpu.configurations`，类型为 `ConfigurationSetAttr`。
 `shared` 阶段绑定共同的静态参数；provider 完成合法性筛选后，以 `complete` 表替换它。
 每行给出该阶段全部必要符号的具体值，顺序是候选枚举顺序。Coverage 的运行期 extent
-通过独立的 deferred 声明绑定，不写成静态候选值；没有候选时直接失败。
+通过独立的 deferred 声明绑定，不写成静态候选值。改写使候选失效时保留空 rows 与
+已有 requirements；完整候选的消费者拒绝空表，不能将其当作默认配置。
 
 Kernel 的 `intent_gpu.parameters` 保存唯一有序 `ParameterAttr` 声明表，包含名字、
 类型、有限 domain、角色、绑定阶段与 typed source/coverage binding。
@@ -521,6 +522,25 @@ types 中的引用。标准 DCE/CSE 可以删除或合并读取，无需保活�
 不能只做 SSA RAUW，也不能把名称改写分散到 serializer。
 跨类型参数引用不是 MLIR 标准 SymbolTable 的完整遍历合同，因此这里使用 kernel-owned
 typed references 和显式 owner API，不把自有参数冒充通用 module symbols。
+
+`ConfigurationSetAttr.requirements` 保存 `ConfigurationRequirementAttr`：种类、数量、
+`usage <= limit` 的两侧表达式和诊断原因。`legality` 表示 provider 硬性限制，
+`nominal_budget` 表示按当前物理结构使用的预算策略；`fragment_register_words` 的
+单位是结构上的 32-bit words，不是机器码实际分配的寄存器。表达式引用当前参数或
+host metadata binding，不依赖某个比较 SSA 值仍然存活。
+
+新增条件时，先在所属 family/provider 从当前 typed facts 构造一次 requirement，
+再交给 [Resources](lib/Dialect/GPU/Transforms/Resources.cpp) 筛选和发布。Triton 的
+静态 tensor/collective 条件与最终 deferred 条件共用收集器；cuTile 复用共同归约预算，
+保留自身的适用范围。普通分支内 primitive assertion 仍留在原分支，不提升成无条件
+kernel requirement。Serializer 只导出当前 attributes，不识别 `cf.assert` 的比较形状。
+
+参数改名、替换和改域通过现有 mutation owner 同时维护 requirements；失效的是候选行，
+不能顺便丢弃条件。Verifier 检查参数和 metadata 引用；改变控制域的变换必须证明条件
+仍适用，不能把分支约束无条件合并。分析的 `Unknown` 保留给 invocation 绑定，
+不是静态拒绝理由；实际 launch 时尚未绑定则明确报 `candidate_binding`。
+全部候选被拒绝时，`candidate_selection` 给出类别、实际 usage/limit 和候选值。
+已有 `optimization_remarks` 输出静态拒绝与待绑定条件，不另造决策日志路径。
 
 Triton 的 [ConfigurationSchema](include/Intent/Target/Triton/IR/Configuration.h)
 统一查询 kernel constexpr 顺序以及 `num_warps/stages/ctas` 对应的参数符号，
@@ -628,6 +648,7 @@ CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通�
 | 候选、deferred coverage 与资源条件 | [gpu/configurations.py](python/intent/runtime/gpu/configurations.py) | 唯一解析已导出的候选表；provider 明确选择用于执行或展示的现有行，不再重建第二份配置 |
 | 调用生命周期与原生结果 | [gpu/program.py](python/intent/runtime/gpu/program.py) | `GPUProgram` 共用 run/launch/prepare；`PreparedCall` 属于已绑定的实参和 workspace，改变参数或元数据时重新 prepare |
 | Provider 的 JIT、调优和发射 | [runtime/triton.py](python/intent/runtime/triton.py)、[runtime/cutile.py](python/intent/runtime/cutile.py)、[runtime/tilelang.py](python/intent/runtime/tilelang.py) | 消费 `BoundInvocation`，返回 `LaunchResult`；保留各下层 compiler/tuner 的职责，复用公共 trial-state 规则 |
+| 原生资源与候选观察 | [runtime/diagnostics.py](python/intent/runtime/diagnostics.py) | 不可变 `NativeObservation` 保存实际调用、已选配置、SDK 返回值与失败；不持有 tensor，不参与候选策略 |
 | PyTorch operator 注册 | [runtime/torch.py](python/intent/runtime/torch.py) | `as_torch_op` 按 `TorchOutputInference` 能力注册 CPU/CUDA opaque 调用；GPU 与 Mojo CPU 支持只读 In/scalar 和 fresh Out，backward 由作者注册 |
 | 安装与依赖说明 | [tools/backends.py](python/intent/tools/backends.py)、[environment/install.py](environment/install.py) | 新安装路线声明实际依赖和外部工具链要求；不把实验私有环境或 baseline 包当作公共 runtime 依赖 |
 
@@ -660,6 +681,24 @@ native kernel 仍用于后端 IR 收集，不成为公共调用结果。
 `artifact.prepare(*inputs, outputs=(...))` 可显式绑定 Out 并复用调用。GPU 使用当前
 stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()` 不隐含同步。
 参数或其 shape/stride 改变时重新 prepare。enqueue、benchmark 等扩展仍归具体 provider。
+
+实际 GPU 调用后读取 `artifact.observation` 或 `prepared.observation`，得到该调用的
+原生快照；首次执行前为 `None`，读取不触发 JIT 或 launch。快照包含 target facts、
+实参 shape/dtype/stride、已选配置、现有 tuner 实际提供的候选状态，以及每项资源的
+来源、阶段和单位。Prepared 重放沿用已取得的快照，不虚构新的调优或缓存命中记录。
+可用 `dataclasses.asdict` 保存 JSON；生成产物的编译 metadata 不混入设备运行观察。
+
+Triton 读取 loaded kernel 的寄存器、local-memory words、shared memory 与线程限制。
+`n_spills` 在当前 NVIDIA driver 中是每线程 local-memory bytes 除以四，不能称为
+“溢出的寄存器数”。cuTile 当前公开编译结果不提供这些资源字段；TileLang 的这些
+查询限于 HIP，CUDA 观察保留 unavailable reason。SDK 未返回完整失败历史或无法
+区分磁盘缓存命中时明确保留未知，不重跑 tuner 补造记录。失败快照附在
+`CompilationStageError.observation`，CLI/MCP 错误响应导出为 `native_observation`。
+
+职责参考：本地 Triton `python/triton/compiler/compiler.py:468–484` 在 native loading
+检查真实 shared-memory 上限并接收 driver 的资源数；Intent 的结构预算发生在 GPU IR
+候选形成阶段。两者依据与时机不同。TileLang `tilelang/autotuner/tuner.py:1003–1020`
+可直接命中 SDK 缓存，因此 Intent 自己没有缓存记录不能证明 SDK 未命中。
 
 PyTorch fake 通过 runtime 的 `infer_outputs` 调用同一个公共 binder，使用 symbolic
 关系断言，既不读取 data pointer，也不创建 GPU workspace 或执行 native code。
@@ -695,6 +734,14 @@ Triton/cuTile 的 `Transforms/Configurations.cpp` 负责各自的候选策略与
 cuTile 的 [Analysis/Tuning.h](include/Intent/Target/CuTile/Analysis/Tuning.h) 从最终 provider IR 查询哪些 runtime scalar 必须按值区分调优结果。证明覆盖 SSA、类型/属性中的 ScalarABI 以及潜在的写后读依赖；索引、控制、形状、资源和未知用途保持区分，只有完整证明为数据用途时才移除其值。Serializer 消费这份只读结果，并保留 view、overlap、完整覆盖和 array-view eligibility 的实际事实；它不改变 scalar 的原生传参或候选执行。
 
 资源查询的 `Unknown` 表示当前求值无法证明，可能来自未绑定维度，也可能来自表达式求值失败；不能据此宣称候选合法或已精确证明资源不足。Shared 候选策略只按可得事实筛选和绑定，保留需要 specialization 或下层 compiler 判断的约束；局部候选 matcher 也不等同于完整 coverage 证明。
+
+Pointwise blocking、retained gather 和 reduction blocking 共用
+`minimumFragmentRegisterFootprint`，统一 dtype word 数、当前参数域最小值和饱和乘积。
+调用方明确选择当前 physical shape，或包含 construction scalar seed 的完整逻辑容量，
+再按自身策略判断预算；不能把任意非单调表达式的各叶最小值当作表达式下界。
+Retained loop/store 的作用域检查共用 `isSingletonExecutionGroup`，从当前 program
+space、segment 与实际 extents 证明单 program；不因中间多了 execution-group owner
+就漏掉已有变换，也不把多 program 的私有状态提升为共享 workspace。
 
 BANG C 的 [Storage.cpp](lib/Target/BangC/Transforms/Storage.cpp) 分开只读 `measureStorage` 和最终 `bindStorage`。前者可供局部复用与供数变换比较资源需求，后者才写入目标偏移；公共 alias/lifetime 查询在 [DSA Analysis](include/Intent/Dialect/DSA/Analysis/PhysicalProgram.h)。新增目标实现需要的 workspace 在目标变换中形成显式 operand，最终由目标 verifier 检查，不能在资源查询或 serializer 中补写。
 

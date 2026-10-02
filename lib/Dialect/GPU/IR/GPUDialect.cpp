@@ -539,12 +539,39 @@ LogicalResult TuningProfilesAttr::verify(
   return success();
 }
 
+LogicalResult ConfigurationRequirementAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    ConfigurationRequirementKind kind, ConfigurationRequirementMetric metric,
+    PhysicalExprAttr usage, PhysicalExprAttr limit, StringAttr message) {
+  if ((kind != ConfigurationRequirementKind::Legality &&
+       kind != ConfigurationRequirementKind::NominalBudget) ||
+      (metric != ConfigurationRequirementMetric::FragmentElements &&
+       metric != ConfigurationRequirementMetric::FragmentRegisterWords) ||
+      !usage || !limit || !message || message.empty())
+    return emitError() << "configuration requirement needs a kind, metric, expressions and diagnostic message";
+  bool valid = true;
+  AttrTypeWalker walker;
+  walker.addWalk([&](PhysicalExprAttr expression) {
+    if (!valid) return;
+    if (failed(PhysicalExprAttr::verify(emitError, expression.getKind(),
+          expression.getValue(), expression.getSymbol(), expression.getOperands()))) {
+      valid = false;
+    } else if (expression.getKind() == PhysicalExprKind::ScalarABI) {
+      emitError() << "configuration requirement cannot depend on a runtime scalar argument";
+      valid = false;
+    }
+  });
+  walker.walk(usage);
+  walker.walk(limit);
+  return success(valid);
+}
+
 LogicalResult ConfigurationSetAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, ConfigurationStage stage,
-    ArrayAttr rows) {
+    ArrayAttr rows, ArrayAttr requirements) {
   if ((stage != ConfigurationStage::Shared &&
-       stage != ConfigurationStage::Complete) || !rows || rows.empty())
-    return emitError() << "configuration set requires a binding stage and nonempty rows";
+       stage != ConfigurationStage::Complete) || !rows || !requirements)
+    return emitError() << "configuration set requires a binding stage, rows and explicit requirements";
   llvm::DenseSet<Attribute> unique;
   for (Attribute attribute : rows) {
     auto row = mlir::dyn_cast<DictionaryAttr>(attribute);
@@ -556,6 +583,16 @@ LogicalResult ConfigurationSetAttr::verify(
           !value.getType().isSignlessInteger(64))
         return emitError() << "configuration bindings require named i64 values";
     }
+  }
+  unique.clear();
+  for (Attribute attribute : requirements) {
+    auto requirement = mlir::dyn_cast<ConfigurationRequirementAttr>(attribute);
+    if (!requirement || !unique.insert(attribute).second)
+      return emitError() << "configuration requirements must be distinct typed constraints";
+    if (failed(ConfigurationRequirementAttr::verify(emitError,
+          requirement.getKind(), requirement.getMetric(), requirement.getUsage(),
+          requirement.getLimit(), requirement.getMessage())))
+      return failure();
   }
   return success();
 }

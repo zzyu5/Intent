@@ -77,7 +77,7 @@ LogicalResult finalizeTritonProgram(ModuleOp module) {
     assumption.erase();
   if (failed(gpu::eliminateCommonValues(module)) ||
       failed(detail::legalizeCollectiveCallbacks(*kernel)) ||
-      failed(materializeDeferredResourceBounds(*kernel)))
+      failed(finalizeConfigurationRequirements(*kernel)))
     return failure();
   detail::sinkSelectProducers(*kernel);
   if (failed(verifyTritonProgram(module)))

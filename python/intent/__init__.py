@@ -16,6 +16,7 @@ from .diagnostics import LanguageUseError
 from .frontend import FrontendError
 from .frontend import lower_to_mlir
 from .runtime import CompiledArtifact, PreparedCall, PublicInterface, ScalarParameter, ViewParameter
+from .runtime import NativeObservation, NativeResource, CandidateObservation, InvocationArgument
 from .targets import CuTileTarget
 from .targets import TileLangTarget
 from .targets import TritonTarget
@@ -51,6 +52,10 @@ __all__ = [
     "PublicInterface",
     "ScalarParameter",
     "ViewParameter",
+    "NativeObservation",
+    "NativeResource",
+    "CandidateObservation",
+    "InvocationArgument",
     "CuTileTarget",
     "TileLangTarget",
     "TritonTarget",

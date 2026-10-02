@@ -183,7 +183,11 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
     if (!configurations)
       return kernel.emitError("candidate bindings require a typed configuration set");
     auto space = ParameterSpace::read(kernel);
-    if (failed(space) ||
+    if (failed(space) || failed(space->requirements()))
+      return failure();
+    // Parameter mutation leaves the requirements intact while discarding stale
+    // rows. A consumer requesting a materialized candidate set rejects emptiness.
+    if (!configurations.getRows().empty() &&
         failed(space->configurations(configurations.getStage())))
       return failure();
   }

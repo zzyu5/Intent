@@ -5,6 +5,8 @@ from .artifact import CompiledArtifact
 from .gpu.expressions import evaluate_shape, read_expressions
 from .gpu.program import LaunchResult, materialize_gpu_program
 from .tuning import TuningState
+from .diagnostics import CandidateObservation, bindings, observation, unavailable_resources
+from intent.compiler.toolchain import CompilationStageError
 
 
 def bind_array_view(view, group_ends: tuple[int, ...]):
@@ -69,10 +71,11 @@ def _search(*arguments, **keywords):
 
 
 class CuTileProgram:
-    def __init__(self, interface, namespace: dict, facts: dict) -> None:
+    def __init__(self, interface, namespace: dict, facts: dict, target: dict) -> None:
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
+        self.target = target
         self.kernel = namespace[facts["kernel"]]
         self.narrow_kernel = None if facts["narrow_kernel"] is None else namespace[facts["narrow_kernel"]]
         self.native_kernels = {name: namespace[name] for name in (facts["kernel"], facts["narrow_kernel"])
@@ -120,6 +123,8 @@ class CuTileProgram:
         self._array_values(values)
         key = self._key(invocation, values)
         cached = self._winners.get(key)
+        reused = cached is not None
+        candidates = ()
         if cached is None:
             configurations = tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
             kernel = self.kernel
@@ -134,14 +139,26 @@ class CuTileProgram:
                                 zip(self.interface.public_views, state.views, strict=True))
             self._array_values(trial_values)
             hints = (self._hints,) if self.facts["compiler_hints"] else ()
-            result = self.search(configurations, torch.cuda.current_stream(),
-                                  lambda config: self._grid(values, config), kernel,
-                                  lambda config: state.arguments(self._arguments(trial_values, config)),
-                                  *hints, quiet=True, **self.tuning_options)
+            try:
+                result = self.search(configurations, torch.cuda.current_stream(),
+                                      lambda config: self._grid(values, config), kernel,
+                                      lambda config: state.arguments(self._arguments(trial_values, config)),
+                                      *hints, quiet=True, **self.tuning_options)
+            except Exception as error:
+                details = observation("cutile", self.target, invocation, None, _native_resources(),
+                    stage="failed", history_unavailable=
+                    "cuTile did not return a TuningResult; its exception is preserved, but no complete candidate history is available")
+                stage = "provider_native_compilation" if self._compiling else "provider_tuning"
+                raise CompilationStageError(stage, str(error), observation=details) from error
             if self.observe_tuning is not None:
                 self.observe_tuning(configurations, result)
             config = result.best.config
             selected = kernel.replace_hints(**self._hints(config)) if hints else kernel
+            candidates = () if self._compiling else tuple(
+                [CandidateObservation(bindings(vars(item.config)), "trial_completed", "provider_tuning")
+                 for item in result.successes] +
+                [CandidateObservation(bindings(vars(config)), "failed", "provider_tuning", error.__name__, message)
+                 for config, error, message in result.failures])
             cached = config, selected
             if not self._compiling:
                 self._winners[key] = cached
@@ -150,10 +167,19 @@ class CuTileProgram:
         arguments = self._arguments(values, config)
 
         def invoke():
-            return ct.launch(torch.cuda.current_stream(), grid, selected, arguments)
+            try:
+                return ct.launch(torch.cuda.current_stream(), grid, selected, arguments)
+            except Exception as error:
+                details = observation("cutile", self.target, invocation, vars(config), _native_resources(),
+                                      candidates, stage="failed")
+                raise CompilationStageError("provider_invocation", str(error), observation=details) from error
 
         invoke()
-        return LaunchResult(None if self._compiling else invoke, selected)
+        details = None if self._compiling else observation(
+            "cutile", self.target, invocation, vars(config), _native_resources(), candidates,
+            tuning_cache_hit=reused, history_unavailable=
+            "The existing tuning winner was reused; no candidates were retried in this invocation" if reused else None)
+        return LaunchResult(None if self._compiling else invoke, selected, details)
 
     def tuning_configurations(self, invocation):
         return self.configurations.enumerate(invocation.values,
@@ -170,6 +196,11 @@ class CuTileProgram:
         finally:
             self.search, self.trial_state, self.observe_tuning, self._compiling = previous
             self._winners.clear()
+
+
+def _native_resources():
+    return unavailable_resources("cuda.tile.CompilationResult",
+        "The selected cuTile dispatcher exposes no native register/shared-memory resource fields")
 
 
 def materialize_cutile_artifact(

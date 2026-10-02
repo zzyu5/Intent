@@ -94,6 +94,9 @@ def _failure(result: dict, error: BaseException, stage: str) -> None:
         frontend = getattr(cause, "diagnostic", None)
         if frontend is not None and is_dataclass(frontend):
             diagnostic["frontend"] = asdict(frontend)
+        native = getattr(cause, "observation", None)
+        if native is not None:
+            result.setdefault("native_observation", asdict(native))
         cause = cause.__cause__
     diagnostic["causes"] = causes
     structured = next((item for item in causes if "stage" in item), None)

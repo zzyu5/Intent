@@ -1,6 +1,8 @@
 """Call the existing softmax algorithm from PyTorch using an installed Intent."""
 
 import argparse
+from dataclasses import asdict
+import json
 from pathlib import Path
 import intent
 import torch
@@ -13,6 +15,8 @@ def main() -> None:
     parser.add_argument("--target", choices=("triton", "cutile", "mojo"), default="triton")
     parser.add_argument("--program", type=Path,
                         help="Load a saved generated program and bind it to the selected runtime")
+    parser.add_argument("--inspect-native", action="store_true",
+                        help="Show the last provider observation; unavailable fields remain explicit")
     invocation = parser.add_mutually_exclusive_group()
     invocation.add_argument("--prepared", action="store_true",
                             help="Bind an explicit output once, then launch the prepared call")
@@ -47,6 +51,9 @@ def main() -> None:
     print(f"softmax: {tuple(y.shape)}, {y.dtype}, {y.device}")
     print(y[0, :8])
     print(f"Generated source and IR: {softmax.cache_directory}")
+    if args.inspect_native:
+        observed = softmax.observation
+        print(json.dumps(asdict(observed) if observed is not None else None, indent=2))
 
 
 if __name__ == "__main__":

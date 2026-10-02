@@ -8,6 +8,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -131,30 +132,12 @@ bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || !capabilities || capabilities.getRegistersPerUnit() <= 0)
     return false;
-  Type element = fragment.getElementType();
-  unsigned bits = element.isIndex() ? 64 : element.getIntOrFloatBitWidth();
-  __int128 registers = std::max(1u, (bits + 31) / 32);
-  __int128 budget = capabilities.getRegistersPerUnit();
-  for (Attribute attribute : fragment.getShape()) {
-    auto extent = cast<PhysicalExprAttr>(attribute);
-    int64_t minimum;
-    if (extent.getKind() == PhysicalExprKind::Constant) {
-      minimum = extent.getValue();
-    } else if (extent.getKind() == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
-      if (failed(parameter))
-        return false;
-      minimum = *llvm::min_element(parameter->getCandidates().asArrayRef());
-    } else {
-      return false;
-    }
-    if (minimum <= 0)
-      return false;
-    registers = std::min(budget + 1, registers * minimum);
-  }
+  int64_t budget = capabilities.getRegistersPerUnit();
+  auto registers = minimumFragmentRegisterFootprint(kernel, source, budget,
+      FragmentFootprintScope::PhysicalShape);
   // Even the smallest source must leave space for the reduction state.
   // Larger concrete tuples are filtered after all parameters are bound.
-  return registers >= budget;
+  return registers && *registers >= budget;
 }
 
 FailureOr<Value> scalarSource(Value value);

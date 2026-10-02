@@ -1879,6 +1879,28 @@ bool isLaunchUniformScalar(Value value, func::FuncOp kernel) {
   return true;
 }
 
+bool isSingletonExecutionGroup(ExecutionGroupOp group, func::FuncOp kernel) {
+  if (!group || group->getParentOfType<func::FuncOp>() != kernel)
+    return false;
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (!space || space.empty() ||
+      !llvm::all_of(space, [](Attribute attribute) {
+        auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+        return extent && constantPhysicalExpression(extent) == 1;
+      }) || constantPhysicalExpression(group.getSegmentOffset()) != 0 ||
+      constantPhysicalExpression(group.getSegmentLength()) != 1)
+    return false;
+  if (!llvm::all_of(group.getLaunchExtents(), [](Attribute attribute) {
+        auto extent = dyn_cast<PhysicalExprAttr>(attribute);
+        return extent && constantPhysicalExpression(extent) == 1;
+      }))
+    return false;
+  return llvm::all_of(group.getExtents(), [](Value value) {
+    auto extent = queryLaunchExpression(value);
+    return extent && constantPhysicalExpression(extent) == 1;
+  });
+}
+
 PhysicalExprAttr queryLaunchExpression(Value value) {
   std::function<PhysicalExprAttr(Value, unsigned)> query =
       [&](Value current, unsigned depth) -> PhysicalExprAttr {

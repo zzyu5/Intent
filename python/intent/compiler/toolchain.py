@@ -15,12 +15,14 @@ from .cache import _compilation_key, compilation_directory, locked_cache_entry
 
 class CompilationStageError(RuntimeError):
     def __init__(self, stage: str, message: str, *, cache_directory: Path | None = None,
-                 candidate: str | None = None, artifacts: dict[str, Path] | None = None) -> None:
+                 candidate: str | None = None, artifacts: dict[str, Path] | None = None,
+                 observation=None) -> None:
         super().__init__(message)
         self.stage = stage
         self.cache_directory = cache_directory
         self.candidate = candidate
         self.artifacts = dict(artifacts or {})
+        self.observation = observation
 
 
 def _resolve_executable(executable_path: str | Path | None, name: str,

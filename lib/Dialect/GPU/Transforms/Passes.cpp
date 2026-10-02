@@ -366,6 +366,11 @@ scf::IfOp independentUniformBranches(func::FuncOp kernel) {
 
 FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     scf::IfOp conditional, function_ref<LogicalResult(ModuleOp)> runTransforms) {
+  // Requirements describe the current whole program. This rewrite has no
+  // representation for moving their control domain into either branch.
+  if (auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+      set && !set.getRequirements().empty())
+    return false;
   // Optimize each mutually exclusive region with the existing kernel passes,
   // then rejoin their physical programs under one launch and the original ABI.
   SmallVector<OwningOpRef<ModuleOp>> branches;
@@ -402,6 +407,9 @@ FailureOr<bool> realizeUniformBranches(ModuleOp module, func::FuncOp kernel,
     eraseDeadPhysicalValues(function);
     if (failed(runTransforms(*branch)))
       return failure();
+    if (auto set = function->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+        set && !set.getRequirements().empty())
+      return false;
     eraseUnusedParameters(function);
     auto space = function->getAttrOfType<ArrayAttr>(programSpaceAttr);
     bool separateResources =

@@ -1,4 +1,6 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
@@ -75,6 +77,69 @@ LogicalResult ParameterSpace::verifyBindings(DictionaryAttr bindings,
   return success();
 }
 
+LogicalResult ParameterSpace::verifyRequirements(
+    ArrayRef<ConfigurationRequirementAttr> requirements) const {
+  bool valid = true;
+  AttrTypeWalker walker;
+  walker.addWalk([&](PhysicalExprAttr expression) {
+    if (!valid) return;
+    if (expression.getKind() == PhysicalExprKind::Parameter) {
+      auto declaration = lookup(expression.getParameterReference());
+      if (!declaration || !declaration.isExtent()) {
+        kernel->emitError("configuration requirement references an undeclared or non-index parameter: ")
+            << expression.getParameterReference();
+        valid = false;
+      } else if (declaration.isDeferred() &&
+                 !declaration.getBinding().getCoverageBound()) {
+        kernel->emitError("configuration requirement references an unresolved coverage parameter: ")
+            << expression.getParameterReference();
+        valid = false;
+      }
+    } else if (expression.getKind() == PhysicalExprKind::Dimension) {
+      auto argument = resolveArgument(kernel, expression.getArgumentReference());
+      if (!argument || queryArgumentExpression(argument) != expression) {
+        kernel->emitError("configuration requirement does not match its current argument binding: ")
+            << expression;
+        valid = false;
+      }
+    }
+  });
+  for (ConfigurationRequirementAttr requirement : requirements) {
+    if (!requirement)
+      return kernel->emitError("configuration requirement cannot be null");
+    if (failed(ConfigurationRequirementAttr::verify(
+            [&] { return kernel->emitError("invalid configuration requirement: "); },
+            requirement.getKind(), requirement.getMetric(), requirement.getUsage(),
+            requirement.getLimit(), requirement.getMessage())))
+      return failure();
+    walker.walk(requirement);
+    if (!valid) return failure();
+  }
+  return success();
+}
+
+FailureOr<SmallVector<ConfigurationRequirementAttr>>
+ParameterSpace::requirements() const {
+  SmallVector<ConfigurationRequirementAttr> result;
+  Attribute attribute = kernel->getAttr(configurationsAttr);
+  if (!attribute) return result;
+  auto set = dyn_cast<ConfigurationSetAttr>(attribute);
+  if (!set || !set.getRequirements())
+    return kernel->emitError("configuration requirements require a complete typed configuration set");
+  if (failed(ConfigurationSetAttr::verify(
+          [&] { return kernel->emitError("invalid configuration set: "); },
+          set.getStage(), set.getRows(), set.getRequirements())))
+    return failure();
+  for (Attribute attribute : set.getRequirements()) {
+    auto requirement = dyn_cast<ConfigurationRequirementAttr>(attribute);
+    if (!requirement)
+      return kernel->emitError("configuration set contains an untyped requirement");
+    result.push_back(requirement);
+  }
+  if (failed(verifyRequirements(result))) return failure();
+  return result;
+}
+
 FailureOr<SmallVector<DictionaryAttr>>
 ParameterSpace::configurations(ConfigurationStage stage) const {
   auto set = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
@@ -85,6 +150,7 @@ ParameterSpace::configurations(ConfigurationStage stage) const {
   llvm::DenseSet<Attribute> unique;
   if (set.getRows().empty())
     return kernel->emitError("configuration set cannot be empty");
+  if (failed(requirements())) return failure();
   for (Attribute attribute : set.getRows()) {
     auto row = dyn_cast<DictionaryAttr>(attribute);
     if (failed(verifyBindings(row, stage))) return failure();

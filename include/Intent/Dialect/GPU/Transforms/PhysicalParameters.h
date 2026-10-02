@@ -16,8 +16,9 @@ mlir::FailureOr<ParameterRefAttr> getOrCreatePhysicalParameter(
     llvm::ArrayRef<int64_t> candidates, ParameterBindingAttr binding = {});
 ParameterOp materializeParameter(mlir::OpBuilder &builder, mlir::Location location,
                                 ParameterRefAttr reference);
-// Declaration changes invalidate candidate bindings. Reference changes also
-// rewrite operation attributes, result types and region argument types.
+// Declaration changes invalidate candidate rows, retaining their requirements.
+// Reference changes also rewrite operation attributes, result types and region
+// argument types, including references used only by requirements.
 mlir::LogicalResult updateParameter(mlir::func::FuncOp kernel,
                                     ParameterAttr declaration);
 mlir::LogicalResult replaceParameter(mlir::func::FuncOp kernel,
@@ -32,6 +33,10 @@ mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult writeConfigurations(
     mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::DictionaryAttr> rows,
     ConfigurationStage stage);
+mlir::LogicalResult writeConfigurations(
+    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::DictionaryAttr> rows,
+    ConfigurationStage stage,
+    llvm::ArrayRef<ConfigurationRequirementAttr> requirements);
 
 } // namespace intent::gpu
 

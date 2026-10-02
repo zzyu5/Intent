@@ -25,6 +25,10 @@ public:
   ParameterAttr find(ParameterRole role) const;
   mlir::LogicalResult verifyBindings(mlir::DictionaryAttr bindings,
                                     ConfigurationStage stage) const;
+  mlir::LogicalResult verifyRequirements(
+      llvm::ArrayRef<ConfigurationRequirementAttr> requirements) const;
+  mlir::FailureOr<llvm::SmallVector<ConfigurationRequirementAttr>>
+  requirements() const;
   mlir::FailureOr<llvm::SmallVector<mlir::DictionaryAttr>>
   configurations(ConfigurationStage stage) const;
 

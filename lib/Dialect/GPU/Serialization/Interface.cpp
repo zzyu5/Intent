@@ -6,8 +6,6 @@
 #include "Intent/Dialect/Intent/IR/Interface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -27,24 +25,6 @@ llvm::json::Array integers(ArrayRef<int64_t> values) {
   for (int64_t value : values)
     result.push_back(value);
   return result;
-}
-
-bool isLaunchSpecialization(PhysicalExprAttr expression) {
-  if (expression.getKind() ==
-      PhysicalExprKind::ScalarABI)
-    return false;
-  return llvm::all_of(expression.getOperands(), [](Attribute operand) {
-    return isLaunchSpecialization(cast<PhysicalExprAttr>(operand));
-  });
-}
-
-std::optional<llvm::json::Value> resourceExpression(Value value) {
-  if (auto constant = value.getDefiningOp<arith::ConstantIndexOp>())
-    return llvm::json::Object{{"kind", "constant"}, {"value", constant.value()}};
-  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
-    if (isLaunchSpecialization(physical.getExpression()))
-      return serializeExpression(physical.getExpression());
-  return std::nullopt;
 }
 
 FailureOr<llvm::json::Array> configurations(const ParameterSpace &space) {
@@ -197,17 +177,16 @@ FailureOr<llvm::json::Object> serializeInterface(
   if (!valid)
     return failure();
 
-  llvm::json::Array bounds;
-  for (auto assertion : kernel.front().getOps<cf::AssertOp>()) {
-    auto comparison = assertion.getArg().getDefiningOp<CompareOp>();
-    if (!comparison || comparison.getPredicate() != ComparePredicate::Le)
-      continue;
-    auto lhs = resourceExpression(comparison.getLhs());
-    auto rhs = resourceExpression(comparison.getRhs());
-    if (lhs && rhs)
-      bounds.push_back(llvm::json::Object{{"lhs", std::move(*lhs)},
-                                         {"rhs", std::move(*rhs)}});
-  }
+  auto declaredRequirements = configurationSpace->requirements();
+  if (failed(declaredRequirements)) return failure();
+  llvm::json::Array requirements;
+  for (ConfigurationRequirementAttr requirement : *declaredRequirements)
+    requirements.push_back(llvm::json::Object{
+        {"kind", stringifyConfigurationRequirementKind(requirement.getKind())},
+        {"metric", stringifyConfigurationRequirementMetric(requirement.getMetric())},
+        {"usage", serializeExpression(requirement.getUsage())},
+        {"limit", serializeExpression(requirement.getLimit())},
+        {"message", requirement.getMessage().getValue()}});
   auto configs = configurations(*configurationSpace);
   if (failed(configs))
     return failure();
@@ -234,7 +213,7 @@ FailureOr<llvm::json::Object> serializeInterface(
       {"parameters", std::move(parameters)}, {"grid", expressions(space)},
       {"overlaps", std::move(overlaps)},
       {"configurations", std::move(*configs)},
-      {"resource_bounds", std::move(bounds)}};
+      {"requirements", std::move(requirements)}};
   return llvm::json::Object{{"provider", provider},
                             {"compile_options", serializeCompileOptions(*options)},
                             {"entry_name", kernel.getName()},
