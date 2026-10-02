@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..artifact import CompiledArtifact
-from ..diagnostics import NativeObservation
+from ..diagnostics import ConfigurationAssessment, NativeObservation, ObservedCall
 from intent.compiler.toolchain import CompilationStageError
 from ..source import load_python_source
 from .interface import BoundInvocation, GPUInterface
@@ -24,8 +24,10 @@ class Provider(Protocol):
 
     def tuning_configurations(self, invocation: BoundInvocation) -> tuple: ...
 
+    def inspect_configurations(self, invocation: BoundInvocation) -> tuple[ConfigurationAssessment, ...]: ...
 
-class PreparedCall:
+
+class PreparedCall(ObservedCall):
     """A call bound to these tensors and scalars, including invocation-owned workspace."""
 
     def __init__(self, program: GPUProgram, invocation: BoundInvocation) -> None:
@@ -34,10 +36,10 @@ class PreparedCall:
         self._launch: LaunchResult | None = None
         self._observation: NativeObservation | None = None
 
-    @property
-    def observation(self) -> NativeObservation | None:
-        """This prepared call's latest native snapshot; reading does not execute."""
-        return self._observation
+    def inspect_configurations(self) -> tuple[ConfigurationAssessment, ...]:
+        """Explain the bound invocation's candidates without allocation, JIT or tuning."""
+        with self.program.invocation_context():
+            return self.program.provider.inspect_configurations(self.invocation)
 
     @property
     def outputs(self) -> tuple:
@@ -57,22 +59,18 @@ class PreparedCall:
                 self._invoke()
 
     def _invoke(self):
+        replay = self._launch is not None and self._launch.replay is not None
         try:
-            if self._launch is None or self._launch.replay is None:
+            if not replay:
                 self._launch = self.program.provider.launch(self.invocation)
             else:
                 self._launch.replay()
         except CompilationStageError as error:
             self._record_observation(error.observation)
             raise
-        self._record_observation(self._launch.observation)
+        self._record_execution("launched", self._launch.observation, replay=replay)
         if self.program.artifact is not None:
             self.program.artifact._capture_backend_ir(self._launch.kernel)
-
-    def _record_observation(self, observation):
-        self._observation = observation
-        if self.program.artifact is not None:
-            self.program.artifact._observation = observation
 
     __call__ = launch
 
@@ -84,7 +82,12 @@ class GPUProgram:
         self.device = device
         self.provider = provider
         self.artifact: CompiledArtifact | None = None
+        self._observation: NativeObservation | None = None
         self.invocation_context = nullcontext
+
+    @property
+    def observation(self) -> NativeObservation | None:
+        return self._observation
 
     def prepare(self, *arguments, outputs: tuple | None = None,
                 explicit_outputs: bool = False) -> PreparedCall:

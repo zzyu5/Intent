@@ -17,6 +17,7 @@ from .frontend import FrontendError
 from .frontend import lower_to_mlir
 from .runtime import CompiledArtifact, PreparedCall, PublicInterface, ScalarParameter, ViewParameter
 from .runtime import NativeObservation, NativeResource, CandidateObservation, InvocationArgument
+from .runtime import CacheObservation, ConfigurationAssessment, RequirementEvaluation
 from .targets import CuTileTarget
 from .targets import TritonTarget
 from .targets import MojoTarget
@@ -55,6 +56,9 @@ __all__ = [
     "NativeResource",
     "CandidateObservation",
     "InvocationArgument",
+    "CacheObservation",
+    "ConfigurationAssessment",
+    "RequirementEvaluation",
     "CuTileTarget",
     "TritonTarget",
     "MojoTarget",

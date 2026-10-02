@@ -50,6 +50,15 @@ def _compile(context, definition, *, constexprs=None):
     return artifact
 
 
+def report_selection(observed):
+    trials = tuple((dict(candidate.configuration), candidate.elapsed_ms)
+                   for candidate in observed.candidates if candidate.elapsed_ms is not None)
+    reuse = tuple(f"{entry.layer}/{entry.scope}/{entry.stage}={entry.hit}"
+                  for entry in observed.caches if entry.layer != "native_compilation")
+    print(f"mojo: selected {dict(observed.configuration)}; tuning_trials_ms={trials}; "
+          f"history_unavailable={observed.candidate_history_unavailable}; reuse={reuse}", flush=True)
+
+
 def prepare_comparison(context, definition, arguments, runtime_path, tolerance, note=""):
     artifact = _compile(context, definition)
     generated = artifact.prepare(*arguments)
@@ -59,8 +68,8 @@ def prepare_comparison(context, definition, arguments, runtime_path, tolerance, 
     report_stage("adapter_preparation")
     def benchmark_generated():
         elapsed = generated.benchmark()
-        print(f"mojo: selected {generated.program.candidates[generated.winner]}; measured_ms={elapsed}; "
-              f"candidate_ms={generated.program.timings[generated.key]}", flush=True)
+        report_selection(generated.observation)
+        print(f"mojo: measured_ms={elapsed}", flush=True)
         return elapsed
     return PreparedComparison(
         PreparedLaunch(generated.launch, generated.result, native_benchmark=benchmark_generated),
@@ -74,23 +83,22 @@ def prepare_host_comparison(context, definition, arguments, reference, tolerance
     artifact = _compile(context, definition, constexprs=constexprs)
     runtime = load_module(context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py", "intent_cpu_reference")
 
-    def side(function, program=None):
+    def side(function, artifact=None):
         state = {}
 
         def launch():
             state["output"] = function(*arguments)
 
         def outputs():
-            if program is not None:
-                for key, winner in program.winners.items():
-                    print(f"mojo: selected {program.candidates[winner]}; candidate_ms={program.timings[key]}", flush=True)
+            if artifact is not None:
+                report_selection(artifact.observation)
             return state["output"]
 
         return PreparedLaunch(launch, outputs)
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run, artifact.runtime), side(getattr(runtime, reference)), tolerance,
+        side(artifact.run, artifact), side(getattr(runtime, reference)), tolerance,
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有 example 同算法、输入规模和外部 dtype；PyTorch eager CPU reference，单 NUMA 8 核；双方计完整 host 调用，含 ABI 处理、输出分配和任务同步。" + note,
     )

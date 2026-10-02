@@ -1,10 +1,12 @@
 from contextvars import copy_context
+from dataclasses import replace
+from math import isfinite
 
 from ..artifact import CompiledArtifact
 from ..gpu.expressions import evaluate_shape
 from ..gpu.program import LaunchResult, materialize_gpu_program
 from ..tuning import TuningState
-from ..diagnostics import CandidateRecorder, observation, resource, unavailable_resources
+from ..diagnostics import CacheObservation, CandidateRecorder, bindings, observation, resource, unavailable_resources
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -81,7 +83,7 @@ class TritonProgram:
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
-        self.target = target
+        self.target = bindings(target)
         self.descriptors = facts.descriptors
         self.hooks = TuningHooks(tuple(view.kernel_name for view in interface.public_views),
                                  tuple(view.writable for view in interface.public_views),
@@ -156,17 +158,17 @@ class TritonProgram:
                 and all(tensor.stride(axis) * tensor.element_size() % alignment == 0
                         for axis in entry.aligned_stride_axes))
 
-    def _eligible_rows(self, values, rows=None):
-        retained = self.configurations.candidates(values, rows=rows)
+    def _assess_rows(self, values, rows=None):
+        assessed = self.configurations.inspect(values, rows=rows)
         choice = self.facts.descriptor_choice
         if choice is not None and not values[choice.eligibility]:
-            retained = tuple(row for row in retained if not row[choice.config])
-        if not retained:
-            raise CompilationStageError(
-                "provider_eligibility",
-                "No Triton configuration satisfies the declared descriptor view alignment, shape and stride requirements",
-            )
-        return retained
+            assessed = tuple(replace(entry, provider_reason=
+                "Triton descriptors require the declared view alignment, shape and strides")
+                if dict(entry.configuration)[choice.config] else entry for entry in assessed)
+        return assessed
+
+    def _eligible_rows(self, values, rows=None):
+        return self.configurations.select(self._assess_rows(values, rows))
 
     def _prune(self, configs, named_args, **kwargs):
         values = self._context({**named_args, **kwargs})
@@ -201,6 +203,10 @@ class TritonProgram:
             recorder.record(self._trial_configuration(arguments),
                             "failed" if error is not None else "trial_completed", "provider_tuning", error)
 
+        def candidate_history():
+            return tuple(replace(item, configuration=bindings(self.configurations.bound_configuration(
+                invocation.values, dict(item.configuration)))) for item in recorder.snapshot())
+
         def grid(config):
             return evaluate_shape(self.interface.grid, {**values, **config})
 
@@ -219,12 +225,16 @@ class TritonProgram:
                 # descriptor's allocator local to this invocation, including
                 # its native JIT/tuning, without replacing the caller's binding.
                 return copy_context().run(execute) if self.facts.allocator else execute()
-            except CompilationStageError:
+            except CompilationStageError as error:
+                if error.observation is None:
+                    error.observation = observation("triton", self.target, invocation.description, None,
+                        unavailable_resources("triton", "No loaded kernel was returned by the failed invocation"),
+                        candidate_history(), stage="failed")
                 raise
             except Exception as error:
-                details = observation("triton", self.target, invocation, None,
+                details = observation("triton", self.target, invocation.description, None,
                     unavailable_resources("triton", "The invocation did not return a loaded native kernel"),
-                    recorder.snapshot(), stage="failed")
+                    candidate_history(), stage="failed")
                 raise CompilationStageError("provider_invocation", str(error), observation=details) from error
             finally:
                 self.hooks.observe_trial = previous
@@ -234,18 +244,36 @@ class TritonProgram:
         # execution, including winners reconstructed by Triton's disk cache.
         config = self._trial_configuration(self.kernel.best_config.all_kwargs())
         history = recorder.snapshot()
-        recorder.record(config, "selected", "provider_invocation")
-        details = observation("triton", self.target, invocation, config, _native_resources(compiled),
-                              recorder.snapshot(), history_unavailable=None if history else
-                              "No tuning trial callbacks occurred in this invocation; only the selected kernel was observed")
+        if history:
+            # Triton's autotuner returns the median in milliseconds at index 0
+            # for its requested (0.5, 0.2, 0.8) quantiles. Do not read an older
+            # search's timings when this invocation did not run trial callbacks.
+            for candidate, samples in self.kernel.configs_timings.items():
+                elapsed = samples[0] if isinstance(samples, (tuple, list)) else samples
+                if isinstance(elapsed, (int, float)) and isfinite(elapsed):
+                    recorder.timing(self._trial_configuration(candidate.all_kwargs()), float(elapsed))
+        details = observation("triton", self.target, invocation.description,
+                              bindings(self.configurations.bound_configuration(invocation.values, config)), _native_resources(compiled),
+                              candidate_history(), history_unavailable=None if history else
+                              "No tuning trial callbacks occurred in this invocation; only the selected kernel was observed",
+                              caches=(CacheObservation("tuning", "provider", False if history else None,
+                                  "Triton autotuner trial callbacks", "selection",
+                                  None if history else "No trial callbacks does not distinguish a cached winner from a single configuration"),
+                                      CacheObservation("native_compilation", "sdk", None, "Triton JIT",
+                                                       "native_dispatch",
+                                                       "The returned compiled kernel does not identify a native compilation cache hit")))
         return LaunchResult(invoke, compiled, details)
 
     def tuning_configurations(self, invocation):
+        return self.configurations.enumerate(invocation.values,
+                                             self.configurations.select(self.inspect_configurations(invocation)))
+
+    def inspect_configurations(self, invocation):
         values = dict(invocation.values)
         choice = self.facts.descriptor_choice
         if choice is not None:
             values[choice.eligibility] = all(self._eligible(entry, values) for entry in self.descriptors)
-        return self.configurations.enumerate(values, self._eligible_rows(values))
+        return self._assess_rows(values)
 
 def _collect_triton_ir(compiled_kernel: object) -> dict[str, str]:
     asm = getattr(compiled_kernel, "asm", None)

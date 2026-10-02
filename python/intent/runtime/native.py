@@ -8,6 +8,7 @@ from ..language.dtypes import DType, dtype
 from .interface import AliasCheck, PublicInterface, ScalarParameter, ViewParameter
 from .invocation import ViewFacts, build_invocation_binders
 from .native_requirements import NativeRequirements
+from .diagnostics import ConfigurationAssessment, NativeObservation, invocation_arguments
 
 
 _CARRIERS = {"ptr": ctypes.c_void_p, "bool": ctypes.c_bool,
@@ -20,6 +21,7 @@ class BoundArguments:
     native_arguments: tuple[object, ...]
     outputs: tuple[object, ...]
     key: tuple[object, ...]
+    views: tuple[ViewFacts | None, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +166,7 @@ class NativeABI:
                     if scalar_key is not None:
                         key.append(f"_scalar_key(_p{index}, {value})")
             lines.append(f"    return _BoundArguments(public.arguments, {tuple_expression(native)}, "
-                         f"public.outputs, {tuple_expression(key)})")
+                         f"public.outputs, {tuple_expression(key)}, public.views)")
             code = compile("\n".join(lines) + "\n", "<intent.native.abi>", "exec", dont_inherit=True)
             exec(code, namespace)
             result.append(namespace["bind"])
@@ -179,6 +181,19 @@ class NativePreparedRuntime:
     """
 
     interface: PublicInterface
+    _observation: NativeObservation | None = None
+
+    @property
+    def observation(self) -> NativeObservation | None:
+        """Latest native call snapshot; reading does not choose or execute a candidate."""
+        return self._observation
+
+    def describe_arguments(self, bound: BoundArguments, device: str):
+        return invocation_arguments(self.interface, bound.arguments, bound.views, device)
+
+    def inspect_configurations(self):
+        """Read a CPU portfolio already accepted by this entry's binder."""
+        return tuple(ConfigurationAssessment(description, ()) for description in self.configuration_descriptions)
 
     def run(self, *arguments):
         call = self.prepare(arguments)

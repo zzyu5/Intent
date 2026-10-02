@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import statistics
 
 from .buffer import DeviceBuffer, DeviceView, runtime
@@ -9,14 +9,31 @@ from .compilation import compile_library
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
 from ..native import NativePreparedRuntime
+from ..diagnostics import CacheObservation, ObservedCall, bindings, observation
+from intent.compiler.toolchain import CompilationStageError
 
 
 @dataclass
-class NativeCall:
+class NativeCall(ObservedCall):
     program: NativeProgram
     arguments: tuple[object, ...]
     native_arguments: tuple[object, ...]
     outputs: tuple[DeviceBuffer | DeviceView, ...]
+    description: tuple
+
+    def inspect_configurations(self):
+        """BANG C has a fixed generated entry, not a runtime tuning portfolio."""
+        return ()
+
+    def _observed(self, stage):
+        if self.observation is not None:
+            return replace(self.observation, stage=stage)
+        return observation("bangc", self.program.target_facts, self.description, None, (), stage=stage,
+            history_unavailable="The generated DSA entry has fixed bindings; there is no runtime candidate search",
+            caches=(CacheObservation("tuning", "not_applicable", None, "BANG C fixed entry", "selection"),
+                    CacheObservation("native_compilation", "process", None, "BANG C compile_library",
+                                     "materialization",
+                                     "The native compilation API does not expose its cache decision")))
 
     def _validate(self) -> None:
         if not self.program.queue.value:
@@ -31,12 +48,25 @@ class NativeCall:
             raise RuntimeError(f"BANG C kernel submission failed with CNRT status {status}")
 
     def enqueue(self, queue: ctypes.c_void_p | None = None) -> None:
-        self._validate()
-        self._submit(self.program.queue if queue is None else queue)
+        try:
+            self._validate()
+            self._submit(self.program.queue if queue is None else queue)
+        except Exception as error:
+            details = self._observed("failed")
+            self._record_observation(details)
+            raise CompilationStageError("provider_invocation", str(error), observation=details) from error
+        self._record_observation(self.observation if self.observation is not None and
+                                 self.observation.stage == "submitted" else self._observed("submitted"))
 
     def launch(self) -> None:
         self.enqueue()
-        self.program.runtime.invoke("cnrtQueueSync", self.program.queue)
+        try:
+            self.program.runtime.invoke("cnrtQueueSync", self.program.queue)
+        except Exception as error:
+            details = self._observed("failed")
+            self._record_observation(details)
+            raise CompilationStageError("provider_invocation", str(error), observation=details) from error
+        self._record_observation(self._observed("launched"))
 
     def result(self):
         return invocation_result(self.outputs)
@@ -101,7 +131,10 @@ class NativeProgram(NativePreparedRuntime):
 
         require_matching_target(contract.target, target.compilation)
         self.target = target
+        self.target_facts = bindings(contract.metadata["target"])
         self.facts = contract.facts
+        self.candidates = ()
+        self.configuration_descriptions = ()
         abi = contract.abi
         self.interface = abi.interface
         self.requirements = requirements = abi.requirements
@@ -135,7 +168,8 @@ class NativeProgram(NativePreparedRuntime):
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         bound = self._binders[bool(explicit_outputs)](self, arguments)
-        return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs)
+        return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
+                          self.describe_arguments(bound, f"mlu:{self.target.device}"))
 
     def _view(self, parameter: ViewParameter, value) -> ViewFacts:
         if not isinstance(value, (DeviceBuffer, DeviceView)) or not value.pointer:

@@ -643,6 +643,10 @@ CPU 的候选绑定、存储证明与执行变换有各自的入口。[共享 pi
 
 [NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/NormalizeReductions.cpp) 随后从当前单轴 generic 和私有 rank-zero 结果槽形成标量 SSA `cpu.reduce`：初始化、全部使用与生命周期必须闭合，才删除结果槽。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为 scalar SSA 与 shaped DPS 提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
 
+[ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h) 统一当前 extent 的判等、表达式和常数上界查询；[IR ShapeRelations](include/Intent/Dialect/CPU/IR/ShapeRelations.h) 从公共接口取得同一 dimension 的代表及静态约束，也供入口 `memref.dim` 规范化使用。[registerExtentRelations](lib/Dialect/CPU/Analysis/ExtentRelations.cpp) 由 [Compiler Registration](lib/Compiler/Registration.cpp) 注册 CPU helper、ABI 与缺失的描述符 ValueBounds 模型，复用 MLIR 已有的 memref/SCF 模型。未知关系保留为 unknown，不把任意可能 wrap 的 index 算术当作无界整数；extent 相等不代表 offset、stride 或访问坐标相同。
+
+只读证明可以沿 helper formal 查询实际参数的尺寸，不能据此把外部 SSA 插入隔离 region。用于改写的 `queryExtentValue` 停在当前 block argument 和尺寸 SSA，只返回已有值或常量；消费者仍检查 dominance。共同查询在 IR 改写后重新执行，不维护独立 shape 表。
+
 普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
 
 同一 source 规范化阶段先调用私有 `normalizeContractionSources`，将满足条件的 f32 乘法与零初始化普通求和组合为显式乘加 contraction，再由上述 normalizer 和 implementation registry 处理。它仅穿过纯轴投影与 unit views，用 [Storage analysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 证明读取快照稳定，不跨越数值 cast 或其它计算；没有独立 free 轴的逐行点积仍交给普通归约路径。只有一侧 free 轴时，还要求能够形成连续矩阵列，否则保留原 producer-fused reduction，避免为了单个向量结果物化和打包矩阵。源识别、投影视图折叠和零初始化证明集中在相邻 `ContractionSources.cpp`，矩阵展平、batch 循环与 pack 保留在 `NormalizeContractions.cpp`。修改其中一个阶段不需要在 provider serializer 新增算子分支。
@@ -656,7 +660,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
 | 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
 | 存储别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `queryStorageAliases`、`queryStorageLifetime` 查询 views、captures、uses 与 lexical end；`areDisjointStorage`、`preservesStorage`、`isStorageReadStable` 结合当前 effects、alias analysis 与显式 ABI 证明能否重放读取，不移动 allocation 或决定 packing |
-| 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 通过 MLIR ValueBounds 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸，也不将未经溢出证明的 index 算术当作数学整数等式 |
+| 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 委托共同 ExtentRelations 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸 |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
 扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，核对实现身份、绑定参数及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
@@ -688,6 +692,8 @@ CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrder
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
 Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
+
+View 大小相等与动态 shape 来源统一查询 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h)，不在 Weft 再递归解读 Dim、Subview、allocation 和 task captures。Weft 仍负责 offset/stride 与轴投影资格，以及将查询结果映射到真实 native shape：本地 shape 可使用已证明常量，动态 host descriptor 则仍绑定已有公共 shape 参数，其余表达式不能凭相等证明获得新的运行时符号。存储轴来源相同不代表切片长度相等，不能以 `AxisRelations` 代替 extent 查询。
 
 Host 已计算的 size、stride 等标量直接作为 capture，不为取得一个 shape 值将整块无数据用途的 storage 带入 task。生成完整 Weft body 后，[TaskInterface.h](lib/Target/Weft/Transforms/TaskInterface.h) 的 `finalizeTaskInterface` 统一清理可删除的无用值、收缩 kernel 参数及其属性并验证；host 调用与 scalar box 只根据该入口返回的参数位置生成。形状符号和 domain 还绑定类型中的身份，不能只按 SSA use 数删除。修改 task capture 或目标 lowering 时复用这一完整入口，不能只裁剪 kernel 签名而保留旧 host 参数或另让 serializer 修补接口。
 
@@ -781,16 +787,38 @@ native kernel 仍用于后端 IR 收集，不成为公共调用结果。
 stream，CPU 等待本次任务，BANG C 同步自己的 CNRT queue；`result()` 不隐含同步。
 参数或其 shape/stride 改变时重新 prepare。enqueue、benchmark 等扩展仍归具体 provider。
 
-实际 GPU 调用后读取 `artifact.observation` 或 `prepared.observation`，得到该调用的
-原生快照；首次执行前为 `None`，读取不触发 JIT 或 launch。快照包含 target facts、
-实参 shape/dtype/stride、已选配置、现有 tuner 实际提供的候选状态，以及每项资源的
-来源、阶段和单位。Prepared 重放沿用已取得的快照，不虚构新的调优或缓存命中记录。
-可用 `dataclasses.asdict` 保存 JSON；生成产物的编译 metadata 不混入设备运行观察。
+`prepared.inspect_configurations()` 直接使用本次绑定，返回每个声明候选的
+`ConfigurationAssessment`，不重新绑定、分配、编译、选优或计时。GPU 的 requirements
+及 Triton descriptor 实参资格与实际候选筛选共用一条判定路径；已知拒绝优先于未知
+条件，状态为 `eligible`、`rejected` 或 `unknown`，不把资格判断当作原生编译成功。
+Mojo/Weft 返回真实 entry、配置值与 implementation portfolio；BANG C 没有运行时
+候选搜索，返回空 tuple。`artifact.inspect_configurations(*inputs, outputs=(...))`
+是先 prepare 的便利入口，因而可能分配 Out；现有
+`artifact.tuning_configurations(*all_arguments)` 仍要求完整实参（含 Out），用于读取
+可用 GPU 配置投影。
+
+实际调用后读取 `artifact.observation` 或 `prepared.observation`，得到同一份
+`NativeObservation`；读取不触发 JIT 或 launch。快照包含各 family 的真实 target
+facts、本次实参 shape/dtype/stride、已选配置和已有 tuner 返回的候选状态。候选
+`elapsed_ms` 只取现有 `provider_tuning` 测量，不作为完整算子 benchmark 时间。
+GPU 候选历史、资格查询与已选配置均包含本次调用的 coverage 绑定；这不改变 SDK
+内部的候选 identity 或调优 key。目标和 native portfolio 的固定描述在程序创建时冻结，
+每次调用只补实际实参、选择与执行事实。
+CPU 的配置保留原生 portfolio 结构，不套用 GPU 参数角色，也不声明 GPU 寄存器或
+shared-memory 计数。Mojo/Weft 的选择、launch 和 benchmark 分别记录
+`selected`、`launched`、`benchmarked` 阶段；BANG C enqueue 记录 `submitted`。
+
+`CacheObservation` 按 layer、scope、stage 标明事实来源：产物加载与候选选择的记录
+保留其原阶段，Prepared 首次重放增加本次调用复用的 `prepared_call`/`dispatch`
+记录，后续重放复用该快照。该记录不推断 SDK 是否命中缓存；Triton 重放仍可能进入
+SDK dispatcher。快照不持有 tensor，可用 `dataclasses.asdict` 保存 JSON；保存和
+加载 GeneratedProgram 只处理编译产物，不序列化这些运行观察或选优缓存。
 
 Triton 读取 loaded kernel 的寄存器、local-memory words、shared memory 与线程限制。
 `n_spills` 在当前 NVIDIA driver 中是每线程 local-memory bytes 除以四，不能称为
 “溢出的寄存器数”。cuTile 当前公开编译结果不提供这些资源字段，观察保留
-unavailable reason。SDK 未返回完整失败历史或无法
+unavailable reason。Mojo native artifact 命中取实际库加载结果，Weft 外部 AOT
+构建和 BANG C 编译若没有公开命中记录则保持未知。SDK 未返回完整失败历史或无法
 区分磁盘缓存命中时明确保留未知，不重跑 tuner 补造记录。失败快照附在
 `CompilationStageError.observation`，CLI/MCP 错误响应导出为 `native_observation`。
 

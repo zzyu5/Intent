@@ -7,7 +7,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from .interface import PublicInterface
-from .diagnostics import NativeObservation
+from .diagnostics import ConfigurationAssessment, NativeObservation
 
 
 BackendIRCollector = Callable[[object], dict[str, str]]
@@ -32,6 +32,15 @@ class PreparedCall(Protocol):
 
     def result(self) -> object:
         """Return the runtime's output containers without launching or synchronizing."""
+        ...
+
+    @property
+    def observation(self) -> NativeObservation | None:
+        """Read this call's latest native facts without execution."""
+        ...
+
+    def inspect_configurations(self) -> tuple[ConfigurationAssessment, ...]:
+        """Explain this binding's declared candidates without choosing or timing one."""
         ...
 
 
@@ -91,7 +100,6 @@ class CompiledArtifact:
     cache_directory: Path | None = field(default=None, kw_only=True)
     backend_ir: dict[str, str] = field(default_factory=dict, init=False)
     _backend_ir_kernel: object = field(default_factory=object, init=False, repr=False)
-    _observation: NativeObservation | None = field(default=None, init=False, repr=False)
 
     @property
     def observation(self) -> NativeObservation | None:
@@ -100,7 +108,7 @@ class CompiledArtifact:
         Reading it never compiles or launches. Resource fields come from the
         provider; unavailable fields are explicit and are not Intent estimates.
         """
-        return self._observation
+        return getattr(self.runtime, "observation", None)
 
     @property
     def entry(self) -> Callable[..., None]:
@@ -158,11 +166,25 @@ class CompiledArtifact:
     def tuning_configurations(
         self, *arguments: Any,
     ) -> tuple[TuningConfiguration, ...]:
+        """List eligible GPU bindings using all arguments, including explicit Out buffers.
+
+        For an already prepared call, inspect_configurations() reuses its binding
+        and includes reasons for rejected rows without allocating again.
+        """
         if not hasattr(self.runtime, "tuning_configurations"):
             raise NotImplementedError(
                 "this provider does not export structured tuning configurations"
             )
         return self._invoke(self.runtime.tuning_configurations, arguments)
+
+    def inspect_configurations(self, *arguments: Any, outputs: tuple | None = None) -> tuple[ConfigurationAssessment, ...]:
+        """Prepare inputs/optional Out buffers and explain candidates without execution.
+
+        Preparation can allocate outputs and workspace. Use the prepared call's
+        method to reuse an existing binding. Eligibility is not native compilation
+        success; DSA entries without a tuning portfolio return an empty tuple.
+        """
+        return self.prepare(*arguments, outputs=outputs).inspect_configurations()
 
     def launch(self, *arguments: Any) -> None:
         """Execute with every runtime argument, including explicit Out buffers."""

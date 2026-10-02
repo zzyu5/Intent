@@ -5,7 +5,7 @@ from ..artifact import CompiledArtifact
 from ..gpu.expressions import evaluate_shape
 from ..gpu.program import LaunchResult, materialize_gpu_program
 from ..tuning import TuningState
-from ..diagnostics import CandidateObservation, bindings, observation, unavailable_resources
+from ..diagnostics import CacheObservation, CandidateObservation, bindings, observation, unavailable_resources
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -75,7 +75,7 @@ class CuTileProgram:
         self.interface = interface
         self.configurations = interface.configuration_space
         self.facts = facts
-        self.target = target
+        self.target = bindings(target)
         self.kernel = namespace[facts.kernel]
         self.narrow_kernel = None if facts.narrow_kernel is None else namespace[facts.narrow_kernel]
         self.native_kernels = {name: namespace[name] for name in (facts.kernel, facts.narrow_kernel)
@@ -125,7 +125,12 @@ class CuTileProgram:
         reused = cached is not None
         candidates = ()
         if cached is None:
-            configurations = tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
+            try:
+                configurations = tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
+            except CompilationStageError as error:
+                error.observation = observation("cutile", self.target, invocation.description, None, _native_resources(),
+                                                stage="failed", history_unavailable="Candidate binding failed before native tuning")
+                raise
             kernel = self.kernel
             if self.tile_bounds is not None:
                 bounds = tuple(evaluate_shape(bound, values) for bound in self.tile_bounds)
@@ -144,7 +149,7 @@ class CuTileProgram:
                                       lambda config: state.arguments(self._arguments(trial_values, config)),
                                       *hints, quiet=True, **self.tuning_options)
             except Exception as error:
-                details = observation("cutile", self.target, invocation, None, _native_resources(),
+                details = observation("cutile", self.target, invocation.description, None, _native_resources(),
                     stage="failed", history_unavailable=
                     "cuTile did not return a TuningResult; its exception is preserved, but no complete candidate history is available")
                 stage = "provider_native_compilation" if self._compiling else "provider_tuning"
@@ -154,9 +159,13 @@ class CuTileProgram:
             config = result.best.config
             selected = kernel.replace_hints(**self._hints(config)) if hints else kernel
             candidates = () if self._compiling else tuple(
-                [CandidateObservation(bindings(vars(item.config)), "trial_completed", "provider_tuning")
+                [CandidateObservation(bindings(self.configurations.bound_configuration(invocation.values, vars(item.config))),
+                                      "trial_completed", "provider_tuning",
+                                      elapsed_ms=item.mean_us * 1e-3)
                  for item in result.successes] +
-                [CandidateObservation(bindings(vars(config)), "failed", "provider_tuning", error.__name__, message)
+                [CandidateObservation(bindings(self.configurations.bound_configuration(invocation.values, vars(config))),
+                                      "failed", "provider_tuning",
+                                      error if isinstance(error, str) else error.__name__, message)
                  for config, error, message in result.failures])
             cached = config, selected
             if not self._compiling:
@@ -169,20 +178,28 @@ class CuTileProgram:
             try:
                 return ct.launch(torch.cuda.current_stream(), grid, selected, arguments)
             except Exception as error:
-                details = observation("cutile", self.target, invocation, vars(config), _native_resources(),
+                details = observation("cutile", self.target, invocation.description,
+                                      bindings(self.configurations.bound_configuration(invocation.values, vars(config))), _native_resources(),
                                       candidates, stage="failed")
                 raise CompilationStageError("provider_invocation", str(error), observation=details) from error
 
         invoke()
         details = None if self._compiling else observation(
-            "cutile", self.target, invocation, vars(config), _native_resources(), candidates,
-            tuning_cache_hit=reused, history_unavailable=
-            "The existing tuning winner was reused; no candidates were retried in this invocation" if reused else None)
+            "cutile", self.target, invocation.description,
+            bindings(self.configurations.bound_configuration(invocation.values, vars(config))), _native_resources(), candidates,
+            caches=(CacheObservation("tuning", "runtime_instance", reused, "CuTileProgram._winners", "selection"),
+                    CacheObservation("native_compilation", "sdk", None, "cuTile dispatcher",
+                                     "native_dispatch",
+                                     "The dispatcher does not report native compilation cache hits")),
+            history_unavailable="The existing tuning winner was reused; no candidates were retried in this invocation" if reused else None)
         return LaunchResult(None if self._compiling else invoke, selected, details)
 
     def tuning_configurations(self, invocation):
         return self.configurations.enumerate(invocation.values,
-                                             self.configurations.candidates(invocation.values))
+                                             self.configurations.select(self.inspect_configurations(invocation)))
+
+    def inspect_configurations(self, invocation):
+        return self.configurations.inspect(invocation.values)
 
     @contextmanager
     def compilation_only(self, search, trial_state):

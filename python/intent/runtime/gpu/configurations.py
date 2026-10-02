@@ -4,34 +4,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from ..artifact import ParameterRole, TuningConfiguration, TuningParameter
+from ..diagnostics import ConfigurationAssessment, RequirementEvaluation, bindings
 from .expressions import Expression
-
-
-@dataclass(frozen=True, slots=True)
-class RequirementEvaluation:
-    kind: str
-    metric: str
-    predicate: str
-    message: str
-    status: str
-    usage: int | None
-    limit: int | None
-    detail: str = ""
-
-    def describe(self) -> str:
-        quantities = []
-        if self.usage is not None:
-            quantities.append(f"usage={self.usage}")
-        if self.limit is not None:
-            quantities.append(f"limit={self.limit}")
-        if self.detail:
-            quantities.append(self.detail)
-        suffix = "; " + ", ".join(quantities) if quantities else ""
-        return f"{self.kind}/{self.metric}/{self.predicate}: {self.message} ({self.status}{suffix})"
-
-    @property
-    def accepted(self) -> bool:
-        return self.status in {"satisfied", "inactive"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,21 +184,38 @@ class ConfigurationSpace:
 
     def candidates(self, values: Mapping[int | str, object], *,
                    rows: Iterable[Mapping[str, int]] | None = None) -> tuple[dict, ...]:
+        return self.select(self.inspect(values, rows=rows))
+
+    def bound_configuration(self, values: Mapping[int | str, object], row: Mapping[str, int]) -> dict:
+        return {**row, **{name: values[name] for name in self.coverage_names}}
+
+    def inspect(self, values: Mapping[int | str, object], *,
+                rows: Iterable[Mapping[str, int]] | None = None) -> tuple[ConfigurationAssessment, ...]:
+        """Evaluate current rows once, retaining rejected conditions for inspection."""
         selected = self.rows if rows is None else tuple(rows)
         if any(row not in self.rows for row in selected):
             from ...compiler.toolchain import CompilationStageError
             raise CompilationStageError("candidate_binding", "candidate is absent from the generated configuration space")
-        assessed = tuple((row, self.assess({**values, **row})) for row in selected)
-        result = tuple(row for row, evaluations in assessed if self._within(evaluations))
+        return tuple(ConfigurationAssessment(bindings(self.bound_configuration(values, row)),
+                                              self.assess({**values, **row})) for row in selected)
+
+    def select(self, assessed: tuple[ConfigurationAssessment, ...]) -> tuple[dict, ...]:
+        """Select evaluated rows without reinterpreting or re-evaluating conditions."""
+        result = tuple({name: value for name, value in entry.configuration if name in self.bound_names}
+                       for entry in assessed if entry.provider_reason is None and self._within(entry.requirements))
         if not result:
             from ...compiler.toolchain import CompilationStageError
             reasons = []
-            for row, evaluations in assessed[:4]:
-                rejected = [entry.describe() for entry in evaluations if not entry.accepted]
-                reasons.append(f"{row}: " + "; ".join(rejected[:3]))
+            for entry in assessed[:4]:
+                rejected = [value.describe() for value in entry.requirements if not value.accepted]
+                if entry.provider_reason is not None:
+                    rejected.append(entry.provider_reason)
+                reasons.append(f"{dict(entry.configuration)}: " + "; ".join(rejected[:3]))
             if len(assessed) > 4:
                 reasons.append(f"{len(assessed) - 4} additional candidate rows rejected")
-            raise CompilationStageError("candidate_selection",
+            stage = "provider_eligibility" if any(
+                all(value.accepted for value in entry.requirements) for entry in assessed) else "candidate_selection"
+            raise CompilationStageError(stage,
                 "no candidate satisfies the declared configuration requirements\n" + "\n".join(reasons))
         return result
 

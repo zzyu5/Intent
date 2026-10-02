@@ -64,6 +64,7 @@ class BoundInvocation:
     arguments: tuple
     outputs: tuple
     values: dict[int | str, object]
+    description: tuple
 
     @property
     def views(self) -> tuple:
@@ -264,7 +265,10 @@ class GPUInterface:
         binders = self._abstract_binders if abstract else self._binders
         public = binders[bool(explicit_outputs)](device, arguments)
         values = {self._public_bindings[position].id: value for position, value in enumerate(public.arguments)}
-        result = BoundInvocation(self, public.arguments, public.outputs, values)
+        from ..diagnostics import invocation_arguments
+        description = () if abstract else invocation_arguments(
+            self.public, public.arguments, public.views, f"cuda:{device}")
+        result = BoundInvocation(self, public.arguments, public.outputs, values, description)
         if abstract:
             return result
         for entry in self._host_order:

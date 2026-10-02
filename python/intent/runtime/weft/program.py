@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -17,6 +17,8 @@ from ..contract import ProgramContract
 from ..interface import ViewParameter
 from ..invocation import ViewFacts, invocation_result
 from ..native import NativePreparedRuntime
+from ..diagnostics import CacheObservation, CandidateObservation, ObservedCall, bindings, observation
+from intent.compiler.toolchain import CompilationStageError
 
 
 def _isa_extensions(isa: str) -> set[str]:
@@ -102,14 +104,18 @@ _winners: dict[tuple, int] = {}
 
 
 @dataclass
-class NativeCall:
+class NativeCall(ObservedCall):
     program: NativeProgram
     arguments: tuple
     native_arguments: tuple
     outputs: tuple[Buffer, ...]
     key: tuple
+    description: tuple
     trial_inputs: tuple[tuple[Buffer, bytes], ...] = ()
     winner: int | None = None
+
+    def inspect_configurations(self):
+        return self.program.inspect_configurations()
 
     def restore_trial_inputs(self) -> None:
         for buffer, snapshot in self.trial_inputs:
@@ -118,29 +124,68 @@ class NativeCall:
     def choose(self, prepare=None) -> int:
         if self.winner is not None:
             return self.winner
-        if len(self.program.measurements) == 1:
+        observed = []
+        single = len(self.program.measurements) == 1
+        reused = not single and self.key in _winners
+        if single:
             self.winner = 0
-            return self.winner
-        if self.key not in _winners:
+        elif not reused:
             timings = []
             try:
-                for measure in self.program.measurements:
+                for candidate, measure, configuration in zip(self.program.candidates, self.program.measurements,
+                                                             self.program.configuration_descriptions, strict=True):
                     samples = []
-                    for _ in range(3):
-                        self.restore_trial_inputs()
-                        if prepare is not None:
-                            prepare()
-                        samples.append(measure(*self.native_arguments, 1))
-                    timings.append(statistics.median(samples))
+                    try:
+                        for _ in range(3):
+                            self.restore_trial_inputs()
+                            if prepare is not None:
+                                prepare()
+                            samples.append(measure(*self.native_arguments, 1))
+                    except Exception as error:
+                        observed.append(CandidateObservation(configuration, "failed", "provider_tuning",
+                                                             type(error).__name__, str(error)))
+                        details = observation("weft", self.program.target, self.description, None, (), observed,
+                                              stage="failed", caches=self.program.compilation_cache)
+                        self._record_observation(details)
+                        raise CompilationStageError("provider_tuning", str(error), candidate=candidate.entry,
+                                                    observation=details) from error
+                    elapsed = statistics.median(samples)
+                    timings.append(elapsed)
+                    observed.append(CandidateObservation(configuration, "trial_completed", "provider_tuning",
+                                                         elapsed_ms=elapsed))
                 _winners[self.key] = min(range(len(timings)), key=timings.__getitem__)
             finally:
                 self.restore_trial_inputs()
-        self.winner = _winners[self.key]
+        if not single:
+            self.winner = _winners[self.key]
+        self._record_observation(observation("weft", self.program.target, self.description,
+            self.program.configuration_descriptions[self.winner], (), observed, stage="selected",
+            history_unavailable="Only one native candidate; tuning was not required" if single else
+                                "The process-local winner was reused; no candidates were retried" if reused else None,
+            caches=(*self.program.compilation_cache,
+                    CacheObservation("tuning", "process", None if single else reused, "Weft runtime winner cache",
+                                     "selection",
+                                     "Only one native candidate" if single else None))))
         return self.winner
 
     def launch(self) -> None:
-        self.program.check_execution()
-        self.program.functions[self.choose()](*self.native_arguments)
+        try:
+            self.program.check_execution()
+        except Exception as error:
+            details = observation("weft", self.program.target, self.description, None, (),
+                                  stage="failed", caches=self.program.compilation_cache,
+                                  history_unavailable="Native execution requirements failed before candidate invocation")
+            self._record_observation(details)
+            raise CompilationStageError("provider_invocation", str(error), observation=details) from error
+        selected = self.choose()
+        try:
+            self.program.functions[selected](*self.native_arguments)
+        except Exception as error:
+            details = replace(self.observation, stage="failed")
+            self._record_observation(details)
+            raise CompilationStageError("provider_invocation", str(error),
+                                        candidate=self.program.candidates[selected].entry, observation=details) from error
+        self._record_execution("launched")
 
     def benchmark(self, *, prepare=None, samples: int = 10) -> float:
         self.program.check_execution()
@@ -151,7 +196,9 @@ class NativeCall:
             if prepare is not None:
                 prepare()
             values.append(measure(*self.native_arguments, 1))
-        return statistics.median(values)
+        elapsed = statistics.median(values)
+        self._record_execution("benchmarked")
+        return elapsed
 
     def result(self):
         return invocation_result(self.outputs)
@@ -167,6 +214,10 @@ class NativeProgram(NativePreparedRuntime):
         validate_artifact(manifest, contract)
         self.profile = TargetProfile(**manifest["profile"])
         self.facts = contract.facts
+        self.target = bindings({"family": "cpu", **{name: value for name, value in asdict(contract.target).items()
+                                                  if name != "provider"}})
+        self.compilation_cache = (CacheObservation("native_compilation", "external_aot", None, "Weft kernel.so", "materialization",
+            "The native runtime loads an existing external AOT artifact and does not observe its build cache"),)
         abi = contract.abi
         self.interface = abi.interface
         self.requirements = requirements = abi.requirements
@@ -179,6 +230,7 @@ class NativeProgram(NativePreparedRuntime):
             scalar_key=lambda parameter, value: (parameter.dtype.name, value),
         )
         self.candidates = self.facts.candidates
+        self.configuration_descriptions = tuple(bindings(candidate.metadata()) for candidate in self.candidates)
         kernels = {kernel["symbol"]: kernel for kernel in manifest["weft"]["kernels"]}
         self.candidate_extensions = tuple(frozenset(
             extension for task in self.facts.tasks if task.cpu_entry == candidate.entry
@@ -229,7 +281,7 @@ class NativeProgram(NativePreparedRuntime):
                            bytes(bound.arguments[parameter.position].storage))
                           for parameter in self.interface.mutable_inputs)
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs,
-                          (self.identity, bound.key), snapshots)
+                          (self.identity, bound.key), self.describe_arguments(bound, "cpu"), snapshots)
 
     def close(self) -> None:
         import _ctypes

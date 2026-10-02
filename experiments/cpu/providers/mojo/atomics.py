@@ -7,12 +7,11 @@ from kernels.synchronization.compare_exchange import claim_zero_slots
 from experiments._common.loading import load_module
 from experiments._common.measurement import report_stage
 from experiments._common.model import PreparedComparison, PreparedLaunch, Tolerance
+from .common import report_selection
 
 
 def selected_outputs(artifact, outputs):
-    program = artifact.runtime
-    for key, winner in program.winners.items():
-        print(f"mojo: selected {program.candidates[winner]}; candidate_ms={program.timings[key]}", flush=True)
+    report_selection(artifact.observation)
     return outputs
 
 
