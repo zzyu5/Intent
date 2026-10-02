@@ -2,7 +2,7 @@
 #include "Intent/Analysis/IntegerRelations.h"
 #include "Utilities.h"
 #include "VectorReductions.h"
-#include "mlir/Analysis/AliasAnalysis.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -178,15 +178,10 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
   }
   if (reductionInputs.empty() && stores.empty()) return;
   auto function = original->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
+  StorageAnalysis storage(function);
   auto independent = [&](Value lhs, ValueRange lhsIndices, Value rhs, ValueRange rhsIndices) {
     if (lhs == rhs && lhsIndices == rhsIndices) return true;
-    if (aliases.alias(lhs, rhs).isNo()) return true;
-    auto left = physical.externalView(lhs), right = physical.externalView(rhs);
-    auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-    return left && right && physical.storageRoot(lhs) != physical.storageRoot(rhs) &&
-        interface.getDisjointOutputs() && (left.getAccess() != 0 || right.getAccess() != 0);
+    return storage.disjoint(lhs, rhs);
   };
   for (auto [number, store] : llvm::enumerate(stores)) {
     for (auto load : loads)
@@ -241,7 +236,6 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
           metadata.getBaseBuffer(), physicalOffset, sizes, physicalStrides));
     }
     auto contiguousLoop = cast<scf::ForOp>(b.clone(*original, mapping));
-    vectorize(contiguousLoop, width, replicas, nonempty || needsInvariantGuard);
     if (original.getNumResults()) {
       b.setInsertionPointToEnd(&dispatch.getThenRegion().front());
       b.create<scf::YieldOp>(loc, contiguousLoop.getResults());
@@ -251,6 +245,9 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
       b.setInsertionPointToEnd(&dispatch.getElseRegion().front());
       b.create<scf::YieldOp>(loc, original.getResults());
     }
+    // Recursive vectorization queries the complete function's storage flow.
+    // Finish both successor regions before taking that new analysis snapshot.
+    vectorize(contiguousLoop, width, replicas, nonempty || needsInvariantGuard);
     return;
   }
   int64_t logicalWidth = replicas * width;

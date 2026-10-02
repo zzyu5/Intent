@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -39,15 +40,24 @@ memref::StoreOp pointwiseStore(scf::ForOp loop) {
   if (!store || store.getIndices().size() != 1 ||
       store.getIndices()[0] != loop.getInductionVar()) return {};
   auto function = loop->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis analysis(function);
-  Value root = analysis.storageRoot(store.getMemref());
-  auto external = analysis.externalView(root);
+  StorageAnalysis storage(function);
+  Value root = storage.uniqueOrigin(store.getMemref());
+  if (!root) return {};
+  auto external = storage.externalView(root);
   if (!root.getDefiningOp<memref::AllocOp>() &&
       (!external || external.getAccess() != 1)) return {};
-  for (auto access : analysis.accesses(function))
-    if (analysis.storageRoot(access.memory) == root &&
-        (access.memory != store.getMemref() ||
-         (access.read && loop->isAncestor(access.operation)))) return {};
+  auto effects = storage.effects(function);
+  if (!effects.complete || effects.ordered) return {};
+  for (const StorageEffect &entry : effects.entries) {
+    const auto &effect = entry.effect;
+    if (isa<MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect())) continue;
+    Value memory = effect.getValue();
+    if (!memory) return {};
+    if (!storage.disjoint(memory, store.getMemref()) &&
+        (memory != store.getMemref() ||
+         (isa<MemoryEffects::Read>(effect.getEffect()) &&
+          loop->isAncestor(entry.operation)))) return {};
+  }
   return store;
 }
 

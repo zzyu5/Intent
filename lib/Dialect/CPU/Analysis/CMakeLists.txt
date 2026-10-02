@@ -12,6 +12,10 @@ add_mlir_library(MLIRIntentCPUAnalysis
   MLIRIntentAnalysis
   MLIRAnalysis
   MLIRArithDialect
+  MLIRBufferizationTransforms
+  MLIRBufferizationDialect
+  MLIRCallInterfaces
+  MLIRControlFlowInterfaces
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMathDialect

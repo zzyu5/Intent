@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -45,7 +46,7 @@ struct RegionGroup {
     if (!fold) return false;
     Value head = parallel.getInductionVars().back();
     int64_t divisor = 0;
-    PhysicalProgramAnalysis physical(function);
+    StorageAnalysis storage(function);
     for (Operation *user : head.getUsers()) {
       if (auto quotient = dyn_cast<arith::FloorDivSIOp>(user)) {
         auto period = getConstantIntValue(quotient.getRhs());
@@ -56,7 +57,7 @@ struct RegionGroup {
       }
       auto view = dyn_cast<memref::SubViewOp>(user);
       if (!view || view->getBlock() != parallel.getBody()) return false;
-      auto external = physical.externalView(view.getSource());
+      auto external = storage.externalView(view.getSource());
       if (!external || (external.getAccess() != 0 && external.getAccess() != 1)) return false;
       auto offsets = view.getMixedOffsets(), sizes = view.getMixedSizes();
       auto strides = view.getMixedStrides();
@@ -205,30 +206,23 @@ struct RegionGroup {
     // ABI disjointness separates input/output buffers. Each writable buffer
     // must additionally use one injective head-row projection; private and
     // helper destinations may not escape the original parallel iteration.
-    SmallVector<Value> summarize(program.getSources());
-    llvm::append_range(summarize, program.getCaptures());
-    llvm::append_range(summarize, program.getDestinations());
-    SmallVector<Value> combine(program.getIdentities());
-    llvm::append_range(combine, program.getIdentities());
-    llvm::append_range(combine, program.getDestinations());
-    auto root = [&](Value memory) {
-      Value value = physical.storageRoot(memory);
-      while (auto argument = dyn_cast<BlockArgument>(value)) {
-        if (argument.getOwner()->getParentOp() != fold) break;
-        value = argument.getOwner() == &program.getSummarize().front()
-            ? summarize[argument.getArgNumber()] : combine[argument.getArgNumber()];
-        value = physical.storageRoot(value);
-      }
-      return value;
-    };
     llvm::DenseMap<Value, Operation *> outputRows;
-    for (const MemoryAccess &access : physical.accesses(parallel)) {
-      Value storage = root(access.memory);
-      auto external = physical.externalView(storage);
+    auto effects = storage.effects(parallel);
+    if (!effects.complete || effects.ordered) return false;
+    for (const StorageEffect &entry : effects.entries) {
+      const auto &effect = entry.effect;
+      if (isa<MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect())) continue;
+      Value memory = effect.getValue();
+      if (!memory || !isa<MemRefType>(memory.getType()) ||
+          !isa<MemoryEffects::Read, MemoryEffects::Write>(effect.getEffect())) return false;
+      Value origin = storage.uniqueOrigin(memory);
+      if (!origin) return false;
+      auto external = storage.externalView(origin);
+      bool write = isa<MemoryEffects::Write>(effect.getEffect());
       if (external) {
-        if (access.read && external.getAccess() != 0) valid = false;
-        if (!access.write) continue;
-        Value projection = access.memory;
+        if (!write && external.getAccess() != 0) valid = false;
+        if (!write) continue;
+        Value projection = memory;
         while (!headViews.count(projection.getDefiningOp())) {
           if (auto view = projection.getDefiningOp<memref::SubViewOp>()) projection = view.getSource();
           else if (auto cast = projection.getDefiningOp<memref::CastOp>()) projection = cast.getSource();
@@ -237,12 +231,12 @@ struct RegionGroup {
         }
         auto view = projection.getDefiningOp<memref::SubViewOp>();
         if (external.getAccess() != 1 || !view || !headViews.count(view) ||
-            view.getSource() != storage || !view.getSourceType().getLayout().isIdentity() ||
-            !lifted.contains(access.memory)) { valid = false; continue; }
-        auto [position, inserted] = outputRows.try_emplace(storage, view);
+            view.getSource() != origin || !view.getSourceType().getLayout().isIdentity() ||
+            !lifted.contains(memory)) { valid = false; continue; }
+        auto [position, inserted] = outputRows.try_emplace(origin, view);
         if (!inserted && position->second != view) valid = false;
-      } else if (access.write) {
-        auto allocation = storage.getDefiningOp<memref::AllocOp>();
+      } else if (write) {
+        auto allocation = origin.getDefiningOp<memref::AllocOp>();
         if (!allocation || !parallel->isAncestor(allocation)) valid = false;
       }
     }

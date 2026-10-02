@@ -1,7 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
-#include "mlir/Analysis/AliasAnalysis.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
@@ -84,17 +84,9 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
 
 LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations,
                                       ArrayRef<Value> leadingExtents) {
-  AliasAnalysis aliases(function);
-  PhysicalProgramAnalysis analysis(function);
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-  auto disjoint = [&](Value left, Value right) {
-    if (aliases.alias(left, right).isNo()) return true;
-    auto lhs = analysis.externalView(left), rhs = analysis.externalView(right);
-    return lhs && rhs && analysis.storageRoot(left) != analysis.storageRoot(right) &&
-        interface.getDisjointOutputs() && (lhs.getAccess() != 0 || rhs.getAccess() != 0);
-  };
   SmallVector<linalg::GenericOp> computations(function.front().getOps<linalg::GenericOp>());
   for (auto operation : computations) {
+    StorageAnalysis storage(function);
     if (!operation.getNumLoops() || operation.getNumResults() || operation.getOutputs().empty() ||
         operation.getIteratorTypesArray()[0] != utils::IteratorType::parallel) continue;
     if (!leadingExtents.empty() && isMatrixContraction(operation)) continue;
@@ -114,10 +106,10 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
     bool independent = true;
     for (auto [number, destination] : llvm::enumerate(operation.getOutputs())) {
       for (Value other : operation.getOutputs().drop_front(number + 1))
-        independent &= disjoint(destination, other);
+        independent &= storage.disjoint(destination, other);
       for (auto [inputNumber, input] : llvm::enumerate(operation.getInputs())) {
         if (!isa<MemRefType>(input.getType())) continue;
-        independent &= disjoint(input, destination) ||
+        independent &= storage.disjoint(input, destination) ||
             (input == destination && maps[inputNumber] == maps[operation.getNumDpsInputs() + number]);
       }
     }
@@ -126,7 +118,7 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
       auto load = dyn_cast<memref::LoadOp>(body);
       if (!load) { independent = false; break; }
       for (Value output : operation.getOutputs())
-        independent &= disjoint(load.getMemref(), output);
+        independent &= storage.disjoint(load.getMemref(), output);
     }
     if (!independent) continue;
     OpBuilder b(operation);
@@ -199,7 +191,7 @@ namespace {
 LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   auto function = root->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);
-  PhysicalProgramAnalysis analysis(function);
+  StorageAnalysis analysis(function);
   auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto rectangular = [&](scf::ParallelOp parallel) {
     for (auto [begin, end, step] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(), parallel.getStep()))
@@ -344,7 +336,7 @@ void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
   auto exchange = exchanges.front();
   auto element = dyn_cast<IntegerType>(exchange.getOldValue().getType());
   if (exchange.getOrdering() != AtomicOrdering::Relaxed || !element || !element.isSignless()) return;
-  PhysicalProgramAnalysis physical(function);
+  StorageAnalysis physical(function);
   Value point = root.getInductionVars()[0];
   auto projection = [&](Value memory, ValueRange indices) -> Value {
     while (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
@@ -359,7 +351,7 @@ void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
     auto type = cast<MemRefType>(memory.getType());
     auto external = physical.externalView(memory);
     if (type.getRank() != 1 || !type.getLayout().isIdentity() ||
-        memory != physical.storageRoot(memory) || !external || external.getAccess() == 0) return {};
+        memory != physical.uniqueOrigin(memory) || !external || external.getAccess() == 0) return {};
     return memory;
   };
   Value target = projection(exchange.getTarget(), exchange.getIndices());
@@ -424,12 +416,12 @@ scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root,
   if (updates.size() != 1) return {};
   auto update = updates.front();
   auto target = cast<MemRefType>(update.getTarget().getType());
-  PhysicalProgramAnalysis physical(function);
+  StorageAnalysis physical(function);
   auto external = physical.externalView(update.getTarget());
   if (update.getOrdering() != AtomicOrdering::Relaxed || update.getKind() != AtomicRMWKind::Add ||
       !update.getValue().getType().isF32() || !update->getResult(0).use_empty() ||
       target.getRank() < 2 || !target.getLayout().isIdentity() || !external || external.getAccess() != 2 ||
-      update.getTarget() != physical.storageRoot(update.getTarget()) ||
+      update.getTarget() != physical.uniqueOrigin(update.getTarget()) ||
       !update->getParentOfType<scf::ForOp>()) return {};
 
   bool valid = true;

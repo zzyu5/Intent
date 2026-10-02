@@ -17,7 +17,8 @@ linalg::GenericOp bufferProducer(Value buffer, Operation *consumer, bool soleCon
                                 bool sameBlock = true) {
   auto allocation = buffer.getDefiningOp<memref::AllocOp>();
   if (!allocation) return {};
-  auto lifetime = queryStorageLifetime(allocation);
+  StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
+  auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(consumer)) return {};
   linalg::GenericOp producer;
   for (Operation *user : lifetime->aliases.users) {
@@ -34,7 +35,7 @@ linalg::GenericOp bufferProducer(Value buffer, Operation *consumer, bool soleCon
   for (Operation *user : lifetime->aliases.users) {
     if (user == producer || user == lifetime->end || isa<memref::DimOp>(user) ||
         isStorageAliasOperation(user)) continue;
-    if ((soleConsumer && user != consumer) || !preservesStorage(user, buffer)) return {};
+    if ((soleConsumer && user != consumer) || !storage.preserves(user, buffer)) return {};
   }
   return producer;
 }
@@ -77,12 +78,13 @@ bool stripView(ProjectedSource &source, SmallVectorImpl<Operation *> &views) {
 
 ProjectedSource projectInput(ProjectedSource source, linalg::GenericOp consumer,
                              SmallVectorImpl<Operation *> &views) {
+  StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
   while (true) {
     if (stripView(source, views)) continue;
     auto projection = bufferProducer(source.value, consumer, false);
     if (!projection || !isProjection(projection)) return source;
     Value input = projection.getInputs()[0];
-    if (!isStorageReadStable(input, projection, consumer)) return source;
+    if (!storage.readStable(input, projection, consumer)) return source;
     source.map = projection.getIndexingMapsArray().front().compose(source.map);
     source.value = input;
   }
@@ -99,13 +101,14 @@ std::optional<ProductSource> productSource(Value source, linalg::GenericOp consu
   if (!type) return std::nullopt;
   ProjectedSource projected{source, AffineMap::getMultiDimIdentityMap(type.getRank(), consumer.getContext())};
   Operation *user = consumer;
+  StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
   while (true) {
     if (stripView(projected, views)) continue;
     auto producer = bufferProducer(projected.value, user, true);
     if (!producer) return std::nullopt;
     if (!isProjection(producer)) return ProductSource{producer, projected.map};
     Value input = producer.getInputs()[0];
-    if (!isStorageReadStable(input, producer, consumer)) return std::nullopt;
+    if (!storage.readStable(input, producer, consumer)) return std::nullopt;
     projected.map = producer.getIndexingMapsArray().front().compose(projected.map);
     projected.value = input;
     user = producer;
@@ -217,9 +220,10 @@ bool fuseProduct(linalg::GenericOp reduction) {
       !((mul.getLhs() == productBody.getArgument(0) && mul.getRhs() == productBody.getArgument(1)) ||
         (mul.getRhs() == productBody.getArgument(0) && mul.getLhs() == productBody.getArgument(1)))) return false;
   SmallVector<OperandAxes> operands;
+  StorageAnalysis storage(reduction->getParentOfType<func::FuncOp>());
   for (unsigned number = 0; number != 2; ++number) {
     ProjectedSource source{multiply.getInputs()[number], multiply.getIndexingMapsArray()[number].compose(product->map)};
-    if (!isStorageReadStable(source.value, multiply, reduction)) return false;
+    if (!storage.readStable(source.value, multiply, reduction)) return false;
     source = projectInput(source, reduction, views);
     auto axes = operandAxes(source);
     if (!axes) return false;
@@ -304,7 +308,8 @@ Value foldContractionInput(Value input, linalg::GenericOp consumer,
       original.getMemorySpace() != allocation.getType().getMemorySpace()) return input;
   for (auto [axis, expression] : llvm::enumerate(map.getResults()))
     if (isa<AffineConstantExpr>(expression) && original.getDimSize(axis) != 1) return input;
-  if (!isStorageReadStable(source, producer, consumer)) return input;
+  StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
+  if (!storage.readStable(source, producer, consumer)) return input;
   source = foldContractionInput(source, consumer);
   auto type = cast<MemRefType>(source.getType());
   SmallVector<int64_t> sourceStrides;
@@ -347,13 +352,15 @@ linalg::FillOp findContractionInitialization(linalg::GenericOp operation) {
   Value value = fill.getInputs()[0];
   if (!(isa<FloatType>(value.getType()) ? matchPattern(value, m_PosZeroFloat()) : matchPattern(value, m_Zero())))
     return {};
+  StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
   for (Operation *between = fill->getNextNode(); between != operation; between = between->getNextNode()) {
-    auto effects = getEffectsRecursively(between);
-    if (!effects) return {};
-    for (auto &effect : *effects) {
+    auto effects = storage.effects(between);
+    if (!effects.complete || effects.ordered) return {};
+    for (const StorageEffect &entry : effects.entries) {
+      const auto &effect = entry.effect;
       if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
       if (!effect.getValue() || !isa<BaseMemRefType>(effect.getValue().getType()) ||
-          !areDisjointStorage(output, effect.getValue(), operation)) return {};
+          !storage.disjoint(output, effect.getValue())) return {};
     }
   }
   return fill;

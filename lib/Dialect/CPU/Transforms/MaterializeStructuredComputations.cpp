@@ -1,7 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Utilities.h"
 #include "VectorReductions.h"
-#include "mlir/Analysis/AliasAnalysis.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -87,23 +87,12 @@ bool materializeProductReduction(linalg::GenericOp operation) {
       return false;
   auto function = operation->getParentOfType<func::FuncOp>();
   bool accumulatePartials = order.getElementPermutation();
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
-  auto abi = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-  auto disjoint = [&](Value first, Value second) {
-    first = physical.storageRoot(first);
-    second = physical.storageRoot(second);
-    if (first == second) return false;
-    if (aliases.alias(first, second).isNo()) return true;
-    auto left = physical.externalView(first), right = physical.externalView(second);
-    return abi && abi.getDisjointOutputs() && left && right &&
-        (left.getAccess() != 0 || right.getAccess() != 0);
-  };
+  StorageAnalysis storage(function);
   for (auto [component, output] : llvm::enumerate(operation.getOutputs())) {
     for (Value input : operation.getInputs())
-      if (isa<MemRefType>(input.getType()) && !disjoint(input, output)) return false;
+      if (isa<MemRefType>(input.getType()) && !storage.disjoint(input, output)) return false;
     for (Value previous : operation.getOutputs().take_front(component))
-      if (!disjoint(previous, output)) return false;
+      if (!storage.disjoint(previous, output)) return false;
   }
 
   OpBuilder b(operation);
@@ -303,17 +292,11 @@ LogicalResult materialize(linalg::GenericOp operation) {
       });
   if (carryReduction) {
     auto function = operation->getParentOfType<func::FuncOp>();
-    PhysicalProgramAnalysis physical(function);
-    AliasAnalysis aliases(function);
-    auto abi = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-    Value output = physical.storageRoot(operation.getOutputs()[0]);
+    StorageAnalysis storage(function);
+    Value output = operation.getOutputs()[0];
     for (Value input : operation.getInputs()) {
       if (!isa<MemRefType>(input.getType())) continue;
-      input = physical.storageRoot(input);
-      if (input != output && aliases.alias(input, output).isNo()) continue;
-      auto source = physical.externalView(input), destination = physical.externalView(output);
-      if (input != output && abi && abi.getDisjointOutputs() && source && destination &&
-          (source.getAccess() != 0 || destination.getAccess() != 0)) continue;
+      if (storage.disjoint(input, output)) continue;
       carryReduction = false;
       break;
     }

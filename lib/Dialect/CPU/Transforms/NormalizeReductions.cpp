@@ -30,7 +30,8 @@ void normalize(linalg::GenericOp operation) {
       allocation->getBlock() != operation->getBlock() ||
       llvm::is_contained(operation.getInputs(), destination))
     return;
-  auto lifetime = queryStorageLifetime(allocation);
+  StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+  auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete ||
       lifetime->aliases.values.size() != 1 || !lifetime->contains(operation))
     return;

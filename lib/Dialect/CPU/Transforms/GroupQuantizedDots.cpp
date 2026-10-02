@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -64,14 +65,14 @@ LogicalResult group(scf::ParallelOp parallel, const ImplementationRegistry &impl
   DominanceInfo dominance(function);
   for (Value source : {lhs.getSource(), dot.getRhs(), output.getSource()})
     if (!dominance.dominates(source, parallel)) return success();
-  PhysicalProgramAnalysis analysis(function);
+  StorageAnalysis analysis(function);
   auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   auto destination = analysis.externalView(output.getSource());
   // Group only the existing independent external writes. Captured preparation
   // remains outside the workset and is read once per record by the local group.
   if (!interface.getDisjointOutputs() || !destination || destination.getAccess() != 1 ||
       !analysis.isReadOnly(lhs.getSource()) ||
-      analysis.storageRoot(dot.getRhs()) == analysis.storageRoot(output.getSource())) return success();
+      !analysis.disjoint(dot.getRhs(), output.getSource())) return success();
 
   OpBuilder b(parallel);
   Location loc = parallel.getLoc();

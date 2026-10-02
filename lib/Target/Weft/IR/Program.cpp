@@ -62,6 +62,22 @@ LogicalResult verifyTaskSignature(func::FuncOp declaration, wk::KernelOp kernel)
 
 } // namespace
 
+FailureOr<DenseI32ArrayAttr> taskCallAccesses(wk::KernelOp kernel) {
+  SmallVector<int32_t> modes;
+  for (Attribute attribute : kernel.getArgAccess()) {
+    StringRef access = cast<StringAttr>(attribute).getValue();
+    if (access == "none") modes.push_back(0);
+    else if (access == "read") modes.push_back(1);
+    else if (access == "write") modes.push_back(2);
+    else if (access == "readwrite") modes.push_back(3);
+    else return kernel.emitError("task argument has an unsupported access mode"), failure();
+  }
+  if (modes.size() != kernel.getBody().front().getNumArguments())
+    return kernel.emitError("task access modes do not match its actual arguments"), failure();
+  modes.append(kernel.getShapeSymbols().size(), 0);
+  return DenseI32ArrayAttr::get(kernel.getContext(), modes);
+}
+
 FailureOr<ProgramModules> getProgramModules(ModuleOp program) {
   ProgramModules modules;
   for (Operation &operation : program.getBody()->getOperations()) {
@@ -146,14 +162,19 @@ LogicalResult verifyProgram(ModuleOp program) {
           encoding.getKind() != "dense" || encoding.getFamily() != "i64")
         return kernel.emitError("task coordinate requires one boxed i64 argument");
     }
-    bool called = false, wrongEntry = false;
-    modules->host.walk([&](func::CallOp call) {
+    auto accesses = taskCallAccesses(kernel);
+    if (failed(accesses)) return failure();
+    bool called = false, wrongEntry = false, wrongAccess = false;
+    modules->host.walk([&](cpu::InvokeOp call) {
       if (call.getCallee() != declaration.getName()) return;
       called = true;
       wrongEntry |= call->getParentOfType<func::FuncOp>() != entry;
+      wrongAccess |= call.getAccessesAttr() != *accesses;
     });
     if (!called || wrongEntry)
       return declaration.emitError("Weft task declaration must be called by its bound host entry");
+    if (wrongAccess)
+      return declaration.emitError("Weft borrowed call access disagrees with its task interface");
   }
   if (boundDeclarations.size() != declarations.size() || boundEntries.size() != entries.size())
     return program.emitError("Weft host contains an entry or declaration without a task binding");

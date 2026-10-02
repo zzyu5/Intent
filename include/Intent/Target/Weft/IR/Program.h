@@ -4,6 +4,8 @@
 #include "Intent/Target/Weft/IR/WeftAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 
+namespace weft::kernel { class KernelOp; }
+
 namespace intent::weft_provider {
 
 inline constexpr llvm::StringLiteral hostModuleName = "host";
@@ -17,6 +19,8 @@ struct ProgramModules {
 };
 
 mlir::FailureOr<ProgramModules> getProgramModules(mlir::ModuleOp program);
+mlir::FailureOr<mlir::DenseI32ArrayAttr>
+taskCallAccesses(::weft::kernel::KernelOp kernel);
 mlir::LogicalResult verifyProgram(mlir::ModuleOp program);
 
 } // namespace intent::weft_provider

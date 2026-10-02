@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "ImplementationInputs.h"
 #include "Utilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -40,15 +41,22 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   }
   if (!initialization)
     return operation.emitError("CPU contraction accumulator initialization is missing");
-  PhysicalProgramAnalysis analysis(operation->getParentOfType<func::FuncOp>());
-  Value root = analysis.storageRoot(output);
+  StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+  Value root = storage.uniqueOrigin(output);
   bool keepInitialization = (*implementation)->contraction.completePrivateInitialization &&
-      isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp());
+      root && isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp());
   for (Operation *between = initialization->getNextNode(); between != operation;
-       between = between->getNextNode())
-    for (auto access : analysis.accesses(between))
-      if (analysis.storageRoot(access.memory) == root)
+       between = between->getNextNode()) {
+    auto effects = storage.effects(between);
+    if (!effects.complete || effects.ordered)
+      return operation.emitError("CPU contraction initialization has an unknown or ordered intervening effect");
+    for (const StorageEffect &entry : effects.entries) {
+      const auto &effect = entry.effect;
+      if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
+      if (!effect.getValue() || !storage.disjoint(effect.getValue(), output))
         return operation.emitError("CPU contraction initialization has an intervening memory access");
+    }
+  }
   Value initial = initialization.getInputs()[0];
   if (!(isa<FloatType>(initial.getType()) ? matchPattern(initial, m_PosZeroFloat()) : matchPattern(initial, m_Zero())))
     return operation.emitError("CPU contraction blocking requires the closed zero-initialized contraction; splitting a nonzero fused accumulator is not implemented");

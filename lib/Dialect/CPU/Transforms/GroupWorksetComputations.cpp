@@ -1,7 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
-#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
@@ -65,51 +65,43 @@ struct Access {
   bool write, row;
 };
 
-FailureOr<SmallVector<Access>> accesses(scf::ParallelOp loop, PhysicalProgramAnalysis &physical) {
+FailureOr<SmallVector<Access>> accesses(scf::ParallelOp loop, StorageAnalysis &storage) {
   SmallVector<Access> result;
-  bool valid = true;
   Value coordinate = loop.getInductionVars()[0];
-  auto access = [&](Value memory, bool write, ValueRange indices = {}) {
-    Value root = physical.storageRoot(memory);
+  auto effects = storage.effects(loop);
+  if (!effects.complete || effects.ordered) return failure();
+  for (const StorageEffect &entry : effects.entries) {
+    const auto &effect = entry.effect;
+    if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
+    Value memory = effect.getValue();
+    if (!memory || !isa<MemRefType>(memory.getType())) return failure();
+    Value root = storage.uniqueOrigin(memory);
+    if (!root) return failure();
+    if (isa<MemoryEffects::Free>(effect.getEffect())) {
+      auto allocation = root.getDefiningOp<memref::AllocOp>();
+      if (!allocation || !loop->isAncestor(allocation)) return failure();
+      continue;
+    }
+    if (!isa<MemoryEffects::Read, MemoryEffects::Write>(effect.getEffect()))
+      return failure();
+    ValueRange indices;
+    if (auto load = dyn_cast<memref::LoadOp>(entry.operation))
+      indices = load.getIndices();
+    else if (auto store = dyn_cast<memref::StoreOp>(entry.operation))
+      indices = store.getIndices();
     bool row = owned(memory, coordinate, root) ||
         (!indices.empty() && indices[0] == coordinate && leadingRoot(memory) == root);
-    result.push_back({root, write, row});
-  };
-  loop.walk([&](Operation *operation) {
-    if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
-      for (Value input : generic.getInputs())
-        if (isa<MemRefType>(input.getType())) access(input, false);
-      for (Value output : generic.getOutputs()) access(output, true);
-    } else if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
-      for (Value output : fill.getOutputs()) access(output, true);
-    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
-      access(copy.getSource(), false);
-      access(copy.getTarget(), true);
-    } else if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-      access(load.getMemref(), false, load.getIndices());
-    } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-      access(store.getMemref(), true, store.getIndices());
-    } else if (auto reduction = dyn_cast<ReduceOp>(operation)) {
-      for (Value input : reduction.getInputs())
-        if (isa<MemRefType>(input.getType())) access(input, false);
-    } else if (auto free = dyn_cast<memref::DeallocOp>(operation)) {
-      auto allocation = physical.storageRoot(free.getMemref()).getDefiningOp<memref::AllocOp>();
-      if (!allocation || !loop->isAncestor(allocation)) valid = false;
-    } else if (!isa<memref::AllocOp, memref::AllocaOp, scf::ForOp, scf::ParallelOp, scf::IfOp>(operation) &&
-               !isMemoryEffectFree(operation)) valid = false;
-  });
-  if (!valid) return failure();
+    result.push_back({root, isa<MemoryEffects::Write>(effect.getEffect()), row});
+  }
   return result;
 }
 
 bool fuse(scf::ParallelOp first, scf::ParallelOp second, ArrayRef<Operation *> between) {
   if (!workset(second) || !sameExtent(first.getUpperBound()[0], second.getUpperBound()[0])) return false;
   auto function = first->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
-  auto lhs = accesses(first, physical), rhs = accesses(second, physical);
+  StorageAnalysis storage(function);
+  auto lhs = accesses(first, storage), rhs = accesses(second, storage);
   if (failed(lhs) || failed(rhs)) return false;
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   for (const auto &left : *lhs)
     for (const auto &right : *rhs) {
       if (!left.write && !right.write) continue;
@@ -118,10 +110,7 @@ bool fuse(scf::ParallelOp first, scf::ParallelOp second, ArrayRef<Operation *> b
         if (!left.row || !right.row || !type || !type.getLayout().isIdentity()) return false;
         continue;
       }
-      if (aliases.alias(left.root, right.root).isNo()) continue;
-      auto l = physical.externalView(left.root), r = physical.externalView(right.root);
-      if (!interface || !interface.getDisjointOutputs() || !l || !r ||
-          (l.getAccess() == 0 && r.getAccess() == 0)) return false;
+      if (!storage.disjoint(left.root, right.root)) return false;
     }
   DominanceInfo dominance(function);
   llvm::SmallPtrSet<Operation *, 16> movable;
@@ -288,20 +277,11 @@ LogicalResult groupWorksetComputations(func::FuncOp function, const Implementati
     if (workset(loop)) extents.push_back(loop.getUpperBound()[0]);
   if (extents.empty()) return success();
   if (failed(exposeStructuredWorksets(function, implementations, extents))) return failure();
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-  auto disjoint = [&](Value first, Value second) {
-    first = physical.storageRoot(first); second = physical.storageRoot(second);
-    if (aliases.alias(first, second).isNo()) return true;
-    auto l = physical.externalView(first), r = physical.externalView(second);
-    return first != second && interface && interface.getDisjointOutputs() && l && r &&
-        (l.getAccess() != 0 || r.getAccess() != 0);
-  };
   SmallVector<Operation *> transfers;
   for (Operation &operation : function.front())
     if (isa<linalg::FillOp, memref::CopyOp>(operation)) transfers.push_back(&operation);
   for (Operation *operation : transfers) {
+    StorageAnalysis storage(function);
     Value output, input;
     if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
       if (fill.getOutputs().size() != 1 || fill.getNumResults()) continue;
@@ -309,7 +289,7 @@ LogicalResult groupWorksetComputations(func::FuncOp function, const Implementati
     } else {
       auto copy = cast<memref::CopyOp>(operation);
       input = copy.getSource(); output = copy.getTarget();
-      if (!disjoint(input, output)) continue;
+      if (!storage.disjoint(input, output)) continue;
     }
     auto type = cast<MemRefType>(output.getType());
     if (!type.getRank() || !injectiveSlice(output)) continue;

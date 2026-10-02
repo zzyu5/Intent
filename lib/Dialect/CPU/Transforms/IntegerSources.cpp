@@ -21,11 +21,11 @@ bool projectedCoordinates(AffineMap map) {
 }
 
 std::optional<linalg::GenericOp> integerProducer(memref::LoadOp load,
-                                               PhysicalProgramAnalysis &physical) {
+                                               StorageAnalysis &storage) {
   if (!integer(load.getType())) return std::nullopt;
   auto allocation = load.getMemref().getDefiningOp<memref::AllocOp>();
   if (!allocation) return std::nullopt;
-  auto lifetime = queryStorageLifetime(allocation);
+  auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
   linalg::GenericOp producer;
   for (Operation *user : lifetime->aliases.users) {
@@ -44,16 +44,15 @@ std::optional<linalg::GenericOp> integerProducer(memref::LoadOp load,
       })) return std::nullopt;
   for (Operation *user : lifetime->aliases.users)
     if (user != producer && user != lifetime->end &&
-        !preservesStorage(user, allocation)) return std::nullopt;
+        !storage.preserves(user, allocation)) return std::nullopt;
 
   Operation *consumer = producer->getBlock()->findAncestorOpInBlock(*load);
   if (!consumer || consumer == producer || !producer->isBeforeInBlock(consumer)) return std::nullopt;
   auto function = producer->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);
   auto stable = [&](Value memory) {
-    Value root = physical.storageRoot(memory);
-    if (root == allocation.getResult() || !dominance.dominates(memory, load)) return false;
-    return isStorageReadStable(memory, producer, load);
+    if (!storage.disjoint(memory, allocation) || !dominance.dominates(memory, load)) return false;
+    return storage.readStable(memory, producer, load);
   };
   for (auto [number, input] : llvm::enumerate(producer.getInputs())) {
     if (body.getArgument(number).use_empty()) continue;
@@ -120,8 +119,8 @@ void foldIntegerSources(func::FuncOp function) {
     for (auto load : loads) {
       // Every successful replay changes both uses and read placement. Queries
       // deliberately do not survive that rewrite or a dead-buffer deletion.
-      PhysicalProgramAnalysis physical(function);
-      if (auto producer = integerProducer(load, physical)) {
+      StorageAnalysis storage(function);
+      if (auto producer = integerProducer(load, storage)) {
         replay(load, *producer);
         changed = true;
       }

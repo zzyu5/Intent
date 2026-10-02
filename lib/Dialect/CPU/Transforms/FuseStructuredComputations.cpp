@@ -2,7 +2,6 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "IntegerSources.h"
 #include "ContiguousAccesses.h"
-#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -55,7 +54,7 @@ void eraseDeadPrivateBuffers(func::FuncOp function) {
 namespace {
 
 linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
-                                    PhysicalProgramAnalysis &analysis) {
+                                    StorageAnalysis &storage) {
   if (!buffer.getDefiningOp<memref::AllocOp>()) return {};
   linalg::GenericOp producer;
   for (Operation *user : buffer.getUsers()) {
@@ -92,18 +91,19 @@ linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
       if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
         return {};
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
-  auto function = consumer->getParentOfType<func::FuncOp>();
-  AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   for (Value read : reads) {
-    if (!analysis.mayReadAt(read, producer, consumer)) return {};
-    if (!generic) continue;
-    for (Value output : generic.getOutputs()) {
-      if (aliases.alias(read, output).isNo()) continue;
-      auto source = analysis.externalView(read), target = analysis.externalView(output);
-      if (!source || !target || analysis.storageRoot(read) == analysis.storageRoot(output) ||
-          !interface.getDisjointOutputs() || (source.getAccess() == 0 && target.getAccess() == 0)) return {};
+    Value observed = read;
+    if (Operation *descriptor = read.getDefiningOp();
+        descriptor && producer->isProperAncestor(descriptor)) {
+      // The complete pure payload, including local views, is cloned by
+      // fuseOne. Only the underlying storage must outlive the old payload.
+      observed = storage.uniqueOrigin(read);
+      if (!observed) return {};
     }
+    if (!storage.readStable(observed, producer, consumer)) return {};
+    if (!generic) continue;
+    for (Value output : generic.getOutputs())
+      if (!storage.disjoint(read, output)) return {};
   }
   return producer;
 }
@@ -243,7 +243,7 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
 }
 
 bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
-                       PhysicalProgramAnalysis &analysis) {
+                       StorageAnalysis &storage) {
   auto source = buffer.getDefiningOp<memref::AllocOp>();
   if (!source || consumer.getNumResults() || consumer.getOutputs().size() != 1 ||
       consumer.getNumReductionLoops() || source->getBlock() != consumer->getBlock()) return false;
@@ -262,21 +262,20 @@ bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
   if (!body.getArguments().back().use_empty() || !pure(body)) return false;
   auto maps = consumer.getIndexingMapsArray();
   if (!maps.back().isIdentity()) return false;
-  AliasAnalysis aliases(consumer->getParentOfType<func::FuncOp>());
   bool readsSource = false;
   for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
     if (!isa<MemRefType>(input.getType())) continue;
-    Value root = analysis.storageRoot(input);
+    Value root = storage.uniqueOrigin(input);
     if (root == output.getResult()) return false;
     if (root == buffer) {
       if (input != buffer || maps[number] != maps.back()) return false;
       readsSource |= !body.getArgument(number).use_empty();
-    } else if (!aliases.alias(root, buffer).isNo()) return false;
+    } else if (!storage.disjoint(input, buffer)) return false;
   }
   if (!readsSource) return false;
 
   auto lifetime = [&](memref::AllocOp allocation, bool oldValues) -> memref::DeallocOp {
-    auto lifetime = queryStorageLifetime(allocation);
+    auto lifetime = storage.lifetime(allocation);
     if (!lifetime || !lifetime->aliases.complete) return {};
     for (Operation *user : lifetime->aliases.users) {
       if (user == lifetime->end || isStorageAliasOperation(user) || isa<memref::DimOp>(user)) continue;
@@ -309,7 +308,7 @@ bool reusePrivateInput(linalg::GenericOp consumer, Value buffer,
 }
 
 bool reuseOutput(linalg::GenericOp consumer, Value buffer,
-                 PhysicalProgramAnalysis &analysis) {
+                 StorageAnalysis &storage) {
   auto allocation = buffer.getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != consumer->getBlock() ||
       consumer.getNumReductionLoops() || consumer.getOutputs().size() != 1 ||
@@ -319,7 +318,7 @@ bool reuseOutput(linalg::GenericOp consumer, Value buffer,
   for (auto [input, map] : llvm::zip(consumer.getInputs(), maps))
     if (input == buffer && !map.isIdentity()) return false;
   Value output = consumer.getOutputs()[0];
-  auto external = analysis.externalView(output);
+  auto external = storage.externalView(output);
   auto view = output.getDefiningOp<memref::SubViewOp>();
   if (!external || external.getAccess() != 1 || !view ||
       view.getType().getRank() != allocation.getType().getRank() ||
@@ -337,8 +336,7 @@ bool reuseOutput(linalg::GenericOp consumer, Value buffer,
       if (!left || !right || *left != *right) return false;
     } else if (getConstantIntValue(extent) != allocation.getType().getDimSize(axis)) return false;
   }
-  Value root = analysis.storageRoot(output);
-  auto aliases = queryStorageAliases(root);
+  auto aliases = storage.aliases(output);
   if (!aliases.complete || llvm::any_of(aliases.users, [&](Operation *user) {
         return user != consumer && !isa<memref::DimOp>(user) && !isStorageAliasOperation(user);
       })) return false;
@@ -419,11 +417,12 @@ void forwardPointwiseCopies(func::FuncOp function) {
       auto copy = entry.second;
       auto writer = writers.lookup(entry.first);
       Value target = copy.getTarget();
-      PhysicalProgramAnalysis physical(function);
-      Value targetRoot = physical.storageRoot(target);
+      StorageAnalysis storage(function);
+      Value targetRoot = storage.uniqueOrigin(target);
       // Retain a private owner. Forwarding into caller storage also needs the
       // provider's native ABI to preserve the disjointness used for load reuse.
-      if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(targetRoot.getDefiningOp())) continue;
+      if (!targetRoot ||
+          !isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(targetRoot.getDefiningOp())) continue;
       DominanceInfo dominance(function);
       if (!dominance.dominates(target, writer)) continue;
       bool legal = true;
@@ -433,18 +432,19 @@ void forwardPointwiseCopies(func::FuncOp function) {
       };
       auto maps = writer.getIndexingMapsArray();
       for (auto [number, input] : llvm::enumerate(writer.getInputs())) {
-        if (!isa<MemRefType>(input.getType()) || physical.storageRoot(input) != targetRoot) continue;
+        if (!isa<MemRefType>(input.getType()) || storage.disjoint(input, target)) continue;
         if (strip(input) != strip(target) || maps[number] != maps.back()) legal = false;
       }
       // Only dst[i] = f(dst[i], ...) is safe in-place. Other observations of the
       // old destination between the definition and its copy keep the snapshot.
       for (Operation *between = writer->getNextNode(); legal && between != copy;
            between = between->getNextNode()) {
-        auto effects = getEffectsRecursively(between);
-        if (!effects) { legal = false; break; }
-        for (auto &effect : *effects) {
+        auto effects = storage.effects(between);
+        if (!effects.complete || effects.ordered) { legal = false; break; }
+        for (const StorageEffect &entry : effects.entries) {
+          const auto &effect = entry.effect;
           if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-          if (!effect.getValue() || physical.storageRoot(effect.getValue()) == targetRoot) legal = false;
+          if (!effect.getValue() || !storage.disjoint(effect.getValue(), target)) legal = false;
         }
       }
       if (!legal) continue;
@@ -486,7 +486,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
       }
     });
     for (Operation *consumer : llvm::reverse(consumers)) {
-      PhysicalProgramAnalysis analysis(function);
+      StorageAnalysis analysis(function);
       auto generic = dyn_cast<linalg::GenericOp>(consumer);
       ValueRange inputs = generic ? ValueRange(generic.getInputs())
                                  : ValueRange(cast<ReduceOp>(consumer).getInputs());
@@ -504,7 +504,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
   for (auto operation : llvm::reverse(outputs)) {
     SmallVector<Value> inputs(operation.getInputs());
     for (Value input : inputs) {
-      PhysicalProgramAnalysis analysis(function);
+      StorageAnalysis analysis(function);
       if (reuseOutput(operation, input, analysis)) break;
     }
   }
@@ -522,7 +522,7 @@ LogicalResult reusePrivateStorage(func::FuncOp function) {
   for (auto consumer : llvm::reverse(consumers)) {
     SmallVector<Value> inputs(consumer.getInputs());
     for (Value input : inputs) {
-      PhysicalProgramAnalysis analysis(function);
+      StorageAnalysis analysis(function);
       if (reusePrivateInput(consumer, input, analysis)) break;
     }
   }

@@ -1,17 +1,82 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
-#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/CPU/IR/CPUOps.h"
-#include "mlir/Analysis/AliasAnalysis.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/Dominance.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
+#include "mlir/Dialect/Bufferization/IR/BufferViewFlowOpInterface.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 namespace intent::cpu {
+namespace {
+
+struct CacheHintResource : SideEffects::Resource::Base<CacheHintResource> {
+  StringRef getName() final { return "IntentCPUCacheHint"; }
+};
+
+struct PrefetchEffects
+    : MemoryEffectOpInterface::ExternalModel<PrefetchEffects, memref::PrefetchOp> {
+  void getEffects(Operation *operation,
+                  SmallVectorImpl<MemoryEffects::EffectInstance> &effects) const {
+    // MLIR 20 leaves prefetch effects unspecified. Both cache intentions observe
+    // the descriptor's storage without modifying its contents; isWrite is a
+    // cache hint, not a store. Keep the op's original speculation contract.
+    effects.emplace_back(MemoryEffects::Read::get(),
+                         &operation->getOpOperand(0));
+    // Preserve the hint through ordinary MLIR dead-op elimination even though
+    // it produces no SSA result. Cache state is separate from buffer contents.
+    effects.emplace_back(MemoryEffects::Write::get(), CacheHintResource::get());
+  }
+};
+
+bool isBuffer(Value value) {
+  return value && isa<BaseMemRefType>(value.getType());
+}
+
+bool isAllocation(Value value) {
+  Operation *owner = value.getDefiningOp();
+  return owner && hasEffect<MemoryEffects::Allocate>(owner, value);
+}
+
+bool isEntryArgument(Value value, func::FuncOp function) {
+  auto argument = dyn_cast<BlockArgument>(value);
+  return argument && argument.getOwner() == &function.front();
+}
+
+bool hasBufferResultOrArgument(Operation *operation) {
+  if (llvm::any_of(operation->getResults(), isBuffer)) return true;
+  for (Region &region : operation->getRegions())
+    for (Block &block : region)
+      if (llvm::any_of(block.getArguments(), isBuffer)) return true;
+  return false;
+}
+
+bool describesBufferFlow(Operation *operation) {
+  return isa<bufferization::BufferViewFlowOpInterface, ViewLikeOpInterface,
+             BranchOpInterface, RegionBranchOpInterface,
+             RegionBranchTerminatorOpInterface>(operation);
+}
+
+bool hasAtomicOrdering(Operation *operation) {
+  return isa<AtomicLoadOp, AtomicStoreOp, AtomicRMWOp, AtomicCompareExchangeOp,
+             memref::AtomicRMWOp, memref::GenericAtomicRMWOp>(operation);
+}
+
+func::FuncOp enclosingFunction(Operation *scope) {
+  if (auto function = dyn_cast<func::FuncOp>(scope)) return function;
+  return scope->getParentOfType<func::FuncOp>();
+}
+
+} // namespace
+
+void registerStorageInterfaces(DialectRegistry &registry) {
+  registry.addExtension(+[](MLIRContext *context, memref::MemRefDialect *) {
+    memref::PrefetchOp::attachInterface<PrefetchEffects>(*context);
+  });
+}
 
 std::optional<int64_t> constantDimensionUpperBound(Value memory, unsigned axis) {
   auto type = dyn_cast<MemRefType>(memory.getType());
@@ -19,133 +84,233 @@ std::optional<int64_t> constantDimensionUpperBound(Value memory, unsigned axis) 
   return constantExtentUpperBound(ValueBoundsConstraintSet::Variable(memory, axis));
 }
 
+Value StorageOriginFacts::uniqueOrigin() const {
+  return complete && values.size() == 1 ? values.front() : Value{};
+}
+
+StorageAnalysis::StorageAnalysis(func::FuncOp function)
+    : function(function), flow(function), bufferOrigins(function),
+      aliasAnalysis(function), dominance(function) {}
+
+StorageOriginFacts StorageAnalysis::origins(Value memory) const {
+  StorageOriginFacts result;
+  if (!isBuffer(memory)) return result;
+  result.complete = true;
+  for (Value value : flow.resolveReverse(memory)) {
+    if (!isBuffer(value) || !flow.mayBeTerminalBuffer(value)) continue;
+    result.values.push_back(value);
+    // A declared helper formal has identity within its invocation, but is not a
+    // fresh allocation. Unknown operation terminals have no such contract.
+    auto formal = dyn_cast<BlockArgument>(value);
+    if (!isAllocation(value) && !isEntryArgument(value, function) &&
+        !(formal && isCollectiveArgument(formal)))
+      result.complete = false;
+  }
+  if (result.values.empty()) result.complete = false;
+  return result;
+}
+
+Value StorageAnalysis::uniqueOrigin(Value memory) const {
+  return origins(memory).uniqueOrigin();
+}
+
+intent::ViewType StorageAnalysis::externalView(Value memory) const {
+  auto argument = dyn_cast_or_null<BlockArgument>(uniqueOrigin(memory));
+  auto currentFunction = function;
+  if (!argument || argument.getOwner() != &currentFunction.front()) return {};
+  auto interface = getPublicInterface(currentFunction);
+  return interface ? getPublicView(interface, argument.getArgNumber())
+                   : intent::ViewType{};
+}
+
+bool StorageAnalysis::isReadOnly(Value memory) const {
+  if (auto formal = dyn_cast_or_null<BlockArgument>(memory);
+      formal && isReadOnlyCollectiveArgument(formal)) return true;
+  auto source = origins(memory);
+  if (source.values.empty()) return false;
+  return llvm::all_of(source.values, [&](Value value) {
+    if (auto view = externalView(value)) return view.getAccess() == 0;
+    auto argument = dyn_cast<BlockArgument>(value);
+    return argument && isReadOnlyCollectiveArgument(argument);
+  });
+}
+
 bool isStorageAliasOperation(Operation *operation) {
   return isa<ViewLikeOpInterface, memref::CastOp,
              memref::ExtractStridedMetadataOp>(operation);
 }
 
-StorageAliasFacts queryStorageAliases(Value root) {
+StorageAliasFacts StorageAnalysis::aliases(Value root) const {
   StorageAliasFacts result;
   result.root = root;
-  result.values.push_back(root);
-  llvm::DenseSet<Value> seenValues;
+  if (!isBuffer(root)) {
+    result.complete = false;
+    return result;
+  }
   llvm::DenseSet<Operation *> seenUsers;
-  for (unsigned index = 0; index < result.values.size(); ++index) {
-    Value alias = result.values[index];
-    if (!seenValues.insert(alias).second)
-      continue;
-    for (Operation *user : alias.getUsers()) {
-      if (seenUsers.insert(user).second)
-        result.users.push_back(user);
-      if (isStorageAliasOperation(user)) {
-        // A view-like operation can also read another memref (for example the
-        // shape operand of memref.reshape). Only its view source forwards data.
-        if (auto view = dyn_cast<ViewLikeOpInterface>(user);
-            view && view.getViewSource() != alias) {
-          result.complete = false;
-          continue;
-        }
-        for (Value value : user->getResults())
-          if (isa<BaseMemRefType>(value.getType()) && !seenValues.contains(value))
-            result.values.push_back(value);
-      } else if (auto tasks = dyn_cast<TasksOp>(user)) {
-        for (auto [position, capture] : llvm::enumerate(tasks.getCaptures()))
-          if (capture == alias)
-            result.values.push_back(tasks.getBody().front().getArgument(position + 1));
-      } else if (llvm::any_of(user->getResultTypes(), [](Type type) {
-                   return isa<BaseMemRefType>(type);
-                 })) {
+  for (Value value : flow.resolve(root)) {
+    if (!isBuffer(value)) continue;
+    result.values.push_back(value);
+    for (Operation *user : value.getUsers()) {
+      if (seenUsers.insert(user).second) result.users.push_back(user);
+      // Calls and returns may escape storage. Unknown buffer-producing users
+      // cannot be silently treated as ordinary reads just because their effects
+      // are known. Native forwarding interfaces own their complete flow.
+      if (isa<CallOpInterface, func::ReturnOp,
+              memref::ExtractAlignedPointerAsIndexOp>(user) ||
+          (!describesBufferFlow(user) && hasBufferResultOrArgument(user)) ||
+          !effects(user).complete)
         result.complete = false;
-      }
     }
   }
   return result;
 }
 
 bool StorageLifetime::contains(Operation *operation) const {
-  auto owner = allocation;
-  auto release = end;
-  Operation *ancestor = owner->getBlock()->findAncestorOpInBlock(*operation);
-  return ancestor && owner->isBeforeInBlock(ancestor) &&
-         ancestor->isBeforeInBlock(release);
+  Operation *ancestor = allocation->getBlock()->findAncestorOpInBlock(*operation);
+  return ancestor && allocation->isBeforeInBlock(ancestor) &&
+         ancestor->isBeforeInBlock(end);
 }
 
 std::optional<StorageLifetime>
-queryStorageLifetime(memref::AllocOp allocation) {
-  StorageLifetime lifetime{allocation, {}, queryStorageAliases(allocation)};
-  for (Operation *user : lifetime.aliases.users) {
-    auto end = dyn_cast<memref::DeallocOp>(user);
-    if (!end)
-      continue;
-    if (lifetime.end || end.getMemref() != allocation.getResult() ||
-        end->getBlock() != allocation->getBlock() ||
-        !allocation->isBeforeInBlock(end))
+StorageAnalysis::lifetime(memref::AllocOp allocation) const {
+  StorageLifetime result{allocation, {}, aliases(allocation)};
+  if (!result.aliases.complete) return std::nullopt;
+  for (Operation *user : result.aliases.users) {
+    auto release = dyn_cast<memref::DeallocOp>(user);
+    if (!release) continue;
+    if (result.end || release.getMemref() != allocation.getResult() ||
+        release->getBlock() != allocation->getBlock() ||
+        !allocation->isBeforeInBlock(release))
       return std::nullopt;
-    lifetime.end = end;
+    result.end = release;
   }
-  if (!lifetime.end)
-    return std::nullopt;
-  for (Operation *user : lifetime.aliases.users)
-    if (user != lifetime.end && !lifetime.contains(user))
-      return std::nullopt;
-  return lifetime;
+  if (!result.end) return std::nullopt;
+  for (Operation *user : result.aliases.users)
+    if (user != result.end && !result.contains(user)) return std::nullopt;
+  return result;
 }
 
-namespace {
-bool disjoint(Value first, Value second, PhysicalProgramAnalysis &physical,
-              AliasAnalysis &aliases, EntryRequirementsAttr interface) {
-  Value root = physical.storageRoot(first), other = physical.storageRoot(second);
-  if (root == other) return false;
-  if (aliases.alias(root, other).isNo()) return true;
-  auto source = physical.externalView(root), destination = physical.externalView(other);
-  if (!source || !destination) return false;
-  return source.getConstraints().getNoalias() || destination.getConstraints().getNoalias() ||
-      (interface && interface.getDisjointOutputs() &&
-       (source.getAccess() != 0 || destination.getAccess() != 0));
-}
-} // namespace
-
-bool areDisjointStorage(Value first, Value second, Operation *scope) {
-  auto function = dyn_cast<func::FuncOp>(scope);
-  if (!function) function = scope->getParentOfType<func::FuncOp>();
-  if (!function) return false;
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
-  return disjoint(first, second, physical, aliases,
-      function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr));
-}
-
-bool preservesStorage(Operation *scope, Value memory) {
-  auto function = dyn_cast<func::FuncOp>(scope);
-  if (!function) function = scope->getParentOfType<func::FuncOp>();
-  if (!function) return false;
-  auto effects = getEffectsRecursively(scope);
-  if (!effects) return false;
-  PhysicalProgramAnalysis physical(function);
-  AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-  return llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
-    if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
-    Value affected = effect.getValue();
-    if (!affected || !isa<BaseMemRefType>(affected.getType())) return false;
-    return disjoint(memory, affected, physical, aliases, interface);
-  });
+StorageEffects StorageAnalysis::effects(Operation *scope) const {
+  StorageEffects result;
+  SmallVector<Operation *> pending;
+  if (isa<func::FuncOp>(scope)) {
+    for (Region &region : scope->getRegions())
+      for (Block &block : region)
+        for (Operation &operation : block) pending.push_back(&operation);
+  } else pending.push_back(scope);
+  while (!pending.empty()) {
+    Operation *operation = pending.pop_back_val();
+    bool recursive = operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+    if (recursive)
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block) pending.push_back(&nested);
+    if (auto interface = dyn_cast<MemoryEffectOpInterface>(operation)) {
+      SmallVector<MemoryEffects::EffectInstance> current;
+      interface.getEffects(current);
+      for (auto effect : current)
+        if (effect.getResource() != CacheHintResource::get())
+          result.entries.push_back({operation, effect});
+    } else if (!recursive) result.complete = false;
+    result.ordered |= hasAtomicOrdering(operation);
+  }
+  return result;
 }
 
-bool isStorageReadStable(Value memory, Operation *from, Operation *to) {
-  auto function = from->getParentOfType<func::FuncOp>();
-  if (!function || function != to->getParentOfType<func::FuncOp>() ||
-      !DominanceInfo(function).dominates(memory, to)) return false;
+bool StorageAnalysis::disjoint(Value first, Value second) {
+  if (!isBuffer(first) || !isBuffer(second) || first == second) return false;
+  auto left = origins(first), right = origins(second);
+  // Native local AA does not consume external buffer-flow models. In particular
+  // an isolated task formal can carry an existing allocation. Resolve the
+  // registered flow before asking AA about terminal storage identities.
+  for (Value lhs : left.values)
+    if (llvm::is_contained(right.values, lhs)) return false;
+  auto allocatedAfter = [&](const StorageOriginFacts &sources, Value existing) {
+    return sources.complete && llvm::all_of(sources.values, [&](Value source) {
+      return isAllocation(source) &&
+          dominance.properlyDominates(existing, source.getDefiningOp());
+    });
+  };
+  // A fresh allocation cannot alias a descriptor already available before it.
+  // This also applies inside a helper with opaque state formals: it proves only
+  // the local allocation's freshness, never disjointness between those formals.
+  if (allocatedAfter(left, second) || allocatedAfter(right, first)) return true;
+  if (!left.values.empty() && !right.values.empty())
+    if (auto same = bufferOrigins.isSameAllocation(first, second); same && !*same)
+      return true;
+  if (!left.complete || !right.complete) return false;
+  auto interface = getPublicInterface(function);
+  auto requirements = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  for (Value lhs : left.values)
+    for (Value rhs : right.values) {
+      if (lhs == rhs) return false;
+      if (aliasAnalysis.alias(lhs, rhs).isNo()) continue;
+      if (!isEntryArgument(lhs, function) || !isEntryArgument(rhs, function) || !interface)
+        return false;
+      auto source = getPublicView(interface, cast<BlockArgument>(lhs).getArgNumber());
+      auto target = getPublicView(interface, cast<BlockArgument>(rhs).getArgNumber());
+      if (!source || !target) return false;
+      if (source.getConstraints().getNoalias() || target.getConstraints().getNoalias()) continue;
+      if (requirements && requirements.getDisjointOutputs() &&
+          (source.getAccess() != 0 || target.getAccess() != 0)) continue;
+      return false;
+    }
+  return true;
+}
+
+bool StorageAnalysis::preserves(Operation *scope, Value memory) {
+  auto summary = effects(scope);
+  if (!summary.complete || summary.ordered) return false;
+  for (const auto &entry : summary.entries) {
+    const auto &effect = entry.effect;
+    if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
+    if (!disjoint(memory, effect.getValue())) return false;
+  }
+  return true;
+}
+
+bool StorageAnalysis::isLiveAt(Value memory, Operation *operation) const {
+  auto origin = origins(memory);
+  if (origin.values.empty()) return false;
+  for (Value value : origin.values) {
+    if (auto allocation = value.getDefiningOp<memref::AllocOp>()) {
+      auto owner = lifetime(allocation);
+      if (!owner || !owner->contains(operation)) return false;
+    } else if (auto allocation = value.getDefiningOp<memref::AllocaOp>()) {
+      Operation *owner = allocation->getParentWithTrait<OpTrait::AutomaticAllocationScope>();
+      if (!owner || !owner->isAncestor(operation)) return false;
+    } else if (!isEntryArgument(value, function)) {
+      // A modeled region's opaque formal is valid for that region invocation.
+      // This is a lifetime fact, not a fresh-allocation or no-alias assertion.
+      auto formal = dyn_cast<BlockArgument>(value);
+      if (!formal || !isCollectiveArgument(formal) ||
+          !formal.getOwner()->getParent()->isAncestor(operation->getParentRegion()))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool StorageAnalysis::unchangedBetween(Value memory, Operation *from, Operation *to) {
+  if (!isBuffer(memory) || enclosingFunction(from) != function ||
+      enclosingFunction(to) != function || from->getBlock() != to->getBlock() ||
+      !from->isBeforeInBlock(to) || !dominance.dominates(memory, to) ||
+      !isLiveAt(memory, to)) return false;
+  for (Operation *operation = from->getNextNode(); operation != to;
+       operation = operation->getNextNode())
+    if (!preserves(operation, memory)) return false;
+  return true;
+}
+
+bool StorageAnalysis::readStable(Value memory, Operation *from, Operation *to) {
+  if (!isBuffer(memory) || enclosingFunction(from) != function ||
+      enclosingFunction(to) != function || !dominance.dominates(memory, to) ||
+      !isLiveAt(memory, to)) return false;
   Operation *consumer = from->getBlock()->findAncestorOpInBlock(*to);
   if (!consumer || consumer == from || !from->isBeforeInBlock(consumer)) return false;
-  PhysicalProgramAnalysis physical(function);
-  Value root = physical.storageRoot(memory);
-  if (auto allocation = root.getDefiningOp<memref::AllocOp>()) {
-    auto lifetime = queryStorageLifetime(allocation);
-    if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(to)) return false;
-  }
   for (Operation *operation = from; ; operation = operation->getNextNode()) {
-    if (!preservesStorage(operation, memory)) return false;
+    if (!preserves(operation, memory)) return false;
     if (operation == consumer) break;
   }
   return true;

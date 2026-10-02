@@ -1,11 +1,13 @@
 #include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include <memory>
 
 using namespace mlir;
 namespace intent::cpu {
@@ -14,26 +16,22 @@ namespace {
 class UniformComputations {
 public:
   explicit UniformComputations(func::FuncOp function)
-      : physical(function), values(describeScalarValue) {}
+      : function(function), values(describeScalarValue) {}
 
   void run(Block &block, UniformBindings memory) {
-    auto read = [&](Value value) -> Attribute {
-      if (!isa<MemRefType>(value.getType())) return values.evaluate(value);
-      auto found = memory.find(value);
-      return found != memory.end() ? found->second : memory.lookup(physical.storageRoot(value));
-    };
-    auto forget = [&](Value value) {
-      Value root = physical.storageRoot(value);
-      SmallVector<Value> aliases;
-      for (auto &fact : memory)
-        if (physical.storageRoot(fact.first) == root) aliases.push_back(fact.first);
-      for (Value alias : aliases) memory.erase(alias);
-    };
-    auto write = [&](Value value, Attribute constant) {
-      forget(value);
-      if (constant) memory[value] = constant;
-    };
     for (Operation &operation : llvm::make_early_inc_range(block)) {
+      StorageAnalysis &storage = currentStorage();
+      auto read = [&](Value value) -> Attribute {
+        if (!isa<MemRefType>(value.getType())) return values.evaluate(value);
+        auto found = memory.find(value);
+        if (found != memory.end()) return found->second;
+        Value origin = storage.uniqueOrigin(value);
+        return origin ? memory.lookup(origin) : Attribute{};
+      };
+      auto write = [&](Value value, Attribute constant) {
+        forget(memory, value, storage);
+        if (constant) memory[value] = constant;
+      };
       if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
         write(fill.getOutputs()[0], values.evaluate(fill.getInputs()[0]));
         continue;
@@ -54,14 +52,18 @@ public:
         bool contraction = isMatrixContraction(generic);
         bool unsafeAlias = false;
         for (auto [index, input] : llvm::enumerate(generic.getInputs())) {
-          bool aliasesOutput = physical.storageRoot(input) == physical.storageRoot(output);
+          bool aliasesOutput = isa<MemRefType>(input.getType()) && !storage.disjoint(input, output);
           bool sameElement = input == output && !generic.getNumReductionLoops() &&
               maps[index] == maps.back() && maps.back().isPermutation();
           unsafeAlias |= aliasesOutput && !sameElement;
           inputs[input] = !aliasesOutput || sameElement ? read(input) : Attribute();
         }
-        if (unsafeAlias) { forget(output); continue; }
-        if (foldCoordinateReduction(generic)) { forget(output); continue; }
+        if (unsafeAlias) { forget(memory, output, storage); continue; }
+        if (foldCoordinateReduction(generic)) {
+          storageSnapshot.reset();
+          forget(memory, output, currentStorage());
+          continue;
+        }
         inputs[output] = read(output);
         Attribute constant = foldUniformComputation(generic, inputs);
         if (!contraction && !constant) {
@@ -79,24 +81,25 @@ public:
         Value scalar = builder.create<arith::ConstantOp>(generic.getLoc(), cast<MemRefType>(output.getType()).getElementType(), cast<TypedAttr>(constant));
         builder.create<linalg::FillOp>(generic.getLoc(), ValueRange{scalar}, ValueRange{output});
         generic.erase();
+        storageSnapshot.reset();
         continue;
       }
       if (isa<memref::AllocOp, memref::AllocaOp, memref::CastOp, memref::SubViewOp, memref::DimOp>(operation)) continue;
-      if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) { forget(dealloc.getMemref()); continue; }
-      auto accesses = physical.accesses(&operation);
-      auto effects = getEffectsRecursively(&operation);
-      bool unknownWrite = !effects.has_value();
-      SmallVector<Value> written;
-      if (effects)
-        for (auto &effect : *effects) {
-          if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-          if (Value value = effect.getValue()) written.push_back(value);
-          else unknownWrite = true;
-        }
+      if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) {
+        forget(memory, dealloc.getMemref(), storage);
+        continue;
+      }
       auto invalidate = [&]() {
-        if (unknownWrite) { memory.clear(); return; }
-        for (Value value : written) forget(value);
-        for (auto access : accesses) if (access.write) forget(access.memory);
+        StorageAnalysis &current = currentStorage();
+        auto effects = current.effects(&operation);
+        if (!effects.complete || effects.ordered) { memory.clear(); return; }
+        for (const StorageEffect &entry : effects.entries) {
+          const auto &effect = entry.effect;
+          if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
+          Value written = effect.getValue();
+          if (!written || !isa<MemRefType>(written.getType())) { memory.clear(); return; }
+          forget(memory, written, current);
+        }
       };
       // A repeated body cannot inherit a pre-loop constant for mutated storage.
       if (isa<scf::ForOp, scf::WhileOp>(operation)) invalidate();
@@ -107,6 +110,19 @@ public:
   }
 
 private:
+  StorageAnalysis &currentStorage() {
+    if (!storageSnapshot) storageSnapshot = std::make_unique<StorageAnalysis>(function);
+    return *storageSnapshot;
+  }
+
+  static void forget(UniformBindings &memory, Value value,
+                     StorageAnalysis &storage) {
+    SmallVector<Value> invalidated;
+    for (const auto &fact : memory)
+      if (!storage.disjoint(fact.first, value)) invalidated.push_back(fact.first);
+    for (Value alias : invalidated) memory.erase(alias);
+  }
+
   bool foldCoordinateReduction(linalg::GenericOp reduction) {
     if (reduction.getNumDpsInputs() != 1 || reduction.getNumReductionLoops() != 1 ||
         reduction.getNumLoops() != 1) return false;
@@ -135,7 +151,7 @@ private:
     if (!predicate || predicate.getNumResults() || predicate.getOutputs().size() != 1 ||
         predicate.getNumReductionLoops() || predicate.getNumLoops() != 1 ||
         !predicate.getIndexingMapsArray().back().isIdentity() ||
-        !physical.mayReadAt(input, predicate, reduction)) return false;
+        !currentStorage().unchangedBetween(input, predicate, reduction)) return false;
     Block &predicateBody = predicate.getRegion().front();
     if (!predicateBody.getArguments().back().use_empty() ||
         llvm::any_of(predicateBody.without_terminator(), [](Operation &operation) {
@@ -173,7 +189,8 @@ private:
     return true;
   }
 
-  PhysicalProgramAnalysis physical;
+  func::FuncOp function;
+  std::unique_ptr<StorageAnalysis> storageSnapshot;
   UniformValueAnalysis values;
 };
 

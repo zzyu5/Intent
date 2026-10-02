@@ -112,12 +112,13 @@ bool formPointwiseReduction(SliceReduceOp operation) {
   SmallVector<Value> reads(operation.getSources());
   llvm::append_range(reads, operation.getIdentities());
   llvm::append_range(reads, operation.getCaptures());
+  StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
   for (auto [number, output] : llvm::enumerate(operation.getOutputs())) {
     for (Value input : reads)
-      if (isa<MemRefType>(input.getType()) && !areDisjointStorage(input, output, operation))
+      if (isa<MemRefType>(input.getType()) && !storage.disjoint(input, output))
         return false;
     for (Value previous : operation.getOutputs().take_front(number))
-      if (!areDisjointStorage(previous, output, operation)) return false;
+      if (!storage.disjoint(previous, output)) return false;
   }
   OpBuilder builder(operation);
   Location location = operation.getLoc();

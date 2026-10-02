@@ -1,8 +1,8 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "../../../Dialect/CPU/Transforms/ImplementationInputs.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
-#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -38,12 +38,12 @@ std::optional<LocalEpilogue> localEpilogue(linalg::GenericOp contraction) {
     if (user != initialization && user != contraction && user != consumer) return std::nullopt;
   auto shape = cast<MemRefType>(partial.getType()).getShape();
   Type element = cast<MemRefType>(partial.getType()).getElementType();
-  PhysicalProgramAnalysis analysis(contraction->getParentOfType<func::FuncOp>());
+  StorageAnalysis storage(contraction->getParentOfType<func::FuncOp>());
   Value destination = consumer.getOutputs()[0];
   for (Value memory : consumer->getOperands()) {
     auto type = dyn_cast<MemRefType>(memory.getType());
     if (!type || type.getShape() != shape || type.getElementType() != element) return std::nullopt;
-    if (memory != destination && analysis.storageRoot(memory) == analysis.storageRoot(destination))
+    if (memory != destination && !storage.disjoint(memory, destination))
       return std::nullopt;
   }
   for (Operation &operation : consumer.getRegion().front().without_terminator())
@@ -97,16 +97,11 @@ std::optional<IndexedContraction> indexedContraction(linalg::GenericOp operation
   Value rhs = load.getMemref();
   if (rhs.getParentBlock() == &body) return std::nullopt;
   auto function = operation->getParentOfType<func::FuncOp>();
-  PhysicalProgramAnalysis analysis(function);
-  AliasAnalysis aliases(function);
-  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  StorageAnalysis storage(function);
   auto independent = [&](Value input) {
-    if (aliases.alias(input, output).isNo()) return true;
-    auto source = analysis.externalView(input), destination = analysis.externalView(output);
-    return source && destination && interface.getDisjointOutputs() &&
-        analysis.storageRoot(input) != analysis.storageRoot(output) && destination.getAccess() != 0;
+    return storage.disjoint(input, output);
   };
-  if (!independent(lhs) || !analysis.isReadOnly(rhs)) return std::nullopt;
+  if (!independent(lhs) || !storage.isReadOnly(rhs)) return std::nullopt;
   for (Operation &instruction : body.without_terminator()) {
     if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction);
         coordinate && coordinate.getDim() == 2 && coordinate.getResult() != column) return std::nullopt;

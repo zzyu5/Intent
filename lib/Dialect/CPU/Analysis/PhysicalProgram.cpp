@@ -60,116 +60,9 @@ bool isMatrixContraction(linalg::GenericOp operation) {
   return queryContractionAxes(operation).has_value();
 }
 
-Value PhysicalProgramAnalysis::storageRoot(Value memory) {
-  while (true) {
-    if (auto view = dyn_cast_or_null<ViewLikeOpInterface>(memory.getDefiningOp())) memory = view.getViewSource();
-    else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
-    else if (auto metadata = memory.getDefiningOp<memref::ExtractStridedMetadataOp>()) memory = metadata.getSource();
-    else if (auto argument = dyn_cast<BlockArgument>(memory)) {
-      auto tasks = dyn_cast<TasksOp>(argument.getOwner()->getParentOp());
-      if (!tasks || argument.getArgNumber() == 0) return memory;
-      memory = tasks.getCaptures()[argument.getArgNumber() - 1];
-    }
-    else return memory;
-  }
-}
-
-intent::ViewType PhysicalProgramAnalysis::externalView(Value memory) {
-  auto argument = dyn_cast<BlockArgument>(storageRoot(memory));
-  if (!argument || argument.getOwner() != &function.front()) return {};
-  auto interface = getPublicInterface(function);
-  return interface ? getPublicView(interface, argument.getArgNumber()) : intent::ViewType();
-}
-
-bool PhysicalProgramAnalysis::isReadOnly(Value memory) {
-  auto view = externalView(memory);
-  return view && view.getAccess() == 0;
-}
-
-bool PhysicalProgramAnalysis::mayReadAt(Value memory, Operation *from, Operation *to) {
-  if (isReadOnly(memory)) return true;
-  if (from->getBlock() != to->getBlock() || !from->isBeforeInBlock(to)) return false;
-  Value root = storageRoot(memory);
-  if (!root.getDefiningOp<memref::AllocOp>() && !root.getDefiningOp<memref::AllocaOp>())
-    return false;
-  for (Operation *operation = from->getNextNode(); operation != to;
-       operation = operation->getNextNode()) {
-    if (isMemoryEffectFree(operation)) continue;
-    auto effects = getEffectsRecursively(operation);
-    if (!effects) return false;
-    for (auto &effect : *effects) {
-      if (isa<MemoryEffects::Read>(effect.getEffect())) continue;
-      if (!effect.getValue() || storageRoot(effect.getValue()) == root) return false;
-    }
-  }
-  return true;
-}
-
-SmallVector<MemoryAccess> PhysicalProgramAnalysis::accesses(Operation *scope) {
-  SmallVector<MemoryAccess> result;
-  scope->walk<WalkOrder::PreOrder>([&](Operation *operation) {
-    auto add = [&](Value memory, bool read, bool write) {
-      if (isa<MemRefType>(memory.getType()))
-        result.push_back({operation, memory, read, write});
-    };
-    if (auto generic = dyn_cast<linalg::LinalgOp>(operation)) {
-      for (OpOperand *input : generic.getDpsInputOperands())
-        if (generic.payloadUsesValueFromOperand(input)) add(input->get(), true, false);
-      for (OpOperand &output : generic.getDpsInitsMutable())
-        add(output.get(), generic.payloadUsesValueFromOperand(&output), true);
-    } else if (auto reduce = dyn_cast<ReduceOp>(operation)) {
-      for (Value input : reduce.getInputs()) add(input, true, false);
-    } else if (auto reduce = dyn_cast<SliceReduceOp>(operation)) {
-      for (Value input : reduce.getSources()) add(input, true, false);
-      for (Value input : reduce.getIdentities()) add(input, true, false);
-      for (Value input : reduce.getCaptures()) add(input, true, false);
-      for (Value output : reduce.getOutputs()) add(output, false, true);
-    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
-      for (Value input : scan.getSources()) add(input, true, false);
-      for (Value input : scan.getInitials()) add(input, true, false);
-      for (Value input : scan.getCaptures()) add(input, true, false);
-      for (Value output : scan.getOutputs()) add(output, false, true);
-    } else if (auto histogram = dyn_cast<HistogramOp>(operation)) {
-      add(histogram.getValues(), true, false); add(histogram.getValid(), true, false);
-      add(histogram.getOutput(), false, true);
-    } else if (auto atomic = dyn_cast<AtomicLoadOp>(operation)) {
-      add(atomic.getTarget(), true, false);
-    } else if (auto atomic = dyn_cast<AtomicStoreOp>(operation)) {
-      add(atomic.getTarget(), false, true);
-    } else if (auto atomic = dyn_cast<AtomicRMWOp>(operation)) {
-      add(atomic.getTarget(), true, true);
-    } else if (auto atomic = dyn_cast<AtomicCompareExchangeOp>(operation)) {
-      add(atomic.getTarget(), true, true);
-    } else if (auto update = dyn_cast<memref::GenericAtomicRMWOp>(operation)) {
-      add(update.getMemref(), true, true);
-    } else if (isa<RegionFoldOp, RegionScanOp>(operation)) {
-      auto program = cast<RegionOpInterface>(operation);
-      for (Value input : program.getSources()) add(input, true, false);
-      for (Value input : program.getIdentities()) add(input, true, false);
-      for (Value input : program.getInitialStates()) add(input, true, false);
-      for (Value input : program.getCaptures()) add(input, true, false);
-      for (Value output : program.getDestinations()) add(output, false, true);
-    } else if (auto quantize = dyn_cast<QuantizeOp>(operation)) {
-      add(quantize.getInput(), true, false);
-      add(quantize.getOutput(), false, true);
-    } else if (auto dot = dyn_cast<QuantizedDotOp>(operation)) {
-      add(dot.getLhs(), true, false);
-      add(dot.getRhs(), true, false);
-      add(dot.getOutput(), false, true);
-    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
-      add(copy.getSource(), true, false); add(copy.getTarget(), false, true);
-    } else if (auto load = dyn_cast<memref::LoadOp>(operation)) add(load.getMemref(), true, false);
-    else if (auto load = dyn_cast<vector::LoadOp>(operation)) add(load.getBase(), true, false);
-    else if (auto store = dyn_cast<memref::StoreOp>(operation)) add(store.getMemref(), false, true);
-    else if (auto store = dyn_cast<vector::StoreOp>(operation)) add(store.getBase(), false, true);
-    return isa<SliceReduceOp, ScanOp, RegionOpInterface>(operation)
-        ? WalkResult::skip() : WalkResult::advance();
-  });
-  return result;
-}
-
 SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
   SmallVector<AllocationFacts> result;
+  StorageAnalysis storage(function);
   function.walk([&](Operation *operation) {
     if (!isa<memref::AllocOp, memref::AllocaOp>(operation)) return;
     Value value = operation->getResult(0);
@@ -179,23 +72,21 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
     if (type.hasStaticShape() && type.getNumElements() <= std::numeric_limits<int64_t>::max() / elementBytes)
       bytes = type.getNumElements() * elementBytes;
     Operation *writer = nullptr;
-    bool multiple = false;
-    for (Operation *user : value.getUsers()) {
-      bool writes = false;
-      if (auto generic = dyn_cast<linalg::LinalgOp>(user))
-        writes = llvm::is_contained(generic.getDpsInits(), value);
-      else if (auto store = dyn_cast<memref::StoreOp>(user)) writes = store.getMemref() == value;
-      else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == value;
-      else if (auto quantize = dyn_cast<QuantizeOp>(user)) writes = quantize.getOutput() == value;
-      else if (auto dot = dyn_cast<QuantizedDotOp>(user)) writes = dot.getOutput() == value;
-      else if (auto scan = dyn_cast<ScanOp>(user)) writes = llvm::is_contained(scan.getOutputs(), value);
-      else if (auto reduce = dyn_cast<SliceReduceOp>(user)) writes = llvm::is_contained(reduce.getOutputs(), value);
-      else if (auto histogram = dyn_cast<HistogramOp>(user)) writes = histogram.getOutput() == value;
-      else if (!isa<memref::LoadOp, memref::DimOp, memref::DeallocOp, ReduceOp, QuantizedDotOp>(user))
-        multiple = true;
-      if (writes) {
-        if (writer) multiple = true;
-        writer = user;
+    auto aliases = storage.aliases(value);
+    bool multiple = !aliases.complete;
+    for (Operation *user : aliases.users) {
+      auto effects = storage.effects(user);
+      multiple |= !effects.complete || effects.ordered;
+      for (const StorageEffect &entry : effects.entries) {
+        if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
+        Value affected = entry.effect.getValue();
+        if (affected && storage.disjoint(value, affected)) continue;
+        if (!affected || storage.uniqueOrigin(affected) != value) {
+          multiple = true;
+          continue;
+        }
+        if (writer && writer != entry.operation) multiple = true;
+        writer = entry.operation;
       }
     }
     result.push_back({value, operation->getParentOp(), multiple ? nullptr : writer,
@@ -205,6 +96,7 @@ SmallVector<AllocationFacts> PhysicalProgramAnalysis::allocations() {
 }
 
 LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
+  StorageAnalysis storage(function);
   auto interface = getPublicInterface(function);
   auto requirements = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
   if (failed(verifyPublicInterface(function, interface))) return failure();
@@ -252,17 +144,21 @@ LogicalResult PhysicalProgramAnalysis::verify(bool realized) {
     if (facts.stack && capabilities && (!facts.bytes || *facts.bytes > capabilities.getPrivateBytes()))
       return facts.value.getDefiningOp()->emitError("CPU stack allocation exceeds its declared budget");
     if (!facts.stack) {
-      if (!queryStorageLifetime(cast<memref::AllocOp>(facts.value.getDefiningOp())))
+      if (!storage.lifetime(cast<memref::AllocOp>(facts.value.getDefiningOp())))
         return facts.value.getDefiningOp()->emitError(
             "CPU heap allocation requires one lexical lifetime end covering every known alias use");
     }
   }
   bool invalid = false;
-  for (MemoryAccess access : accesses(function)) {
-    auto view = externalView(access.memory);
-    if (access.write && view && view.getAccess() == 0) {
-      access.operation->emitError("CPU write contradicts its input-only ABI");
-      invalid = true;
+  for (const StorageEffect &entry : storage.effects(function).entries) {
+    if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
+    for (Value origin : storage.origins(entry.effect.getValue()).values) {
+      auto view = storage.externalView(origin);
+      if (view && view.getAccess() == 0) {
+        entry.operation->emitError("CPU write contradicts its input-only ABI");
+        invalid = true;
+        break;
+      }
     }
   }
   function.walk([&](Operation *operation) {

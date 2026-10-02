@@ -232,7 +232,8 @@ bool foldRead(linalg::GenericOp producer, func::FuncOp function) {
   auto allocation = producer.getOutputs()[0].getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock()) return false;
   auto strides = rowMajorStrides(allocation.getType());
-  auto lifetime = queryStorageLifetime(allocation);
+  StorageAnalysis storage(function);
+  auto lifetime = storage.lifetime(allocation);
   if (!strides || !lifetime || !lifetime->aliases.complete || lifetime->aliases.values.size() != 1) return false;
   Block &body = producer.getRegion().front();
   if (!body.getArguments().back().use_empty()) return false;
@@ -251,9 +252,7 @@ bool foldRead(linalg::GenericOp producer, func::FuncOp function) {
   DominanceInfo dominance(function);
   if (!dominance.dominates(read.getMemref(), allocation) ||
       llvm::any_of(coordinates.getSymbols(), [&](Value symbol) { return !dominance.dominates(symbol, allocation); })) return false;
-  PhysicalProgramAnalysis physical(function);
-  Value sourceRoot = physical.storageRoot(read.getMemref());
-  if (sourceRoot == allocation.getResult()) return false;
+  if (!storage.disjoint(read.getMemref(), allocation)) return false;
   for (Operation *user : lifetime->aliases.users) {
     if (user == producer || user == lifetime->end || isa<memref::DimOp>(user)) continue;
     // An effect-free operation can still observe the backing pointer or its
@@ -264,8 +263,8 @@ bool foldRead(linalg::GenericOp producer, func::FuncOp function) {
           !llvm::is_contained(scan.getCaptures(), allocation.getResult()) &&
           !llvm::is_contained(scan.getInitials(), allocation.getResult());
     if (!elements) return false;
-    if (!preservesStorage(user, allocation) ||
-        !isStorageReadStable(read.getMemref(), producer, user)) return false;
+    if (!storage.preserves(user, allocation) ||
+        !storage.readStable(read.getMemref(), producer, user)) return false;
   }
   Value view = contiguousView(read.getMemref(), allocation.getType(), *strides,
                               *displacement, coordinates.getSymbols(), allocation);
@@ -281,7 +280,8 @@ bool composeWrite(memref::StoreOp store, func::FuncOp function) {
   auto allocation = read ? read.getMemref().getDefiningOp<memref::AllocOp>() : memref::AllocOp();
   if (!allocation || !read.getResult().hasOneUse() || read->getBlock() != store->getBlock()) return false;
   auto strides = rowMajorStrides(allocation.getType());
-  auto lifetime = queryStorageLifetime(allocation);
+  StorageAnalysis storage(function);
+  auto lifetime = storage.lifetime(allocation);
   if (!strides || !lifetime || !lifetime->aliases.complete || !allocation.getType().getRank()) return false;
   SmallVector<scf::ForOp> loops;
   Operation *root = store;
@@ -310,7 +310,7 @@ bool composeWrite(memref::StoreOp store, func::FuncOp function) {
       destination.getMemorySpace() != allocation.getType().getMemorySpace()) return false;
   // memref.copy itself must preserve the scalar traversal before the separate
   // output-forwarding transform considers it. Overlapping ranges stay as loops.
-  if (!areDisjointStorage(allocation.getResult(), store.getMemref(), function)) return false;
+  if (!storage.disjoint(allocation, store.getMemref())) return false;
   auto displacement = coordinates.displacement(store.getMemref(), store.getIndices(), *strides);
   if (!displacement) return false;
   DominanceInfo dominance(function);

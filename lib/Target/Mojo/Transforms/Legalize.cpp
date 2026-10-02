@@ -37,7 +37,7 @@ bool needsFloatingPointEnvironment(Operation *scope) {
   };
   return scope->walk([&](Operation *operation) {
     // Calls may depend on the caller's FP state even with an integer-only ABI.
-    if (isa<func::CallOp>(operation) ||
+    if (isa<func::CallOp, cpu::InvokeOp>(operation) ||
         llvm::any_of(operation->getOperandTypes(), floating) ||
         llvm::any_of(operation->getResultTypes(), floating))
       return WalkResult::interrupt();
@@ -71,12 +71,11 @@ void promotePrivateScratch(func::FuncOp function, int64_t budget) {
         !allocation.getType().getLayout().isIdentity()) continue;
     int64_t alignment = alignmentOf(allocation);
     if (!fits(*facts.bytes, alignment)) continue;
-    auto lifetime = cpu::queryStorageLifetime(allocation);
+    cpu::StorageAnalysis storage(function);
+    auto lifetime = storage.lifetime(allocation);
     if (!lifetime || !lifetime->aliases.complete) continue;
     if (!llvm::all_of(lifetime->aliases.users, [&](Operation *user) {
-          return user == lifetime->end || cpu::isStorageAliasOperation(user) ||
-                 isa<memref::LoadOp, memref::StoreOp, memref::DimOp,
-                     vector::LoadOp, vector::StoreOp, memref::PrefetchOp>(user);
+          return user == lifetime->end || storage.effects(user).complete;
         })) continue;
     OpBuilder builder(allocation);
     auto stack = builder.create<memref::AllocaOp>(allocation.getLoc(), allocation.getType(),
@@ -102,7 +101,8 @@ LogicalResult checkSurface(ModuleOp module) {
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::FromElementsOp, vector::ShuffleOp, vector::StepOp,
         vector::ExtractElementOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
-        cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation);
+        cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp,
+        cpu::InvokeOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
     if (auto dimension = dyn_cast<memref::DimOp>(operation))

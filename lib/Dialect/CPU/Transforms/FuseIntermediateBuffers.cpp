@@ -1,7 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Utilities.h"
-#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -63,19 +62,13 @@ void forwardDestinations(func::FuncOp function) {
                     replacementType.getMemorySpace() != allocation.getType().getMemorySpace())) continue;
     bool castReplacement = replacementType != allocation.getType() &&
         sameStaticLayout(replacementType, allocation.getType());
-    PhysicalProgramAnalysis analysis(function);
-    AliasAnalysis aliasAnalysis(function);
-    Value targetRoot = analysis.storageRoot(target);
-    auto external = analysis.externalView(target);
+    StorageAnalysis storage(function);
+    Value targetRoot = storage.uniqueOrigin(target);
+    if (!targetRoot) continue;
+    auto external = storage.externalView(target);
     if (!targetRoot.getDefiningOp<memref::AllocOp>() &&
         (!external || external.getAccess() != 1)) continue;
     if (targetRoot == allocation.getResult()) continue;
-    auto disjoint = [&](Value memory) {
-      Value root = analysis.storageRoot(memory);
-      if (root == targetRoot) return false;
-      if (aliasAnalysis.alias(root, targetRoot).isNo()) return true;
-      return external && analysis.externalView(root);
-    };
     auto targetOp = target.getDefiningOp();
     DominanceInfo dominance(function);
     if (targetOp && !dominance.dominates(targetOp, allocation)) {
@@ -85,7 +78,7 @@ void forwardDestinations(func::FuncOp function) {
             return !dominance.dominates(value, allocation);
           })) continue;
     }
-    auto lifetime = queryStorageLifetime(allocation);
+    auto lifetime = storage.lifetime(allocation);
     if (!lifetime || !lifetime->aliases.complete) continue;
     bool legal = true;
     Operation *lastUse = copy;
@@ -117,21 +110,17 @@ void forwardDestinations(func::FuncOp function) {
     for (Operation *between = allocation->getNextNode(); legal && between != lastUse->getNextNode();
          between = between->getNextNode()) {
       if (between == copy) continue;
-      between->walk([&](Operation *operation) {
-        if (isMemoryEffectFree(operation)) return;
-        auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
-        if (!effects) {
-          if (!operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) legal = false;
-          return;
-        }
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (auto &effect : instances) {
-          if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-          if (!effect.getValue() || !disjoint(effect.getValue()))
-            legal = false;
-        }
-      });
+      auto effects = storage.effects(between);
+      if (!effects.complete || effects.ordered) {
+        legal = false;
+        break;
+      }
+      for (const StorageEffect &entry : effects.entries) {
+        const auto &effect = entry.effect;
+        if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
+        if (!effect.getValue() || !storage.disjoint(effect.getValue(), target))
+          legal = false;
+      }
     }
     if (!legal) continue;
     if (targetOp && !dominance.dominates(targetOp, allocation)) targetOp->moveBefore(allocation);
@@ -170,50 +159,6 @@ bool canReplay(Value value, Operation *root, llvm::SmallPtrSetImpl<Operation *> 
   if (operation->getNumRegions() || operation->getNumResults() != 1 ||
       (!isMemoryEffectFree(operation) && !isa<memref::LoadOp>(operation))) return false;
   return llvm::all_of(operation->getOperands(), [&](Value input) { return canReplay(input, root, seen); });
-}
-
-bool stableRead(memref::LoadOp load, Operation *producer, func::FuncOp function,
-                ArrayRef<Operation *> consumers) {
-  PhysicalProgramAnalysis physical(function);
-  Value base = physical.storageRoot(load.getMemref());
-  if (physical.isReadOnly(base)) return true;
-  if (auto argument = dyn_cast<BlockArgument>(base)) {
-    if (argument.getOwner() != &function.front()) return false;
-    auto abi = getPublicInterface(function);
-    if (!getPublicView(abi, argument.getArgNumber())) return false;
-    auto aliases = queryStorageAliases(base);
-    if (!aliases.complete) return false;
-    for (Operation *user : aliases.users) {
-      if (isStorageAliasOperation(user) || isa<memref::LoadOp, memref::DimOp>(user)) continue;
-      if (!isa<memref::StoreOp>(user)) return false;
-      Operation *write = producer->getBlock()->findAncestorOpInBlock(*user);
-      if (!write || write == producer || !write->isBeforeInBlock(producer)) return false;
-    }
-    return true;
-  }
-  auto allocation = base.getDefiningOp<memref::AllocOp>();
-  if (!allocation) return false;
-  auto lifetime = queryStorageLifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete) return false;
-  Block *owner = allocation->getBlock();
-  Operation *preparation = owner->findAncestorOpInBlock(*producer);
-  if (!preparation) return false;
-  for (Operation *user : lifetime->aliases.users) {
-    if (user == lifetime->end || isStorageAliasOperation(user) ||
-        isa<memref::LoadOp, vector::LoadOp, memref::DimOp>(user)) continue;
-    if (!isa<memref::StoreOp, vector::StoreOp>(user)) return false;
-    Operation *write = owner->findAncestorOpInBlock(*user);
-    if (!write || write == preparation) return false;
-    if (write->isBeforeInBlock(preparation)) continue;
-    if (!llvm::all_of(consumers, [&](Operation *consumer) {
-          Operation *use = owner->findAncestorOpInBlock(*consumer);
-          return use && use->isBeforeInBlock(write);
-        })) return false;
-  }
-  // Replay extends the backing allocation's observation to every consumer.
-  return llvm::all_of(consumers, [&](Operation *consumer) {
-    return lifetime->contains(consumer);
-  });
 }
 
 Value replay(Value value, Operation *root, OpBuilder &builder, IRMapping &mapping) {
@@ -413,8 +358,19 @@ bool fuse(memref::AllocOp allocation) {
         })) return false;
   }
   auto function = allocation->getParentOfType<func::FuncOp>();
-  for (Operation *operation : seen)
-    if (auto read = dyn_cast<memref::LoadOp>(operation); read && !stableRead(read, root, function, loads)) return false;
+  StorageAnalysis storage(function);
+  for (Operation *operation : seen) {
+    if (auto read = dyn_cast<memref::LoadOp>(operation)) {
+      // canReplay already proves the local descriptor can be cloned. Prove
+      // stability of its backing storage without requiring that descriptor's
+      // original SSA value to dominate a consumer outside the producer.
+      Value backing = storage.uniqueOrigin(read.getMemref());
+      if (!backing) return false;
+      if (!llvm::all_of(loads, [&](Operation *consumer) {
+            return storage.readStable(backing, root, consumer);
+          })) return false;
+    }
+  }
   DominanceInfo dominance(function);
   for (Operation *load : loads)
     if (root->isAncestor(load) || !dominance.dominates(root, load)) return false;

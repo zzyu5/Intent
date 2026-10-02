@@ -3,6 +3,7 @@
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/IR/WeftDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "TaskLowering.h"
 #include "Quantization.h"
@@ -44,12 +45,22 @@ LogicalResult legalizeProgram(ModuleOp program) {
   SmallVector<func::FuncOp> functions(cpuProgram.getOps<func::FuncOp>());
   if (functions.empty()) return cpuProgram.emitError("Weft conversion requires CPU candidates");
   auto interface = getPublicInterface(functions.front());
-  cpu::PhysicalProgramAnalysis rootAnalysis(functions.front());
+  cpu::StorageAnalysis rootAnalysis(functions.front());
   llvm::DenseMap<Value, int64_t> alignments;
-  functions.front().walk([&](cpu::QuantizedDotOp op) {
-    alignments[rootAnalysis.storageRoot(op.getLhs())] = 2;
-    alignments[rootAnalysis.storageRoot(op.getRhs())] = 4;
+  auto alignmentStatus = functions.front().walk([&](cpu::QuantizedDotOp op) {
+    for (auto [memory, alignment] :
+         {std::pair<Value, int64_t>{op.getLhs(), 2}, {op.getRhs(), 4}}) {
+      auto origins = rootAnalysis.origins(memory);
+      if (!origins.complete) {
+        op.emitError("encoded input alignment requires known storage origins");
+        return WalkResult::interrupt();
+      }
+      for (Value origin : origins.values)
+        alignments[origin] = std::max(alignments.lookup(origin), alignment);
+    }
+    return WalkResult::advance();
   });
+  if (alignmentStatus.wasInterrupted()) return failure();
   SmallVector<ArgumentAlignmentAttr> publicAlignments(interface.getArguments().size());
   for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
     if (auto view = getPublicView(interface, index)) {
@@ -70,17 +81,23 @@ LogicalResult legalizeProgram(ModuleOp program) {
   for (func::FuncOp function : functions) {
     for (auto [index, alignment] : llvm::enumerate(publicAlignments))
       if (alignment) function.setArgAttr(index, argumentAlignmentAttr, alignment);
-    cpu::PhysicalProgramAnalysis analysis(function);
+    cpu::StorageAnalysis storage(function);
     llvm::DenseMap<Value, intent::QuantFormat> formats;
     bool conflict = false;
+    bool unresolved = false;
     auto requireFormat = [&](Value memory, intent::QuantFormat format) {
-      auto [it, inserted] = formats.try_emplace(analysis.storageRoot(memory), format);
-      if (!inserted && it->second != format) conflict = true;
+      auto origins = storage.origins(memory);
+      unresolved |= !origins.complete;
+      for (Value origin : origins.values) {
+        auto [it, inserted] = formats.try_emplace(origin, format);
+        if (!inserted && it->second != format) conflict = true;
+      }
     };
     function.walk([&](cpu::QuantizeOp op) { requireFormat(op.getOutput(), op.getFormat()); });
     function.walk([&](cpu::QuantizedDotOp op) {
       requireFormat(op.getLhs(), op.getLhsFormat()); requireFormat(op.getRhs(), op.getRhsFormat());
     });
+    if (unresolved) return function.emitError("encoded CPU storage has unresolved origins");
     if (conflict) return function.emitError("one CPU storage has incompatible quantized record interpretations");
     TaskLowering lowering(function, output, formats, **registry);
     OpBuilder host(function.getContext());
@@ -125,7 +142,11 @@ LogicalResult legalizeProgram(ModuleOp program) {
         declaration.setPrivate();
         declaration->setAttr("cpu.external_runtime", host.getUnitAttr());
       }
-      host.create<func::CallOp>(loc, name, TypeRange{}, arguments);
+      auto deviceTask = cast<wk::KernelOp>(SymbolTable::lookupSymbolIn(output, name));
+      auto accessModes = taskCallAccesses(deviceTask);
+      if (failed(accessModes)) return failure();
+      host.create<cpu::InvokeOp>(loc, FlatSymbolRefAttr::get(program.getContext(), name),
+                                 arguments, *accessModes);
       taskBindings.push_back(TaskBindingAttr::get(program.getContext(),
           symbol(hostModuleName, function.getName()), symbol(hostModuleName, name),
           symbol(deviceModuleName, name), ordinal,

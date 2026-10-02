@@ -4,6 +4,7 @@
 #include "Intent/Dialect/Intent/IR/IntentDialect.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/IR/ImplementationProvider.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
@@ -42,6 +43,7 @@ private:
 void registerDialects(DialectRegistry &registry) {
   registerAllDialects(registry);
   cpu::registerExtentRelations(registry);
+  cpu::registerStorageInterfaces(registry);
   registry.insert<IntentDialect, gpu::IntentGPUDialect, cpu::IntentCPUDialect,
       dsa::IntentDSADialect>();
   registry.addExtension(+[](MLIRContext *, cpu::IntentCPUDialect *dialect) {

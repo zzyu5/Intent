@@ -89,7 +89,7 @@ std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequiremen
   auto view = source.getDefiningOp<memref::SubViewOp>();
   bool transposed = false;
   if (!view && source.getDefiningOp<memref::AllocOp>()) {
-    PhysicalProgramAnalysis physical(consumer->getParentOfType<func::FuncOp>());
+    StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
     auto swap = AffineMap::getPermutationMap(ArrayRef<unsigned>{1, 0}, source.getContext());
     for (Operation *user : source.getUsers()) {
       auto producer = dyn_cast<linalg::GenericOp>(user);
@@ -102,7 +102,7 @@ std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequiremen
       if (body.getOperations().size() != 1 || body.getTerminator()->getOperand(0) != body.getArgument(0) ||
           !maps[0].isPermutation() || !maps[1].isPermutation() ||
           maps[0].compose(inversePermutation(maps[1])) != swap ||
-          !physical.mayReadAt(source, producer, consumer)) continue;
+          !storage.unchangedBetween(source, producer, consumer)) continue;
       view = producer.getInputs()[0].getDefiningOp<memref::SubViewOp>();
       if (view) { transposed = true; break; }
     }
@@ -180,9 +180,9 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
   if (!window) return std::nullopt;
   auto view = window->view;
   Value base = view.getSource();
-  PhysicalProgramAnalysis physical(function);
+  StorageAnalysis storage(function);
   auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
-  if (!interface || !interface.getDisjointOutputs() || !physical.isReadOnly(base)) return std::nullopt;
+  if (!interface || !interface.getDisjointOutputs() || !storage.isReadOnly(base)) return std::nullopt;
   unsigned axis = window->axis;
   unsigned logicalAxis = window->transposed ? 1 - axis : axis;
   OpBuilder b(operation);
@@ -197,21 +197,7 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
     auto step = getConstantIntValue(candidate.getStep());
     if (!step || *step <= 0 || !candidate->isAncestor(view) || !dominance.dominates(base, candidate)) continue;
     if (!hasIndependentWindowCoordinates(view, candidate)) continue;
-    auto effects = getEffectsRecursively(candidate);
-    if (!effects) continue;
-    bool stable = true;
-    candidate->walk([&](Operation *nested) {
-      if (!isa<MemoryEffectOpInterface>(nested) && !nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) stable = false;
-    });
-    Value root = physical.storageRoot(base);
-    for (auto &effect : *effects) {
-      if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-      Value memory = effect.getValue();
-      if (!memory || !isa<MemRefType>(memory.getType()) ||
-          !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) || physical.storageRoot(memory) == root)
-        stable = false;
-    }
-    if (stable) scope = candidate;
+    if (storage.preserves(candidate, base)) scope = candidate;
   }
   if (!scope) return std::nullopt;
 
@@ -286,8 +272,9 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
 Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp operation,
     const InputRequirement &requirement, const Implementation &implementation) {
   if (auto branch = dyn_cast<scf::IfOp>(operation->getParentOp()); branch && !branch.getElseRegion().empty()) {
-    PhysicalProgramAnalysis physical(function);
-    if (physical.isReadOnly(source) && DominanceInfo(function).dominates(source, branch)) {
+    StorageAnalysis storage(function);
+    if (storage.isReadOnly(source) && storage.preserves(branch, source) &&
+        DominanceInfo(function).dominates(source, branch)) {
       auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
       auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
       Block *other = operation->getParentRegion() == &branch.getThenRegion() ? branch.elseBlock() : branch.thenBlock();
@@ -306,28 +293,8 @@ Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp o
   if (!loop || loop.getNumResults()) return operation;
   auto step = getConstantIntValue(loop.getStep());
   if (!step || *step <= 0 || !DominanceInfo(function).dominates(source, loop)) return operation;
-  auto effects = getEffectsRecursively(loop);
-  if (!effects) return operation;
-  bool known = true;
-  loop->walk([&](Operation *nested) {
-    if (!isa<MemoryEffectOpInterface>(nested) &&
-        !nested->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) known = false;
-  });
-  if (!known) return operation;
-  PhysicalProgramAnalysis physical(function);
-  Value sourceRoot = physical.storageRoot(source);
-  auto fresh = [](Value value) {
-    return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(value.getDefiningOp());
-  };
-  for (auto &effect : *effects) {
-    if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-    Value memory = effect.getValue();
-    if (!memory || !isa<MemRefType>(memory.getType()) ||
-        !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) return operation;
-    Value root = physical.storageRoot(memory);
-    if (root == sourceRoot || (!fresh(root) && !fresh(sourceRoot))) return operation;
-  }
-  return loop;
+  StorageAnalysis storage(function);
+  return storage.preserves(loop, source) ? loop.getOperation() : operation;
 }
 
 FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp operation,
@@ -337,8 +304,10 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp o
     return operation.emitError("captured input supply requires its consumer load and enclosing scope"), failure();
   Value source = input.getMemref();
   DominanceInfo dominance(function);
-  PhysicalProgramAnalysis analysis(function);
-  if (!dominance.dominates(source, scope) || (scope != operation && !analysis.isReadOnly(source)))
+  StorageAnalysis storage(function);
+  if (!dominance.dominates(source, scope) ||
+      (scope != operation &&
+       (!storage.isReadOnly(source) || !storage.preserves(scope, source))))
     return operation.emitError("captured input supply cannot preserve its scoped read snapshot"), failure();
   if (auto reason = checkInputRequirement(source, input.getResult(), requirement))
     return operation.emitError(*reason), failure();
@@ -346,7 +315,7 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp o
 }
 
 InputSupply ImplementationInputs::materialize(Value source, const InputRequirement &requirement, Operation *scope) {
-  PhysicalProgramAnalysis analysis(function);
+  StorageAnalysis analysis(function);
   DominanceInfo dominance(function);
   auto type = cast<MemRefType>(source.getType());
   memref::AllocOp storage;
@@ -359,8 +328,8 @@ InputSupply ImplementationInputs::materialize(Value source, const InputRequireme
         !consumer || !dominance.dominates(previous.allocation.getOperation(), scope) ||
         !previous.allocation->isBeforeInBlock(consumer) ||
         (previous.allocation->getBlock() != scope->getBlock() && !analysis.isReadOnly(source)) ||
-        !analysis.mayReadAt(source, previous.allocation, consumer)) continue;
-    auto lifetime = queryStorageLifetime(previous.allocation);
+        !analysis.readStable(source, previous.allocation, consumer)) continue;
+    auto lifetime = analysis.lifetime(previous.allocation);
     if (!lifetime || !lifetime->aliases.complete) continue;
     storage = previous.allocation;
     if (lifetime->end->isBeforeInBlock(consumer)) lifetime->end->moveAfter(consumer);

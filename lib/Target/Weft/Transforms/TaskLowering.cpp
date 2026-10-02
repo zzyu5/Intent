@@ -6,7 +6,7 @@
 #include "Reductions.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
-#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
@@ -58,7 +58,7 @@ public:
   Impl(func::FuncOp function, ModuleOp output,
                const llvm::DenseMap<Value, intent::QuantFormat> &formats,
                const cpu::ImplementationRegistry &implementations)
-      : sourceFunction(function), analysis(function), relations(function),
+      : sourceFunction(function), relations(function),
         output(output), b(output.getContext()),
         formats(formats), implementations(implementations) {
     auto interface = getPublicInterface(function);
@@ -100,12 +100,39 @@ public:
 
   LogicalResult lower(cpu::TasksOp tasks, StringRef name,
                       SmallVectorImpl<unsigned> &argumentPositions) {
+    storage = std::make_unique<cpu::StorageAnalysis>(sourceFunction);
+    currentTask = tasks;
     values.clear(); locals.clear(); readOnlySupplies.clear(); viewAxes.clear();
     Location loc = tasks.getLoc();
     SmallVector<Attribute> names, accesses, symbols;
     SmallVector<int64_t> aliases;
     SmallVector<Type> types;
-    auto memoryAccesses = analysis.accesses(tasks);
+    auto memoryEffects = storage->effects(tasks);
+    if (!memoryEffects.complete)
+      return tasks.emitError("Weft task requires complete storage effects");
+    auto formatStatus = tasks.walk([&](Operation *operation) {
+      for (Value memory : operation->getOperands()) {
+        if (!isa<MemRefType>(memory.getType())) continue;
+        auto origins = storage->origins(memory);
+        std::optional<intent::QuantFormat> selected;
+        bool denseOrigin = false;
+        for (Value origin : origins.values) {
+          auto found = formats.find(origin);
+          if (found == formats.end()) { denseOrigin = true; continue; }
+          if (selected && *selected != found->second) {
+            operation->emitError("Weft view merges incompatible encoded storage");
+            return WalkResult::interrupt();
+          }
+          selected = found->second;
+        }
+        if (selected && (!origins.complete || denseOrigin)) {
+          operation->emitError("Weft encoded view requires one representation across all storage origins");
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (formatStatus.wasInterrupted()) return failure();
     for (unsigned position : argumentPositions) {
       Value capture = position == 0 ? tasks.getBody().front().getArgument(0) : tasks.getCaptures()[position - 1];
       names.push_back(b.getStringAttr(position == 0 ? "coordinate" : "capture_" + std::to_string(position - 1)));
@@ -122,20 +149,22 @@ public:
             dimensions.push_back(-*symbol);
           } else dimensions.push_back(extent);
         }
-        auto format = formats.find(analysis.storageRoot(capture));
-        if (format != formats.end()) {
-          int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
+        auto format = quantizedFormat(capture);
+        if (format) {
+          int64_t bytes = *format == intent::QuantFormat::Q4K ? 144 : 292;
           if (memory.getShape().back() != bytes)
             return tasks.emitError("encoded capture requires a statically complete contiguous record byte span");
           dimensions.back() = 256;
         }
         types.push_back(wk::ViewType::get(b.getContext(), encoding(capture), array(dimensions), array(ids)));
-        Value storage = analysis.storageRoot(capture);
         bool reads = false, writes = false;
-        for (auto access : memoryAccesses)
-          if (analysis.storageRoot(access.memory) == storage) {
-            reads |= access.read; writes |= access.write;
+        for (const cpu::StorageEffect &entry : memoryEffects.entries) {
+          Value affected = entry.effect.getValue();
+          if (!affected || !storage->disjoint(affected, capture)) {
+            reads |= isa<MemoryEffects::Read>(entry.effect.getEffect());
+            writes |= isa<MemoryEffects::Write>(entry.effect.getEffect());
           }
+        }
         accesses.push_back(b.getStringAttr(reads ? (writes ? "readwrite" : "read")
                                                : (writes ? "write" : "none")));
         aliases.push_back(0);
@@ -200,9 +229,15 @@ private:
   }
   wk::EncodingType encoding(Value memory = {}) {
     if (!memory) return dense(b.getF32Type());
-    auto format = formats.find(analysis.storageRoot(memory));
-    return format == formats.end() ? dense(cast<MemRefType>(memory.getType()).getElementType())
-                                  : quantEncoding(b, format->second);
+    auto format = quantizedFormat(memory);
+    return format ? quantEncoding(b, *format)
+                  : dense(cast<MemRefType>(memory.getType()).getElementType());
+  }
+  std::optional<intent::QuantFormat> quantizedFormat(Value memory) {
+    for (Value origin : storage->origins(memory).values)
+      if (auto found = formats.find(origin); found != formats.end())
+        return found->second;
+    return std::nullopt;
   }
   wk::ViewType scalarView(Type type) {
     return wk::ViewType::get(b.getContext(), dense(type), array({1}), array({nextAxis++}));
@@ -245,20 +280,13 @@ private:
     return a && c && *a == *c;
   }
   Value localRoot(Value memory) {
-    while (true) {
-      if (auto view = memory.getDefiningOp<memref::SubViewOp>()) memory = view.getSource();
-      else if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
-      else if (auto view = memory.getDefiningOp<memref::ReinterpretCastOp>()) {
-        auto metadata = view.getSource().getDefiningOp<memref::ExtractStridedMetadataOp>();
-        if (!metadata || view.getSource() != metadata.getBaseBuffer()) return memory;
-        memory = metadata.getSource();
-      } else if (auto view = memory.getDefiningOp<memref::ExpandShapeOp>()) memory = view.getSrc();
-      else if (auto view = memory.getDefiningOp<memref::CollapseShapeOp>()) memory = view.getSrc();
-      else return memory;
-    }
+    return storage->uniqueOrigin(memory);
   }
   bool isLocal(Value memory) {
-    return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(localRoot(memory).getDefiningOp());
+    Value root = localRoot(memory);
+    Operation *owner = root ? root.getDefiningOp() : nullptr;
+    return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) &&
+           currentTask->isProperAncestor(owner);
   }
 
   std::optional<int64_t> nativeExtent(const cpu::ExtentExpression &extent) {
@@ -425,9 +453,9 @@ private:
         dynamic.push_back(values.lookup(cast<Value>(size)));
       }
     }
-    auto format = formats.find(analysis.storageRoot(memory));
-    if (format != formats.end()) {
-      int64_t bytes = format->second == intent::QuantFormat::Q4K ? 144 : 292;
+    auto format = quantizedFormat(memory);
+    if (format) {
+      int64_t bytes = *format == intent::QuantFormat::Q4K ? 144 : 292;
       if (offsets.back() != 0 || extents.back() != bytes)
         return operation.emitError("encoded view projection must retain its complete record bytes"), failure();
       extents.back() = dimensions.back() = 256;
@@ -559,7 +587,7 @@ private:
       // Cache only the admitted snapshot. A positional read and a named-axis
       // contraction may consume this same value in different axis orders.
       operandReads[memory] = loaded;
-      if (analysis.isReadOnly(memory)) readOnlySupplies[memory] = loaded;
+      if (storage->preserves(currentTask, memory)) readOnlySupplies[memory] = loaded;
       return loaded;
     }
     Value root = localRoot(memory);
@@ -1202,14 +1230,22 @@ private:
     return success();
   }
 
-  SmallVector<Value> writtenEnclosingLocals(Operation *scope) {
+  FailureOr<SmallVector<Value>> writtenEnclosingLocals(Operation *scope) {
     SmallVector<Value> result;
-    for (auto access : analysis.accesses(scope)) {
-      Value root = localRoot(access.memory);
-      if (access.write && isLocal(root) &&
-          !scope->isProperAncestor(root.getDefiningOp()) &&
-          !llvm::is_contained(result, root))
-        result.push_back(root);
+    auto effects = storage->effects(scope);
+    if (!effects.complete)
+      return scope->emitError("Weft control requires complete storage effects"), failure();
+    for (const cpu::StorageEffect &entry : effects.entries) {
+      if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
+      Value memory = entry.effect.getValue();
+      if (!memory)
+        return scope->emitError("Weft control write has no storage target"), failure();
+      auto origins = storage->origins(memory);
+      if (!origins.complete)
+        return scope->emitError("Weft control write has unresolved storage origins"), failure();
+      for (Value root : origins.values)
+        if (isLocal(root) && !scope->isProperAncestor(root.getDefiningOp()) &&
+            !llvm::is_contained(result, root)) result.push_back(root);
     }
     return result;
   }
@@ -1358,7 +1394,9 @@ private:
     if (auto genericOp = dyn_cast<linalg::GenericOp>(operation)) return generic(genericOp);
     if (auto reduce = dyn_cast<cpu::ReduceOp>(operation)) return reduction(reduce);
     if (auto conditional = dyn_cast<scf::IfOp>(operation)) {
-      auto roots = writtenEnclosingLocals(conditional);
+      auto written = writtenEnclosingLocals(conditional);
+      if (failed(written)) return failure();
+      auto &roots = *written;
       auto savedLocals = locals;
       SmallVector<Type> types;
       for (Type type : conditional.getResultTypes()) types.push_back(scalarType(type));
@@ -1402,7 +1440,9 @@ private:
       for (Value value : loop.getInitArgs()) initial.push_back(values.lookup(value));
       auto savedLocals = locals;
       SmallVector<Value> roots;
-      for (Value root : writtenEnclosingLocals(loop))
+      auto written = writtenEnclosingLocals(loop);
+      if (failed(written)) return failure();
+      for (Value root : *written)
         if (locals.count(root)) { roots.push_back(root); initial.push_back(locals.lookup(root).value); }
       auto target = b.create<scf::ForOp>(loc, values.lookup(loop.getLowerBound()),
           values.lookup(loop.getUpperBound()), values.lookup(loop.getStep()), initial);
@@ -1452,7 +1492,8 @@ private:
   }
 
   func::FuncOp sourceFunction;
-  cpu::PhysicalProgramAnalysis analysis;
+  std::unique_ptr<cpu::StorageAnalysis> storage;
+  cpu::TasksOp currentTask;
   cpu::AxisRelations relations;
   ModuleOp output;
   OpBuilder b;

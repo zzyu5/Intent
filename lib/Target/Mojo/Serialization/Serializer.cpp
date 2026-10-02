@@ -293,7 +293,14 @@ private:
       assign(operation->getResult(0), *expression, isa<arith::ConstantOp>(operation));
       return success();
     }
-    if (auto op = dyn_cast<func::CallOp>(operation)) {
+    if (auto op = dyn_cast<cpu::InvokeOp>(operation)) {
+      SmallVector<std::string> arguments;
+      for (Value argument : op.getArguments())
+        arguments.push_back(isa<MemRefType>(argument.getType())
+            ? pointer(argument, {}) : name(argument));
+      line("external_call[\"" + op.getCallee().str() + "\", NoneType](" +
+           join(arguments, ", ") + ")");
+    } else if (auto op = dyn_cast<func::CallOp>(operation)) {
       if (op.getCallee() == "intent_cpu_enter_ieee") {
         assign(op.getResult(0), "external_call[\"intent_cpu_enter_ieee\", UInt32]()");
       } else if (op.getCallee() == "intent_cpu_leave_ieee") {

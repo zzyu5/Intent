@@ -223,8 +223,7 @@ private:
     if (auto store = dyn_cast<memref::StoreOp>(operation)) {
       line("*" + address(store.getMemref(), store.getIndices()) + " = " + value(store.getValue()) + ";"); return success();
     }
-    if (auto call = dyn_cast<func::CallOp>(operation)) {
-      if (call.getNumResults()) return call.emitError("native task call must return through explicit storage");
+    if (auto call = dyn_cast<cpu::InvokeOp>(operation)) {
       std::string text = call.getCallee().str() + "(";
       for (auto [i, argument] : llvm::enumerate(call.getOperands())) {
         if (i) text += ", ";

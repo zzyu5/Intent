@@ -24,8 +24,7 @@ struct PreparedInput {
 };
 
 std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *loop,
-    PhysicalProgramAnalysis &physical, ArrayRef<MemoryEffects::EffectInstance> effects,
-    ArrayRef<MemoryAccess> accesses, const llvm::SmallDenseSet<Value> &groupInputs) {
+    StorageAnalysis &storage, const llvm::SmallDenseSet<Value> &groupInputs) {
   if (producer->getNumResults() || producer.getNumDpsInits() != 1 || producer.getNumReductionLoops() ||
       !producer.getIndexingMapsArray().back().isIdentity() ||
       !producer->getRegion(0).front().getArguments().back().use_empty()) return std::nullopt;
@@ -33,18 +32,14 @@ std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *l
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
   auto stable = [&](Value memory) {
-    if (physical.isReadOnly(memory)) return true;
-    Value root = physical.storageRoot(memory);
+    Value root = storage.uniqueOrigin(memory);
+    if (!root) return false;
     if (groupInputs.contains(root)) return true;
     Operation *owner = root.getDefiningOp();
-    if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) || loop->isAncestor(owner)) return false;
-    if (llvm::any_of(accesses, [&](const MemoryAccess &access) {
-          return access.write && physical.storageRoot(access.memory) == root;
-        })) return false;
-    return llvm::all_of(effects, [&](const MemoryEffects::EffectInstance &effect) {
-      return isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect()) ||
-          (effect.getValue() && physical.storageRoot(effect.getValue()) != root);
-    });
+    if (!storage.isReadOnly(memory) &&
+        (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) ||
+         loop->isAncestor(owner))) return false;
+    return storage.preserves(loop, memory);
   };
   for (Value input : producer.getDpsInputs())
     if (isa<MemRefType>(input.getType()) && !stable(input)) return std::nullopt;
@@ -55,7 +50,7 @@ std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *l
     } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
   }
 
-  auto lifetime = queryStorageLifetime(allocation);
+  auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
   PreparedInput result{producer, allocation, lifetime->end, {}};
   SmallVector<Operation *> reads;
@@ -63,12 +58,8 @@ std::optional<PreparedInput> scopedInput(linalg::LinalgOp producer, Operation *l
     if (user == producer) continue;
     if (!loop->isAncestor(user)) return std::nullopt;
     if (user == result.end || isStorageAliasOperation(user) || isa<memref::DimOp>(user)) continue;
-    if (auto copy = dyn_cast<memref::CopyOp>(user)) {
-      if (physical.storageRoot(copy.getTarget()) == allocation.getResult()) return std::nullopt;
-    } else if (auto generic = dyn_cast<linalg::LinalgOp>(user)) {
-      for (Value output : generic.getDpsInits())
-        if (physical.storageRoot(output) == allocation.getResult()) return std::nullopt;
-    } else if (!isa<memref::LoadOp>(user)) return std::nullopt;
+    if (!isa<memref::CopyOp, linalg::LinalgOp, memref::LoadOp>(user) ||
+        !storage.preserves(user, allocation)) return std::nullopt;
     reads.push_back(user);
   }
   if (reads.empty() || !producer->isBeforeInBlock(result.end)) return std::nullopt;
@@ -165,16 +156,9 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
       llvm::append_range(outerCoordinates, ValueRange(parallel.getInductionVars()).drop_back());
     }
     if (getConstantIntValue(lower) != 0 || getConstantIntValue(step) != 1) continue;
-    auto effects = getEffectsRecursively(loop);
-    if (!effects) continue;
-    bool knownEffects = true;
-    loop->walk([&](Operation *operation) {
-      if (!isa<MemoryEffectOpInterface>(operation) &&
-          !operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) knownEffects = false;
-    });
-    if (!knownEffects) continue;
-    PhysicalProgramAnalysis physical(function);
-    auto accesses = physical.accesses(loop);
+    StorageAnalysis storage(function);
+    auto effects = storage.effects(loop);
+    if (!effects.complete || effects.ordered) continue;
     for (auto quotient : body->getOps<arith::FloorDivSIOp>()) {
       auto divisor = getConstantIntValue(quotient.getRhs());
       if (quotient.getLhs() != induction || !divisor || *divisor <= 1) continue;
@@ -199,19 +183,8 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
           return true;
         };
         if (auto view = dyn_cast<memref::SubViewOp>(operation);
-            view && requestedWindows.count(view.getResult()) && physical.isReadOnly(view)) {
-          Value root = physical.storageRoot(view);
-          bool stable = llvm::all_of(*effects, [&](const MemoryEffects::EffectInstance &effect) {
-            if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) return true;
-            Value memory = effect.getValue();
-            if (!memory || !isa<MemRefType>(memory.getType()) ||
-                !isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) return false;
-            Value written = physical.storageRoot(memory);
-            if (written == root) return false;
-            if (isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(written.getDefiningOp())) return true;
-            auto external = physical.externalView(written);
-            return external && external.getAccess() != 0;
-          });
+            view && requestedWindows.count(view.getResult()) && storage.isReadOnly(view)) {
+          bool stable = storage.preserves(loop, view);
           if (stable && llvm::any_of(requestedWindows[view], [&](memref::SubViewOp window) {
                 return hasIndependentWindowCoordinates(window, loop, quotient.getResult());
               }) && invariant(view.getResult())) {
@@ -224,7 +197,7 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
         }
         auto producer = dyn_cast<linalg::LinalgOp>(operation);
         if (!producer) continue;
-        auto prepared = scopedInput(producer, loop, physical, *effects, accesses, groupInputs);
+        auto prepared = scopedInput(producer, loop, storage, groupInputs);
         if (!prepared) continue;
         llvm::SetVector<Value> inputs;
         getUsedValuesDefinedAbove(producer->getRegion(0), inputs);
@@ -308,7 +281,8 @@ std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   auto allocation = output.getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock() ||
       !allocation->isBeforeInBlock(producer)) return std::nullopt;
-  auto lifetime = queryStorageLifetime(allocation);
+  StorageAnalysis storage(producer->getParentOfType<func::FuncOp>());
+  auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
   PreparedInput result{cast<linalg::LinalgOp>(producer.getOperation()), allocation, lifetime->end, {}};
   for (Operation *user : lifetime->aliases.users) {
@@ -333,7 +307,7 @@ std::optional<PreparedInput> preparedInput(linalg::GenericOp producer) {
   return result;
 }
 
-bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis &physical) {
+bool equivalent(PreparedInput &lhs, PreparedInput &rhs, StorageAnalysis &storage) {
   if (lhs.producer->getBlock() != rhs.producer->getBlock() ||
       !lhs.producer->isBeforeInBlock(rhs.producer) || lhs.consumer != rhs.consumer ||
       lhs.allocation.getType() != rhs.allocation.getType() ||
@@ -349,7 +323,8 @@ bool equivalent(PreparedInput &lhs, PreparedInput &rhs, PhysicalProgramAnalysis 
         })) return false;
   }
   for (Value input : lhs.producer.getDpsInputs())
-    if (isa<MemRefType>(input.getType()) && !physical.mayReadAt(input, lhs.producer, rhs.producer)) return false;
+    if (isa<MemRefType>(input.getType()) &&
+        !storage.readStable(input, lhs.producer, rhs.producer)) return false;
   llvm::DenseMap<Value, Value> pairs;
   pairs[lhs.allocation] = rhs.allocation;
   return OperationEquivalence::isEquivalentTo(lhs.producer, rhs.producer,
@@ -368,11 +343,11 @@ LogicalResult reusePreparedInputs(func::FuncOp function, const ImplementationReg
     function.walk([&](linalg::GenericOp operation) {
       if (auto supply = preparedInput(operation)) supplies.push_back(*supply);
     });
-    PhysicalProgramAnalysis physical(function);
+    StorageAnalysis storage(function);
     for (unsigned i = 0; i < supplies.size() && !changed; ++i) {
       for (unsigned j = i + 1; j < supplies.size(); ++j) {
         auto &first = supplies[i], &second = supplies[j];
-        if (!equivalent(first, second, physical)) continue;
+        if (!equivalent(first, second, storage)) continue;
         // The shared representation remains owned by this lexical scope until
         // both consumer groups finish, before either implementation expands.
         if (first.end->isBeforeInBlock(second.end)) first.end->moveAfter(second.end);

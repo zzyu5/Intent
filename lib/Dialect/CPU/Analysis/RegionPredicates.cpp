@@ -1,6 +1,6 @@
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
-#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -38,21 +38,13 @@ Value stripIdentityViews(Value value) {
   }
 }
 std::optional<SmallVector<Value>> fullAliases(Value value) {
-  SmallVector<Value> aliases{stripIdentityViews(value)};
-  llvm::SmallDenseSet<Value> seen;
-  seen.insert(aliases.front());
-  for (unsigned index = 0; index < aliases.size(); ++index) {
-    for (Operation *user : aliases[index].getUsers()) {
-      Value alias;
-      if (auto cast = dyn_cast<memref::CastOp>(user)) alias = cast.getResult();
-      else if (auto view = dyn_cast<memref::SubViewOp>(user)) {
-        if (!fullSubview(view)) return std::nullopt;
-        alias = view.getResult();
-      }
-      if (alias && seen.insert(alias).second) aliases.push_back(alias);
-    }
-  }
-  return aliases;
+  value = stripIdentityViews(value);
+  StorageAnalysis storage(value.getParentRegion()->getParentOfType<func::FuncOp>());
+  auto aliases = storage.aliases(value);
+  if (!aliases.complete || llvm::any_of(aliases.values, [&](Value alias) {
+        return stripIdentityViews(alias) != value;
+      })) return std::nullopt;
+  return aliases.values;
 }
 bool nonnegative(Value value) {
   if (auto constant = getConstantIntValue(value)) return *constant >= 0;
@@ -179,19 +171,27 @@ bool shiftedSequenceDoesNotWrap(memref::AllocOp allocation, Value origin) {
          (end->second - begin->first).sle(maximum);
 }
 
-Operation *lastWriter(Value value) {
+Operation *lastWriter(Value value, Operation *before = nullptr) {
   auto aliases = fullAliases(value);
   if (!aliases) return nullptr;
+  StorageAnalysis storage(value.getParentRegion()->getParentOfType<func::FuncOp>());
+  Value observed = stripIdentityViews(value);
   Operation *last = nullptr;
   for (Value alias : *aliases) for (Operation *user : alias.getUsers()) {
-    if (isa<memref::CastOp, memref::SubViewOp>(user)) continue;
-    bool writes = false;
-    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), alias);
-    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == alias;
-    else if (!isa<memref::DimOp, memref::LoadOp, memref::DeallocOp>(user)) return nullptr;
-    if (!writes) continue;
-    if (last && user->getBlock() != last->getBlock()) return nullptr;
-    if (!last || last->isBeforeInBlock(user)) last = user;
+    if (user == before) continue;
+    auto effects = storage.effects(user);
+    if (!effects.complete || effects.ordered) return nullptr;
+    for (const StorageEffect &entry : effects.entries) {
+      if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
+      Value target = entry.effect.getValue();
+      if (target && storage.disjoint(value, target)) continue;
+      if (!target || stripIdentityViews(target) != observed) return nullptr;
+      Operation *writer = entry.operation;
+      if (before && writer->getBlock() != before->getBlock()) return nullptr;
+      if (before && !writer->isBeforeInBlock(before)) continue;
+      if (last && writer->getBlock() != last->getBlock()) return nullptr;
+      if (!last || last->isBeforeInBlock(writer)) last = writer;
+    }
   }
   return last;
 }
@@ -206,20 +206,7 @@ linalg::GenericOp producer(Value value) {
   return {};
 }
 bool initializedFalse(Value value, Operation *before) {
-  auto aliases = fullAliases(value);
-  if (!aliases) return false;
-  Operation *writer = nullptr;
-  for (Value alias : *aliases) for (Operation *user : alias.getUsers()) {
-    if (user == before || isa<memref::CastOp, memref::SubViewOp>(user)) continue;
-    bool writes = false;
-    if (auto generic = dyn_cast<linalg::LinalgOp>(user)) writes = llvm::is_contained(generic.getDpsInits(), alias);
-    else if (auto copy = dyn_cast<memref::CopyOp>(user)) writes = copy.getTarget() == alias;
-    else if (!isa<memref::DimOp, memref::LoadOp, memref::DeallocOp>(user)) return false;
-    if (!writes) continue;
-    if (user->getBlock() != before->getBlock()) return false;
-    if (user->isBeforeInBlock(before) && (!writer || writer->isBeforeInBlock(user))) writer = user;
-  }
-  auto fill = dyn_cast_or_null<linalg::FillOp>(writer);
+  auto fill = dyn_cast_or_null<linalg::FillOp>(lastWriter(value, before));
   return fill && uniformBoolean(UniformValueAnalysis(describeScalarValue).evaluate(fill.getInputs()[0])) == false;
 }
 
@@ -261,19 +248,23 @@ std::optional<unsigned> validityField(RegionOpInterface program, linalg::Generic
 
 class ConstantMemory {
 public:
-  explicit ConstantMemory(PhysicalProgramAnalysis &physical) : physical(physical), values(describeScalarValue) {}
+  explicit ConstantMemory(StorageAnalysis &storage) : storage(storage), values(describeScalarValue) {}
 
   Attribute read(Value value, const UniformBindings &scalars = UniformBindings()) {
     if (!isa<MemRefType>(value.getType())) return values.evaluate(value, scalars);
+    Type element = cast<MemRefType>(value.getType()).getElementType();
     value = stripIdentityViews(value);
     auto found = facts.find(value);
-    return found != facts.end() ? found->second : facts.lookup(physical.storageRoot(value));
+    Value origin = storage.uniqueOrigin(value);
+    Attribute constant = found != facts.end() ? found->second
+        : origin ? facts.lookup(origin) : Attribute();
+    auto typed = dyn_cast_or_null<TypedAttr>(constant);
+    return typed && typed.getType() == element ? constant : Attribute();
   }
   void write(Value value, Attribute constant) {
-    Value root = physical.storageRoot(value);
     SmallVector<Value> invalidated;
     for (auto &fact : facts)
-      if (physical.storageRoot(fact.first) == root) invalidated.push_back(fact.first);
+      if (!storage.disjoint(fact.first, value)) invalidated.push_back(fact.first);
     for (Value alias : invalidated) facts.erase(alias);
     if (constant) facts[stripIdentityViews(value)] = constant;
   }
@@ -284,48 +275,58 @@ public:
       write(copy.getTarget(), read(copy.getSource(), scalars));
     } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
       if (generic.getOutputs().size() != 1) { facts.clear(); return; }
+      auto effects = storage.effects(operation);
+      if (!effects.complete || effects.ordered) { facts.clear(); return; }
       UniformBindings operands;
       Value output = generic.getOutputs()[0];
       auto maps = generic.getIndexingMapsArray();
       bool unsafeAlias = false;
       for (auto [number, input] : llvm::enumerate(generic.getInputs())) {
         operands[input] = read(input, scalars);
-        if (isa<MemRefType>(input.getType()) && physical.storageRoot(input) == physical.storageRoot(output))
+        if (isa<MemRefType>(input.getType()) && !storage.disjoint(input, output))
           unsafeAlias |= input != output || generic.getNumReductionLoops() ||
               maps[number] != maps.back() || !maps.back().isPermutation();
       }
       operands[output] = read(output, scalars);
-      write(output, unsafeAlias ? Attribute() : foldUniformComputation(generic, operands, scalars));
+      Attribute constant = unsafeAlias ? Attribute()
+          : foldUniformComputation(generic, operands, scalars);
+      invalidate(effects);
+      write(output, constant);
     } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
       write(store.getMemref(), store.getIndices().empty() ? read(store.getValue(), scalars) : Attribute());
     } else {
-      auto effects = getEffectsRecursively(operation);
-      if (!effects) { facts.clear(); return; }
-      for (auto &effect : *effects) {
-        if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-        if (effect.getValue()) write(effect.getValue(), {});
-        else facts.clear();
-      }
+      invalidate(storage.effects(operation));
     }
   }
 
 private:
-  PhysicalProgramAnalysis &physical;
+  void invalidate(const StorageEffects &effects) {
+    if (!effects.complete || effects.ordered) { facts.clear(); return; }
+    for (const StorageEffect &entry : effects.entries) {
+      if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(entry.effect.getEffect())) continue;
+      if (entry.effect.getValue()) write(entry.effect.getValue(), {});
+      else facts.clear();
+    }
+  }
+
+  StorageAnalysis &storage;
   UniformValueAnalysis values;
   UniformBindings facts;
 };
 
 bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
-  PhysicalProgramAnalysis physical(program.getOperation()->getParentOfType<func::FuncOp>());
+  StorageAnalysis storage(program.getOperation()->getParentOfType<func::FuncOp>());
   for (Region &region : program.getOperation()->getRegions()) {
     auto destinations = program.getRegionArguments(region, RegionArgumentKind::Destinations);
     for (Operation &operation : region.front().without_terminator()) {
-      auto effects = getEffectsRecursively(&operation);
-      if (!effects) return false;
-      for (auto &effect : *effects) {
+      auto effects = storage.effects(&operation);
+      if (!effects.complete || effects.ordered) return false;
+      for (const StorageEffect &entry : effects.entries) {
+        const auto &effect = entry.effect;
         if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
         if (!effect.getValue()) return false;
-        Value root = physical.storageRoot(effect.getValue());
+        Value root = storage.uniqueOrigin(effect.getValue());
+        if (!root) return false;
         if (auto argument = dyn_cast<BlockArgument>(root)) {
           if (!llvm::is_contained(destinations, argument) ||
               !isa<MemoryEffects::Write>(effect.getEffect())) return false;
@@ -337,7 +338,7 @@ bool summaryIsIdentityWhenFalse(RegionOpInterface program, Value predicate) {
       }
     }
   }
-  ConstantMemory outer(physical), summary(physical);
+  ConstantMemory outer(storage), summary(storage);
   for (Operation &operation : *program.getOperation()->getBlock()) {
     if (&operation == program.getOperation()) break;
     outer.visit(&operation);
