@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
+#include "Intent/Analysis/ControlFlow.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -30,80 +31,7 @@ bool isAllocationRoot(Value value) {
                       bool(getPublicView(argument))));
 }
 
-// RegionBranch describes the actual forwarded operands, including zero-trip
-// loop results and both while regions. Produced arguments have no incoming
-// resource and therefore cannot establish an allocation identity.
-bool regionPredecessors(RegionBranchOpInterface owner, Value value,
-                        SmallVectorImpl<Value> &incoming) {
-  auto targetsValue = [&](RegionSuccessor successor) {
-    if (auto argument = dyn_cast<BlockArgument>(value))
-      return successor.getSuccessor() == argument.getOwner()->getParent();
-    return successor.isParent();
-  };
-  auto append = [&](RegionSuccessor successor, ValueRange operands) {
-    if (!targetsValue(successor))
-      return true;
-    auto inputs = successor.getSuccessorInputs();
-    auto found = llvm::find(inputs, value);
-    if (found == inputs.end() || inputs.size() != operands.size())
-      return false;
-    incoming.push_back(operands[found - inputs.begin()]);
-    return true;
-  };
-  SmallVector<RegionSuccessor> successors;
-  owner.getSuccessorRegions(RegionBranchPoint::parent(), successors);
-  for (RegionSuccessor successor : successors)
-    if (!append(successor, owner.getEntrySuccessorOperands(successor)))
-      return false;
-  for (Region &region : owner->getRegions()) {
-    successors.clear();
-    owner.getSuccessorRegions(&region, successors);
-    if (!llvm::any_of(successors, targetsValue))
-      continue;
-    for (Block &block : region) {
-      if (block.empty())
-        return false;
-      Operation *terminator = block.getTerminator();
-      if (terminator->getNumSuccessors())
-        continue;
-      auto branch = dyn_cast<RegionBranchTerminatorOpInterface>(terminator);
-      if (!branch)
-        return false;
-      SmallVector<RegionSuccessor> outgoing;
-      SmallVector<Attribute> unknownOperands(terminator->getNumOperands());
-      branch.getSuccessorRegions(unknownOperands, outgoing);
-      for (RegionSuccessor successor : outgoing)
-        if (!append(successor, branch.getSuccessorOperands(successor)))
-          return false;
-    }
-  }
-  return !incoming.empty();
-}
-
 bool predecessors(Value value, SmallVectorImpl<Value> &incoming) {
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    Block *block = argument.getOwner();
-    bool complete = true;
-    if (block->isEntryBlock()) {
-      auto owner = dyn_cast<RegionBranchOpInterface>(block->getParentOp());
-      complete = owner && regionPredecessors(owner, value, incoming);
-    }
-    for (Block *predecessor : block->getPredecessors()) {
-      auto branch = dyn_cast<BranchOpInterface>(predecessor->getTerminator());
-      if (!branch)
-        return false;
-      for (unsigned index = 0; index < branch->getNumSuccessors(); ++index) {
-        if (branch->getSuccessor(index) != block)
-          continue;
-        auto operands = branch.getSuccessorOperands(index);
-        unsigned position = argument.getArgNumber();
-        if (position >= operands.size() || operands.isOperandProduced(position))
-          return false;
-        incoming.push_back(operands[position]);
-      }
-    }
-    return complete && !incoming.empty();
-  }
   Operation *definition = value.getDefiningOp();
   if (auto view = dyn_cast_or_null<ViewLikeOpInterface>(definition)) {
     incoming.push_back(view.getViewSource());
@@ -113,8 +41,10 @@ bool predecessors(Value value, SmallVectorImpl<Value> &incoming) {
     incoming.append({select.getTrueValue(), select.getFalseValue()});
     return true;
   }
-  auto owner = dyn_cast_or_null<RegionBranchOpInterface>(definition);
-  return owner && regionPredecessors(owner, value, incoming);
+  auto edges = queryControlFlowIncoming(value);
+  for (const ControlFlowEdge &edge : edges.edges)
+    if (edge.operand) incoming.push_back(edge.operand->get());
+  return edges.complete && !incoming.empty();
 }
 
 bool disjointRoots(Value lhs, Value rhs) {

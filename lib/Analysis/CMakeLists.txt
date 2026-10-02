@@ -1,6 +1,7 @@
 add_mlir_library(MLIRIntentAnalysis
   CanonicalKernel.cpp
   ContractionAxes.cpp
+  ControlFlow.cpp
   UniformValues.cpp
   IntegerRelations.cpp
   RegionSemantics.cpp
@@ -11,6 +12,7 @@ add_mlir_library(MLIRIntentAnalysis
   MLIRFuncDialect
   MLIRArithDialect
   MLIRMathDialect
+  MLIRControlFlowInterfaces
   MLIRIR
   MLIRIntentDialect
   MLIRIntentStructuredOpInterface

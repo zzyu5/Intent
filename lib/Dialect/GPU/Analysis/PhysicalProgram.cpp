@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Analysis/ControlFlow.h"
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 
@@ -11,6 +12,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -2014,6 +2016,32 @@ PhysicalExprAttr queryLaunchRangeExtent(MakeRangeOp range) {
 }
 
 namespace {
+OpOperand *singleControlInput(Value target, ControlFlowEdgeKind kind,
+                              Region *sourceRegion) {
+  auto incoming = queryControlFlowIncoming(target);
+  if (!incoming.complete) return nullptr;
+  OpOperand *selected = nullptr;
+  for (const ControlFlowEdge &edge : incoming.edges) {
+    if (edge.kind != kind || edge.sourceRegion != sourceRegion) continue;
+    if (!edge.operand || (selected && selected != edge.operand)) return nullptr;
+    selected = edge.operand;
+  }
+  return selected;
+}
+
+Value singleControlTarget(OpOperand &operand, ControlFlowEdgeKind kind,
+                          Region *targetRegion) {
+  auto outgoing = queryControlFlowOutgoing(operand);
+  if (!outgoing.complete) return {};
+  Value selected;
+  for (const ControlFlowEdge &edge : outgoing.edges) {
+    if (edge.kind != kind || edge.targetRegion != targetRegion) continue;
+    if (selected && selected != edge.target) return {};
+    selected = edge.target;
+  }
+  return selected;
+}
+
 struct IndexBounds {
   bool nonNegative = false;
   PhysicalExprAttr upper;
@@ -2114,20 +2142,27 @@ IndexBounds queryIndexBounds(Value value) {
         }
       }
       auto whileLoop = dyn_cast<scf::WhileOp>(argument.getOwner()->getParentOp());
-      if (whileLoop && argument.getOwner() == &whileLoop.getAfter().front()) {
-        auto condition = cast<scf::ConditionOp>(
-            whileLoop.getBefore().front().getTerminator());
-        auto carried = dyn_cast<BlockArgument>(stripScalarIdentity(
-            condition.getArgs()[argument.getArgNumber()]));
-        auto compare = condition.getCondition().getDefiningOp<CompareOp>();
-        if (carried && carried.getOwner() == &whileLoop.getBefore().front() &&
+      if (whileLoop && argument.getOwner()->getParent() == &whileLoop.getAfter()) {
+        OpOperand *forwarded = singleControlInput(
+            argument, ControlFlowEdgeKind::RegionTransfer, &whileLoop.getBefore());
+        auto condition = forwarded
+            ? dyn_cast<scf::ConditionOp>(forwarded->getOwner()) : scf::ConditionOp();
+        auto carried = forwarded
+            ? dyn_cast<BlockArgument>(stripScalarIdentity(forwarded->get()))
+            : BlockArgument();
+        auto compare = condition
+            ? condition.getCondition().getDefiningOp<CompareOp>() : CompareOp();
+        if (carried && carried.getOwner()->getParent() == &whileLoop.getBefore() &&
             compare && compare.getPredicate() == ComparePredicate::Lt &&
             sameScalarExpression(compare.getLhs(), carried)) {
-          auto yield = cast<scf::YieldOp>(whileLoop.getAfter().front().getTerminator());
-          Value limit = clampedIncrementLimit(
-              yield.getResults()[carried.getArgNumber()], argument);
+          OpOperand *initialValue = singleControlInput(
+              carried, ControlFlowEdgeKind::Entry, nullptr);
+          OpOperand *nextValue = singleControlInput(
+              carried, ControlFlowEdgeKind::RegionTransfer, &whileLoop.getAfter());
+          if (!initialValue || !nextValue) return {};
+          Value limit = clampedIncrementLimit(nextValue->get(), argument);
           PhysicalExprAttr end = limit ? queryLaunchExpression(limit) : PhysicalExprAttr();
-          Bounds initial = bound(whileLoop.getInits()[carried.getArgNumber()], depth + 1);
+          Bounds initial = bound(initialValue->get(), depth + 1);
           if (end && queryLaunchExpression(compare.getRhs()) == end &&
               initial.nonNegative && bound(limit, depth + 1).nonNegative) {
             // With 0 <= p < end, p + min(step, end-p) remains in [p,end]
@@ -2756,6 +2791,27 @@ bool PhysicalProgramAnalysis::carriesSource(Type type,
   return false;
 }
 
+namespace {
+
+// Forwarding slots describe the structural boundary. Range analysis may also
+// exclude a counted loop's statically unreachable exit, without changing the
+// type constraints that the boundary mutator must preserve on every edge.
+ControlFlowEdges executableIncoming(Value value) {
+  auto incoming = queryControlFlowIncoming(value);
+  if (auto loop = value.getDefiningOp<scf::ForOp>()) {
+    auto lower = integerConstant(loop.getLowerBound());
+    auto upper = integerConstant(loop.getUpperBound());
+    if (lower && upper)
+      llvm::erase_if(incoming.edges, [&](const ControlFlowEdge &edge) {
+        return (*lower < *upper && edge.kind == ControlFlowEdgeKind::Bypass) ||
+               (*lower >= *upper && edge.kind == ControlFlowEdgeKind::Exit);
+      });
+  }
+  return incoming;
+}
+
+} // namespace
+
 SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
     BlockArgument argument) const {
   SmallVector<Value, 2> sources;
@@ -2784,17 +2840,12 @@ SmallVector<Value, 2> PhysicalProgramAnalysis::structuredSourcesForArgument(
     }
     return sources;
   }
-  if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
-    if (argument == loop.getInductionVar())
-      return sources;
-    unsigned offset = argument.getArgNumber() - 1;
-    if (offset >= loop.getInitArgs().size())
-      return sources;
-    sources.push_back(loop.getInitArgs()[offset]);
-    if (auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-        yield && offset < yield.getResults().size())
-      sources.push_back(yield.getResults()[offset]);
-  }
+  auto incoming = queryControlFlowIncoming(argument);
+  if (!incoming.complete)
+    return sources;
+  for (const ControlFlowEdge &edge : incoming.edges)
+    if (edge.operand && !llvm::is_contained(sources, edge.operand->get()))
+      sources.push_back(edge.operand->get());
   return sources;
 }
 
@@ -2829,14 +2880,31 @@ void PhysicalProgramAnalysis::collectRanges(
     // Scalar ABI/control coordinates do not introduce a fragment range.
     if (isa<IntegerType, FloatType, IndexType>(argument.getType()))
       return;
-    SmallVector<Value, 2> outer = structuredSourcesForArgument(argument);
-    if (outer.empty()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, argument.getOwner()->getParentOp());
-      return;
+    SmallVector<Value> pending{argument};
+    llvm::DenseSet<Value> arguments;
+    while (!pending.empty()) {
+      Value current = pending.pop_back_val();
+      auto formal = dyn_cast<BlockArgument>(current);
+      if (!formal) {
+        collectRanges(current, source, result, visited, followScalarDependencies);
+        continue;
+      }
+      if (isa<IntegerType, FloatType, IndexType>(formal.getType()) ||
+          (source && !carriesSource(formal.getType(), *source)))
+        continue;
+      if (!followScalarDependencies)
+        if (auto fragment = dyn_cast<FragmentType>(formal.getType());
+            fragment && fragment.getShape().empty())
+          continue;
+      if (!arguments.insert(formal).second) continue;
+      auto outer = structuredSourcesForArgument(formal);
+      if (outer.empty()) {
+        result.state = PhysicalFactState::Unknown;
+        appendUnique(result.blockers, formal.getOwner()->getParentOp());
+      } else {
+        llvm::append_range(pending, outer);
+      }
     }
-    for (Value related : outer)
-      collectRanges(related, source, result, visited, followScalarDependencies);
     return;
   }
   Operation *operation = value.getDefiningOp();
@@ -2847,7 +2915,7 @@ void PhysicalProgramAnalysis::collectRanges(
       appendUnique(result.roots, range);
     return;
   }
-  if (isa<scf::ForOp>(operation)) {
+  if (isa<RegionBranchOpInterface>(operation)) {
     if (auto fragment = dyn_cast<FragmentType>(value.getType())) {
       // A completed loop contributes its result lanes to an indirect access,
       // not the reduction lanes used to compute each index. Follow the typed
@@ -3022,6 +3090,7 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     }
     if (!followed) {
       result.state = PhysicalFactState::Unknown;
+      appendUnique(result.blockers, argument.getOwner()->getParentOp());
       return;
     }
     return;
@@ -3141,52 +3210,86 @@ void PhysicalProgramAnalysis::collectAxisRanges(
   if (auto extract = dyn_cast<ExtractOp>(operation)) {
     bool followed = false;
     llvm::SmallPtrSet<Value, 8> visitedRecords;
+    auto unknownRecord = [&](Value recordValue) {
+      result.state = PhysicalFactState::Unknown;
+      Operation *blocker = recordValue ? recordValue.getDefiningOp() : nullptr;
+      if (auto argument = dyn_cast_or_null<BlockArgument>(recordValue))
+        blocker = argument.getOwner()->getParentOp();
+      appendUnique(result.blockers, blocker ? blocker : extract.getOperation());
+    };
     std::function<void(Value)> collectRecordField = [&](Value recordValue) {
-      if (!recordValue || !visitedRecords.insert(recordValue).second)
+      if (!recordValue) {
+        unknownRecord(recordValue);
+        return;
+      }
+      // Reaching an already visited carry closes a cycle; it is not another
+      // unknown branch. Each distinct incoming source is checked separately.
+      if (!visitedRecords.insert(recordValue).second)
         return;
       if (auto record = recordValue.getDefiningOp<MakeRecordOp>()) {
-        if (extract.getField() >= record.getFields().size())
+        if (extract.getField() >= record.getFields().size()) {
+          unknownRecord(recordValue);
           return;
+        }
         Value field = record.getFields()[extract.getField()];
         auto type = dyn_cast<FragmentType>(field.getType());
-        if (!type || fragmentAxis >= type.getShape().size())
+        if (!type || fragmentAxis >= type.getShape().size()) {
+          unknownRecord(recordValue);
           return;
+        }
         followed = true;
         collectAxisRanges(field, fragmentAxis, result, visited);
         return;
       }
       if (auto argument = dyn_cast<BlockArgument>(recordValue)) {
-        for (Value related : structuredSourcesForArgument(argument))
+        auto sources = structuredSourcesForArgument(argument);
+        if (sources.empty())
+          unknownRecord(recordValue);
+        for (Value related : sources)
           collectRecordField(related);
         return;
       }
       auto opResult = dyn_cast<OpResult>(recordValue);
-      if (!opResult)
+      if (!opResult) {
+        unknownRecord(recordValue);
         return;
+      }
       if (auto fold = dyn_cast<RegionFoldOp>(opResult.getOwner())) {
         unsigned component = opResult.getResultNumber();
-        if (component >= fold.getIdentities().size())
+        if (component >= fold.getIdentities().size()) {
+          unknownRecord(recordValue);
           return;
+        }
         collectRecordField(fold.getIdentities()[component]);
-        if (auto yield =
-                dyn_cast<YieldOp>(fold.getSummarize().front().getTerminator());
-            yield && component < yield.getValues().size())
-          collectRecordField(yield.getValues()[component]);
+        Region &summarize = fold.getSummarize();
+        if (summarize.empty() || summarize.front().empty()) {
+          unknownRecord(recordValue);
+          return;
+        }
+        auto yield = dyn_cast<YieldOp>(summarize.front().back());
+        if (!yield || component >= yield.getValues().size()) {
+          unknownRecord(recordValue);
+          return;
+        }
+        collectRecordField(yield.getValues()[component]);
         return;
       }
-      if (auto loop = dyn_cast<scf::ForOp>(opResult.getOwner())) {
-        unsigned component = opResult.getResultNumber();
-        if (component < loop.getInitArgs().size())
-          collectRecordField(loop.getInitArgs()[component]);
-        if (auto yield =
-                dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-            yield && component < yield.getResults().size())
-          collectRecordField(yield.getResults()[component]);
+      if (isa<RegionBranchOpInterface>(opResult.getOwner())) {
+        auto incoming = executableIncoming(opResult);
+        if (!incoming.complete || incoming.edges.empty())
+          unknownRecord(recordValue);
+        for (const ControlFlowEdge &edge : incoming.edges)
+          if (edge.operand)
+            collectRecordField(edge.operand->get());
+          else
+            unknownRecord(recordValue);
+        return;
       }
+      unknownRecord(recordValue);
     };
     collectRecordField(extract.getRecord());
     if (!followed)
-      result.state = PhysicalFactState::Unknown;
+      unknownRecord(extract.getRecord());
     return;
   }
   if (auto gather = dyn_cast<GatherOp>(operation)) {
@@ -3413,43 +3516,16 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     }
     return;
   }
-  if (auto branch = dyn_cast<scf::IfOp>(operation)) {
-    auto opResult = dyn_cast<OpResult>(value);
-    if (!opResult || branch.getElseRegion().empty()) {
+  if (isa<RegionBranchOpInterface>(operation)) {
+    auto incoming = executableIncoming(value);
+    if (!incoming.complete || incoming.edges.empty()) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
       return;
     }
-    for (Region &region : branch->getRegions()) {
-      auto yield = dyn_cast<scf::YieldOp>(region.front().getTerminator());
-      if (!yield || opResult.getResultNumber() >= yield.getNumOperands()) {
-        result.state = PhysicalFactState::Unknown;
-        appendUnique(result.blockers, operation);
-        return;
-      }
-      collectAxisRanges(yield.getOperand(opResult.getResultNumber()),
-                        fragmentAxis, result, visited);
-    }
-    return;
-  }
-  if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-    auto opResult = dyn_cast<OpResult>(value);
-    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    if (!opResult || !yield ||
-        opResult.getResultNumber() >= yield.getResults().size() ||
-        opResult.getResultNumber() >= loop.getInitArgs().size()) {
-      result.state = PhysicalFactState::Unknown;
-      appendUnique(result.blockers, operation);
-      return;
-    }
-    auto lower = integerConstant(loop.getLowerBound());
-    auto upper = integerConstant(loop.getUpperBound());
-    if (!lower || !upper || *lower >= *upper)
-      collectAxisRanges(loop.getInitArgs()[opResult.getResultNumber()],
-                        fragmentAxis, result, visited);
-    if (!lower || !upper || *lower < *upper)
-      collectAxisRanges(yield.getResults()[opResult.getResultNumber()],
-                        fragmentAxis, result, visited);
+    for (const ControlFlowEdge &edge : incoming.edges)
+      if (edge.operand)
+        collectAxisRanges(edge.operand->get(), fragmentAxis, result, visited);
     return;
   }
   if (!isCoordinateReplayNode(operation)) {
@@ -3510,10 +3586,10 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
 
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
-    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner);
-        loop && argument.getOwner() == loop.getBody() &&
-        argument.getArgNumber() > 0) {
-      Value initial = loop.getInitArgs()[argument.getArgNumber() - 1];
+    for (const ControlFlowEdge &edge : queryControlFlowIncoming(argument).edges) {
+      if (edge.kind != ControlFlowEdgeKind::Entry || !edge.operand)
+        continue;
+      Value initial = edge.operand->get();
       if (initial.getType() == fragment) {
         PhysicalAxisRealizationFact input =
             axisRealization(initial, fragmentAxis);
@@ -3684,8 +3760,8 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
 
   if (auto loop = value.getDefiningOp<scf::ForOp>()) {
     auto reductions = loop->getAttrOfType<ArrayAttr>(reductionSourcesAttr);
-    auto opResult = dyn_cast<OpResult>(value);
-    auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    OpOperand *initial = singleControlInput(value, ControlFlowEdgeKind::Bypass, nullptr);
+    OpOperand *yielded = singleControlInput(value, ControlFlowEdgeKind::Exit, &loop.getRegion());
     bool preservesAxis = reductions && !reductions.empty() &&
                          llvm::none_of(reductions, [&](Attribute attribute) {
                            auto reduction = dyn_cast<PhysicalSourceAttr>(attribute);
@@ -3695,12 +3771,10 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
                                                      reduction.getDerived()} ==
                                       result.source;
                          });
-    if (preservesAxis && opResult && yield &&
-        opResult.getResultNumber() < loop.getInitArgs().size() &&
-        loop.getInitArgs()[opResult.getResultNumber()].getType() == fragment &&
-        yield.getOperand(opResult.getResultNumber()).getType() == fragment) {
+    if (preservesAxis && initial && yielded &&
+        initial->get().getType() == fragment && yielded->get().getType() == fragment) {
       PhysicalRangeFact provenance =
-          sourceRanges(yield.getOperand(opResult.getResultNumber()), result.source);
+          sourceRanges(yielded->get(), result.source);
       auto kind = extent.getKind();
       bool physicalExtent =
           kind != PhysicalExprKind::Dimension &&
@@ -4152,6 +4226,13 @@ void PhysicalProgramAnalysis::analyzeReplay(
     return;
   if (auto argument = dyn_cast<BlockArgument>(value)) {
     Operation *owner = argument.getOwner()->getParentOp();
+    if (isa_and_nonnull<RegionBranchOpInterface>(owner) && !isa<scf::ForOp>(owner)) {
+      // Structural forwarding alone does not authorize replaying new control
+      // forms. Whole-region replay below deliberately supports only if/for.
+      appendUnique(result.blockers, owner);
+      result.state = PhysicalFactState::Unknown;
+      return;
+    }
     if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
       bool replayingLoop = ensureEnclosingReplay(loop);
       // Replaying the complete loop checks its initial operands and all
@@ -4565,18 +4646,20 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
         exact.depends = true;
         return exact;
       }
-      auto result = dyn_cast<OpResult>(current);
-      auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-      if (!result || !yield ||
-          result.getResultNumber() >= loop.getInitArgs().size()) {
+      OpOperand *initial = singleControlInput(current, ControlFlowEdgeKind::Bypass, nullptr);
+      OpOperand *yielded = singleControlInput(current, ControlFlowEdgeKind::Exit, &loop.getRegion());
+      Value carry = initial ? singleControlTarget(*initial, ControlFlowEdgeKind::Entry,
+                                                 &loop.getRegion()) : Value();
+      if (!initial || !yielded || !carry ||
+          singleControlTarget(*yielded, ControlFlowEdgeKind::RegionTransfer,
+                              &loop.getRegion()) != carry) {
         exact.state = PhysicalFactState::Unknown;
         appendUnique(exact.blockers, operation);
         return exact;
       }
-      unsigned index = result.getResultNumber();
       auto carryFeedsReduction = [&](unsigned carryAxis) {
         SmallVector<std::pair<Value, unsigned>> pending{
-            {loop.getRegionIterArgs()[index], carryAxis}};
+            {carry, carryAxis}};
         llvm::DenseMap<Value, SmallVector<unsigned, 2>> reached;
         for (unsigned cursor = 0; cursor < pending.size(); ++cursor) {
           auto [carried, axis] = pending[cursor];
@@ -4653,8 +4736,7 @@ PhysicalReductionDependencyFact PhysicalProgramAnalysis::reductionDependency(
               loopTraversals.push_back(related);
           }
       }
-      for (Value related :
-           {loop.getInitArgs()[index], yield.getResults()[index]}) {
+      for (Value related : {initial->get(), yielded->get()}) {
         for (auto [identity, dimension] : loopTraversals) {
           PhysicalReductionDependencyFact nested = analyze(related, identity, dimension);
           if (nested.depends)
