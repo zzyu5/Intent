@@ -1,7 +1,7 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,1.683168,1.927568,1.775696,1.145202,1.054973,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,,,adapter_preparation_failed,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer","Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer"
-dense_gemm,M4096-N14336-K4096-fp16,1.584376,1.249840,1.337216,0.788853,0.844002,pass,pass,Intent target=triton; source corpus=cutile.,
+dense_gemm,M4096-N14336-K4096-fp16,1.535672,1.249840,1.334616,0.813872,0.869076,pass,pass,Intent target=triton; source corpus=cutile.,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,3.097600,3.486504,4.374440,1.125550,1.412203,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用预计算 block ownership,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.446112,0.050552,0.051344,0.114645,0.115092,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Mean/Rstd,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.139768,0.128016,0.130176,0.915918,0.931372,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
@@ -17,7 +17,7 @@ grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.487456,0.414952,0.444008,0
 moe_alignment,T4096-top2-E64,0.040976,0.037072,0.024928,0.904725,0.608356,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.067568,0.056368,0.056416,0.834241,0.834951,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.878456,0.576672,0.707456,0.656461,0.805340,pass,pass,Intent target=triton; source corpus=cutile.,
-rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.063632,0.063584,0.064224,0.999246,1.009303,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入
+rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.064160,0.063584,0.064512,0.991022,1.005486,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入
 gelu,8192x4096-fp16-tanh,0.050768,0.069560,0.051672,1.370154,1.017806,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 geglu,4096x28672-fp16-tanh,0.226864,0.150120,0.138680,0.661718,0.611291,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 f16 中间舍入,同算法；source 保留 f16 中间舍入
 relu,8192x4096-fp16,0.049624,0.049800,0.049528,1.003547,0.998065,pass,pass,Intent target=triton; source corpus=cutile. 同算法；NaN 传播方式不同,同算法；NaN 传播方式不同
