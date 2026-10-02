@@ -171,7 +171,7 @@ def main() -> None:
     build_environment = work / "build-environment"
     run(sys.executable, "-m", "venv", build_environment, cwd=work, env=env)
     build_python = build_environment / "bin/python"
-    run(build_python, "-m", "pip", "install", "build>=1.2,<2", cwd=work, env=env)
+    run(build_python, "-m", "pip", "install", "--upgrade", "pip", "build>=1.2,<2", cwd=work, env=env)
     source_output, wheel_output = work / "sdist", work / "wheel"
     run(build_python, "-m", "build", "--sdist", "--outdir", source_output,
         REPOSITORY, cwd=work, env=env)
