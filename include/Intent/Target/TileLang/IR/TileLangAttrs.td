@@ -21,7 +21,8 @@ class IntentTileLang_I32EnumAttr<string mnemonic,
 def IntentTileLang_BufferSpace : IntentTileLang_I32Enum<
     "BufferSpace", "Selected TileLang native allocation space", [
       I32EnumAttrCase<"Shared", 0, "shared">,
-      I32EnumAttrCase<"Fragment", 1, "fragment">
+      I32EnumAttrCase<"Fragment", 1, "fragment">,
+      I32EnumAttrCase<"Local", 2, "local">
     ]>;
 def IntentTileLang_BufferSpaceAttr : IntentTileLang_I32EnumAttr<
     "buffer_space", IntentTileLang_BufferSpace>;

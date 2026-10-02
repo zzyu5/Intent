@@ -7,7 +7,7 @@ include "mlir/IR/AttrTypeBase.td"
 
 def IntentTileLang_BufferType : TypeDef<IntentTileLang_Dialect, "Buffer"> {
   let mnemonic = "buffer";
-  let summary = "A selected TileLang shared or fragment allocation";
+  let summary = "A selected TileLang shared, distributed fragment or thread-local allocation";
   let parameters = (ins
     "::mlir::Type":$elementType,
     "::mlir::ArrayAttr":$shape,

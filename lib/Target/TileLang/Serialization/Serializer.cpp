@@ -309,10 +309,16 @@ private:
                                       std::to_string(extract.getField()) + "]");
     } else if (auto allocation = dyn_cast<AllocOp>(operation)) {
       auto type = allocation.getResult().getType();
-      std::string function =
-          type.getSpace().getValue() == BufferSpace::Shared
-              ? "T.alloc_shared"
-              : "T.alloc_fragment";
+      std::string function;
+      switch (type.getSpace().getValue()) {
+      case BufferSpace::Shared: function = "T.alloc_shared"; break;
+      case BufferSpace::Fragment: function = "T.alloc_fragment"; break;
+      case BufferSpace::Local: function = "T.alloc_local"; break;
+      default:
+        allocation.emitOpError("TileLang allocation space has no source spelling");
+        failed = true;
+        return;
+      }
       assign(allocation.getResult(), function + "(" + shape(type.getShape()) +
                                          ", " + tileLangType(type.getElementType()) + ")");
     } else if (auto clear = dyn_cast<ClearOp>(operation)) {

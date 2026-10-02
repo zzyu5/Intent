@@ -2,7 +2,7 @@ kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
 block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks128,0.120856,0.099168,1.218700,pass,
 dense_flash_attention,B4-S4096-H32-D128-fp16-causal,,,,provider_program_verification_failed,
 varlen_gqa_prefill,packed8-QH32-KVH8-D128-fp16-causal,,,,provider_program_verification_failed,
-gqa_decode,B32-QH32-KVH8-S8192-D128-fp16,,,,physical_program_verification_failed,
+gqa_decode,B32-QH32-KVH8-S8192-D128-fp16,,,,numerical_failed,"generated/source floating result 0 differs: max_abs=0.0835723876953125, atol=0.05, rtol=0.02; first_failure=1599; largest tolerance excess has generated=0.0089263916015625, source=-0.07464599609375, abs_error=0.0835723876953125, limit=0.05149292200803757"
 varlen_gqa_decode_logits,B16-QH32-KVH8-S4096-D64-fp16,,,,kernel_ir_parse_failed,
 paged_mla_decode,B32-QH128-KVH1-S8192-V128-R64-page64-fp16,,,,compiler_process_failed,
 persistent_mla_decode,B8-H64-S16384-C128-R64-split4-fp16,,,,intent_implementation_gap,
@@ -15,10 +15,10 @@ sparse_2to4_gemm,M8192-N14336-K8192-fp16,,,,physical_program_verification_failed
 deepgemm_fp8_2xacc,M4096-N4096-K4096-e4m3-bf16,,,,physical_program_verification_failed,
 online_softmax,8192x8192-fp16,,,,provider_program_verification_failed,
 deepseek_topk_selector,B32-S32768-topk2048-fp32,,,,intent_implementation_gap,
-rms_norm,8192x4096-fp32,0.179808,0.179824,0.999911,pass,
+rms_norm,8192x4096-fp32,0.177792,0.179848,0.988568,pass,
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-fp16,,,,provider_program_verification_failed,
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-fp16,0.016928,0.018032,0.938776,pass,
-linear_attention_forward,B1-S2048-H16-D128-fp16,,,,physical_program_verification_failed,
+linear_attention_forward,B1-S2048-H16-D128-fp16,,,,generated_provider_jit_or_initial_launch_failed,Auto-tuning failed: No configuration successfully compiled and passed benchmarking/validation.
 linear_attention_backward,B1-S2048-H16-D128-fp16,,,,physical_program_verification_failed,
 retention_forward,B1-S2048-H16-D128-fp16,,,,physical_program_verification_failed,
 mhc_pre,T2048-H4096-streams4-bf16,,,,provider_jit_or_initial_launch_failed,

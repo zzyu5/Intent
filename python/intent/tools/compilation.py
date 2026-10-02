@@ -178,7 +178,8 @@ def describe(target: str | None = None) -> dict:
             "target": _declaration(getattr(intent, backend(name)["target"]))} for name in names}
         result["api"] = {name: _declaration(getattr(intent, name)) for name in (
             "compile", "generate", "compile_ir", "generate_from_ir", "optimize_ir", "CompileOptions",
-            "GPUCompilationTarget", "GPUCapabilities", "CPUCompilationTarget", "DSACompilationTarget")}
+            "GPUCompilationTarget", "GPUCapabilities", "CPUCompilationTarget", "DSACompilationTarget",
+            "NativeObservation", "NativeResource", "CandidateObservation", "InvocationArgument")}
         result["tools"] = {name: _declaration(function) for name, function in (
             ("compile", compile_request), ("generate_from_ir", generate_ir_request),
             ("materialize", materialize_request), ("optimize", optimize_request),

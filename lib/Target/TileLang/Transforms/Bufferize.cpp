@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
@@ -269,6 +270,38 @@ Operation *allocationAnchor(Operation *operation) {
 }
 
 class Bufferizer {
+  struct BufferedFragment {
+    Value buffer;
+    Operation *availableBefore;
+    SmallVector<unsigned> axes;
+
+    bool hasIdentityAxes() const {
+      return llvm::all_of(llvm::enumerate(axes), [](auto item) {
+        return item.index() == item.value();
+      });
+    }
+
+    SmallVector<Value> physicalIndices(ValueRange logicalIndices) const {
+      if (axes.empty())
+        return SmallVector<Value>(logicalIndices);
+      SmallVector<Value> result;
+      for (unsigned axis : axes)
+        result.push_back(logicalIndices[axis]);
+      return result;
+    }
+
+    ArrayAttr logicalShape() const {
+      ArrayAttr physical = cast<BufferType>(buffer.getType()).getShape();
+      if (axes.empty())
+        return physical;
+      SmallVector<Attribute> logical(axes.size());
+      for (auto [position, axis] : llvm::enumerate(axes))
+        logical[axis] = physical[position];
+      return ArrayAttr::get(buffer.getContext(), logical);
+    }
+  };
+  using BufferBindings = DenseMap<Value, SmallVector<BufferedFragment>>;
+
 public:
   explicit Bufferizer(func::FuncOp kernel) : kernel(kernel) {}
 
@@ -332,13 +365,6 @@ public:
           if (operand.hasOneUse())
             deferredScaledLoads.insert(load);
     });
-    WalkResult contractShapes = kernel.walk([&](gpu::ContractOp op) {
-      if (failed(recordContractPhysicalAxes(op)))
-        return WalkResult::interrupt();
-      return WalkResult::advance();
-    });
-    if (contractShapes.wasInterrupted())
-      return failure();
     kernel.walk([&](Operation *operation) {
       if (isa<gpu::ContractOp, gpu::ScaledContractOp, gpu::SparseContractOp,
               gpu::ReduceOp, gpu::ScanOp>(operation))
@@ -398,13 +424,17 @@ public:
     // bufferization rather than keeping its fragment index alive.
     for (gpu::AssumeInBoundsOp assumption : boundsAssumptions)
       lowered.insert(assumption);
+    // No materialization queries occur during terminal SSA cleanup. Release
+    // bindings before that cleanup erases their source values and scope anchors.
+    fragmentBuffers.clear();
+    sharedBuffers.clear();
     eraseLoweredOperations();
     eraseDeadPureValues();
     if (failed(dropFragmentLoopCarries()) || failed(bufferizeScalarLoopCarries()))
       return failure();
     eraseLoweredOperations();
     eraseDeadPureValues();
-    if (failed(dropFragmentIfResults()))
+    if (failed(dropFragmentIfResults()) || failed(bufferizeScalarIfResults()))
       return failure();
     eraseLoweredOperations();
     eraseDeadPureValues();
@@ -516,13 +546,10 @@ private:
         auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
         if (!fragment)
           continue;
-        auto shape = physicalShapeFor(value, choice);
-        if (failed(shape))
-          return WalkResult::interrupt();
-        auto buffer = allocateFor(value, BufferSpace::Fragment, choice, *shape);
+        auto buffer = allocateFor(value, BufferSpace::Fragment, choice);
         if (failed(buffer))
           return WalkResult::interrupt();
-        fragmentBuffers[value] = *buffer;
+        bindBuffer(fragmentBuffers, value, *buffer, choice);
       }
       return WalkResult::advance();
     });
@@ -535,7 +562,7 @@ private:
         auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
         if (!fragment)
           continue;
-        Value buffer = fragmentBuffers.lookup(value);
+        Value buffer = lookupBuffer(fragmentBuffers, value, choice);
         for (Region &region : choice->getRegions()) {
           auto yield = cast<scf::YieldOp>(region.front().getTerminator());
           if (failed(storeFragment(yield.getOperand(index), buffer, yield)))
@@ -727,22 +754,22 @@ private:
   FailureOr<SmallVector<Value>> indicesFor(
       OpBuilder &builder, gpu::FragmentType source,
       gpu::FragmentType target, ValueRange targetIndices, Operation *owner) {
+    // An identical lane schema preserves occurrences positionally, including
+    // Cartesian products with two occurrences of the same source dimension.
+    // Other relationships need an exact axis identity; only explicit broadcast
+    // and reshape operations may introduce a positional projection.
+    if (source.getShape() == target.getShape() &&
+        source.getAxisMaps() == target.getAxisMaps())
+      return SmallVector<Value>(targetIndices);
     SmallVector<Value> result(source.getShape().size());
     for (Attribute sourceAttribute : source.getAxisMaps()) {
       auto sourceMap = cast<gpu::AxisMapAttr>(sourceAttribute);
-      std::optional<unsigned> targetAxis;
-      for (Attribute targetAttribute : target.getAxisMaps()) {
-        auto targetMap = cast<gpu::AxisMapAttr>(targetAttribute);
-        if (targetMap.getSourceId() == sourceMap.getSourceId() &&
-            targetMap.getSourceAxis() == sourceMap.getSourceAxis()) {
-          if (targetAxis)
-            return owner->emitOpError(
-                "TileLang scalarization found an ambiguous coordinate axis");
-          targetAxis = targetMap.getFragmentAxis();
-        }
-      }
-      if (targetAxis) {
-        result[sourceMap.getFragmentAxis()] = targetIndices[*targetAxis];
+      auto targetAxis = gpu::queryFragmentAxis(
+          target, gpu::sourceAxisIdentity(sourceMap), sourceMap.getDimensionId());
+      if (targetAxis.isExact() &&
+          targetAxis.dimensionId == sourceMap.getDimensionId()) {
+        result[sourceMap.getFragmentAxis()] =
+            targetIndices[targetAxis.fragmentAxis];
         continue;
       }
       auto extent = cast<gpu::PhysicalExprAttr>(
@@ -849,111 +876,80 @@ private:
                                      gpu::FragmentType source,
                                      gpu::FragmentType target,
                                      ValueRange targetIndices,
-                                     Operation *owner) {
+                                     Operation *owner,
+                                     const BufferedFragment *binding = nullptr) {
     FailureOr<SmallVector<Value>> indices =
         indicesFor(builder, source, target, targetIndices, owner);
     if (failed(indices))
       return failure();
+    if (binding)
+      *indices = binding->physicalIndices(*indices);
     return builder
         .create<BufferLoadOp>(owner->getLoc(), source.getElementType(), buffer,
                               *indices)
         .getResult();
   }
 
-  Value findBuffer(Value value) const {
-    auto fragment = fragmentBuffers.find(value);
-    if (fragment != fragmentBuffers.end())
-      return fragment->second;
-    auto shared = sharedBuffers.find(value);
-    return shared == sharedBuffers.end() ? Value() : shared->second;
+  static void bindBuffer(BufferBindings &bindings, Value value, Value buffer,
+                         Operation *availableBefore,
+                         ArrayRef<unsigned> axes = {}) {
+    bindings[value].push_back({buffer, availableBefore,
+                               SmallVector<unsigned>(axes)});
+  }
+
+  const BufferedFragment *lookupBinding(const BufferBindings &bindings,
+                                        Value value, Operation *before) const {
+    auto found = bindings.find(value);
+    if (found == bindings.end())
+      return nullptr;
+    // Allocation may be hoisted outside a loop, but initialization is not.
+    // The materialization site, rather than allocation dominance alone, owns
+    // availability of this immutable snapshot in the current region tree.
+    DominanceInfo dominance;
+    for (const BufferedFragment &binding : llvm::reverse(found->second))
+      if (dominance.dominates(binding.availableBefore, before))
+        return &binding;
+    return nullptr;
+  }
+
+  Value lookupBuffer(const BufferBindings &bindings, Value value,
+                     Operation *before) const {
+    const BufferedFragment *binding = lookupBinding(bindings, value, before);
+    return binding ? binding->buffer : Value();
+  }
+
+  const BufferedFragment *findBinding(Value value, Operation *before) const {
+    if (auto *binding = lookupBinding(fragmentBuffers, value, before))
+      return binding;
+    return lookupBinding(sharedBuffers, value, before);
+  }
+
+  Value findBuffer(Value value, Operation *before) const {
+    auto *binding = findBinding(value, before);
+    return binding ? binding->buffer : Value();
   }
 
   bool dependsOnBufferedFragment(Value value,
-                                 llvm::DenseSet<Value> &active) const {
+                                  Operation *before,
+                                  llvm::DenseSet<Value> &active) const {
     if (!isa<gpu::FragmentType>(value.getType()))
       return false;
-    if (findBuffer(value))
+    if (findBuffer(value, before))
       return true;
     if (!active.insert(value).second)
       return false;
     Operation *producer = value.getDefiningOp();
     bool dependent =
         producer && llvm::any_of(producer->getOperands(), [&](Value operand) {
-          return dependsOnBufferedFragment(operand, active);
+          return dependsOnBufferedFragment(operand, before, active);
         });
     active.erase(value);
     return dependent;
   }
 
-  bool dependsOnBufferedFragment(Value value) const {
+  bool dependsOnBufferedFragment(Value value, Operation *before) const {
     llvm::DenseSet<Value> active;
-    return dependsOnBufferedFragment(value, active);
-  }
-
-  FailureOr<ArrayAttr> physicalShapeForImpl(Value value, Operation *owner,
-                                            llvm::DenseSet<Value> &active) {
-    auto result = dyn_cast<gpu::FragmentType>(value.getType());
-    if (!result)
-      return failure();
-    if (!active.insert(value).second)
-      return result.getShape();
-    SmallVector<Attribute> shape(result.getShape().begin(),
-                                 result.getShape().end());
-    for (Attribute axisAttribute : result.getAxisMaps()) {
-      auto axis = cast<gpu::AxisMapAttr>(axisAttribute);
-      auto found = nativeAxisExtents.find(axisAttribute);
-      if (found != nativeAxisExtents.end())
-        shape[axis.getFragmentAxis()] = found->second;
-    }
-    Operation *producer = value.getDefiningOp();
-    if (!producer) {
-      active.erase(value);
-      return ArrayAttr::get(kernel.getContext(), shape);
-    }
-    for (Value operand : producer->getOperands()) {
-      auto source = dyn_cast<gpu::FragmentType>(operand.getType());
-      Value buffer = findBuffer(operand);
-      if (!source)
-        continue;
-      ArrayAttr sourceShape;
-      if (buffer) {
-        sourceShape = cast<BufferType>(buffer.getType()).getShape();
-      } else {
-        FailureOr<ArrayAttr> inferred =
-            physicalShapeForImpl(operand, owner, active);
-        if (failed(inferred)) {
-          active.erase(value);
-          return failure();
-        }
-        sourceShape = *inferred;
-      }
-      for (Attribute resultAttribute : result.getAxisMaps()) {
-        auto resultMap = cast<gpu::AxisMapAttr>(resultAttribute);
-        for (Attribute sourceAttribute : source.getAxisMaps()) {
-          auto sourceMap = cast<gpu::AxisMapAttr>(sourceAttribute);
-          if (sourceMap.getSourceId() != resultMap.getSourceId() ||
-              sourceMap.getSourceAxis() != resultMap.getSourceAxis())
-            continue;
-          unsigned resultAxis = resultMap.getFragmentAxis();
-          unsigned sourceAxis = sourceMap.getFragmentAxis();
-          Attribute physical = sourceShape[sourceAxis];
-          if (physical == source.getShape()[sourceAxis])
-            continue;
-          if (shape[resultAxis] != result.getShape()[resultAxis] &&
-              shape[resultAxis] != physical)
-            return owner->emitOpError(
-                "TileLang fragment operands require incompatible provider-native physical extents");
-          shape[resultAxis] = physical;
-        }
-      }
-    }
-    active.erase(value);
-    return ArrayAttr::get(kernel.getContext(), shape);
-  }
-
-  FailureOr<ArrayAttr> physicalShapeFor(Value value, Operation *owner) {
-    llvm::DenseSet<Value> active;
-    return physicalShapeForImpl(value, owner, active);
+    return dependsOnBufferedFragment(value, before, active);
   }
 
   FailureOr<Value> scalarize(Value value, gpu::FragmentType target,
@@ -967,9 +963,10 @@ private:
       return cached;
     auto source = cast<gpu::FragmentType>(value.getType());
     if (!preferSourceGraph) {
-      if (Value buffer = findBuffer(value)) {
+      if (const BufferedFragment *binding = findBinding(value, owner)) {
         FailureOr<Value> loaded = loadBufferElement(
-            builder, buffer, source, target, targetIndices, owner);
+            builder, binding->buffer, source, target, targetIndices, owner,
+            binding);
         if (succeeded(loaded))
           memo[value] = *loaded;
         return loaded;
@@ -992,21 +989,10 @@ private:
         return failure();
       result = *loaded;
     } else if (auto range = dyn_cast<gpu::MakeRangeOp>(producer)) {
-      FailureOr<unsigned> targetAxis = failure();
-      for (Attribute targetAttribute : target.getAxisMaps()) {
-        auto mapping = cast<gpu::AxisMapAttr>(targetAttribute);
-        if (mapping.getSourceId() == range.getSourceId() &&
-            mapping.getSourceAxis() == range.getSourceAxis()) {
-          if (succeeded(targetAxis))
-            return owner->emitOpError(
-                "range provenance maps to multiple TileLang loop axes");
-          targetAxis = mapping.getFragmentAxis();
-        }
-      }
-      if (failed(targetAxis))
-        return owner->emitOpError(
-            "range provenance is absent from the TileLang parallel shape");
-      Value scaled = targetIndices[*targetAxis];
+      auto rangeIndices = indicesFor(builder, source, target, targetIndices, owner);
+      if (failed(rangeIndices))
+        return failure();
+      Value scaled = rangeIndices->front();
       if (!isProvably(range.getStep(), 1))
         scaled = builder.create<gpu::BinaryOp>(
             owner->getLoc(), builder.getIndexType(), scaled, range.getStep(),
@@ -1132,6 +1118,77 @@ private:
       if (failed(input))
         return failure();
       result = *input;
+    } else if (auto gather = dyn_cast<gpu::GatherOp>(producer)) {
+      auto resultIndices = indicesFor(builder, source, target, targetIndices, owner);
+      if (failed(resultIndices))
+        return failure();
+      auto inputType = cast<gpu::FragmentType>(gather.getSource().getType());
+      auto readSource = [&](OpBuilder &nested) -> FailureOr<Value> {
+        SmallVector<Value> inputIndices(inputType.getShape().size());
+        DenseMap<Value, Value> coordinateMemo;
+        for (auto [coordinate, axis] :
+             llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+          auto scalar = scalarize(coordinate, source, *resultIndices, nested,
+                                  owner, coordinateMemo);
+          if (failed(scalar))
+            return failure();
+          if (!scalar->getType().isIndex())
+            *scalar = nested.create<gpu::CastOp>(
+                owner->getLoc(), nested.getIndexType(), *scalar);
+          inputIndices[axis] = *scalar;
+        }
+        for (auto [axis, attribute] : llvm::enumerate(inputType.getAxisMaps())) {
+          if (inputIndices[axis])
+            continue;
+          auto mapping = cast<gpu::AxisMapAttr>(attribute);
+          auto retained = gpu::queryFragmentAxis(
+              source, gpu::sourceAxisIdentity(mapping), mapping.getDimensionId());
+          if (retained.isExact() &&
+              retained.dimensionId == mapping.getDimensionId() &&
+              source.getShape()[retained.fragmentAxis] == inputType.getShape()[axis]) {
+            inputIndices[axis] = (*resultIndices)[retained.fragmentAxis];
+          } else if (gpu::constantPhysicalExpression(
+                         cast<gpu::PhysicalExprAttr>(inputType.getShape()[axis])) == 1) {
+            inputIndices[axis] = nested.create<arith::ConstantIndexOp>(
+                owner->getLoc(), 0);
+          } else {
+            return gather.emitOpError(
+                "TileLang gather cannot identify a retained source axis");
+          }
+        }
+        // Gather indexes an existing SSA snapshot. Do not use the load-replay
+        // mode even when the surrounding consumer can replay its own inputs.
+        DenseMap<Value, Value> inputMemo;
+        return scalarize(gather.getSource(), inputType, inputIndices, nested,
+                         owner, inputMemo);
+      };
+      if (gather.getValid()) {
+        DenseMap<Value, Value> validityMemo;
+        auto valid = scalarize(gather.getValid(), source, *resultIndices,
+                               builder, owner, validityMemo);
+        if (failed(valid))
+          return failure();
+        auto choice = builder.create<scf::IfOp>(
+            owner->getLoc(), TypeRange{source.getElementType()}, *valid, true);
+        OpBuilder selected = OpBuilder::atBlockBegin(&choice.getThenRegion().front());
+        auto input = readSource(selected);
+        if (failed(input))
+          return failure();
+        selected.create<scf::YieldOp>(owner->getLoc(), *input);
+        OpBuilder unselected = OpBuilder::atBlockBegin(&choice.getElseRegion().front());
+        DenseMap<Value, Value> fillMemo;
+        auto fill = scalarize(gather.getFill(), source, *resultIndices,
+                              unselected, owner, fillMemo);
+        if (failed(fill))
+          return failure();
+        unselected.create<scf::YieldOp>(owner->getLoc(), *fill);
+        result = choice.getResult(0);
+      } else {
+        auto input = readSource(builder);
+        if (failed(input))
+          return failure();
+        result = *input;
+      }
     } else if (auto join = dyn_cast<gpu::JoinOp>(producer)) {
       if (join.getAxis() >= targetIndices.size())
         return owner->emitOpError(
@@ -1357,8 +1414,8 @@ private:
     if (access.getAccessValidity())
       accessFragments.push_back(access.getAccessValidity());
     for (Value value : accessFragments)
-      if (isa<gpu::FragmentType>(value.getType()) && !findBuffer(value) &&
-          dependsOnBufferedFragment(value))
+      if (isa<gpu::FragmentType>(value.getType()) && !findBuffer(value, load) &&
+          dependsOnBufferedFragment(value, load))
         if (failed(materialize(value, BufferSpace::Fragment, load)))
           return load.emitOpError(
               "TileLang indirect access fragment cannot be materialized");
@@ -1385,6 +1442,7 @@ private:
     if (failed(allocation))
       return failure();
     Value destination = *allocation;
+    SmallVector<unsigned> bufferAxes;
     if (directCopy) {
       OpBuilder builder(load);
       builder.create<CopyInOp>(load.getLoc(), access.getAccessResource(), *offsets,
@@ -1393,8 +1451,7 @@ private:
                                                       layout->viewAxes),
                                DenseI64ArrayAttr::get(
                                    kernel.getContext(), boundary.boundaryAxes));
-      if (space == BufferSpace::Shared)
-        sharedBufferAxes[load.getResult()] = layout->bufferToFragment;
+      bufferAxes = layout->bufferToFragment;
     } else {
       FailureOr<ParallelOp> parallel = createParallel(load, fragment);
       if (failed(parallel))
@@ -1407,15 +1464,13 @@ private:
                                     body.getArguments(), *loaded);
       builder.create<YieldOp>(load.getLoc());
       if (space == BufferSpace::Shared) {
-        sharedBufferAxes[load.getResult()] =
-            identityAxisOrder(fragment.getShape().size());
         OpBuilder after(load);
         after.setInsertionPointAfter(load);
         after.create<SyncOp>(load.getLoc());
       }
     }
-    (space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers)[load.getResult()] =
-        destination;
+    bindBuffer(space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers,
+               load.getResult(), destination, load, bufferAxes);
     lowered.insert(load);
     return success();
   }
@@ -1425,16 +1480,19 @@ private:
     auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
     if (!fragment)
       return failure();
-    DenseMap<Value, Value> &selected =
+    BufferBindings &selected =
         space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers;
-    if (Value existing = selected.lookup(value))
-      return existing;
+    if (auto *binding = lookupBinding(selected, value, owner))
+      if ((space == BufferSpace::Shared || binding->hasIdentityAxes()) &&
+          binding->logicalShape() == fragment.getShape())
+        return binding->buffer;
     if (space == BufferSpace::Shared && directContractOperands.contains(value))
       if (auto transpose = value.getDefiningOp<gpu::TransposeOp>()) {
         Value source = transpose.getValue();
-        if (Value existing = sharedBuffers.lookup(source)) {
+        if (auto *binding = lookupBinding(sharedBuffers, source, owner)) {
+          Value existing = binding->buffer;
           ArrayRef<int64_t> permutation = transpose.getPermutation();
-          SmallVector<unsigned> sourceOrder = sharedBufferAxes.lookup(source);
+          SmallVector<unsigned> sourceOrder = binding->axes;
           if (sourceOrder.empty())
             sourceOrder = identityAxisOrder(permutation.size());
           if (permutation.size() != sourceOrder.size())
@@ -1451,8 +1509,7 @@ private:
           SmallVector<unsigned> targetOrder;
           for (unsigned sourceAxis : sourceOrder)
             targetOrder.push_back(inverse[sourceAxis]);
-          sharedBuffers[value] = existing;
-          sharedBufferAxes[value] = std::move(targetOrder);
+          bindBuffer(sharedBuffers, value, existing, owner, targetOrder);
           lowered.insert(transpose);
           return existing;
         }
@@ -1460,28 +1517,13 @@ private:
     if (auto loop = value.getDefiningOp<scf::ForOp>()) {
       if (failed(bufferizeFragmentLoopCarries(loop)))
         return failure();
-      if (Value existing = selected.lookup(value))
+      if (Value existing = lookupBuffer(selected, value, owner))
         return existing;
     }
-    FailureOr<ArrayAttr> physicalShape = physicalShapeFor(value, owner);
-    if (failed(physicalShape))
-      return failure();
-    if (*physicalShape != fragment.getShape())
-      if (Operation *producer = value.getDefiningOp())
-        for (Value operand : producer->getOperands()) {
-          auto operandFragment = dyn_cast<gpu::FragmentType>(operand.getType());
-          if (operandFragment && operandFragment.getShape() == fragment.getShape() &&
-              operandFragment.getAxisMaps() == fragment.getAxisMaps())
-            if (failed(materializePadded(operand, space, owner,
-                                         *physicalShape)))
-              return failure();
-        }
-    FailureOr<Value> allocation =
-        allocateFor(value, space, owner, *physicalShape);
+    FailureOr<Value> allocation = allocateFor(value, space, owner);
     if (failed(allocation))
       return failure();
-    FailureOr<ParallelOp> parallel =
-        createParallel(owner, fragment, *physicalShape);
+    FailureOr<ParallelOp> parallel = createParallel(owner, fragment);
     if (failed(parallel))
       return failure();
     Block &body = parallel->getBody().front();
@@ -1498,9 +1540,7 @@ private:
       OpBuilder after(owner);
       after.create<SyncOp>(owner->getLoc());
     }
-    selected[value] = *allocation;
-    if (space == BufferSpace::Shared)
-      sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
+    bindBuffer(selected, value, *allocation, owner);
     return *allocation;
   }
 
@@ -1512,52 +1552,29 @@ private:
     for (auto [extentAttribute, alignment] :
          llvm::zip(fragment.getShape(), alignments)) {
       auto extent = cast<gpu::PhysicalExprAttr>(extentAttribute);
-      if (extent.getKind() ==
-          gpu::PhysicalExprKind::Constant) {
-        int64_t value = extent.getValue();
-        int64_t padded = ((value + alignment - 1) / alignment) * alignment;
-        shape.push_back(constantExtent(kernel.getContext(), padded));
-      } else {
+      if (alignment == 1) {
         shape.push_back(extent);
+        continue;
       }
+      auto alignmentExtent = constantExtent(kernel.getContext(), alignment);
+      auto blocks = gpu::PhysicalExprAttr::get(
+          kernel.getContext(), gpu::PhysicalExprKind::CeilDiv, 0,
+          StringAttr::get(kernel.getContext()),
+          ArrayAttr::get(kernel.getContext(), {extent, alignmentExtent}));
+      auto rounded = gpu::PhysicalExprAttr::get(
+          kernel.getContext(), gpu::PhysicalExprKind::Multiply, 0,
+          StringAttr::get(kernel.getContext()),
+          ArrayAttr::get(kernel.getContext(), {blocks, alignmentExtent}));
+      auto count = gpu::IndexRelations().constant(extent, kernel);
+      auto padded = gpu::IndexRelations().constant(rounded, kernel);
+      if (count && padded && *count == *padded)
+        shape.push_back(extent);
+      else if (padded)
+        shape.push_back(constantExtent(kernel.getContext(), *padded));
+      else
+        shape.push_back(rounded);
     }
     return ArrayAttr::get(kernel.getContext(), shape);
-  }
-
-  LogicalResult recordNativeAxes(Operation *owner, gpu::FragmentType fragment,
-                                 ArrayAttr physicalShape) {
-    for (Attribute axisAttribute : fragment.getAxisMaps()) {
-      auto axis = cast<gpu::AxisMapAttr>(axisAttribute);
-      unsigned index = axis.getFragmentAxis();
-      if (physicalShape[index] == fragment.getShape()[index])
-        continue;
-      auto [position, inserted] =
-          nativeAxisExtents.try_emplace(axisAttribute, physicalShape[index]);
-      if (!inserted && position->second != physicalShape[index])
-        return owner->emitOpError(
-            "TileLang native forms require incompatible physical extents for one logical axis");
-    }
-    return success();
-  }
-
-  LogicalResult recordContractPhysicalAxes(gpu::ContractOp contract) {
-    if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1} ||
-        contract.getRhsReductionAxes() != ArrayRef<int64_t>{0} ||
-        !contract.getLhsBatchAxes().empty() ||
-        !contract.getRhsBatchAxes().empty())
-      return success();
-    auto lhs = cast<gpu::FragmentType>(contract.getLhs().getType());
-    auto rhs = cast<gpu::FragmentType>(contract.getRhs().getType());
-    auto accumulator = cast<gpu::FragmentType>(contract.getResult().getType());
-    int64_t reductionAlignment =
-        lhs.getElementType().getIntOrFloatBitWidth() <= 8 ? 32 : 16;
-    ArrayAttr lhsShape = paddedContractShape(lhs, {16, reductionAlignment});
-    ArrayAttr rhsShape = paddedContractShape(rhs, {reductionAlignment, 1});
-    ArrayAttr accumulatorShape = paddedContractShape(accumulator, {16, 1});
-    return success(succeeded(recordNativeAxes(contract, lhs, lhsShape)) &&
-                   succeeded(recordNativeAxes(contract, rhs, rhsShape)) &&
-                   succeeded(recordNativeAxes(contract, accumulator,
-                                                accumulatorShape)));
   }
 
   FailureOr<Value> materializePadded(Value value, BufferSpace space,
@@ -1565,11 +1582,11 @@ private:
     auto fragment = dyn_cast<gpu::FragmentType>(value.getType());
     if (!fragment || !shape)
       return failure();
-    DenseMap<Value, Value> &selected =
+    BufferBindings &selected =
         space == BufferSpace::Shared ? sharedBuffers : fragmentBuffers;
-    if (Value existing = selected.lookup(value))
-      if (cast<BufferType>(existing.getType()).getShape() == shape)
-        return existing;
+    if (auto *binding = lookupBinding(selected, value, owner))
+      if (binding->hasIdentityAxes() && binding->logicalShape() == shape)
+        return binding->buffer;
 
     FailureOr<Value> allocation = allocateFor(value, space, owner, shape);
     if (failed(allocation))
@@ -1595,16 +1612,25 @@ private:
                                             valid, inBounds,
                                             BinaryOperator::LogicalAnd);
     }
-    DenseMap<Value, Value> memo;
-    FailureOr<Value> scalar = scalarize(value, fragment, body.getArguments(),
-                                        builder, owner, memo);
-    if (failed(scalar))
-      return failure();
     Value zero = builder.create<arith::ConstantOp>(
         owner->getLoc(), fragment.getElementType(),
         builder.getZeroAttr(fragment.getElementType()));
-    Value padded = builder.create<gpu::SelectOp>(
-        owner->getLoc(), fragment.getElementType(), valid, *scalar, zero);
+    // Buffer reads must occur only inside the logical extent. A select after
+    // scalarization would still read outside an existing unpadded snapshot.
+    auto choice = builder.create<scf::IfOp>(
+        owner->getLoc(), TypeRange{fragment.getElementType()}, valid, true);
+    OpBuilder selectedBuilder =
+        OpBuilder::atBlockBegin(&choice.getThenRegion().front());
+    DenseMap<Value, Value> memo;
+    FailureOr<Value> scalar = scalarize(value, fragment, body.getArguments(),
+                                        selectedBuilder, owner, memo);
+    if (failed(scalar))
+      return failure();
+    selectedBuilder.create<scf::YieldOp>(owner->getLoc(), *scalar);
+    OpBuilder rejectedBuilder =
+        OpBuilder::atBlockBegin(&choice.getElseRegion().front());
+    rejectedBuilder.create<scf::YieldOp>(owner->getLoc(), zero);
+    Value padded = choice.getResult(0);
     builder.create<BufferStoreOp>(owner->getLoc(), *allocation,
                                   body.getArguments(), padded);
     builder.create<YieldOp>(owner->getLoc());
@@ -1612,9 +1638,7 @@ private:
       OpBuilder after(owner);
       after.create<SyncOp>(owner->getLoc());
     }
-    selected[value] = *allocation;
-    if (space == BufferSpace::Shared)
-      sharedBufferAxes[value] = identityAxisOrder(fragment.getShape().size());
+    bindBuffer(selected, value, *allocation, owner);
     return *allocation;
   }
 
@@ -1670,7 +1694,7 @@ private:
       if (!isa<gpu::FragmentType>(argument.getType()) ||
           alreadyDropped.contains(index))
         continue;
-      Value buffer = fragmentBuffers.lookup(argument);
+      Value buffer = lookupBuffer(fragmentBuffers, argument, yield);
       if (!buffer)
         return loop.emitOpError(
             "TileLang fragment loop carry was not prepared before transition lowering");
@@ -1695,7 +1719,7 @@ private:
       snapshots.push_back(*snapshot);
     }
     for (auto [transition, snapshot] : llvm::zip(transitions, snapshots))
-      fragmentBuffers[transition] = snapshot;
+      bindBuffer(fragmentBuffers, transition, snapshot, yield);
     for (auto [index, transition, carry] :
          llvm::zip(indices, transitions, carryBuffers)) {
       if (failed(storeFragment(transition, carry, yield)))
@@ -1717,15 +1741,19 @@ private:
       alreadyDropped.insert(index);
     for (auto [index, argument] : llvm::enumerate(loop.getRegionIterArgs())) {
       if (!isa<gpu::FragmentType>(argument.getType()) ||
-          alreadyDropped.contains(index) || fragmentBuffers.lookup(argument))
+          alreadyDropped.contains(index) ||
+          lookupBuffer(fragmentBuffers, argument, loop))
         continue;
+      Value initial = loop.getInitArgs()[index];
+      // Each carry is mutable storage owned by this loop. An immutable initial
+      // SSA value can seed several carries or loops without aliasing their state.
       FailureOr<Value> buffer =
-          materialize(loop.getInitArgs()[index], BufferSpace::Fragment, loop);
-      if (failed(buffer))
+          allocateFor(initial, BufferSpace::Fragment, loop);
+      if (failed(buffer) || failed(storeFragment(initial, *buffer, loop)))
         return loop.emitOpError(
             "TileLang fragment loop identity cannot be materialized");
-      fragmentBuffers[argument] = *buffer;
-      fragmentBuffers[loop.getResult(index)] = *buffer;
+      bindBuffer(fragmentBuffers, argument, *buffer, loop);
+      bindBuffer(fragmentBuffers, loop.getResult(index), *buffer, loop);
     }
     return success();
   }
@@ -1760,52 +1788,27 @@ private:
 
   FailureOr<Value> structuredAccumulator(Operation *owner, Value accumulator,
                                          Value result, ArrayAttr shape) {
-    if (Value existing = fragmentBuffers.lookup(accumulator)) {
-      if (cast<BufferType>(existing.getType()).getShape() == shape)
-        return existing;
-      return materializePadded(accumulator, BufferSpace::Fragment, owner, shape);
-    }
-    auto argument = dyn_cast<BlockArgument>(accumulator);
-    auto loop = argument
-                    ? dyn_cast_or_null<scf::ForOp>(
-                          argument.getOwner()->getParentOp())
-                    : scf::ForOp();
-    if (loop && argument != loop.getInductionVar()) {
-      unsigned index = argument.getArgNumber() - 1;
-      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-      if (index >= loop.getInitArgs().size() ||
-          yield.getOperand(index) != result)
-        return owner->emitOpError(
-            "TileLang contract accumulator is not the loop-carried physical result");
-      FailureOr<Value> initial = scalarSplat(loop.getInitArgs()[index]);
-      if (failed(initial))
-        return owner->emitOpError(
-            "TileLang native GEMM requires a scalar-filled physical accumulator");
-      FailureOr<Value> allocation =
-          allocateFor(result, BufferSpace::Fragment, loop, shape);
-      if (failed(allocation))
-        return failure();
-      OpBuilder builder(loop);
-      builder.create<FillOp>(owner->getLoc(), *allocation, *initial);
-      fragmentBuffers[accumulator] = *allocation;
-      fragmentBuffers[result] = *allocation;
-      fragmentBuffers[loop.getResult(index)] = *allocation;
-      loopDrops[loop.getOperation()].push_back(index);
-      return *allocation;
-    }
+    // Native GEMM mutates its accumulator. Reuse a snapshot only when the
+    // current computation is its sole reader, including repeated operands.
+    if (accumulator.hasOneUse() && *accumulator.getUsers().begin() == owner)
+      if (auto *binding = lookupBinding(fragmentBuffers, accumulator, owner))
+        if (binding->hasIdentityAxes() && binding->logicalShape() == shape)
+          return binding->buffer;
+    FailureOr<Value> allocation =
+        allocateFor(result, BufferSpace::Fragment, owner, shape);
+    if (failed(allocation))
+      return failure();
     FailureOr<Value> initial = scalarSplat(accumulator);
     if (succeeded(initial)) {
-      FailureOr<Value> allocation =
-          allocateFor(result, BufferSpace::Fragment, owner, shape);
-      if (failed(allocation))
-        return failure();
       OpBuilder builder(owner);
       builder.create<FillOp>(owner->getLoc(), *allocation, *initial);
-      fragmentBuffers[accumulator] = *allocation;
-      fragmentBuffers[result] = *allocation;
-      return *allocation;
+    } else {
+      if (failed(materializePadded(accumulator, BufferSpace::Fragment, owner,
+                                   shape)) ||
+          failed(storeFragment(accumulator, *allocation, owner)))
+        return failure();
     }
-    return materializePadded(accumulator, BufferSpace::Fragment, owner, shape);
+    return *allocation;
   }
 
   LogicalResult lowerContract(gpu::ContractOp contract) {
@@ -1851,7 +1854,8 @@ private:
       return failure();
     auto transpose = [&](Value operand) -> FailureOr<bool> {
       auto fragment = cast<gpu::FragmentType>(operand.getType());
-      SmallVector<unsigned> order = sharedBufferAxes.lookup(operand);
+      const BufferedFragment *binding = lookupBinding(sharedBuffers, operand, contract);
+      SmallVector<unsigned> order = binding ? binding->axes : SmallVector<unsigned>();
       if (order.empty())
         order = identityAxisOrder(fragment.getShape().size());
       if (order.size() == 2 && order[0] == 0 && order[1] == 1)
@@ -1916,7 +1920,7 @@ private:
       builder.create<GemmOp>(contract.getLoc(), *lhs, *rhs, *accumulator,
                              *transposeLhs, *transposeRhs);
     }
-    fragmentBuffers[contract.getResult()] = *accumulator;
+    bindBuffer(fragmentBuffers, contract.getResult(), *accumulator, contract);
     lowered.insert(contract);
     return success();
   }
@@ -2119,7 +2123,7 @@ private:
         contract.getLoc(), *accumulator, accumulateBody.getArguments(), updated);
     accumulateBuilder.create<YieldOp>(contract.getLoc());
 
-    fragmentBuffers[contract.getResult()] = *accumulator;
+    bindBuffer(fragmentBuffers, contract.getResult(), *accumulator, contract);
     for (gpu::LoadOp load : {lhsLoad, lhsScaleLoad, rhsLoad, rhsScaleLoad})
       lowered.insert(load);
     lowered.insert(contract);
@@ -2186,7 +2190,8 @@ private:
 
     auto transpose = [&](Value operand) -> FailureOr<bool> {
       auto fragment = cast<gpu::FragmentType>(operand.getType());
-      SmallVector<unsigned> order = sharedBufferAxes.lookup(operand);
+      const BufferedFragment *binding = lookupBinding(sharedBuffers, operand, contract);
+      SmallVector<unsigned> order = binding ? binding->axes : SmallVector<unsigned>();
       if (order.empty())
         order = identityAxisOrder(fragment.getShape().size());
       if (order.size() == 2 && order[0] == 0 && order[1] == 1)
@@ -2287,7 +2292,7 @@ private:
     builder.create<SparseGemmOp>(
         contract.getLoc(), *compressed, packedMetadata, *rhs, *accumulator,
         *transposeCompressed, /*transpose_metadata=*/false, *transposeRhs);
-    fragmentBuffers[contract.getResult()] = *accumulator;
+    bindBuffer(fragmentBuffers, contract.getResult(), *accumulator, contract);
     lowered.insert(metadataRecord);
     lowered.insert(contract);
     return success();
@@ -2323,7 +2328,7 @@ private:
     }
     FailureOr<ArrayAttr> destinationShape = failure();
     if (isa<gpu::FragmentType>(reduce.getResult(0).getType())) {
-      destinationShape = physicalShapeFor(reduce.getResult(0), reduce);
+      destinationShape = cast<gpu::FragmentType>(reduce.getResult(0).getType()).getShape();
     } else {
       SmallVector<Attribute> scalarShape;
       for (auto [axis, extent] : llvm::enumerate(sourceBuffer.getShape()))
@@ -2347,7 +2352,7 @@ private:
                              reduce.getAxes().front(), *kind);
     Type resultType = reduce.getResultTypes().front();
     if (auto fragment = dyn_cast<gpu::FragmentType>(resultType)) {
-      fragmentBuffers[reduce.getResult(0)] = destination;
+      bindBuffer(fragmentBuffers, reduce.getResult(0), destination, reduce);
     } else {
       SmallVector<Value> indices(destinationType.getShape().size());
       for (Value &index : indices)
@@ -2386,12 +2391,10 @@ private:
       if (failed(source))
         return failure();
     }
-    FailureOr<ArrayAttr> destinationShape =
-        physicalShapeFor(scan.getResult(0), scan);
-    if (failed(destinationShape))
-      return failure();
+    ArrayAttr destinationShape =
+        cast<gpu::FragmentType>(scan.getResult(0).getType()).getShape();
     auto destinationType = BufferType::get(
-        kernel.getContext(), sourceType.getElementType(), *destinationShape,
+        kernel.getContext(), sourceType.getElementType(), destinationShape,
         BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Fragment));
     OpBuilder allocationBuilder(allocationAnchor(scan));
     Value destination =
@@ -2399,7 +2402,7 @@ private:
     OpBuilder builder(scan);
     builder.create<ScanOp>(scan.getLoc(), *source, destination, scan.getAxis(),
                            *kind, scan.getReverse());
-    fragmentBuffers[scan.getResult(0)] = destination;
+    bindBuffer(fragmentBuffers, scan.getResult(0), destination, scan);
     lowered.insert(scan);
     return success();
   }
@@ -2448,7 +2451,9 @@ private:
       if (auto cast = access.getAccessPayloads().front().getDefiningOp<gpu::CastOp>()) {
         auto input = dyn_cast<gpu::FragmentType>(cast.getValue().getType());
         auto result = dyn_cast<gpu::FragmentType>(cast.getResult().getType());
-        Value source = findBuffer(cast.getValue());
+        const BufferedFragment *binding = findBinding(cast.getValue(), store);
+        Value source = binding && binding->hasIdentityAxes()
+                           ? binding->buffer : Value();
         if (input && result && source && input.getShape() == result.getShape() &&
             input.getAxisMaps() == result.getAxisMaps() &&
             input.getValidity() == result.getValidity() &&
@@ -2599,6 +2604,53 @@ private:
     return success();
   }
 
+  Value allocateScalarSlot(OpBuilder &builder, Location location, Type type) {
+    auto bufferType = BufferType::get(
+        kernel.getContext(), type,
+        builder.getArrayAttr({constantExtent(kernel.getContext(), 1)}),
+        BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Local));
+    return builder.create<AllocOp>(location, bufferType);
+  }
+
+  LogicalResult bufferizeScalarIfResults() {
+    SmallVector<scf::IfOp> choices;
+    kernel.walk<WalkOrder::PostOrder>([&](scf::IfOp choice) {
+      if (choice.getNumResults())
+        choices.push_back(choice);
+    });
+    for (scf::IfOp choice : choices) {
+      SmallVector<Value> buffers;
+      OpBuilder before(choice);
+      Value zero = before.create<arith::ConstantIndexOp>(choice.getLoc(), 0);
+      for (Type type : choice.getResultTypes()) {
+        if (!isa<IntegerType, IndexType, FloatType>(type))
+          return choice.emitOpError(
+              "TileLang branch result has no scalar or fragment buffer representation");
+        buffers.push_back(allocateScalarSlot(before, choice.getLoc(), type));
+      }
+      auto replacement = before.create<scf::IfOp>(
+          choice.getLoc(), TypeRange{}, choice.getCondition(), true);
+      replacement->setAttrs(choice->getAttrs());
+      replacement.getThenRegion().takeBody(choice.getThenRegion());
+      replacement.getElseRegion().takeBody(choice.getElseRegion());
+      for (Region &region : replacement->getRegions()) {
+        auto yield = cast<scf::YieldOp>(region.front().getTerminator());
+        OpBuilder nested(yield);
+        for (auto [buffer, value] : llvm::zip(buffers, yield.getOperands()))
+          nested.create<BufferStoreOp>(yield.getLoc(), buffer, ValueRange{zero}, value);
+        yield->setOperands(ValueRange{});
+      }
+      OpBuilder after(choice);
+      for (auto [result, buffer] : llvm::zip(choice.getResults(), buffers)) {
+        Value loaded = after.create<BufferLoadOp>(
+            choice.getLoc(), result.getType(), buffer, ValueRange{zero});
+        result.replaceAllUsesWith(loaded);
+      }
+      choice.erase();
+    }
+    return success();
+  }
+
   LogicalResult bufferizeScalarLoopCarries() {
     SmallVector<scf::ForOp> loops;
     kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
@@ -2614,13 +2666,11 @@ private:
               "TileLang loop carries a non-scalar value without explicit bufferization");
       SmallVector<Value> buffers;
       OpBuilder before(loop);
+      Value initialIndex = before.create<arith::ConstantIndexOp>(loop.getLoc(), 0);
       for (Value initial : loop.getInitArgs()) {
-        auto type = BufferType::get(
-            kernel.getContext(), initial.getType(),
-            before.getArrayAttr({constantExtent(kernel.getContext(), 1)}),
-            BufferSpaceAttr::get(kernel.getContext(), BufferSpace::Fragment));
-        Value buffer = before.create<AllocOp>(loop.getLoc(), type);
-        before.create<FillOp>(loop.getLoc(), buffer, initial);
+        Value buffer = allocateScalarSlot(before, loop.getLoc(), initial.getType());
+        before.create<BufferStoreOp>(loop.getLoc(), buffer,
+                                      ValueRange{initialIndex}, initial);
         buffers.push_back(buffer);
       }
       auto replacement = before.create<scf::ForOp>(
@@ -2710,10 +2760,8 @@ private:
   }
 
   func::FuncOp kernel;
-  DenseMap<Value, Value> sharedBuffers;
-  DenseMap<Value, SmallVector<unsigned>> sharedBufferAxes;
-  DenseMap<Value, Value> fragmentBuffers;
-  DenseMap<Attribute, Attribute> nativeAxisExtents;
+  BufferBindings sharedBuffers;
+  BufferBindings fragmentBuffers;
   llvm::DenseSet<Value> directContractOperands;
   llvm::DenseSet<Operation *> deferredScaledLoads;
   llvm::DenseSet<Operation *> deferredSparseMetadataLoads;

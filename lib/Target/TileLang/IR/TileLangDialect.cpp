@@ -41,7 +41,15 @@ LogicalResult BufferType::verify(function_ref<InFlightDiagnostic()> emitError,
                                  BufferSpaceAttr space) {
   if (!elementType || !shape || shape.empty() || !space)
     return emitError()
-           << "TileLang buffer requires element type, non-empty shape and shared/fragment space";
+           << "TileLang buffer requires element type, non-empty shape and allocation space";
+  switch (space.getValue()) {
+  case BufferSpace::Shared:
+  case BufferSpace::Fragment:
+  case BufferSpace::Local:
+    break;
+  default:
+    return emitError() << "TileLang buffer has an unknown allocation space";
+  }
   for (Attribute extent : shape)
     if (!mlir::isa<gpu::PhysicalExprAttr>(extent))
       return emitError() << "TileLang buffer extents must be typed physical expressions";

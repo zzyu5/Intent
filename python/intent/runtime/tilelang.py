@@ -1,7 +1,8 @@
 from .artifact import CompiledArtifact
 from .gpu.program import LaunchResult, materialize_gpu_program
 from .tuning import TuningState
-from .diagnostics import CandidateRecorder, observation, unavailable_resources
+from .diagnostics import (CandidateRecorder, describe_tuning_failure, observation,
+                          unavailable_resources)
 from intent.compiler.toolchain import CompilationStageError
 from threading import Lock
 
@@ -103,7 +104,9 @@ class TileLangProgram:
                 details = observation("tilelang", self.target, invocation, None, _native_resources(),
                                       recorder.snapshot(), stage="failed", history_unavailable=
                                       "Only the SDK compilation/benchmark callbacks reached during this invocation are recorded")
-                raise CompilationStageError("provider_tuning", str(error), observation=details) from error
+                raise CompilationStageError(
+                    "provider_tuning", describe_tuning_failure(error, details.candidates),
+                    observation=details) from error
         compiled = self._winners[key]
         configuration = compiled.config
 

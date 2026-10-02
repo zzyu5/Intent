@@ -1,6 +1,6 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
-fused_softmax,8192x8192-fp16,0.122144,0.131072,0.122696,1.073094,1.021377,pass,pass,,Intent target=cutile; source corpus=triton.
-dense_gemm,M4096-N14336-K4096-fp16,1.415544,1.350576,1.423472,0.954104,0.948728,pass,pass,,Intent target=cutile; source corpus=triton.
+fused_softmax,8192x8192-fp16,0.121840,0.123768,0.122696,1.015824,1.007026,pass,pass,,Intent target=cutile; source corpus=triton.
+dense_gemm,M4096-N14336-K4096-fp16,1.374104,1.321712,1.423472,0.961872,1.035927,pass,pass,,Intent target=cutile; source corpus=triton.
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.657024,3.715232,4.434936,0.797770,0.952311,pass,pass,,Intent target=cutile; source corpus=triton.
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,1.825024,1.935944,1.923192,1.060777,0.951423,pass,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.062192,0.053024,0.053624,0.852586,0.862233,pass,pass,,Intent target=cutile; source corpus=triton.

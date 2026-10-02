@@ -8,13 +8,16 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
+#include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Target/TileLang/IR/TileLangOps.h"
 #include "PassDetail.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -304,18 +307,50 @@ LogicalResult diagnoseConfigurationFailures(func::FuncOp kernel, unsigned failur
   return failure();
 }
 
-SmallVector<int64_t> extentCandidates(func::FuncOp kernel, Attribute attribute) {
-  auto extent = dyn_cast<gpu::PhysicalExprAttr>(attribute);
-  if (!extent)
-    return {};
-  auto kind = extent.getKind();
-  if (kind == gpu::PhysicalExprKind::Constant)
-    return {extent.getValue()};
-  if (kind != gpu::PhysicalExprKind::Parameter)
-    return {};
-  auto parameter = gpu::lookupParameter(kernel, extent.getParameterReference());
-  return parameter ? SmallVector<int64_t>(parameter.getCandidates().asArrayRef())
-                   : SmallVector<int64_t>();
+bool hasLegalMmaShape(const gpu::ParameterSpace &space,
+                     ArrayRef<DictionaryAttr> sharedRows,
+                     gpu::PhysicalExprAttr mExtent,
+                     gpu::PhysicalExprAttr nExtent, int64_t threads) {
+  SmallVector<gpu::ParameterAttr> deferred;
+  bool known = true;
+  AttrTypeWalker walker;
+  walker.addWalk([&](gpu::ParameterRefAttr reference) {
+    auto declaration = space.lookup(reference);
+    if (!declaration) {
+      known = false;
+      return;
+    }
+    if (declaration.isDeferred() && !llvm::is_contained(deferred, declaration))
+      deferred.push_back(declaration);
+  });
+  walker.walk(mExtent);
+  walker.walk(nExtent);
+  if (!known) return false;
+
+  // Shared values come from one complete correlated row. Only deferred values
+  // remain unbound there; bind each referenced declaration once for both whole
+  // expressions, including repeated occurrences inside an expression.
+  for (DictionaryAttr row : sharedRows) {
+    NamedAttrList bindings(row);
+    Builder builder(row.getContext());
+    std::function<bool(unsigned)> accepts = [&](unsigned index) {
+      if (index == deferred.size()) {
+        auto config = bindings.getDictionary(row.getContext());
+        auto m = evaluate(mExtent, config);
+        auto n = evaluate(nExtent, config);
+        return m && n && *m > 0 && *n > 0 &&
+               isLegalMmaWarpPartition(*m, *n, threads);
+      }
+      auto declaration = deferred[index];
+      for (int64_t candidate : declaration.getCandidates().asArrayRef()) {
+        bindings.set(declaration.getName(), builder.getI64IntegerAttr(candidate));
+        if (accepts(index + 1)) return true;
+      }
+      return false;
+    };
+    if (accepts(0)) return true;
+  }
+  return false;
 }
 
 LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
@@ -363,47 +398,28 @@ LogicalResult materializeLegalConfigurations(func::FuncOp kernel) {
   return gpu::writeConfigurations(kernel, accepted, gpu::ConfigurationStage::Complete);
 }
 
-bool supportsThreads(func::FuncOp kernel, int64_t threads) {
+bool supportsThreads(func::FuncOp kernel, const gpu::ParameterSpace &space,
+                     ArrayRef<DictionaryAttr> sharedRows, int64_t threads) {
   bool sawGemm = false;
   bool supported = true;
   kernel.walk([&](GemmOp gemm) {
     sawGemm = true;
     auto lhs = gemm.getLhs().getType();
     auto rhs = gemm.getRhs().getType();
-    Attribute mExtent = lhs.getShape()[gemm.getTransposeLhs() ? 1 : 0];
-    Attribute nExtent = rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1];
-    SmallVector<int64_t> mCandidates = extentCandidates(kernel, mExtent);
-    SmallVector<int64_t> nCandidates = extentCandidates(kernel, nExtent);
-    if (mCandidates.empty() || nCandidates.empty()) {
-      supported = false;
-      return;
-    }
-    bool hasLegalShape = false;
-    for (int64_t m : mCandidates)
-      for (int64_t n : nCandidates)
-        hasLegalShape |= isLegalMmaWarpPartition(m, n, threads);
-    if (!hasLegalShape)
+    auto mExtent = cast<gpu::PhysicalExprAttr>(lhs.getShape()[gemm.getTransposeLhs() ? 1 : 0]);
+    auto nExtent = cast<gpu::PhysicalExprAttr>(rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]);
+    if (!hasLegalMmaShape(space, sharedRows, mExtent, nExtent, threads))
       supported = false;
   });
   kernel.walk([&](SparseGemmOp gemm) {
     sawGemm = true;
     auto compressed = gemm.getCompressed().getType();
     auto rhs = gemm.getRhs().getType();
-    Attribute mExtent = compressed.getShape()[
-        gemm.getTransposeCompressed() ? 1 : 0];
-    Attribute nExtent =
-        rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1];
-    SmallVector<int64_t> mCandidates = extentCandidates(kernel, mExtent);
-    SmallVector<int64_t> nCandidates = extentCandidates(kernel, nExtent);
-    if (mCandidates.empty() || nCandidates.empty()) {
-      supported = false;
-      return;
-    }
-    bool hasLegalShape = false;
-    for (int64_t m : mCandidates)
-      for (int64_t n : nCandidates)
-        hasLegalShape |= isLegalMmaWarpPartition(m, n, threads);
-    if (!hasLegalShape)
+    auto mExtent = cast<gpu::PhysicalExprAttr>(
+        compressed.getShape()[gemm.getTransposeCompressed() ? 1 : 0]);
+    auto nExtent = cast<gpu::PhysicalExprAttr>(
+        rhs.getShape()[gemm.getTransposeRhs() ? 0 : 1]);
+    if (!hasLegalMmaShape(space, sharedRows, mExtent, nExtent, threads))
       supported = false;
   });
   return !sawGemm || supported;
@@ -418,10 +434,14 @@ LogicalResult declareThreadParameter(
   if (!capabilities)
     return kernel.emitError(
         "TileLang launch configuration requires typed GPU capabilities");
+  auto space = gpu::ParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  auto sharedRows = space->configurations(gpu::ConfigurationStage::Shared);
+  if (failed(sharedRows)) return failure();
   SmallVector<int64_t> candidates;
   auto legalThreads = [&](int64_t threads) {
     return isLegalThreadCount(threads, capabilities) &&
-           supportsThreads(kernel, threads);
+           supportsThreads(kernel, *space, *sharedRows, threads);
   };
   bool smallPartition = !legalThreads(128) && !legalThreads(256);
   auto rows = profiles.get(tuningProfileSchema(), smallPartition ? "small_threads" : "threads",
@@ -463,7 +483,11 @@ LogicalResult formNativeMemory(ModuleOp module) {
       failed(gpu::lowerExecutionGroups(module)))
     return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
-  return failed(kernel) ? failure() : bufferizeGPUProgram(*kernel);
+  if (failed(kernel) ||
+      failed(gpu::contraction::normalizeMatrixContractShapes(*kernel)) ||
+      failed(gpu::verifyGPUProgram(module)))
+    return failure();
+  return bufferizeGPUProgram(*kernel);
 }
 
 LogicalResult configureNativeProgram(ModuleOp module) {

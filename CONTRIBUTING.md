@@ -731,6 +731,32 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 
 Triton/cuTile 的 `Transforms/Configurations.cpp` 负责各自的候选策略与资源合法性，使用共同的参数绑定分析。Triton 的 tensor/descriptor/collective 约束从当前 IR 一次收集后逐候选求值；cuTile 保留 launch 与 memory hints 的相关候选及 resident-capacity 绑定。新增设备约束时在对应模块处理，不复制参数解析器，也不把 Triton TTGIR 的布局、MMA 或 pipeline 再实现一遍。
 
+矩阵 primitive 需要的二维物理投影由现有
+[ContractionProjection.cpp](lib/Dialect/GPU/Transforms/ContractionProjection.cpp) 依据
+typed free/batch/reduction axes 形成，并恢复结果的原坐标映射。Triton、cuTile 和
+TileLang 在各自准备边界共用 `normalizeMatrixContractShapes`；serializer 只输出
+已决定的 transpose/reshape。新增 provider 不应重新限制作者只能声明二维矩阵。
+
+Value schema 的闭合先查询 [ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h)：
+`queryElementwiseShapeSource` 描述 unary/cast/bitcast 的逐 lane 等形关系；
+`queryStructuredSchemaGroups` 按位置连接 region summary/state 的 producer、seed
+operand、helper formals、yield 与 result。正向刷新、反向 extent 传播和 value
+materialization 使用这些关系。不同 state 分量可复用同一个零值 SSA，仍是不同
+operand slot，不能仅按 SSA 相等合并 schema。这里闭合的是物理表示，不改变作者的
+combine/apply/emit、迭代次序或数值运算。
+
+TileLang 的 [Bufferize.cpp](lib/Target/TileLang/Transforms/Bufferize.cpp) 在这份当前
+GPU program 上维护短期 buffer bindings：每条绑定同时携带初始化的可见位置与原生
+轴顺序。复用要证明初始化支配本次使用，不能只证明 allocation 支配使用。
+Loop/carry 各自拥有可变存储，SSA 初值仍是不可变值；原生矩阵只有在旧 accumulator
+没有其他读取者时才可原位更新。Gather 读取已经形成的 SSA snapshot，并在有效分支
+中取值；不能为补缓存重读外部 memory。Binding 在删除源 SSA 前结束生命周期。
+矩阵 alignment padding 属于对应 GEMM 的原生 buffer；不按 source-axis 标签向全图
+传播另一份容量。普通 reduce、scan、控制状态和输出继续消费当前 Fragment 的逻辑范围。
+Scalar if/loop 的可变槽位使用 provider `BufferSpace::Local`，由 serializer 映射到
+`T.alloc_local`；分布在多个线程上的 fragment 不能用单元素数组冒充线程私有标量。
+Collective 的 fragment 输出继续使用自己的空间和通信合同。
+
 cuTile 的 [Analysis/Tuning.h](include/Intent/Target/CuTile/Analysis/Tuning.h) 从最终 provider IR 查询哪些 runtime scalar 必须按值区分调优结果。证明覆盖 SSA、类型/属性中的 ScalarABI 以及潜在的写后读依赖；索引、控制、形状、资源和未知用途保持区分，只有完整证明为数据用途时才移除其值。Serializer 消费这份只读结果，并保留 view、overlap、完整覆盖和 array-view eligibility 的实际事实；它不改变 scalar 的原生传参或候选执行。
 
 资源查询的 `Unknown` 表示当前求值无法证明，可能来自未绑定维度，也可能来自表达式求值失败；不能据此宣称候选合法或已精确证明资源不足。Shared 候选策略只按可得事实筛选和绑定，保留需要 specialization 或下层 compiler 判断的约束；局部候选 matcher 也不等同于完整 coverage 证明。
