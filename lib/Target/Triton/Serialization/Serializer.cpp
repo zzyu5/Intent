@@ -8,7 +8,7 @@
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
-#include "Intent/Dialect/GPU/Serialization/Python.h"
+#include "Intent/Dialect/GPU/Serialization/PythonEmitter.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -28,20 +28,14 @@ using namespace mlir;
 namespace intent::triton {
 namespace {
 
-std::string pythonType(Type type) {
-  static const gpu::PythonScalarSyntax syntax{
-      "tl.", "int1", "float64", "float8e4nv", "float8e5"};
-  return gpu::pythonScalarType(type, syntax);
-}
 
-std::string literal(Attribute value) {
-  return gpu::pythonLiteral(value);
-}
-
-class Serializer {
+class Serializer : public gpu::PythonEmitter {
 public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
-      : kernel(kernel), output(output) {}
+      : gpu::PythonEmitter(kernel, output,
+            {"tl.", "int1", "float64", "float8e4nv", "float8e5"},
+            {"", "min", "max", "", "triton.next_power_of_2", true},
+            ": tl.constexpr") {}
 
   LogicalResult emit(std::string &metadata) {
     bindArguments();
@@ -52,22 +46,112 @@ public:
     return failed ? failure() : emitMetadata(metadata);
   }
 
-private:
-  std::string expressionString(gpu::PhysicalExprAttr expression) {
-    static const gpu::PythonExpressionSyntax syntax{
-        "", "min", "max", "", "triton.next_power_of_2", true};
-    return gpu::pythonExpression(expression, syntax, [&](gpu::PhysicalExprAttr leaf) {
-      if (leaf.getKind() == gpu::PhysicalExprKind::Parameter)
-        return leaf.getParameterReference().getName().getValue().str();
-      return valueString(gpu::resolveArgument(kernel, leaf.getArgumentReference()));
-    });
+  static const Emitters &sourceOperations() {
+    static const Emitters emitters = [] {
+      Emitters result;
+      gpu::PythonEmitter::addCommonOperations(result);
+      addNative<CtaBarrierOp>(result);
+      addBinding<TensorDescriptorChoiceOp>(result);
+      addBinding<TensorDescriptorAllocatorOp>(result);
+      addBinding<TensorDescriptorOp>(result);
+      addNative<MapElementwiseOp>(result);
+      addNative<SplitOp>(result);
+      addNative<DescriptorLoadOp>(result);
+      addNative<BlockLoadOp>(result);
+      addNative<gpu::LoadOp>(result);
+      addNative<gpu::GatherOp>(result);
+      addNative<gpu::ContractOp>(result);
+      addNative<gpu::ScaledContractOp>(result);
+      addNative<ReduceOp>(result);
+      addNative<ScanOp>(result);
+      addNative<gpu::HistogramOp>(result);
+      addNative<gpu::RandomBitsOp>(result);
+      addNative<gpu::AtomicStoreOp>(result);
+      addNative<gpu::AtomicRMWOp>(result);
+      addNative<gpu::AtomicCompareExchangeOp>(result);
+      addNative<DescriptorStoreOp>(result);
+      addNative<BlockStoreOp>(result);
+      addNative<gpu::StoreOp>(result);
+      return result;
+    }();
+    return emitters;
   }
 
-  std::string fragmentShape(gpu::FragmentType fragment) {
-    SmallVector<std::string> extents;
-    for (Attribute extent : fragment.getShape())
-      extents.push_back(expressionString(cast<gpu::PhysicalExprAttr>(extent)));
-    return stringTuple(extents);
+  const Emitters &operationEmitters() const override { return sourceOperations(); }
+
+private:
+  template <typename Op> static void addNative(Emitters &result) {
+    result.add<Op>([](Op) { return success(); }, [](Op op, gpu::PythonEmitter &emitter) {
+      static_cast<Serializer &>(emitter).emitTyped(op);
+      return failure(emitter.hasFailed());
+    });
+  }
+  template <typename Op> static void addBinding(Emitters &result) {
+    result.add<Op>([](Op) { return success(); },
+                   [](Op, gpu::PythonEmitter &) { return success(); });
+  }
+
+  void emitTyped(ReduceOp op) { emitCollective(*op.getOperation()); }
+  void emitTyped(ScanOp op) { emitCollective(*op.getOperation()); }
+
+  void emitConstant(arith::ConstantOp constant) override {
+      std::string value = literal(constant.getValue());
+      if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) {
+        value = "tl.full((), " + value + ", " +
+                pythonType(constant.getType()) + ")";
+        // Triton's scalar constructor canonicalizes both zero signs to +0.
+        if (floating.getValue().isNegZero())
+          value = "(-" + value + ")";
+        assign(constant.getResult(), value);
+      } else {
+        values[constant.getResult()] = value;
+        constexprValues.insert(constant.getResult());
+      }
+      return;
+      }
+
+  std::string programId(gpu::ProgramIdOp op) override {
+    return "tl.program_id(" + std::to_string(op.getAxis()) + ")";
+  }
+  std::string makeRange(gpu::MakeRangeOp op) override {
+    auto type = cast<gpu::FragmentType>(op.getResult().getType());
+    return "(" + valueString(op.getStart()) + " + tl.arange(0, " +
+        expressionString(cast<gpu::PhysicalExprAttr>(type.getShape()[0])) + ") * " + valueString(op.getStep()) + ")";
+  }
+  std::string splat(gpu::SplatOp op) override {
+    if (emittingHelper) return valueString(op.getValue());
+    return "tl.full(" + fragmentShape(op.getResult().getType()) + ", " + valueString(op.getValue()) +
+        ", " + pythonType(op.getResult().getType().getElementType()) + ")";
+  }
+  std::string castValue(Value value, Type type, bool bitcast) override {
+    return "tl.cast(" + valueString(value) + ", " + pythonType(elementType(type)) +
+        (bitcast ? ", bitcast=True)" : ")");
+  }
+  std::string reshape(gpu::ReshapeOp op) override {
+    auto source = cast<gpu::FragmentType>(op.getValue().getType());
+    auto target = cast<gpu::FragmentType>(op.getResult().getType());
+    return (source.getShape().empty() ? "tl.broadcast_to(" : "tl.reshape(") +
+        valueString(op.getValue()) + ", " + fragmentShape(target) +
+        (source.getShape().empty() ? ")" : ", can_reorder=False)");
+  }
+  std::string join(gpu::JoinOp op) override {
+    return "tl.join(" + valueString(op.getLhs()) + ", " + valueString(op.getRhs()) + ")";
+  }
+  std::string select(gpu::SelectOp op) override {
+    return "tl.where(" + valueString(op.getCondition()) + ", " + controlValueString(op.getTrueValue()) +
+        ", " + controlValueString(op.getFalseValue()) + ")";
+  }
+  std::string permute(Value value, ArrayRef<int64_t> permutation) override {
+    return "tl.permute(" + valueString(value) + ", " + axisTuple(permutation) + ")";
+  }
+  std::string forRange(scf::ForOp loop) override {
+    auto unroll = loop->getAttrOfType<IntegerAttr>("intent_gpu.triton.loop_unroll_factor");
+    auto stages = loop->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
+    std::string result = unroll || stages ? "tl.range(" : "range(";
+    result += valueString(loop.getLowerBound()) + ", " + valueString(loop.getUpperBound()) + ", " + valueString(loop.getStep());
+    if (unroll) result += ", loop_unroll_factor=" + std::to_string(unroll.getInt());
+    if (stages) result += ", num_stages=" + stages.getName().getValue().str();
+    return result + ")";
   }
 
   using ViewABI = gpu::PythonArgument;
@@ -136,6 +220,8 @@ private:
       overlapFacts.push_back(overlap);
       constexprValues.insert(overlap.getResult());
     });
+    for (const auto &name : argumentNames)
+      reserveName(name.getKey());
     if (descriptorChoice && !descriptorAllocator) {
       kernel.emitError(
           "tensor descriptor form has no declared allocator requirement");
@@ -149,55 +235,15 @@ private:
               "from intent.runtime.triton.math import contract_fma\n\n";
   }
 
-  void emitHelper(Operation *owner, Region &region, StringRef role) {
-    std::string name =
-        ("_intent_" + role + "_" + Twine(helperCounter++)).str();
-    helperNames[owner].push_back(name);
-    Block &block = region.front();
-    output << "@triton.jit\ndef " << name << "(";
-    for (auto [index, argument] : llvm::enumerate(block.getArguments())) {
-      if (index)
-        output << ", ";
-      std::string argumentName = "a" + std::to_string(index);
-      output << argumentName;
-      values[argument] = argumentName;
-    }
-    output << "):\n";
-    unsigned savedIndent = indent;
-    bool savedEmittingHelper = emittingHelper;
-    indent = 1;
-    emittingHelper = true;
-    for (Operation &operation : block.without_terminator())
-      emitOperation(operation);
-    auto yield = dyn_cast<gpu::YieldOp>(block.getTerminator());
-    if (!yield) {
-      failed = true;
-    } else {
-      std::string result = "return ";
-      if (yield.getValues().size() > 1)
-        result += "(";
-      for (auto [index, value] : llvm::enumerate(yield.getValues())) {
-        if (index)
-          result += ", ";
-        result += valueString(value);
-      }
-      if (yield.getValues().size() > 1)
-        result += ")";
-      line(result);
-    }
-    indent = savedIndent;
-    emittingHelper = savedEmittingHelper;
-    output << "\n";
-  }
-
   void emitHelpers() {
+    auto emit = [&](Operation *owner, Region &region, StringRef role) {
+      std::string name = ("_intent_" + role + "_" + Twine(helperCounter++)).str();
+      emitHelper(owner, region, name, "@triton.jit", "a");
+    };
     kernel.walk([&](Operation *operation) {
-      if (auto reduce = dyn_cast<ReduceOp>(operation))
-        emitHelper(operation, reduce.getCombine(), "reduce");
-      else if (auto scan = dyn_cast<ScanOp>(operation))
-        emitHelper(operation, scan.getCombine(), "scan");
-      else if (auto map = dyn_cast<MapElementwiseOp>(operation))
-        emitHelper(operation, map.getBody(), "map");
+      if (auto reduce = dyn_cast<ReduceOp>(operation)) emit(operation, reduce.getCombine(), "reduce");
+      else if (auto scan = dyn_cast<ScanOp>(operation)) emit(operation, scan.getCombine(), "scan");
+      else if (auto map = dyn_cast<MapElementwiseOp>(operation)) emit(operation, map.getBody(), "map");
     });
   }
 
@@ -246,198 +292,19 @@ private:
            std::to_string(index) + "]");
     line(configuration.warps.getValue().str() +
          ": tl.constexpr = tl.extra.cuda.num_warps()");
-    emitBlock(kernel.getBody().front(), /*isLoop=*/false, {});
+    emitBlock(kernel.getBody().front());
     output << "\n";
   }
 
-  void emitBlock(Block &block, bool isLoop,
-                 ArrayRef<std::string> loopResults) {
-    auto begin = output.tell();
-    for (Operation &operation : block) {
-      if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
-        if (!loopResults.empty()) {
-          SmallVector<std::string> yielded;
-          for (Value value : yield.getOperands())
-            yielded.push_back(controlValueString(value));
-          if (loopResults.size() == 1)
-            line(loopResults.front() + " = " + yielded.front());
-          else
-            line(stringTuple(loopResults) + " = " + stringTuple(yielded));
-        }
-        continue;
-      }
-      if (isa<func::ReturnOp>(operation))
-        continue;
-      emitOperation(operation);
-    }
-    if (output.tell() == begin)
-      line("pass");
-  }
-
-  void emitOperation(Operation &operation) {
-    if (isa<CtaBarrierOp>(operation)) {
+  void emitTyped(CtaBarrierOp) {
       line("tl.debug_barrier()");
       return;
-    }
-    if (isa<gpu::ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
-            TensorDescriptorOp>(operation))
-      return;
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      std::string value = literal(constant.getValue());
-      if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) {
-        value = "tl.full((), " + value + ", " +
-                pythonType(constant.getType()) + ")";
-        // Triton's scalar constructor canonicalizes both zero signs to +0.
-        if (floating.getValue().isNegZero())
-          value = "(-" + value + ")";
-        assign(constant.getResult(), value);
-      } else {
-        values[constant.getResult()] = value;
-        constexprValues.insert(constant.getResult());
       }
-      return;
-    }
-    if (auto parameter = dyn_cast<gpu::ParameterOp>(operation)) {
-      values[parameter.getResult()] =
-          parameter.getReference().getName().getValue().str();
-      constexprValues.insert(parameter.getResult());
-      return;
-    }
-    if (auto physical = dyn_cast<gpu::PhysicalExprOp>(operation)) {
-      assign(physical.getResult(),
-             expressionString(physical.getExpression()),
-             isConstexprExpression(physical.getExpression()));
-      return;
-    }
-    if (auto program = dyn_cast<gpu::ProgramIdOp>(operation)) {
-      assign(program.getResult(),
-             "tl.program_id(" + std::to_string(program.getAxis()) + ")");
-      return;
-    }
-    if (auto coordinate = dyn_cast<gpu::WorksetCoordinateOp>(operation)) {
-      values[coordinate.getResult()] = valueString(coordinate.getCoordinate());
-      return;
-    }
-    if (auto dim = dyn_cast<gpu::DimOp>(operation)) {
-      auto view = dim.getView().getType();
-      auto extent = cast<gpu::PhysicalExprAttr>(
-          view.getLayout().getExtents()[dim.getAxis()]);
-      assign(dim.getResult(), expressionString(extent),
-             isConstexprExpression(extent));
-      return;
-    }
-    if (auto range = dyn_cast<gpu::RangeOp>(operation)) {
-      assign(range.getResult(), "(" + valueString(range.getStart()) + ", " +
-                                    valueString(range.getStop()) + ", " +
-                                    valueString(range.getStep()) + ")");
-      return;
-    }
-    if (auto bound = dyn_cast<gpu::RangeBoundOp>(operation)) {
-      assign(bound.getResult(), valueString(bound.getRange()) + "[" +
-                                    std::to_string(bound.getBound()) + "]");
-      return;
-    }
-    if (auto mapping = dyn_cast<gpu::DelinearizeOp>(operation)) {
-      std::string remaining = valueString(mapping.getLinear());
-      SmallVector<std::string> coordinates(mapping.getCoordinates().size());
-      for (int64_t axis = static_cast<int64_t>(mapping.getCoordinates().size()) - 1;
-           axis >= 0; --axis) {
-        std::string extent = valueString(mapping.getExtents()[axis]);
-        coordinates[axis] = "(" + remaining + " % " + extent + ")";
-        remaining = "(" + remaining + " // " + extent + ")";
-      }
-      for (auto [coordinate, expression] :
-           llvm::zip(mapping.getCoordinates(), coordinates))
-        assign(coordinate, expression);
-      return;
-    }
-    if (auto binary = dyn_cast<gpu::BinaryOp>(operation)) {
-      assign(binary.getResult(), binaryExpression(binary),
-             (binary.getResult().getType().isIndex() ||
-              binary.getResult().getType().isInteger(1)) &&
-                 constexprValues.contains(binary.getLhs()) &&
-                 constexprValues.contains(binary.getRhs()));
-      return;
-    }
-    if (auto unary = dyn_cast<gpu::UnaryOp>(operation)) {
-      assign(unary.getResult(), unaryExpression(unary));
-      return;
-    }
-    if (auto compare = dyn_cast<gpu::CompareOp>(operation)) {
-      auto predicate = [&]() -> StringRef {
-        switch (compare.getPredicate()) {
-        case ComparePredicate::Eq: return "==";
-        case ComparePredicate::Ne: return "!=";
-        case ComparePredicate::Lt: return "<";
-        case ComparePredicate::Le: return "<=";
-        case ComparePredicate::Gt: return ">";
-        case ComparePredicate::Ge: return ">=";
-        }
-        llvm_unreachable("unhandled Intent compare predicate");
-      }();
-      assign(compare.getResult(), "(" + valueString(compare.getLhs()) + " " +
-                                      predicate.str() + " " +
-                                      valueString(compare.getRhs()) + ")",
-             compare.getResult().getType().isInteger(1) &&
-                 constexprValues.contains(compare.getLhs()) &&
-                 constexprValues.contains(compare.getRhs()));
-      return;
-    }
-    if (auto range = dyn_cast<gpu::MakeRangeOp>(operation)) {
-      auto fragment = cast<gpu::FragmentType>(range.getResult().getType());
-      auto physicalExtent =
-          cast<gpu::PhysicalExprAttr>(fragment.getShape()[0]);
-      assign(range.getResult(), "(" + valueString(range.getStart()) +
-                                    " + tl.arange(0, " +
-                                    expressionString(physicalExtent) + ") * " +
-                                    valueString(range.getStep()) + ")");
-      return;
-    }
-    if (auto splat = dyn_cast<gpu::SplatOp>(operation)) {
-      // Triton reduce/scan helpers receive accumulator values directly and
-      // scalar operands broadcast through ordinary elementwise expressions.
-      // Their ABI has no outer-kernel constexpr shape parameters, so spelling
-      // a typed scalar splat with fragmentShape() would reference symbols that
-      // are intentionally outside the helper scope.
-      if (emittingHelper) {
-        assign(splat.getResult(), valueString(splat.getValue()));
-        return;
-      }
-      auto type = splat.getResult().getType();
-      assign(splat.getResult(), "tl.full(" + fragmentShape(type) + ", " +
-                                    valueString(splat.getValue()) + ", " +
-                                    pythonType(type.getElementType()) + ")");
-      return;
-    }
-    if (auto broadcast = dyn_cast<gpu::BroadcastOp>(operation)) {
-      assign(broadcast.getResult(), broadcastValue(broadcast.getValue(),
-                                                   broadcast.getResult().getType()));
-      return;
-    }
-    if (auto cast = dyn_cast<gpu::CastOp>(operation)) {
-      assign(cast.getResult(), "tl.cast(" + valueString(cast.getValue()) +
-                                   ", " +
-                                   pythonType(elementType(cast.getResult().getType())) +
-                                   ")");
-      return;
-    }
-    if (auto bitcast = dyn_cast<gpu::BitcastOp>(operation)) {
-      assign(bitcast.getResult(), "tl.cast(" + valueString(bitcast.getValue()) +
-                                      ", " +
-                                      pythonType(elementType(bitcast.getResult().getType())) +
-                                      ", bitcast=True)");
-      return;
-    }
-    if (auto select = dyn_cast<gpu::SelectOp>(operation)) {
-      assign(select.getResult(), "tl.where(" + valueString(select.getCondition()) +
-                                      ", " + controlValueString(select.getTrueValue()) +
-                                      ", " + controlValueString(select.getFalseValue()) + ")");
-      return;
-    }
-    if (auto map = dyn_cast<MapElementwiseOp>(operation)) {
+
+  void emitTyped(MapElementwiseOp map) {
       bool scalar = map.getResult().getType().getShape().empty();
-      std::string call = scalar ? helperNames[&operation].front() + "("
-                                : "tl.map_elementwise(" + helperNames[&operation].front();
+      std::string call = scalar ? helperName(map.getOperation()) + "("
+                                : "tl.map_elementwise(" + helperName(map.getOperation());
       for (auto [index, input] : llvm::enumerate(map.getInputs())) {
         if (!scalar || index)
           call += ", ";
@@ -445,71 +312,22 @@ private:
       }
       assign(map.getResult(), call + ")");
       return;
-    }
-    if (auto reshape = dyn_cast<gpu::ReshapeOp>(operation)) {
-      auto source = cast<gpu::FragmentType>(reshape.getValue().getType());
-      auto target = cast<gpu::FragmentType>(reshape.getResult().getType());
-      if (source.getShape().empty()) {
-        assign(reshape.getResult(), "tl.broadcast_to(" +
-                                         valueString(reshape.getValue()) + ", " +
-                                         fragmentShape(target) + ")");
-        return;
       }
-      assign(reshape.getResult(), "tl.reshape(" + valueString(reshape.getValue()) +
-                                       ", " + fragmentShape(target) +
-                                       ", can_reorder=False)");
-      return;
-    }
-    if (auto transpose = dyn_cast<gpu::TransposeOp>(operation)) {
-      std::string permutation = "(";
-      for (auto [index, axis] : llvm::enumerate(transpose.getPermutation())) {
-        if (index)
-          permutation += ", ";
-        permutation += std::to_string(axis);
-      }
-      if (transpose.getPermutation().size() == 1)
-        permutation += ",";
-      permutation += ")";
-      assign(transpose.getResult(), "tl.permute(" + valueString(transpose.getValue()) +
-                                         ", " + permutation + ")") ;
-      return;
-    }
-    if (auto join = dyn_cast<gpu::JoinOp>(operation)) {
-      assign(join.getResult(), "tl.join(" + valueString(join.getLhs()) + ", " +
-                                   valueString(join.getRhs()) + ")");
-      return;
-    }
-    if (auto split = dyn_cast<SplitOp>(operation)) {
+
+  void emitTyped(SplitOp split) {
       assignResults(split.getResults(),
                     "tl.split(" + valueString(split.getSource()) + ")");
       return;
-    }
-    if (auto record = dyn_cast<gpu::MakeRecordOp>(operation)) {
-      std::string tuple = "(";
-      for (auto [index, field] : llvm::enumerate(record.getFields())) {
-        if (index)
-          tuple += ", ";
-        // Records can become loop carries; preserve each declared scalar dtype
-        // instead of letting Triton infer a narrower type from a literal.
-        tuple += controlValueString(field);
       }
-      if (record.getFields().size() == 1)
-        tuple += ",";
-      assign(record.getResult(), tuple + ")");
-      return;
-    }
-    if (auto extract = dyn_cast<gpu::ExtractOp>(operation)) {
-      assign(extract.getResult(), valueString(extract.getRecord()) + "[" +
-                                       std::to_string(extract.getField()) + "]");
-      return;
-    }
-    if (auto load = dyn_cast<DescriptorLoadOp>(operation)) {
+
+  void emitTyped(DescriptorLoadOp load) {
       assign(load.getResult(),
              valueString(load.getDescriptor()) + ".load(" +
                  descriptorOffsets(load.getOffsets()) + ")");
       return;
-    }
-    if (auto load = dyn_cast<BlockLoadOp>(operation)) {
+      }
+
+  void emitTyped(BlockLoadOp load) {
       auto fragment = load.getResult().getType();
       std::string call = "tl.load(" +
                          blockPointer(load.getView(), load.getOffsets(),
@@ -523,8 +341,9 @@ private:
         call = "tl.cast(" + call + ", tl.int1)";
       assign(load.getResult(), call);
       return;
-    }
-    if (auto load = dyn_cast<gpu::LoadOp>(operation)) {
+      }
+
+  void emitTyped(gpu::LoadOp load) {
       auto access = cast<gpu::AccessOpInterface>(load.getOperation());
       std::string call = "tl.load(" + pointer(access);
       if (access.getAccessValidity())
@@ -532,8 +351,9 @@ private:
                 ", other=" + valueString(access.getAccessFill());
       assign(access.getAccessResult(), call + ")");
       return;
-    }
-    if (auto gather = dyn_cast<gpu::GatherOp>(operation)) {
+      }
+
+  void emitTyped(gpu::GatherOp gather) {
       auto access = cast<gpu::AccessOpInterface>(gather.getOperation());
       Value coordinate = access.getAccessCoordinates().front();
       std::string indices = valueString(coordinate);
@@ -549,8 +369,9 @@ private:
         call = "tl.reshape(" + call + ", ())";
       assign(access.getAccessResult(), call);
       return;
-    }
-    if (auto contract = dyn_cast<gpu::ContractOp>(operation)) {
+      }
+
+  void emitTyped(gpu::ContractOp contract) {
       auto form = contract->getAttrOfType<StringAttr>(
           "intent_gpu.triton.contract_form");
       if (form && form.getValue() == "fma") {
@@ -585,8 +406,9 @@ private:
                                                      .getType()
                                                      .getElementType()) + ")");
       return;
-    }
-    if (auto contract = dyn_cast<gpu::ScaledContractOp>(operation)) {
+      }
+
+  void emitTyped(gpu::ScaledContractOp contract) {
       auto format = [](ScaledFormat value) -> StringRef {
         switch (value) {
         case ScaledFormat::E2M1: return "e2m1";
@@ -618,8 +440,9 @@ private:
                  format(contract.getRhsFormat()).str() + "\", " +
                  valueString(contract.getAccumulator()) + ")");
       return;
-    }
-    if (isa<ReduceOp, ScanOp>(operation)) {
+      }
+
+  void emitCollective(Operation &operation) {
       auto reduce = dyn_cast<ReduceOp>(operation);
       auto scan = dyn_cast<ScanOp>(operation);
       ValueRange sourceValues = reduce ? reduce.getSources() : scan.getSources();
@@ -634,12 +457,13 @@ private:
         sources += ")";
       }
       std::string call = (reduce ? "tl.reduce(" : "tl.associative_scan(") + sources +
-          ", axis=" + std::to_string(axis) + ", combine_fn=" + helperNames.lookup(&operation).front();
+          ", axis=" + std::to_string(axis) + ", combine_fn=" + helperName(&operation);
       if (scan) call += std::string(", reverse=") + (scan.getReverse() ? "True" : "False");
       assignResults(operation.getResults(), call + ")");
       return;
-    }
-    if (auto histogram = dyn_cast<gpu::HistogramOp>(operation)) {
+      }
+
+  void emitTyped(gpu::HistogramOp histogram) {
       std::string counts = "tl.histogram(" +
                            valueString(histogram.getValues()) + ", " +
                            valueString(histogram.getBins()) + ", mask=" +
@@ -648,14 +472,16 @@ private:
       assign(histogram.getResult(),
              "tl.cast(" + counts + ", " + pythonType(resultElement) + ")");
       return;
-    }
-    if (auto random = dyn_cast<gpu::RandomBitsOp>(operation)) {
+      }
+
+  void emitTyped(gpu::RandomBitsOp random) {
       assign(random.getResult(), "tl.randint(" + valueString(random.getSeed()) +
                                       ", " + valueString(random.getCounter()) +
                                       ").to(tl.uint32, bitcast=True)");
       return;
-    }
-    if (auto atomic = dyn_cast<gpu::AtomicStoreOp>(operation)) {
+      }
+
+  void emitTyped(gpu::AtomicStoreOp atomic) {
       auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
       std::string call = "tl.atomic_xchg(" +
                          pointer(access) + ", " + valueString(access.getAccessPayloads().front());
@@ -665,8 +491,9 @@ private:
               "\", scope=\"" + atomicScope(atomic.getSharing()) + "\")";
       line(call);
       return;
-    }
-    if (auto atomic = dyn_cast<gpu::AtomicRMWOp>(operation)) {
+      }
+
+  void emitTyped(gpu::AtomicRMWOp atomic) {
       auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
       auto operationName = [](AtomicRMWKind kind) -> StringRef {
         switch (kind) {
@@ -689,8 +516,9 @@ private:
               "\", scope=\"" + atomicScope(atomic.getSharing()) + "\")";
       assign(atomic.getResult(), call);
       return;
-    }
-    if (auto atomic = dyn_cast<gpu::AtomicCompareExchangeOp>(operation)) {
+      }
+
+  void emitTyped(gpu::AtomicCompareExchangeOp atomic) {
       auto access = cast<gpu::AccessOpInterface>(atomic.getOperation());
       auto payloads = access.getAccessPayloads();
       std::string old = newName();
@@ -702,16 +530,18 @@ private:
       assign(atomic.getResult(), "(" + old + ", (" + old + " == " +
                                      valueString(payloads[0]) + "))");
       return;
-    }
-    if (auto store = dyn_cast<DescriptorStoreOp>(operation)) {
+      }
+
+  void emitTyped(DescriptorStoreOp store) {
       auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
       line(valueString(store.getDescriptor()) + ".store(" +
            descriptorOffsets(store.getOffsets()) +
            ", tl.cast(" + valueString(store.getValue()) + ", " +
            pythonType(fragment.getElementType()) + "))");
       return;
-    }
-    if (auto store = dyn_cast<BlockStoreOp>(operation)) {
+      }
+
+  void emitTyped(BlockStoreOp store) {
       auto fragment = cast<gpu::FragmentType>(store.getValue().getType());
       std::string storageType = fragment.getElementType().isInteger(1)
                                     ? "tl.int8"
@@ -726,8 +556,9 @@ private:
         call += ", boundary_check=" + axisTuple(store.getBoundaryAxes());
       line(call + ")");
       return;
-    }
-    if (auto store = dyn_cast<gpu::StoreOp>(operation)) {
+      }
+
+  void emitTyped(gpu::StoreOp store) {
       auto access = cast<gpu::AccessOpInterface>(store.getOperation());
       std::string call = "tl.store(" +
                          pointer(access) + ", " + valueString(access.getAccessPayloads().front());
@@ -735,96 +566,7 @@ private:
         call += ", mask=" + valueString(access.getAccessValidity());
       line(call + ")");
       return;
-    }
-    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
-      SmallVector<std::string> results;
-      for (auto [result, initial] : llvm::zip(loop.getResults(), loop.getInitArgs())) {
-        std::string name = newName();
-        values[result] = name;
-        line(name + " = " + controlValueString(initial));
-        results.push_back(name);
       }
-      std::string induction = "iv" + std::to_string(counter++);
-      values[loop.getInductionVar()] = induction;
-      for (auto [argument, name] : llvm::zip(loop.getRegionIterArgs(), results))
-        values[argument] = name;
-      auto unroll = loop->getAttrOfType<IntegerAttr>(
-          "intent_gpu.triton.loop_unroll_factor");
-      auto stages = loop->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
-      std::string range = unroll || stages ? "tl.range(" : "range(";
-      range += valueString(loop.getLowerBound()) + ", " +
-               valueString(loop.getUpperBound()) + ", " +
-               valueString(loop.getStep());
-      if (unroll)
-        range += ", loop_unroll_factor=" + std::to_string(unroll.getInt());
-      if (stages)
-        range += ", num_stages=" + stages.getName().getValue().str();
-      line("for " + induction + " in " + range + "):");
-      ++indent;
-      emitBlock(*loop.getBody(), true, results);
-      --indent;
-      return;
-    }
-    if (auto ifOperation = dyn_cast<scf::IfOp>(operation)) {
-      SmallVector<std::string> results;
-      for (Value result : ifOperation.getResults()) {
-        std::string name = newName();
-        values[result] = name;
-        results.push_back(name);
-      }
-      line("if " + valueString(ifOperation.getCondition()) + ":");
-      ++indent;
-      emitBlock(ifOperation.getThenRegion().front(), false, results);
-      --indent;
-      if (!ifOperation.getElseRegion().empty() &&
-          !ifOperation.getElseRegion().front().empty()) {
-        line("else:");
-        ++indent;
-        emitBlock(ifOperation.getElseRegion().front(), false, results);
-        --indent;
-      }
-      return;
-    }
-    if (auto whileOperation = dyn_cast<scf::WhileOp>(operation)) {
-      SmallVector<std::string> carries;
-      for (auto [result, initial] :
-           llvm::zip(whileOperation.getResults(), whileOperation.getInits())) {
-        std::string name = newName();
-        values[result] = name;
-        line(name + " = " + controlValueString(initial));
-        carries.push_back(name);
-      }
-      Block &before = whileOperation.getBefore().front();
-      for (auto [argument, name] : llvm::zip(before.getArguments(), carries))
-        values[argument] = name;
-      std::string active = newName();
-      line(active + " = tl.full((), True, tl.int1)");
-      line("while " + active + ":");
-      ++indent;
-      for (Operation &nested : before.without_terminator())
-        emitOperation(nested);
-      auto condition = cast<scf::ConditionOp>(before.getTerminator());
-      line(active + " = " + valueString(condition.getCondition()));
-      line("if " + active + ":");
-      ++indent;
-      Block &after = whileOperation.getAfter().front();
-      for (auto [argument, forwarded] :
-           llvm::zip(after.getArguments(), condition.getArgs()))
-        values[argument] = controlValueString(forwarded);
-      emitBlock(after, true, carries);
-      --indent;
-      --indent;
-      return;
-    }
-    operation.emitOpError("has no terminal Triton spelling");
-    failed = true;
-  }
-
-  Type elementType(Type type) const {
-    if (auto fragment = dyn_cast<gpu::FragmentType>(type))
-      return fragment.getElementType();
-    return type;
-  }
 
   std::string binaryExpression(gpu::BinaryOp binary) {
     auto infix = [&](StringRef spelling) {
@@ -1024,40 +766,6 @@ private:
     return "tl.broadcast_to(" + result + "], " + fragmentShape(target) + ")";
   }
 
-  std::string axisTuple(ArrayRef<int64_t> axes) const {
-    std::string result = "(";
-    for (auto [index, axis] : llvm::enumerate(axes)) {
-      if (index)
-        result += ", ";
-      result += std::to_string(axis);
-    }
-    if (axes.size() == 1)
-      result += ",";
-    return result + ")";
-  }
-
-  std::string stringTuple(ArrayRef<std::string> values) const {
-    std::string result = "(";
-    for (auto [index, value] : llvm::enumerate(values)) {
-      if (index)
-        result += ", ";
-      result += value;
-    }
-    if (values.size() == 1)
-      result += ",";
-    return result + ")";
-  }
-
-  std::string stringList(ArrayRef<std::string> values) const {
-    std::string result = "[";
-    for (auto [index, value] : llvm::enumerate(values)) {
-      if (index)
-        result += ", ";
-      result += value;
-    }
-    return result + "]";
-  }
-
   std::string descriptorOffsets(ValueRange offsets) {
     SmallVector<std::string> expressions;
     for (Value offset : offsets)
@@ -1180,62 +888,6 @@ private:
       return "tl.cast(" + result + ", " + pythonType(value.getType()) + ")";
     }
     return result;
-  }
-
-  std::string valueString(Value value) {
-    auto found = values.find(value);
-    if (found == values.end()) {
-      failed = true;
-      return "<missing>";
-    }
-    return found->second;
-  }
-
-  bool isConstexprExpression(gpu::PhysicalExprAttr expression) {
-    if (expression.getKind() ==
-        gpu::PhysicalExprKind::ScalarABI)
-      return false;
-    return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
-      return isConstexprExpression(cast<gpu::PhysicalExprAttr>(operand));
-    });
-  }
-
-  void assign(Value value, const std::string &expression, bool compileTime = false) {
-    std::string name = newName();
-    values[value] = name;
-    if (compileTime)
-      constexprValues.insert(value);
-    line(name + (compileTime ? ": tl.constexpr = " : " = ") + expression);
-  }
-
-  void assignResults(ResultRange results, const std::string &expression) {
-    SmallVector<std::string> names;
-    for (Value result : results) {
-      names.push_back(newName());
-      values[result] = names.back();
-    }
-    std::string statement;
-    for (auto [index, name] : llvm::enumerate(names)) {
-      if (index)
-        statement += ", ";
-      statement += name;
-    }
-    line(statement + " = " + expression);
-  }
-
-  std::string newName() {
-    std::string name;
-    do {
-      name = "v" + std::to_string(counter++);
-    } while (llvm::any_of(values, [&](const auto &entry) {
-      return entry.second == name;
-    }));
-    return name;
-  }
-
-  void line(const std::string &text, unsigned explicitIndent = ~0U) {
-    unsigned level = explicitIndent == ~0U ? indent : explicitIndent;
-    output.indent(level * 4) << text << "\n";
   }
 
   FailureOr<llvm::json::Value> descriptorHostValue(Value value) {
@@ -1364,10 +1016,6 @@ private:
     return failed ? failure() : success();
   }
 
-  func::FuncOp kernel;
-  raw_ostream &output;
-  llvm::DenseMap<Value, std::string> values;
-  llvm::DenseSet<Value> constexprValues;
   SmallVector<ViewABI> views;
   SmallVector<ScalarABI> scalars;
   SmallVector<MetadataABI> metadataArguments;
@@ -1376,18 +1024,17 @@ private:
   std::string overlapArgument = "_intent_overlaps";
   std::set<std::string> coverageNames;
   ConfigurationSchema configuration;
-  llvm::DenseMap<Operation *, SmallVector<std::string>> helperNames;
   TensorDescriptorChoiceOp descriptorChoice;
   TensorDescriptorAllocatorOp descriptorAllocator;
   SmallVector<DescriptorABI> descriptors;
-  unsigned indent = 0;
-  unsigned counter = 0;
   unsigned helperCounter = 0;
-  bool emittingHelper = false;
-  bool failed = false;
 };
 
 } // namespace
+
+LogicalResult verifySourceOperation(Operation *operation) {
+  return Serializer::sourceOperations().verify(operation);
+}
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source,
                                std::string &metadata) {

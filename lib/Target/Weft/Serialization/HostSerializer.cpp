@@ -1,4 +1,6 @@
 #include "Intent/Target/Weft/Serialization/Serializer.h"
+#include "Intent/Target/Weft/IR/HostScalar.h"
+#include "Intent/Serialization/Source.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "TaskABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -29,31 +31,33 @@ struct Memory {
   SmallVector<std::string> shape, strides;
 };
 
-class HostSerializer {
+class HostSerializer : public SourceEmitter {
 public:
-  HostSerializer(ModuleOp module, llvm::raw_ostream &out) : module(module), out(out) {}
+  HostSerializer(ModuleOp module, llvm::raw_ostream &out)
+      : SourceEmitter(out, 2), module(module) {}
 
   LogicalResult run() {
-    out << "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <math.h>\n";
+    output << "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <math.h>\n";
     for (auto function : module.getOps<func::FuncOp>()) {
       if (!function.isExternal()) continue;
-      out << "extern void " << function.getName() << "(";
+      output << "extern void " << function.getName() << "(";
       for (auto [i, type] : llvm::enumerate(function.getArgumentTypes())) {
-        if (i) out << ", ";
-        out << (isa<MemRefType>(type) ? "void *" : scalarType(type));
+        if (i) output << ", ";
+        output << (isa<MemRefType>(type) ? "void *" : scalarType(type));
       }
-      out << ");\n";
+      output << ");\n";
     }
     for (auto function : module.getOps<func::FuncOp>()) {
       if (function.isExternal()) continue;
       auto abi = queryHostABI(function);
-      if (failed(abi)) return failure();
-      values.clear(); memories.clear(); allocations.clear();
-      out << "void " << function.getName() << "(";
+      if (mlir::failed(abi)) return failure();
+      ScopedValues local(*this);
+      memories.clear(); allocations.clear();
+      output << "void " << function.getName() << "(";
       bool first = true;
       auto parameter = [&](const std::string &type, const std::string &name) {
-        if (!first) out << ", ";
-        out << type << " " << name; first = false;
+        if (!first) output << ", ";
+        output << type << " " << name; first = false;
       };
       for (auto [i, argument] : llvm::enumerate(function.getArguments())) {
         std::string name = "a" + std::to_string(i);
@@ -72,28 +76,18 @@ public:
           entries[*slot.axis] = name;
         }
       }
-      out << ") {\n";
+      output << ") {\n";
       indent = 1;
-      if (failed(block(function.front()))) return failure();
-      out << "}\n";
+      if (mlir::failed(block(function.front()))) return failure();
+      output << "}\n";
     }
-    return success();
+    return failure(hasFailed());
   }
 
 private:
-  std::string scalarType(Type type) {
-    if (type.isF32()) return "float";
-    if (type.isF64()) return "double";
-    if (type.isIndex()) return "int64_t";
-    if (auto integer = dyn_cast<IntegerType>(type)) {
-      if (integer.getWidth() == 1) return "int";
-      return (integer.isUnsigned() ? "uint" : "int") + std::to_string(integer.getWidth()) + "_t";
-    }
-    llvm_unreachable("host scalar type must be legalized before serialization");
-  }
-  void line(const std::string &text) { out.indent(indent * 2) << text << '\n'; }
-  std::string fresh() { return "v" + std::to_string(counter++); }
-  std::string value(Value input) { return values.at(input); }
+  std::string scalarType(Type type) { return hostScalarType(type)->name; }
+  std::string fresh() { return newName(); }
+  std::string value(Value input) { return valueString(input); }
   std::string bound(OpFoldResult input) {
     return isa<Attribute>(input) ? std::to_string(cast<IntegerAttr>(cast<Attribute>(input)).getInt())
                                  : value(cast<Value>(input));
@@ -166,23 +160,19 @@ private:
   }
   LogicalResult block(Block &body) {
     for (auto &operation : body)
-      if (failed(emit(&operation))) return failure();
+      if (mlir::failed(emit(&operation))) return failure();
     return success();
   }
   LogicalResult emit(Operation *operation) {
     if (isa<scf::YieldOp, scf::ReduceOp>(operation)) return success();
     if (isa<func::ReturnOp>(operation)) { line("return;"); return success(); }
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      std::string expression;
-      if (auto integer = dyn_cast<IntegerAttr>(constant.getValue())) expression = std::to_string(integer.getInt());
-      else if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) {
-        if (floating.getValue().isInfinity()) expression = floating.getValue().isNegative() ? "-INFINITY" : "INFINITY";
-        else {
-          llvm::SmallString<32> text;
-          floating.getValue().toString(text); expression = "(" + scalarType(constant.getType()) + ")(" + text.str().str() + ")";
-        }
-      } else return operation->emitError("host constant has no scalar C representation");
-      values[constant.getResult()] = expression;
+    if (isStandardScalarOperation(operation)) {
+      SmallVector<std::string> operands;
+      for (Value input : operation->getOperands()) operands.push_back(value(input));
+      auto expression = emitHostScalar(operation, operands);
+      if (mlir::failed(expression)) return failure();
+      if (isa<arith::ConstantOp>(operation)) values[operation->getResult(0)] = *expression;
+      else bind(operation->getResult(0), *expression);
       return success();
     }
     if (auto dim = dyn_cast<memref::DimOp>(operation)) {
@@ -249,14 +239,14 @@ private:
       std::string iv = fresh(); values[loop.getInductionVars()[0]] = iv;
       line("for (int64_t " + iv + " = " + value(loop.getLowerBound()[0]) + "; " + iv + " < " +
           value(loop.getUpperBound()[0]) + "; " + iv + " += " + value(loop.getStep()[0]) + ") {");
-      ++indent; if (failed(block(*loop.getBody()))) return failure(); --indent; line("}"); return success();
+      ++indent; if (mlir::failed(block(*loop.getBody()))) return failure(); --indent; line("}"); return success();
     }
     if (auto loop = dyn_cast<scf::ForOp>(operation)) {
       for (auto [argument, initial] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) bind(argument, value(initial));
       std::string iv = fresh(); values[loop.getInductionVar()] = iv;
       line("for (int64_t " + iv + " = " + value(loop.getLowerBound()) + "; " + iv + " < " + value(loop.getUpperBound()) +
           "; " + iv + " += " + value(loop.getStep()) + ") {");
-      ++indent; if (failed(block(*loop.getBody()))) return failure();
+      ++indent; if (mlir::failed(block(*loop.getBody()))) return failure();
       SmallVector<std::string> next;
       for (Value yielded : loop.getBody()->getTerminator()->getOperands()) {
         next.push_back(fresh());
@@ -275,54 +265,31 @@ private:
         values[result] = name;
       }
       auto branch = [&](Block &body) {
-        if (failed(block(body))) return failure();
+        if (mlir::failed(block(body))) return failure();
         for (auto [result, yielded] : llvm::zip(condition.getResults(), body.getTerminator()->getOperands()))
           line(value(result) + " = " + value(yielded) + ";");
         return success();
       };
       line("if (" + value(condition.getCondition()) + ") {");
-      ++indent; if (failed(branch(*condition.thenBlock()))) return failure(); --indent;
+      ++indent; if (mlir::failed(branch(*condition.thenBlock()))) return failure(); --indent;
       if (!condition.getElseRegion().empty()) {
         line("} else {"); ++indent;
-        if (failed(branch(*condition.elseBlock()))) return failure(); --indent;
+        if (mlir::failed(branch(*condition.elseBlock()))) return failure(); --indent;
       }
       line("}"); return success();
-    }
-    if (auto cast = dyn_cast<arith::IndexCastOp>(operation)) {
-      bind(cast.getResult(), "(" + scalarType(cast.getType()) + ")(" + value(cast.getIn()) + ")"); return success();
-    }
-    if (operation->getNumOperands() == 2 && operation->getNumResults() == 1) {
-      auto a = value(operation->getOperand(0)), c = value(operation->getOperand(1));
-      std::string op;
-      if (isa<arith::AddIOp, arith::AddFOp>(operation)) op = "+";
-      else if (isa<arith::SubIOp, arith::SubFOp>(operation)) op = "-";
-      else if (isa<arith::MulIOp, arith::MulFOp>(operation)) op = "*";
-      else if (isa<arith::DivSIOp, arith::DivFOp>(operation)) op = "/";
-      else if (isa<arith::RemSIOp>(operation)) op = "%";
-      else if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
-        if (compare.getPredicate() == arith::CmpIPredicate::eq) op = "==";
-      }
-      std::string expression;
-      if (!op.empty()) expression = "(" + a + ") " + op + " (" + c + ")";
-      else if (isa<arith::CeilDivSIOp>(operation)) expression = "((" + a + ") + (" + c + ") - 1) / (" + c + ")";
-      else if (isa<arith::MinSIOp, arith::MaxSIOp>(operation)) expression = "(" + a + (isa<arith::MinSIOp>(operation) ? " < " : " > ") + c + ") ? " + a + " : " + c;
-      if (!expression.empty()) { bind(operation->getResult(0), expression); return success(); }
     }
     return operation->emitError("operation has no legalized native host serialization: ") << operation->getName();
   }
 
   ModuleOp module;
-  llvm::raw_ostream &out;
-  llvm::DenseMap<Value, std::string> values;
   llvm::DenseMap<Value, Memory> memories;
   llvm::DenseMap<Value, std::string> allocations;
-  unsigned counter = 0, indent = 0;
 };
 
 }
 
 LogicalResult serializeHostProgram(ModuleOp program, std::string &source) {
-  if (failed(verify(program))) return failure();
+  if (mlir::failed(verify(program)) || mlir::failed(verifyHostScalarOperations(program))) return failure();
   llvm::raw_string_ostream stream(source);
   return HostSerializer(program, stream).run();
 }

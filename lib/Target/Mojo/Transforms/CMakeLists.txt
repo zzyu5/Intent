@@ -6,6 +6,7 @@ add_mlir_library(MLIRIntentMojoTransforms
   DEPENDS IntentMojoTransformsIncGen
   LINK_LIBS PUBLIC
   MLIRIntentCPUTransforms
+  MLIRIntentMojoScalarSerialization
   MLIRPass
   MLIRArithDialect
   MLIRArithTransforms

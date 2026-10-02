@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
+#include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -288,26 +289,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    if (isa<CtaBarrierOp, gpu::ViewOverlapOp, TensorDescriptorChoiceOp, TensorDescriptorAllocatorOp,
-            TensorDescriptorOp, BlockLoadOp, BlockStoreOp, DescriptorLoadOp,
-            DescriptorStoreOp, SplitOp, ReduceOp, ScanOp, MapElementwiseOp, gpu::ParameterOp,
-            gpu::PhysicalExprOp,
-            gpu::ProgramIdOp,
-            gpu::WorksetCoordinateOp, gpu::DelinearizeOp,
-            gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
-            gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
-            gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
-            gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
-            gpu::ExtractOp, gpu::LoadOp, gpu::GatherOp, gpu::StoreOp,
-            gpu::ContractOp,
-            gpu::ScaledContractOp, gpu::HistogramOp, gpu::AtomicStoreOp,
-            gpu::AtomicRMWOp, gpu::AtomicCompareExchangeOp,
-            gpu::RandomBitsOp, gpu::YieldOp, arith::ConstantOp, scf::ForOp,
-            scf::IfOp, scf::WhileOp, scf::ConditionOp, scf::YieldOp,
-            func::FuncOp, func::ReturnOp>(operation))
-      return WalkResult::advance();
-    operation->emitOpError("is outside the closed Triton provider surface");
-    return WalkResult::interrupt();
+    return succeeded(verifySourceOperation(operation))
+        ? WalkResult::advance() : WalkResult::interrupt();
   });
   return result.wasInterrupted() ? failure() : success();
 }

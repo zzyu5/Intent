@@ -8,6 +8,8 @@
 
 namespace intent::triton {
 
+mlir::LogicalResult verifySourceOperation(mlir::Operation *operation);
+
 mlir::LogicalResult serializeProgram(mlir::ModuleOp module,
                                     std::string &source,
                                     std::string &metadata);

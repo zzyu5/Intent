@@ -20,6 +20,7 @@ add_mlir_library(MLIRIntentCuTileTransforms
   MLIRPass
   MLIRSCFDialect
   MLIRIntentCuTileDialect
+  MLIRIntentCuTileSerialization
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
 )

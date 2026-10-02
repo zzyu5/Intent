@@ -17,6 +17,7 @@
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
+#include "Intent/Target/CuTile/Serialization/Serializer.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -342,22 +343,8 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
     }
-    if (isa<ArrayViewOp, TileLoadOp, TileStoreOp, TileAtomicAddOp,
-            ScalarLoadOp, ScalarStoreOp, GatherLoadOp,
-            ScatterStoreOp, AtomicRMWOp, ExtractOp, MMAOp, ScaledMMAOp,
-            ReduceOp, ScanOp, gpu::ParameterOp,
-            gpu::PhysicalExprOp, gpu::ProgramIdOp, gpu::WorksetCoordinateOp,
-            gpu::DelinearizeOp, gpu::ViewOverlapOp,
-            gpu::DimOp, gpu::RangeOp, gpu::RangeBoundOp, gpu::MakeRangeOp,
-            gpu::SplatOp, gpu::BroadcastOp, gpu::UnaryOp, gpu::BinaryOp,
-            gpu::CompareOp, gpu::SelectOp, gpu::CastOp, gpu::BitcastOp,
-            gpu::ReshapeOp, gpu::TransposeOp, gpu::JoinOp, gpu::MakeRecordOp,
-            gpu::ExtractOp, gpu::YieldOp, arith::ConstantOp,
-            scf::ForOp, scf::WhileOp, scf::ConditionOp, scf::IfOp, scf::YieldOp, func::FuncOp,
-            func::ReturnOp>(operation))
-      return WalkResult::advance();
-    operation->emitOpError("is outside the closed cuTile provider surface");
-    return WalkResult::interrupt();
+    return succeeded(verifySourceOperation(operation))
+        ? WalkResult::advance() : WalkResult::interrupt();
   });
   return result.wasInterrupted() ? failure() : success();
 }

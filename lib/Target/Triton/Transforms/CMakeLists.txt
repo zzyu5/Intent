@@ -24,4 +24,5 @@ add_mlir_library(MLIRIntentTritonTransforms
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
   MLIRIntentTritonDialect
+  MLIRIntentTritonSerialization
 )

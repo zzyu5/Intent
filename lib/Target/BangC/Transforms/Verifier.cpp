@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "../Serialization/Scalar.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -55,14 +56,7 @@ LogicalResult verifySurfaceOperations(func::FuncOp function) {
     auto supportedType = [](Type type) {
       if (auto memory = dyn_cast<MemRefType>(type))
         type = memory.getElementType();
-      if (type.isIndex() || type.isF16() || type.isBF16() || type.isF32() ||
-          type.isF64())
-        return true;
-      auto integer = dyn_cast<IntegerType>(type);
-      return integer && integer.isSignless() &&
-             (integer.getWidth() == 1 || integer.getWidth() == 8 ||
-              integer.getWidth() == 16 || integer.getWidth() == 32 ||
-              integer.getWidth() == 64);
+      return scalarType(type).has_value();
     };
     for (Type type : llvm::concat<Type>(op->getOperandTypes(), op->getResultTypes()))
       if (!supportedType(type)) {
@@ -77,23 +71,14 @@ LogicalResult verifySurfaceOperations(func::FuncOp function) {
                 << argument.getType();
             return WalkResult::interrupt();
           }
+    if (isStandardScalarOperation(op))
+      return failed(verifyScalar(op)) ? WalkResult::interrupt() : WalkResult::advance();
     if (!isa<dsa::SynchronizeOp, dsa::GroupSynchronizeOp, dsa::GroupIdOp, dsa::GroupCountOp, dsa::LocalIdOp,
              dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::StrideOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
              dsa::LoadTileOp, dsa::GatherPlanOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::StoreTileOp, dsa::FillOp, dsa::IotaOp,
              dsa::IndexLayoutOp, dsa::IndexBinaryOp, dsa::BroadcastRowsOp, dsa::TransposeOp, dsa::SelectOp, dsa::MaskedFillOp, dsa::UnaryOp, dsa::BinaryOp,
              dsa::CastOp, dsa::CompareOp, dsa::CompareRangeOp, dsa::CompareRampOp, dsa::DivideCastOp, dsa::DivideRNOp, dsa::ReduceOp,
              dsa::PrepareMatrixOp, dsa::PrepareMatrixViewOp, dsa::MatrixTileOp,
-             arith::ConstantOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
-             arith::DivSIOp, arith::DivUIOp, arith::RemSIOp, arith::RemUIOp,
-             arith::CeilDivSIOp, arith::FloorDivSIOp, arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp, arith::MaxUIOp,
-             arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
-             arith::ExtFOp, arith::TruncFOp, arith::IndexCastOp, arith::IndexCastUIOp,
-             arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
-             arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp, arith::CmpIOp, arith::CmpFOp, arith::SelectOp,
-             arith::AndIOp, arith::OrIOp, arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp, math::AbsIOp,
-             arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp, arith::MinNumFOp,
-             arith::NegFOp, math::ExpOp, math::Exp2Op, math::LogOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::AbsFOp,
-             math::SinOp, math::CosOp, math::FloorOp,
              memref::DimOp, memref::AllocaOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp, memref::CopyOp,
              scf::ForOp, scf::WhileOp, scf::IfOp, scf::ConditionOp, scf::YieldOp, func::FuncOp, func::ReturnOp>(op)) {
       op->emitError("operation is outside the bound BANG C surface"); return WalkResult::interrupt();

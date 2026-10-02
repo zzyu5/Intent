@@ -45,19 +45,22 @@ __mlu_func__ uint16_t intent_number_to_bf16(double value) {
   if (e > 127) return sign | 0x7f80u;
   return sign | uint16_t((e + 127) << 7) | uint16_t(rounded - 128);
 }
-__mlu_func__ uint16_t intent_number_to_bf16(int64_t value) {
+__mlu_func__ uint16_t intent_number_to_bf16(uint64_t value) {
   if (!value) return 0;
-  const uint16_t sign = value < 0 ? 0x8000u : 0;
-  const uint64_t magnitude = value < 0 ? uint64_t(0) - uint64_t(value) : uint64_t(value);
   int exponent = 0;
-  for (uint64_t remaining = magnitude; remaining > 1; remaining >>= 1) ++exponent;
-  uint64_t rounded = intent_round_shift(magnitude, exponent - 7);
+  for (uint64_t remaining = value; remaining > 1; remaining >>= 1) ++exponent;
+  uint64_t rounded = intent_round_shift(value, exponent - 7);
   if (rounded == 256) { rounded = 128; ++exponent; }
-  return sign | uint16_t((exponent + 127) << 7) | uint16_t(rounded - 128);
+  return uint16_t((exponent + 127) << 7) | uint16_t(rounded - 128);
+}
+__mlu_func__ uint16_t intent_number_to_bf16(int64_t value) {
+  const uint64_t magnitude = value < 0 ? uint64_t(0) - uint64_t(value) : uint64_t(value);
+  return (value < 0 ? 0x8000u : 0) | intent_number_to_bf16(magnitude);
 }
 __mlu_func__ uint16_t intent_number_to_bf16(float value) { return intent_float_to_bf16(value); }
 __mlu_func__ uint16_t intent_number_to_bf16(half value) { return intent_float_to_bf16(float(value)); }
 __mlu_func__ uint16_t intent_number_to_bf16(int32_t value) { return intent_number_to_bf16(int64_t(value)); }
+__mlu_func__ uint16_t intent_number_to_bf16(uint32_t value) { return intent_number_to_bf16(uint64_t(value)); }
 __mlu_func__ uint16_t intent_number_to_bf16(bool value) { return value ? 0x3f80u : 0; }
 template<class From, class To> struct IntentLocalCast {
   __mlu_func__ static To apply(From value) { return static_cast<To>(value); }

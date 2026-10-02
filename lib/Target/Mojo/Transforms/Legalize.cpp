@@ -1,5 +1,6 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Legalize.h"
+#include "Intent/Target/Mojo/Serialization/Scalar.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -25,16 +26,8 @@ bool directAtomicAdd(Type element) {
 }
 
 bool supportedType(Type type) {
-  if (auto vector = dyn_cast<VectorType>(type)) {
-    int64_t width = vector.getNumElements();
-    return vector.getRank() == 1 && supportedType(vector.getElementType()) &&
-        width > 0 && (width & (width - 1)) == 0;
-  }
-  if (auto memory = dyn_cast<MemRefType>(type)) return supportedType(memory.getElementType());
-  return type.isIndex() || type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
-      isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
-      type.isSignlessInteger(8) || type.isSignlessInteger(16) || type.isSignlessInteger(32) ||
-      type.isSignlessInteger(64) || type.isInteger(1);
+  if (auto memory = dyn_cast<MemRefType>(type)) type = memory.getElementType();
+  return supportsScalarType(type);
 }
 
 bool needsFloatingPointEnvironment(Operation *scope) {
@@ -99,27 +92,19 @@ LogicalResult checkSurface(ModuleOp module) {
   bool invalid = false;
   module.walk([&](Operation *operation) {
     if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp, scf::ConditionOp, cpu::TaskYieldOp>(operation)) return;
-    bool supported = isa<arith::ConstantOp, arith::AddFOp, arith::AddIOp,
-        arith::SubFOp, arith::SubIOp, arith::MulFOp, arith::MulIOp,
-        arith::DivFOp, arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
-        arith::MinSIOp, arith::MaxSIOp, arith::MinUIOp, arith::MaxUIOp, arith::NegFOp,
-        arith::IndexCastOp, arith::IndexCastUIOp, arith::BitcastOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp, arith::FPToUIOp,
-        arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
-        arith::MaxNumFOp, arith::MinNumFOp, arith::MaximumFOp, arith::MinimumFOp,
-        arith::CmpFOp, arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
-        arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
-        math::FmaOp, math::SqrtOp, math::ExpOp, math::Exp2Op, math::LogOp, math::TanhOp,
-        math::SinOp, math::CosOp, math::FloorOp, math::ErfOp, math::AbsFOp, math::AbsIOp, math::PowFOp, memref::DimOp,
+    if (isStandardScalarOperation(operation)) {
+      invalid |= failed(verifyScalar(operation));
+      return;
+    }
+    bool supported = isa<memref::DimOp,
         memref::SubViewOp, memref::CastOp, memref::ReinterpretCastOp, memref::LoadOp, memref::StoreOp,
         memref::ExtractStridedMetadataOp,
         memref::AllocaOp, memref::AllocOp, memref::DeallocOp, memref::PrefetchOp,
         vector::LoadOp, vector::StoreOp, vector::BroadcastOp, vector::FromElementsOp, vector::ShuffleOp, vector::StepOp,
-        vector::ExtractElementOp, arith::CmpIOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
+        vector::ExtractElementOp, scf::IfOp, scf::ForOp, scf::WhileOp, cpu::TaskDispatchOp,
         cpu::AtomicLoadOp, cpu::AtomicStoreOp, cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(operation);
     supported &= llvm::all_of(operation->getOperandTypes(), supportedType);
     supported &= llvm::all_of(operation->getResultTypes(), supportedType);
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation))
-      supported &= isa<IntegerAttr, FloatAttr, DenseElementsAttr>(constant.getValue());
     if (auto dimension = dyn_cast<memref::DimOp>(operation))
       supported &= dimension.getConstantIndex().has_value();
     if (auto stack = dyn_cast<memref::AllocaOp>(operation))
