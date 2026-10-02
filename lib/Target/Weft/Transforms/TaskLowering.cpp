@@ -195,9 +195,8 @@ public:
       Value source = tasks.getBody().front().getArgument(position);
       if (isa<MemRefType>(source.getType())) values.map(source, target);
       else {
-        auto type = cast<wk::ViewType>(target.getType());
         Value scalar = b.create<wk::SliceOp>(loc,
-            wk::SliceType::get(b.getContext(), type.getEncoding(), array({}), array({})),
+            sliceType(target, {}, {}),
             target, ValueRange{index(loc, 0)}, b.getArrayAttr({b.getStringAttr("index")}));
         Type storage = source.getType().isIndex()
             ? Type(IntegerType::get(b.getContext(), 64, IntegerType::Signed)) : source.getType();
@@ -230,11 +229,19 @@ private:
     else { llvm::raw_string_ostream stream(name); type.print(stream); }
     return wk::EncodingType::get(b.getContext(), name, "dense", "dense." + name, array({}));
   }
-  wk::EncodingType encoding(Value memory = {}) {
-    if (!memory) return dense(b.getF32Type());
+  wk::EncodingType encoding(Value memory) {
     auto format = quantizedFormat(memory);
     return format ? quantEncoding(b, *format)
                   : dense(cast<MemRefType>(memory.getType()).getElementType());
+  }
+  wk::SliceType sliceType(Value base, ArrayRef<int64_t> dimensions,
+                         ArrayRef<int64_t> ids) {
+    Type type = base.getType();
+    Type encoding = isa<wk::ViewType>(type)
+                        ? cast<wk::ViewType>(type).getEncoding()
+                        : cast<wk::SliceType>(type).getEncoding();
+    return wk::SliceType::get(b.getContext(), encoding, array(dimensions),
+                             array(ids));
   }
   std::optional<intent::QuantFormat> quantizedFormat(Value memory) {
     for (Value origin : storage->origins(memory).values)
@@ -500,7 +507,7 @@ private:
         } else { keptShape.push_back(baseShape[axis]); keptAxes.push_back(baseAxes[axis]); }
       }
       Value selected = b.create<wk::SliceOp>(operation.getLoc(),
-          wk::SliceType::get(b.getContext(), encoding(memory), array(keptShape), array(keptAxes)),
+          sliceType(*base, keptShape, keptAxes),
           *base, indices, b.getArrayAttr(selectors));
       values.map(memory, selected);
       viewAxes[memory] = std::move(mapping);
@@ -526,7 +533,7 @@ private:
     }
     auto ids = axes((*base).getType());
     Value selected = b.create<wk::SubviewOp>(operation.getLoc(),
-        wk::SliceType::get(b.getContext(), encoding(memory), array(dimensions), array(ids)),
+        sliceType(*base, dimensions, ids),
         *base, dynamic, array(offsets), array(extents));
     if (dropped.any()) {
       SmallVector<Attribute> selectors;
@@ -542,7 +549,7 @@ private:
         }
       }
       selected = b.create<wk::SliceOp>(operation.getLoc(),
-          wk::SliceType::get(b.getContext(), encoding(memory), array(keptShape), array(keptAxes)),
+          sliceType(selected, keptShape, keptAxes),
           selected, indices, b.getArrayAttr(selectors));
     }
     values.map(memory, selected);
@@ -988,8 +995,7 @@ private:
           selectors.push_back(b.getStringAttr(extent < 0 ? "index" : "all"));
           if (extent >= 0) { fixedShape.push_back(extent); fixedAxes.push_back(axis); }
         }
-        auto selectedType = wk::SliceType::get(b.getContext(),
-            cast<wk::SliceType>((*region).getType()).getEncoding(), array(fixedShape), array(fixedAxes));
+        auto selectedType = sliceType(*region, fixedShape, fixedAxes);
         auto selectedValue = valueType(element((*aligned).getType()), fixedShape, fixedAxes);
         SmallVector<Value> indices;
         // Keep the window's runtime extents in loop bounds and issue only
@@ -1840,7 +1846,7 @@ private:
         if (axis == dimensions.size()) {
           SmallVector<Attribute> selectors(dimensions.size(), b.getStringAttr("index"));
           Value selected = b.create<wk::SliceOp>(loc,
-              wk::SliceType::get(b.getContext(), encoding(), array({}), array({})),
+              sliceType(*region, {}, {}),
               *region, indices, b.getArrayAttr(selectors));
           b.create<wk::CommitOp>(loc, initial, selected);
           return;
@@ -1891,7 +1897,7 @@ private:
       if (failed(region)) return failure();
       auto indices = projectIndices(store.getMemref(), store.getIndices(), shape((*region).getType()).size());
       Value selected = b.create<wk::SliceOp>(loc,
-          wk::SliceType::get(b.getContext(), encoding(store.getMemref()), array({}), array({})),
+          sliceType(*region, {}, {}),
           *region, indices, b.getArrayAttr(SmallVector<Attribute>(indices.size(), b.getStringAttr("index"))));
       b.create<wk::CommitOp>(loc, values.lookup(store.getValue()), selected);
       return success();
@@ -2086,7 +2092,7 @@ private:
       if (failed(region)) return failure();
       auto indices = projectIndices(load.getMemref(), load.getIndices(), shape((*region).getType()).size());
       SmallVector<Attribute> selectors(indices.size(), b.getStringAttr("index"));
-      Value selected = b.create<wk::SliceOp>(loc, wk::SliceType::get(b.getContext(), encoding(load.getMemref()), array({}), array({})),
+      Value selected = b.create<wk::SliceOp>(loc, sliceType(*region, {}, {}),
           *region, indices, b.getArrayAttr(selectors));
       values.map(load.getResult(), b.create<wk::AdmitOp>(loc, load.getType(), selected));
       return success();
