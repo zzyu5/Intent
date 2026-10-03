@@ -1,6 +1,6 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-fused_softmax,8192x8192-fp16,0.173840,0.187352,0.927879,pass,
-dense_gemm,M4096-N14336-K4096-fp16,2.096912,2.085616,1.005416,pass,
+fused_softmax,8192x8192-fp16,0.175296,0.187320,0.935810,pass,
+dense_gemm,M4096-N14336-K4096-fp16,2.094296,2.084904,1.004505,pass,
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.392760,4.608792,0.953126,pass,
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,2.731240,2.764144,0.988096,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.086288,0.089864,0.960207,pass,
@@ -20,11 +20,11 @@ scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.522352,0.530512,
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,1.667576,2.555344,0.652584,pass,
 jagged_mean,B512-T33024-D128-fp32,0.016128,0.018176,0.887324,pass,
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.065328,0.124704,0.523865,pass,
-rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.232408,0.440768,0.527280,pass,
+rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.237568,0.439520,0.540517,pass,
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.186160,0.193704,0.961054,pass,
 varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.057344,0.057856,0.991150,pass,
 causal_conv1d_update,B32-D4096-W4-bf16,0.008672,0.005608,1.546362,pass,
-modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.243968,0.409296,0.596067,pass,source launch uses num_stages=1 and num_warps=4.
+modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.244936,0.409200,0.598573,pass,source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.008192,0.008192,1.000000,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,1.412744,0.776440,1.819515,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.186312,2.383000,0.917462,pass,
@@ -46,10 +46,10 @@ flaggems_batch_norm_training,B32-C64-S4096-fp16,0.030720,0.026640,1.153153,pass,
 flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.040752,0.057104,0.713645,pass,
 flaggems_logsumexp,8192x8192-fp32,0.175176,0.177704,0.985774,pass,
 flaggems_softmax_backward,4096x4097-fp32,0.115368,0.157608,0.731993,pass,
-flaggems_fused_adamw,N8388608-fp32,0.151616,0.157664,0.961640,pass,
+flaggems_fused_adamw,N8388608-fp32,0.151552,0.157696,0.961039,pass,
 flaggems_addcmul,B64-C128-L4096-bf16,0.087728,0.106256,0.825629,pass,
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.049712,0.087840,0.565938,pass,
-flaggems_cumsum,8192x8192-fp32-axis1,0.350976,0.352016,0.997046,pass,
+flaggems_cumsum,8192x8192-fp32-axis1,0.349968,0.352016,0.994182,pass,
 flaggems_histogram,N8388608-bins256-fp32,1.520032,1.241088,1.224758,pass,
 flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.012080,0.019984,0.604484,pass,
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,5.199392,7.094000,0.732928,pass,同算法；source 额外写 LSE 和临时数据。
