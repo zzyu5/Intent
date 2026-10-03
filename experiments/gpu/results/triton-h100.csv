@@ -32,7 +32,7 @@ moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.0
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,0.977636,1.416933,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.013488,0.012176,0.011648,0.902728,0.863582,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.045328,0.035768,0.049648,0.789093,1.095305,pass,pass,,Intent target=cutile; source corpus=triton.
-mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.178680,0.294120,0.250984,1.646071,1.404656,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.178240,0.294280,0.251328,1.651032,1.410054,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
 paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.303216,0.370192,0.227392,1.220885,0.749934,pass,pass,,Intent target=cutile; source corpus=triton.
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.813296,0.379112,0.215888,0.466143,0.265448,pass,pass,,Intent target=cutile; source corpus=triton.
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.370520,0.384048,0.226072,1.036511,0.610148,pass,pass,同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
@@ -49,7 +49,7 @@ flaggems_softmax_backward,4096x4097-fp32,0.088320,0.071624,,0.810960,,pass,numer
 flaggems_fused_adamw,N8388608-fp32,0.083456,0.082304,0.082720,0.986196,0.991181,pass,pass,,Intent target=cutile; source corpus=triton.
 flaggems_addcmul,B64-C128-L4096-bf16,0.072144,0.049600,0.049832,0.687514,0.690730,pass,pass,,Intent target=cutile; source corpus=triton.
 flaggems_fp8_mqa_logits,Q256-K4096-H32-D128-e4m3,0.053048,0.051392,0.060912,0.968783,1.148243,pass,pass,,Intent target=cutile; source corpus=triton.
-flaggems_cumsum,8192x8192-fp32-axis1,0.181936,0.182320,0.225640,1.002111,1.240216,pass,pass,,Intent target=cutile; source corpus=triton.
+flaggems_cumsum,8192x8192-fp32-axis1,0.182144,0.182208,0.222320,1.000351,1.220573,pass,pass,,Intent target=cutile; source corpus=triton.
 flaggems_histogram,N8388608-bins256-fp32,2.171536,1.954320,1.158368,0.899971,0.533433,pass,pass,,Intent target=cutile; source corpus=triton.
-flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.018416,0.015328,0.030768,0.832320,1.670721,pass,pass,,Intent target=cutile; source corpus=triton.
+flaggems_max_pool2d_with_indices,B8-C32-H128-W128-K3-S2-P1-fp16,0.014320,0.102816,0.029512,7.179888,2.060894,pass,pass,,Intent target=cutile; source corpus=triton.
 legacy_flash_attention_bias,B4-H32-S4096-D128-fp16-vector-bias,4.452056,3.777608,3.617128,0.848509,0.812462,pass,pass,同算法；source 额外写 LSE 和临时数据。,Intent target=cutile; source corpus=triton. 同算法；source 额外写 LSE 和临时数据。

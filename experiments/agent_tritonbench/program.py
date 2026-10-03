@@ -3,12 +3,13 @@ from __future__ import annotations
 import ast
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 import intent
 from intent.runtime.artifact import CompiledArtifact
+from intent.runtime.diagnostics import NativeObservation
 from intent.runtime.source import materialize_python_source
-from intent.runtime.cutile.compilation import CuTileCompilation
 from intent.runtime.triton.program import TuningHooks
 from intent.targets import CuTileTarget, TritonTarget
 import triton
@@ -23,6 +24,61 @@ from experiments._common.loading import load_module
 from experiments._common.measurement import CUTILE_TUNING_LAUNCH_TIMEOUT_SECONDS
 
 
+class _ProgramCall:
+    def __init__(self, context, name: str, call):
+        self.context, self.name, self.call = context, name, call
+
+    def compile(self):
+        try:
+            self.call.compile()
+        finally:
+            observed = self.call.observation
+            if observed is not None:
+                self.context.compilation_observations.append((self.name, observed))
+
+    def launch(self):
+        if self.context.compiling:
+            self.compile()
+        else:
+            self.call.launch()
+
+    __call__ = launch
+
+    def __getattr__(self, name):
+        return getattr(self.call, name)
+
+
+class _ProgramRuntime:
+    """Intercept this submission's calls through the public prepared-call API."""
+
+    def __init__(self, context, name: str, runtime):
+        self.context, self.name, self.runtime = context, name, runtime
+
+    def prepare_call(self, arguments: tuple, *, outputs: tuple | None = None):
+        return _ProgramCall(self.context, self.name,
+                            self.runtime.prepare_call(arguments, outputs=outputs))
+
+    def run(self, *arguments):
+        if not self.context.compiling:
+            return self.runtime.run(*arguments)
+        call = self.prepare_call(arguments)
+        call.compile()
+        return call.result()
+
+    def launch(self, *arguments):
+        if not self.context.compiling:
+            return self.runtime.launch(*arguments)
+        interface = self.runtime.interface
+        if len(arguments) != len(interface.parameters):
+            raise TypeError(f"expected {len(interface.parameters)} runtime arguments, got {len(arguments)}")
+        inputs = tuple(arguments[parameter.position] for parameter in interface.inputs)
+        outputs = tuple(arguments[parameter.position] for parameter in interface.outputs)
+        self.prepare_call(inputs, outputs=outputs).compile()
+
+    def __getattr__(self, name):
+        return getattr(self.runtime, name)
+
+
 class ProgramContext:
     def __init__(self, compiler: Path, directory: Path, *, language: str,
                  target: str = "triton", tuning_config: Path | None = None):
@@ -34,8 +90,8 @@ class ProgramContext:
         self.tuning_config = tuning_config
         self.generated: dict[str, CompiledArtifact] = {}
         self.tuning: list[dict] = []
-        self._cutile_compilation = CuTileCompilation()
-        self.precompile_failures = self._cutile_compilation.failures
+        self.compiling = False
+        self.compilation_observations: list[tuple[str, NativeObservation]] = []
 
     def compile(self, name: str, definition, *, constexprs=None):
         if self.language != "intent":
@@ -52,30 +108,41 @@ class ProgramContext:
             def record_search(configs, result):
                 self.tuning.append({"kernel": name, "declared": len(configs),
                                     "measured": len(result.successes),
-                                    "failures": [(str(cfg), kind.__name__, message)
+                                    "failures": [(str(cfg), kind if isinstance(kind, str) else kind.__name__, message)
                                                  for cfg, kind, message in result.failures],
                                     "winner": str(result.best.config)})
             provider.observe_tuning = record_search
             # Compiler-owned trial buffers may copy state. Candidate host code
             # remains under CandidateTorchPolicy outside the runtime boundary.
             artifact.runtime.invocation_context = _disable_current_modes
+        artifact.runtime = _ProgramRuntime(self, name, artifact.runtime)
         self.generated[name] = artifact
         return artifact
 
     @property
-    def native_compile_reuses(self):
-        return self._cutile_compilation.reuses
+    def precompile_failures(self):
+        return [{"kernel": name, "configuration": candidate.configuration,
+                 "stage": candidate.stage, "error_type": candidate.error_type,
+                 "error": candidate.message}
+                for name, observed in self.compilation_observations
+                for candidate in observed.candidates if candidate.status == "failed"]
 
     @contextmanager
-    def native_compilation_cache(self):
-        if self.target_name != "cutile":
-            yield
-            return
-        with self._cutile_compilation.cache():
-            yield
-
     def compilation_only(self):
-        return self._cutile_compilation.compilation_only(self.generated.values())
+        if self.compiling:
+            raise RuntimeError("submission native compilation is already active")
+        self.compiling = True
+        try:
+            yield
+        finally:
+            self.compiling = False
+
+    def native_observations(self):
+        return {name: {
+            "compilation": [asdict(observed) for kernel, observed in self.compilation_observations
+                            if kernel == name],
+            "latest": asdict(artifact.observation) if artifact.observation is not None else None,
+        } for name, artifact in self.generated.items()}
 
     def load_source(self, filename: str):
         if self.language != "triton":
