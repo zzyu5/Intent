@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -194,10 +195,11 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   Type element = original.getElementType();
   auto identity = match.identity.getDefiningOp<arith::ConstantOp>();
   auto zero = identity ? dyn_cast<IntegerAttr>(identity.getValue()) : IntegerAttr();
+  auto binaryCombine = queryBinaryCombine(scan.getCombine());
   bool invertIntegerSum =
       isa<IntegerType, IndexType>(element) && !element.isInteger(1) && zero &&
       zero.getValue().isZero() &&
-      queryBinaryCombineKind(scan.getCombine()) == BinaryOperator::Add;
+      binaryCombine && binaryCombine->kind() == BinaryOperator::Add;
   auto reference = getOrCreatePhysicalParameter(
       kernel, name, ParameterRole::ScanChunk, ParameterCategory::Scan,
       element.isIndex() ? 64 : element.getIntOrFloatBitWidth(),

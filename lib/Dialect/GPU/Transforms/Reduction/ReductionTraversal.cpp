@@ -1,6 +1,8 @@
 #include "ReductionRealization.h"
 #include "ReductionParameters.h"
 #include "ReductionValues.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -626,7 +628,7 @@ bool matchReductionCombine(ReduceOp reference, Block *body, ValueRange left,
     Operation *expected = pattern.getDefiningOp();
     Operation *actual = value.getDefiningOp();
     if (!expected || !actual || actual->getBlock() != body ||
-        !canLiftCombineOperation(*expected) ||
+        !isLaneWiseValueOperation(expected) ||
         expected->getName() != actual->getName() ||
         expected->getNumOperands() != actual->getNumOperands() ||
         expected->getNumResults() != actual->getNumResults())
@@ -747,7 +749,7 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
   Region scalarCombine, vectorCombine;
   std::string reason;
   if (failed(scalarizeElementwiseCallback(reference.getCombine(), scalarCombine)) ||
-      failed(cloneLiftedCombineRegion(scalarCombine, vectorCombine,
+      failed(liftCombineRegion(scalarCombine, vectorCombine,
                                       accumulatorTypes, reason)))
     return false;
 

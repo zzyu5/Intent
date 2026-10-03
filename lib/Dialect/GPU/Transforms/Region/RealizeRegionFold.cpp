@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Region/Realization.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "RegionCloning.h"
 #include "RegionPredicates.h"
@@ -126,9 +127,9 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
         isLiteralZeroProjection(
             identity.getFields()[online->summary.massField]) &&
         isLiteralZeroProjection(online->summary.mass.getIdentities().front());
-    encodeEmptyMaximum = massRepresentsValidity &&
-        queryBinaryCombineKind(online->summary.maximum.getCombine()) ==
-            BinaryOperator::MaximumNum &&
+    auto maximumCombine = queryBinaryCombine(online->summary.maximum.getCombine());
+    encodeEmptyMaximum = massRepresentsValidity && maximumCombine &&
+        maximumCombine->kind() == BinaryOperator::MaximumNum &&
         isLiteralZeroProjection(identity.getFields()[online->summary.maximumField]);
     for (unsigned field : {online->summary.maximumField, online->summary.massField,
                            online->summary.momentField})

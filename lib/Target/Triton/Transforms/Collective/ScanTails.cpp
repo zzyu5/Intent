@@ -1,4 +1,5 @@
 #include "Collectives.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -93,9 +94,10 @@ void foldIntegerScanTails(func::FuncOp kernel) {
     Block &body = scan.getCombine().front();
     auto combine = dyn_cast<gpu::BinaryOp>(body.front());
     auto structured = cast<StructuredOpInterface>(scan.getOperation());
+    auto binaryCombine = gpu::queryBinaryCombine(scan.getCombine());
     if (!llvm::hasSingleElement(body.without_terminator()) || !combine ||
         combine.getLhs() != structured.getCombineLhs().front() ||
-        gpu::queryBinaryCombineKind(scan.getCombine()) != BinaryOperator::Add)
+        !binaryCombine || binaryCombine->kind() != BinaryOperator::Add)
       continue;
 
     // A scalar cross-warp gather materializes the whole prefix in shared memory.

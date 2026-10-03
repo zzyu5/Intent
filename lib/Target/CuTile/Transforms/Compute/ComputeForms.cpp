@@ -1,4 +1,6 @@
 #include "ComputeForms.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Target/CuTile/Analysis/Program.h"
 #include "Intent/Target/CuTile/Analysis/IndexBounds.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
@@ -29,9 +31,12 @@ gpu::FragmentType transposeRankTwo(gpu::FragmentType source) {
 }
 
 std::optional<BinaryOperator> nativeCombineKind(Region &region) {
-  std::optional<BinaryOperator> kind = gpu::queryBinaryCombineKind(region);
-  if (!kind)
+  auto combine = gpu::queryBinaryCombine(region);
+  if (!combine)
     return std::nullopt;
+  // Every selected native kind below is commutative and has no non-default
+  // math mode. Other combines retain the actual ordered callback operations.
+  std::optional<BinaryOperator> kind = combine->kind();
   if (*kind == BinaryOperator::Add || *kind == BinaryOperator::MaximumNum ||
       *kind == BinaryOperator::MinimumNum)
     return kind;
@@ -184,10 +189,10 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
       continue;
     }
 
-    std::optional<BinaryOperator> canonicalKind =
-        gpu::queryBinaryCombineKind(reduce.getCombine());
+    auto canonicalCombine = gpu::queryBinaryCombine(reduce.getCombine());
     bool propagatingMaximum =
-        reduce.getSources().size() == 1 && canonicalKind == BinaryOperator::Maximum &&
+        reduce.getSources().size() == 1 && canonicalCombine &&
+        canonicalCombine->kind() == BinaryOperator::Maximum &&
         isNativeReductionIdentity(
             BinaryOperator::Maximum,
             reduce.getIdentities().front());

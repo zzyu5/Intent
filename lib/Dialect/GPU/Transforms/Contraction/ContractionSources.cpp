@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -631,7 +632,8 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
     // can preserve their precision without imposing new provider restrictions.
     if (!resultType || !resultType.getElementType().isF32())
       continue;
-    if (queryBinaryCombineKind(reduce.getCombine()) != BinaryOperator::Add)
+    auto combine = queryBinaryCombine(reduce.getCombine());
+    if (!combine || combine->kind() != BinaryOperator::Add)
       continue;
 
     Value product = reduce.getSources().front();

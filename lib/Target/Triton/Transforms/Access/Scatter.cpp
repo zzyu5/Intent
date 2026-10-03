@@ -1,4 +1,5 @@
 #include "Scatter.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -33,8 +34,8 @@ bool isTritonAtomicAddType(Type type) {
 }
 
 bool isAddCombine(gpu::ScatterReduceOp scatter) {
-  return gpu::queryBinaryCombineKind(scatter.getCombine()) ==
-         BinaryOperator::Add;
+  auto combine = gpu::queryBinaryCombine(scatter.getCombine());
+  return combine && combine->kind() == BinaryOperator::Add;
 }
 
 } // namespace

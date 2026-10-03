@@ -1,5 +1,6 @@
 #include "ReductionValues.h"
 #include "ReductionAnalysis.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -134,105 +135,6 @@ FailureOr<Value> alignToExecutionSchema(OpBuilder &builder, Location location,
   return projectPhysicalValueToSchema(builder, location, value, target);
 }
 
-bool canLiftCombineOperation(Operation &operation) {
-  return isa<arith::ConstantOp, UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp,
-             BitcastOp, SplatOp, MakeRecordOp, ExtractOp>(operation);
-}
-
-LogicalResult cloneLiftedCombineRegion(Region &source, Region &target,
-                                       TypeRange accumulatorTypes,
-                                       std::string &reason) {
-  if (source.empty() || !llvm::hasSingleElement(source)) {
-    reason = "multi-axis combine is not a single typed block";
-    return failure();
-  }
-  Block &sourceBlock = source.front();
-  if (sourceBlock.getNumArguments() < accumulatorTypes.size() * 2) {
-    reason = "multi-axis combine argument schema is incomplete";
-    return failure();
-  }
-  for (Operation &operation : sourceBlock.without_terminator())
-    if (!canLiftCombineOperation(operation)) {
-      reason = ("multi-axis combine contains a non-elementwise operation: " +
-                operation.getName().getStringRef())
-                   .str();
-      return failure();
-    }
-  auto sourceYield = dyn_cast<YieldOp>(sourceBlock.getTerminator());
-  if (!sourceYield || sourceYield.getValues().size() != accumulatorTypes.size()) {
-    reason = "multi-axis combine yield schema is incomplete";
-    return failure();
-  }
-
-  auto *targetBlock = new Block();
-  target.push_back(targetBlock);
-  Location location = sourceYield.getLoc();
-  MLIRContext *context = location.getContext();
-  for (Type type : accumulatorTypes)
-    targetBlock->addArgument(type, location);
-  for (Type type : accumulatorTypes)
-    targetBlock->addArgument(type, location);
-  for (BlockArgument capture :
-       sourceBlock.getArguments().drop_front(accumulatorTypes.size() * 2))
-    targetBlock->addArgument(capture.getType(), location);
-
-  IRMapping mapping;
-  for (auto [original, replacement] :
-       llvm::zip(sourceBlock.getArguments(), targetBlock->getArguments()))
-    mapping.map(original, replacement);
-  OpBuilder builder(context);
-  builder.setInsertionPointToEnd(targetBlock);
-
-  for (Operation &operation : sourceBlock.without_terminator()) {
-    SmallVector<Type> selectedResults;
-    if (auto splat = dyn_cast<SplatOp>(operation)) {
-      FragmentType schema;
-      for (auto [index, type] : llvm::enumerate(accumulatorTypes)) {
-        auto original = dyn_cast<FragmentType>(sourceBlock.getArgument(index).getType());
-        if (!original || !sameExecutionSchema(original, splat.getResult().getType()))
-          continue;
-        auto lifted = dyn_cast<FragmentType>(type);
-        if (!lifted || (schema && !sameExecutionSchema(schema, lifted))) {
-          reason = "lifted splat has conflicting fragment execution schemas";
-          return failure();
-        }
-        schema = lifted;
-      }
-      if (!schema) {
-        reason = "lifted splat has no compatible fragment execution schema";
-        return failure();
-      }
-      selectedResults.push_back(
-          withElementType(schema, splat.getResult().getType().getElementType()));
-    }
-    // The reduction owns its accumulator choice and combine eligibility. Actual
-    // pointwise/product cloning and operand projection share the same mechanism
-    // as workset lifting and predicated control.
-    auto cloned = cloneWithSchema(builder, &operation, mapping, selectedResults);
-    if (failed(cloned)) {
-      reason = "multi-axis combine operation cannot adopt its selected execution schema";
-      return failure();
-    }
-  }
-
-  SmallVector<Value> yields;
-  for (Value value : sourceYield.getValues()) {
-    Value mapped = mapping.lookupOrNull(value);
-    if (!mapped) {
-      reason = "lifted multi-axis combine yield was not mapped";
-      return failure();
-    }
-    yields.push_back(mapped);
-  }
-  for (auto [value, type] : llvm::zip(yields, accumulatorTypes))
-    if (value.getType() != type) {
-      reason = "lifted multi-axis combine result type disagrees with its accumulator";
-      return failure();
-    }
-  builder.create<YieldOp>(sourceYield.getLoc(), yields);
-  return success();
-}
-
 bool prepareVectorAccumulation(ReduceOp reduce,
                                ArrayRef<FragmentType> accumulatorTypes,
                                Region &combine) {
@@ -255,7 +157,7 @@ bool prepareVectorAccumulation(ReduceOp reduce,
   SmallVector<Type> types(accumulatorTypes.begin(), accumulatorTypes.end());
   std::string reason;
   return succeeded(
-      cloneLiftedCombineRegion(reduce.getCombine(), combine, types, reason));
+      liftCombineRegion(reduce.getCombine(), combine, types, reason));
 }
 
 } // namespace intent::gpu::reduction

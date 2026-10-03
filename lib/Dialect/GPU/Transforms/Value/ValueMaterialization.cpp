@@ -1,6 +1,8 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
@@ -168,65 +170,6 @@ FailureOr<Value> materializeAccessCoordinate(OpBuilder &builder,
     value = broadcast.getResult();
   }
   return value;
-}
-
-LogicalResult scalarizeElementwiseCallback(Region &source, Region &target) {
-  if (!target.empty())
-    return target.getParentOp()->emitOpError(
-        "scalar callback target region must be empty");
-  Block &body = source.front();
-  for (Operation &nested : body) {
-    for (Value operand : nested.getOperands())
-      if (operand.getParentBlock() != &body)
-        return nested.emitOpError(
-            "native collective callback cannot capture enclosing values");
-    if (!isa<arith::ConstantOp, SplatOp, BroadcastOp, ReshapeOp, UnaryOp, BinaryOp,
-             CompareOp, SelectOp, CastOp, BitcastOp, MakeRecordOp, ExtractOp,
-             YieldOp>(nested))
-      return nested.emitOpError(
-          "native collective requires an elementwise scalarizable combine");
-    if (auto broadcast = dyn_cast<BroadcastOp>(nested)) {
-      auto sourceType = dyn_cast<FragmentType>(broadcast.getValue().getType());
-      if (sourceType) {
-        auto targetType = broadcast.getResult().getType();
-        auto projection = queryAxisProjection(sourceType, targetType);
-        if (sourceType.getShape() != targetType.getShape() ||
-            !projection.isExact() ||
-            llvm::any_of(llvm::enumerate(projection.targetToSource),
-                         [](auto pair) {
-                           return !pair.value() ||
-                                  *pair.value() != pair.index();
-                         }))
-          return broadcast.emitOpError(
-              "non-identity fragment broadcast in a collective requires prior lane-wise legalization");
-      }
-    }
-    if (auto reshape = dyn_cast<ReshapeOp>(nested))
-      if (cast<FragmentType>(reshape.getValue().getType()).getShape() !=
-          cast<FragmentType>(reshape.getResult().getType()).getShape())
-        return reshape.emitOpError(
-            "non-identity fragment reshape in a collective requires prior lane-wise legalization");
-  }
-
-  Block *scalarBody = new Block();
-  target.push_back(scalarBody);
-  IRMapping mapping;
-  for (BlockArgument argument : body.getArguments())
-    mapping.map(argument, scalarBody->addArgument(
-                             scalarCallbackType(argument.getType()),
-                             argument.getLoc()));
-  OpBuilder builder(body.getTerminator()->getContext());
-  builder.setInsertionPointToEnd(scalarBody);
-  for (Operation &nested : body) {
-    if (isa<SplatOp, BroadcastOp, ReshapeOp>(nested)) {
-      mapping.map(nested.getResult(0), mapping.lookup(nested.getOperand(0)));
-      continue;
-    }
-    Operation *cloned = builder.clone(nested, mapping);
-    for (Value result : cloned->getResults())
-      result.setType(scalarCallbackType(result.getType()));
-  }
-  return success();
 }
 
 FailureOr<Value> materializeNonOverlappingView(func::FuncOp kernel,
@@ -462,63 +405,14 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
              reduce.getIdentities().size() == 1 && reduce.getCaptures().size() == 0 &&
              reduce.getNumResults() == 1 &&
              source.getOwner() == target.getOwner() &&
-             queryBinaryCombineKind(reduce.getCombine())) {
-    // A lane-wise combine preserves every non-reduced axis. Project the
-    // source's free axes with the result, rather than resizing a finished
-    // reduction or treating its construction extent as a broadcast scalar.
-    auto relation = queryAxisProjection(source, target);
-    bool projects =
-        source.getShape().size() == target.getShape().size() &&
-        relation.isExact() && llvm::all_of(
-            llvm::enumerate(relation.targetToSource), [](auto item) {
-              return item.value() && *item.value() == item.index();
-            });
-    if (projects) {
-      auto input = cast<FragmentType>(reduce.getSources().front().getType());
-      llvm::SmallDenseSet<int64_t> axes(reduce.getAxes().begin(),
-                                       reduce.getAxes().end());
-      SmallVector<Attribute> shape(input.getShape().getValue());
-      unsigned resultAxis = 0;
-      for (unsigned axis = 0; axis < shape.size(); ++axis)
-        if (!axes.contains(axis))
-          shape[axis] = target.getShape()[resultAxis++];
-      auto inputTarget = FragmentType::get(
-          target.getContext(), input.getElementType(), builder.getArrayAttr(shape),
-          input.getAxisMaps(), input.getValidity(), input.getOwner());
-      auto resultTarget = FragmentType::get(
-          target.getContext(), target.getElementType(), target.getShape(),
-          source.getAxisMaps(), target.getValidity(), target.getOwner());
-      auto projectedSource = projectFragmentValue(
-          builder, location, reduce.getSources().front(), inputTarget, changed);
-      auto projectedIdentity = projectFragmentValue(
-          builder, location, reduce.getIdentities().front(), resultTarget, changed);
-      if (succeeded(projectedSource) && succeeded(projectedIdentity)) {
-        IRMapping mapping;
-        mapping.map(reduce.getSources().front(), *projectedSource);
-        mapping.map(reduce.getIdentities().front(), *projectedIdentity);
-        auto clone = cast<ReduceOp>(builder.clone(*reduce, mapping));
-        for (BlockArgument argument : clone.getCombine().front().getArguments())
-          for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
-            if (source.getShape()[axis] != target.getShape()[axis])
-              if (failed(retargetFragmentAxisExtent(
-                  argument, axis,
-                  cast<PhysicalExprAttr>(target.getShape()[axis]),
-                  changed, builder.getListener())))
-                return failure();
-        setPhysicalValueType(clone.getResult(0), resultTarget, changed);
-        projection = clone.getOperation();
-        if (resultTarget != target)
-          projection = builder.create<BroadcastOp>(location, target,
-                                                   clone.getResult(0));
-      }
-    }
+             succeeded(proveLaneWiseHelper(reduce.getCombine()))) {
+    auto projected = projectLaneWiseReduction(builder, location, reduce, target);
+    if (succeeded(projected)) projection = projected->getDefiningOp();
   }
   if (!projection && queryBroadcastProjection(source, target).isExact())
     projection = builder.create<BroadcastOp>(location, target, value);
   Operation *definition = value.getDefiningOp();
-  if (!projection &&
-      isa_and_nonnull<UnaryOp, CastOp, BitcastOp, BinaryOp, CompareOp, SelectOp>(
-          definition)) {
+  if (!projection && isLaneWisePointwiseOperation(definition)) {
     IRMapping mapping;
     for (Value operand : definition->getOperands()) {
       Type element = operand.getType();

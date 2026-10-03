@@ -1,4 +1,5 @@
 #include "Collectives.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
@@ -58,6 +59,10 @@ public:
     UniformExpression expression = describeUniformValue(current);
     switch (expression.kind) {
     case UniformKind::Unknown:
+      // Constant evaluability is not numerical lane semantics. Approximate
+      // pointwise operations preserve uniformity without becoming foldable.
+      if (isLaneWisePointwiseOperation(operation)) break;
+      return finish(false);
     case UniformKind::Join:
     case UniformKind::Aggregate:
     case UniformKind::Extract:
@@ -109,10 +114,8 @@ public:
 
 private:
   bool reduction(ReduceOp reduce, unsigned resultAxis) {
-    // This is the existing structured projection domain: one result with an
-    // exact binary combine and no captures. Arbitrary pure slice helpers are
-    // not necessarily lane-wise, and proving a value invariant must not imply
-    // a projection that cannot actually reconstruct that helper.
+    // The structured projection owns one component and no captures. Its helper
+    // is checked by the same lane proof used by the actual reconstruction.
     if (reduce.getSources().size() != 1 ||
         reduce.getIdentities().size() != 1 ||
         !reduce.getCaptures().empty() || reduce.getNumResults() != 1 ||
@@ -120,7 +123,7 @@ private:
       return false;
     Block &body = reduce.getCombine().front();
     if (body.empty() || !body.back().hasTrait<OpTrait::IsTerminator>() ||
-        !queryBinaryCombineKind(reduce.getCombine()))
+        failed(proveLaneWiseHelper(reduce.getCombine())))
       return false;
     auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType());
     auto result = dyn_cast<FragmentType>(reduce.getResult(0).getType());

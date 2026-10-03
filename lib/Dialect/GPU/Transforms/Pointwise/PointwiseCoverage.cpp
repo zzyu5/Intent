@@ -1,4 +1,5 @@
 #include "Pointwise.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -272,9 +273,10 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     return range->hasAttr(sourceSubregionAttr);
   });
   if (subregion) {
+    auto combine = queryBinaryCombine(scan.getCombine());
     if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
         scan.getCaptures().size() != 0 ||
-        queryBinaryCombineKind(scan.getCombine()) != BinaryOperator::Add ||
+        !combine || combine->kind() != BinaryOperator::Add ||
         !isZeroScanIdentity(
             scan.getIdentities().front()))
       return scan.emitOpError(

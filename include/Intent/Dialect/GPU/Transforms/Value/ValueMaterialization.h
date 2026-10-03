@@ -19,8 +19,6 @@ struct ReplayMaterializationOptions {
   bool materializeZeroFill = false;
 };
 
-mlir::LogicalResult scalarizeElementwiseCallback(mlir::Region &source,
-                                                 mlir::Region &target);
 void foldExactConstantDivisions(mlir::func::FuncOp kernel);
 void foldScalarIntegerValues(mlir::func::FuncOp kernel);
 mlir::FailureOr<mlir::Value>

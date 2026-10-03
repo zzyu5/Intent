@@ -1,4 +1,5 @@
 #include "OnlineSummary.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 
 #include "Intent/Analysis/OnlineSummaryCombine.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
@@ -73,10 +74,12 @@ bool sameExecutionSchema(Type lhs, Type rhs) {
 }
 
 bool isSingleBinaryReduction(ReduceOp reduce, BinaryOperator kind) {
-  return reduce && reduce.getNumResults() == 1 &&
+  if (!reduce) return false;
+  auto combine = queryBinaryCombine(reduce.getCombine());
+  return reduce.getNumResults() == 1 &&
          reduce.getAxes().size() == 1 && reduce.getSources().size() == 1 &&
          reduce.getIdentities().size() == 1 && reduce.getCaptures().size() == 0 &&
-         queryBinaryCombineKind(reduce.getCombine()) == kind;
+         combine && combine->kind() == kind;
 }
 
 bool isProjectedFrom(Value value, Value source,
@@ -405,10 +408,12 @@ matchOnlineSummaryMerge(Region &region,
   }
   // Keep the original first-match order among the mass expression's factors.
   ReduceOp summaryMaximum = summary.maximum;
+  auto maximumCombine = queryBinaryCombine(summaryMaximum.getCombine());
+  if (!maximumCombine) return failure();
   auto relations = matchOnlineSummaryCombine<BinaryOp, UnaryOp, SelectOp>(
       record.getFields(), left, right,
       {summary.validityField, summary.maximumField, summary.massField, summary.momentField},
-      queryBinaryCombineKind(summaryMaximum.getCombine()), summary.exponential,
+      std::optional<BinaryOperator>(maximumCombine->kind()), summary.exponential,
       candidates, stripProjection,
       [](Value value, Value source) { return isProjectedFrom(value, source); },
       isRecordField, isZero);

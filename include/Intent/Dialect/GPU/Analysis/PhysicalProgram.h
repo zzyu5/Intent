@@ -135,13 +135,6 @@ PhysicalExprAttr queryNonNegativeIndexUpperBound(mlir::Value value);
 /// validity remain unchanged; the host evaluates this bound before allocation.
 PhysicalExprAttr queryLogicalRangeCapacity(MakeRangeOp range);
 
-/// Returns the single typed binary operation implemented by a two-argument
-/// combine region. Physical broadcast projections inserted while aligning
-/// helper arguments do not change that semantic operation and are ignored.
-/// Arbitrary arithmetic, casts, reshapes, or captures remain unknown.
-std::optional<BinaryOperator>
-queryBinaryCombineKind(mlir::Region &region);
-
 /// All current-IR range roots that carry one requested source axis.
 struct PhysicalRangeFact {
   PhysicalFactState state = PhysicalFactState::Unknown;

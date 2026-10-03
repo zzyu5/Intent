@@ -1,4 +1,6 @@
 #include "AccessComposition.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -19,7 +21,7 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
       reduce.getSources().size() != 1 || reduce.getIdentities().size() != 1 ||
       reduce.getCaptures().size() != 0 || reduce.getNumResults() != 1 ||
       gather.getSourceAxes().size() != output.getShape().size() ||
-      !queryBinaryCombineKind(reduce.getCombine()) ||
+      !queryBinaryCombine(reduce.getCombine()) ||
       std::distance(reduce.getCombine().front().begin(),
                     reduce.getCombine().front().end()) != 2)
     return false;

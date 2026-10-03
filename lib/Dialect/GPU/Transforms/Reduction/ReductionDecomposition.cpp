@@ -1,6 +1,8 @@
 #include "ReductionRealization.h"
 #include "ReductionParameters.h"
 #include "ReductionValues.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -57,9 +59,7 @@ FragmentType eraseFragmentAxes(FragmentType source,
 
 FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
     ReduceOp reduce, func::FuncOp kernel, unsigned outerAxis) {
-  for (Operation &operation : reduce.getCombine().front().without_terminator())
-    if (!canLiftCombineOperation(operation))
-      return false;
+  if (failed(proveLaneWiseHelper(reduce.getCombine()))) return false;
 
   auto firstSource =
       dyn_cast<FragmentType>(reduce.getSources().front().getType());
@@ -171,7 +171,7 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
   if (Attribute origin = reduce->getAttr(originAttr))
     innerReduce->setAttr(originAttr, origin);
   std::string reason;
-  if (failed(cloneLiftedCombineRegion(reduce.getCombine(),
+  if (failed(liftCombineRegion(reduce.getCombine(),
                                       innerReduce.getCombine(),
                                       innerReduce.getResultTypes(), reason)))
     return reduce.emitOpError(
@@ -314,11 +314,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
              range->hasAttr(sourceSubregionAttr);
     });
   bool blockOuterAxis = !outerHasSubregion &&
-                        llvm::all_of(
-                            reduce.getCombine().front().without_terminator(),
-                            [](Operation &operation) {
-                              return canLiftCombineOperation(operation);
-                            });
+                        succeeded(proveLaneWiseHelper(reduce.getCombine()));
   ParameterAttr outerChunk;
   PhysicalExprAttr outerSliceExtent = unitExtent;
   if (blockOuterAxis) {
@@ -701,7 +697,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         if (Attribute origin = reduce->getAttr(originAttr))
           innerReduce->setAttr(originAttr, origin);
         if (blockOuterAxis) {
-          if (failed(cloneLiftedCombineRegion(
+          if (failed(liftCombineRegion(
                   reduce.getCombine(), innerReduce.getCombine(),
                   innerReduce.getResultTypes(), failureReason))) {
             bodyFailed = true;

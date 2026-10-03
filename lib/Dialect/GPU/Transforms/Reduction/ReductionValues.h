@@ -37,12 +37,6 @@ mlir::FailureOr<mlir::Value> alignToExecutionSchema(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     FragmentType executionSchema);
 
-bool canLiftCombineOperation(mlir::Operation &operation);
-
-mlir::LogicalResult cloneLiftedCombineRegion(
-    mlir::Region &source, mlir::Region &target, mlir::TypeRange accumulatorTypes,
-    std::string &reason);
-
 bool prepareVectorAccumulation(ReduceOp reduce,
                                llvm::ArrayRef<FragmentType> accumulatorTypes,
                                mlir::Region &combine);

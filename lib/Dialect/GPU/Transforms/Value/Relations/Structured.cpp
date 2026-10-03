@@ -1,7 +1,9 @@
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Worklist.h"
 
@@ -94,6 +96,32 @@ WalkResult alignReductionIdentityRelation(Operation *operation,
                         : cast<ScanOp>(operation).getIdentities();
   OpBuilder builder(operation);
   builder.setListener(&changes);
+  Region &combine = structured.getCombine();
+  if (!llvm::hasSingleElement(combine) || combine.front().empty())
+    return WalkResult::interrupt();
+  Block &body = combine.front();
+  auto yield = dyn_cast<YieldOp>(&body.back());
+  if (!yield)
+    return WalkResult::interrupt();
+  SmallVector<Type> arguments(operation->getResultTypes());
+  llvm::append_range(arguments, operation->getResultTypes());
+  for (BlockArgument capture : structured.getCombineCaptures())
+    arguments.push_back(capture.getType());
+  bool signatureChanged =
+      !llvm::equal(body.getArgumentTypes(), arguments) ||
+      !llvm::equal(yield.getOperandTypes(), operation->getResultTypes());
+  Region replacementBody;
+  bool rebuild = signatureChanged && succeeded(proveLaneWiseHelper(combine));
+  if (rebuild) {
+    std::string reason;
+    if (failed(cloneLaneWiseHelper(combine, replacementBody, arguments,
+                                  operation->getResultTypes(), reason))) {
+      operation->emitOpError(
+          "lane-wise combine cannot adopt its selected accumulator schema: ")
+          << reason;
+      return WalkResult::interrupt();
+    }
+  }
   for (auto [index, identity] : llvm::enumerate(identities)) {
     Type target = operation->getResult(index).getType();
     auto projected = projectPhysicalValueToSchema(
@@ -105,8 +133,28 @@ WalkResult alignReductionIdentityRelation(Operation *operation,
     }
     operation->setOperand(identities.getBeginOperandIndex() + index,
                           *projected);
-    changes.setType(structured.getCombineLhs()[index], target);
-    changes.setType(structured.getCombineRhs()[index], target);
+    if (!rebuild) {
+      changes.setType(structured.getCombineLhs()[index], target);
+      changes.setType(structured.getCombineRhs()[index], target);
+    }
+  }
+  if (rebuild) {
+    // The selected accumulator is the execution-domain boundary even when a
+    // component is uniform and has no load/range authority of its own. Publish
+    // the whole rebuilt helper while retaining the owner and formal identities
+    // held by the calling transformation. Notify every removed/inserted operation
+    // so the relation worklist cannot retain stale payload references.
+    IRRewriter rewriter(operation->getContext());
+    rewriter.setListener(&changes);
+    rewriter.modifyOpInPlace(operation, [&] {
+      while (!body.empty())
+        rewriter.eraseOp(&body.back());
+      for (auto [argument, replacement] : llvm::zip_equal(
+               body.getArguments(), replacementBody.front().getArguments()))
+        changes.setType(argument, replacement.getType());
+      rewriter.inlineBlockBefore(&replacementBody.front(), &body, body.end(),
+                                 body.getArguments());
+    });
   }
   return WalkResult::advance();
 }

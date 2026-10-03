@@ -156,7 +156,7 @@ def IntentGPU_BroadcastOp : IntentGPU_Op<"broadcast", [Pure, DeclareOpInterfaceM
   let hasFolder = 1;
 }
 
-def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$input,
                        Intent_UnaryOperatorAttr:$operator_kind,
                        DefaultValuedAttr<BoolAttr, "false">:$approximate,
@@ -165,7 +165,7 @@ def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure, DeclareOpInterfaceMethods<I
   let hasVerifier = 1;
 }
 
-def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
                        Intent_BinaryOperatorAttr:$operator_kind,
                        DefaultValuedAttr<BoolAttr, "false">:$approximate,
@@ -175,14 +175,14 @@ def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure, DeclareOpInterfaceMethods
   let hasFolder = 1;
 }
 
-def IntentGPU_CompareOp : IntentGPU_Op<"compare", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_CompareOp : IntentGPU_Op<"compare", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
                        Intent_ComparePredicateAttr:$predicate);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
 }
 
-def IntentGPU_SelectOp : IntentGPU_Op<"select", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_SelectOp : IntentGPU_Op<"select", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$condition,
                        IntentGPU_DataValue:$true_value,
                        IntentGPU_DataValue:$false_value);
@@ -192,14 +192,14 @@ def IntentGPU_SelectOp : IntentGPU_Op<"select", [Pure, DeclareOpInterfaceMethods
   let hasCanonicalizer = 1;
 }
 
-def IntentGPU_CastOp : IntentGPU_Op<"cast", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_CastOp : IntentGPU_Op<"cast", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$value);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
 }
 
-def IntentGPU_BitcastOp : IntentGPU_Op<"bitcast", [Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+def IntentGPU_BitcastOp : IntentGPU_Op<"bitcast", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_DataValue:$value);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;

@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
@@ -326,9 +327,17 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
         Value bothValid = nested.create<BinaryOp>(
             nestedLocation, carries[0].getType(), carries[0],
             chunkValidity.getResult(0), BinaryOperator::LogicalOr);
-        Value maximumOfBoth = nested.create<BinaryOp>(
-            nestedLocation, carries[1].getType(), carries[1], currentMaximum,
-            *queryBinaryCombineKind(pattern.maximum.getCombine()));
+        auto maximumCombine = *queryBinaryCombine(pattern.maximum.getCombine());
+        Value arguments[] = {carries[1], currentMaximum};
+        IRMapping maximumMapping;
+        maximumMapping.map(maximumCombine.operation.getLhs(),
+                           arguments[maximumCombine.arguments[0]]);
+        maximumMapping.map(maximumCombine.operation.getRhs(),
+                           arguments[maximumCombine.arguments[1]]);
+        auto maximumOfBothOp = cast<BinaryOp>(nested.clone(
+            *maximumCombine.operation, maximumMapping));
+        maximumOfBothOp.getResult().setType(carries[1].getType());
+        Value maximumOfBoth = maximumOfBothOp.getResult();
         Value maximumWithRight = nested.create<SelectOp>(
             nestedLocation, carries[1].getType(), chunkValidity.getResult(0),
             maximumOfBoth, carries[1]);

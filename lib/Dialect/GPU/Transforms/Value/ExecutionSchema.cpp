@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -117,10 +118,6 @@ FailureOr<FragmentType> commonSchema(ValueRange operands) {
   return schema;
 }
 
-bool elementwise(Operation *operation) {
-  return isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp>(operation);
-}
-
 } // namespace
 
 FailureOr<LiftedFragmentSchema> ExecutionSchema::project(FragmentType original) const {
@@ -198,7 +195,7 @@ FailureOr<SmallVector<Type>> inferElementwiseSchema(Operation *source,
     return SmallVector<Type>{cast<TypeAttr>(record.getFieldTypes()[extract.getField()]).getValue()};
   }
   if (isa<arith::ConstantOp>(source)) return llvm::to_vector(source->getResultTypes());
-  if (!elementwise(source) || source->getNumResults() != 1) return failure();
+  if (!isLaneWisePointwiseOperation(source) || source->getNumResults() != 1) return failure();
   auto schema = commonSchema(operands);
   if (failed(schema)) return failure();
   Type type = elementType(source->getResult(0).getType());
@@ -362,7 +359,7 @@ FailureOr<SmallVector<Value>> cloneWithSchema(OpBuilder &builder, Operation *sou
     if (failed(projected)) { copy->erase(); return failure(); }
     return publish(ValueRange{*projected});
   }
-  if (elementwise(source)) {
+  if (isLaneWisePointwiseOperation(source)) {
     if (types.size() != 1) return failure();
     for (Value &operand : operands) {
       Type target = elementType(operand.getType());
