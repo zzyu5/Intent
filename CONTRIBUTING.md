@@ -403,7 +403,9 @@ row-major reshape 也不自动成为 transpose。
 `materializeLogicalExtent` 是它的 `Value` 适配入口，两者共用
 [LogicalShape.cpp](lib/Conversion/LogicalShape.cpp) 中同一份 inferred reshape
 乘积／商解释。新增逻辑 shape 规则进入 canonical 查询，family 只实现实际绑定、
-整数运算拼写与物化，不各自重读 ShapeRelation 或维护全局 dimension 到值的替代表。
+整数运算拼写与物化，不各自解释逻辑尺寸公式或维护全局 dimension 到值的替代表。
+GPU construction 仍可读取显式 `Dim(source)` 的来源关系来选择该 source 当前的
+fragment capacity；这属于物理映射，不将 capacity 返回成作者可观察的逻辑尺寸。
 
 物化沿关系查询时，在当前作用域已有的 actual value/formal 处停止，保留具体字段和轴。
 CPU 用当前 tensor/memref 的 dimension，且检查 dominance 与隔离 region 边界；

@@ -18,7 +18,7 @@ qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.162536,1.250128,1.140840,1.07
 index_select,source65536-selected32768-hidden4096-fp16,0.223808,0.183520,0.183984,0.819989,0.822062,pass,pass,,Intent target=cutile; source corpus=triton.
 scaled_index_add,destination65536-routed32768-hidden4096-fp16,0.304880,0.271032,0.269224,0.888979,0.883049,pass,pass,,Intent target=cutile; source corpus=triton.
 scaled_fp8_splitk_gemm,M4096-N14336-K4096-e4m3-split4,3.541576,4.138904,1.829048,1.168662,0.516450,pass,pass,,Intent target=cutile; source corpus=triton.
-jagged_mean,B512-T33024-D128-fp32,0.014368,0.014752,0.015096,1.026726,1.050668,pass,pass,,Intent target=cutile; source corpus=triton.
+jagged_mean,B512-T33024-D128-fp32,0.016880,0.013840,0.014752,0.819905,0.873934,pass,pass,,Intent target=cutile; source corpus=triton.
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.163216,0.040904,0.055384,0.250613,0.339329,pass,pass,,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.483032,0.126080,0.123952,0.261018,0.256612,pass,pass,,Intent target=cutile; source corpus=triton.
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.163032,0.134784,0.198280,0.826733,1.216203,pass,pass,,Intent target=cutile; source corpus=triton.
@@ -30,9 +30,9 @@ flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.615656,0.742112,0.71457
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.833440,1.982688,2.012416,0.699746,0.710238,pass,pass,,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.038880,0.471065,0.464113,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,0.977636,1.416933,pass,pass,,Intent target=cutile; source corpus=triton.
-mamba_state_passing,B1-C8-H32-state8192-fp32,0.013552,0.012240,0.011232,0.903188,0.828808,pass,pass,,Intent target=cutile; source corpus=triton.
+mamba_state_passing,B1-C8-H32-state8192-fp32,0.013488,0.012176,0.011648,0.902728,0.863582,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.045328,0.035768,0.049648,0.789093,1.095305,pass,pass,,Intent target=cutile; source corpus=triton.
-mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.181024,,0.250944,,1.386247,generated_physical_program_failed,pass,Intent triton compiler failed with exit code 3:; /tmp/intentdsl-pass-generality.2zFeqU/examples/kernels/streaming/mamba.py:390:31: error: 'intent.reshape' op reshape result dimension has conflicting logical extent relations,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
+mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.178680,0.294120,0.250984,1.646071,1.404656,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
 paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.303216,0.370192,0.227392,1.220885,0.749934,pass,pass,,Intent target=cutile; source corpus=triton.
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.813296,0.379112,0.215888,0.466143,0.265448,pass,pass,,Intent target=cutile; source corpus=triton.
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.370520,0.384048,0.226072,1.036511,0.610148,pass,pass,同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
