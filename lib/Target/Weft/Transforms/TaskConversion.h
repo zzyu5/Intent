@@ -5,7 +5,7 @@
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
-#include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"

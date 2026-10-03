@@ -1,32 +1,51 @@
 add_mlir_library(MLIRIntentCPUTransforms
-  FuseStructuredComputations.cpp
-  IntegerSources.cpp
-  ContiguousAccesses.cpp
-  FoldUniformComputations.cpp
-  ReusePreparedInputs.cpp
-  GroupQuantizedDots.cpp
-  GroupRegionComputations.cpp
-  GroupWorksetComputations.cpp
-  MaterializeStructuredComputations.cpp
-  FuseIntermediateBuffers.cpp
-  FuseReductionTraversals.cpp
-  BlockContractions.cpp
-  NormalizeContractions.cpp
-  NormalizeReductions.cpp
-  SliceCollectives.cpp
-  ContractionSources.cpp
-  BlockStructuredComputations.cpp
-  RealizeRegions.cpp
-  VectorizeLoops.cpp
-  VectorReductions.cpp
-  PartitionTasks.cpp
-  Implementation.cpp
-  ImplementationInputs.cpp
-  TuningProfiles.cpp
-  Configurations.cpp
-  FinalizedCandidates.cpp
-  Bufferization.cpp
-  CollectiveBufferization.cpp
+  Configuration/Configurations.cpp
+  Configuration/FinalizedCandidates.cpp
+  Configuration/Passes.cpp
+  Configuration/TuningProfiles.cpp
+
+  Implementation/GroupQuantizedDots.cpp
+  Implementation/Implementation.cpp
+  Implementation/ImplementationInputs.cpp
+  Implementation/Passes.cpp
+  Implementation/ReusePreparedInputs.cpp
+
+  Contraction/BlockContractions.cpp
+  Contraction/ContractionSources.cpp
+  Contraction/NormalizeContractions.cpp
+  Contraction/Passes.cpp
+
+  Collective/FuseReductionTraversals.cpp
+  Collective/Histograms.cpp
+  Collective/NormalizeReductions.cpp
+  Collective/Passes.cpp
+  Collective/SliceCollectives.cpp
+
+  Region/GroupRegionComputations.cpp
+  Region/Passes.cpp
+  Region/RealizeRegions.cpp
+
+  Storage/Bufferization.cpp
+  Storage/CollectiveBufferization.cpp
+  Storage/FuseIntermediateBuffers.cpp
+  Storage/Passes.cpp
+  Storage/ReusePrivateStorage.cpp
+
+  Structure/ContiguousAccesses.cpp
+  Structure/FoldUniformComputations.cpp
+  Structure/FuseStructuredComputations.cpp
+  Structure/IntegerSources.cpp
+  Structure/MaterializeStructuredComputations.cpp
+  Structure/Passes.cpp
+
+  Task/BlockStructuredComputations.cpp
+  Task/GroupWorksetComputations.cpp
+  Task/PartitionTasks.cpp
+  Task/Passes.cpp
+
+  Vector/VectorReductions.cpp
+  Vector/VectorizeLoops.cpp
+
   Passes.cpp
 
   DEPENDS IntentCPUTransformsIncGen

@@ -4,7 +4,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 
 namespace intent::weft_provider {
 #define GEN_PASS_DECL

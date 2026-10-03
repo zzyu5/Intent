@@ -1,5 +1,8 @@
 #include "Intent/Compiler/Backend.h"
 #include "Intent/Compiler/Passes.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"

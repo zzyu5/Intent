@@ -1,5 +1,5 @@
 #include "Quantization.h"
-#include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include <functional>

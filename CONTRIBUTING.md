@@ -290,7 +290,7 @@ Intent 另外保留 logical view 的公共合同，但同样由编译结果决�
 | 修改 IR 与 verifier | [include/Intent/Dialect/](include/Intent/Dialect/)、[lib/Dialect/](lib/Dialect/) 中相应 `IR/` | 前者声明 types/ops/attributes，后者实现与验证；优先使用已有 carrier |
 | Provider primitive/form | [lib/Target/](lib/Target/) 中相应 `Transforms/` | 处理真实目标能力、合法性和必要 local structure |
 | 源码翻译 | [Source.h](include/Intent/Serialization/Source.h)、[GPU PythonEmitter](include/Intent/Dialect/GPU/Serialization/PythonEmitter.h)、各目标 `Serialization/` | 共用 SSA 作用域和 typed operation 注册；目标模块只拼写自身语言与原生能力 |
-| CPU micro-kernel | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Mojo implementations](lib/Target/Mojo/Transforms/Implementations.cpp)、[Weft implementations](lib/Target/Weft/Transforms/Implementations.cpp) | 按当前 operation、dtype 和 capability 选择局部实现；外层分块/供数仍由 CPU passes 负责 |
+| CPU micro-kernel | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation/Implementation.h)、[Mojo implementations](lib/Target/Mojo/Transforms/Implementations.cpp)、[Weft implementations](lib/Target/Weft/Transforms/Implementations.cpp) | 按当前 operation、dtype 和 capability 选择局部实现；外层分块/供数仍由 CPU passes 负责 |
 | 设备与运行时接入 | [targets/](python/intent/targets/)、[targets/base.py](python/intent/targets/base.py)、[runtime/](python/intent/runtime/) | Host 解析目标、绑定产物与 launch；不把设备分支加入 KIR |
 
 DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费已有 LoadTile、MatMul、Store 和循环关系，形成协作或常驻供数；[CollectiveGather.cpp](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 从当前 offsets 写入、task 坐标、只读视图与 stride 关系证明相邻参与者可以共享 gather 供数。两个变换都消费完整的普通 DSA program，不通过 construction 候选侧表选择路径。[BANG C driver](lib/Target/BangC/Transforms/Legalize.cpp) 再依次完成原生计算、workspace、实现选择、局部组合、同步和最终存储绑定。当前 DSA 的矩阵与 group 合同、BANG C 实现仍以 MLU370 为已实现边界，目录分层不代表已经支持其他 DSA 设备。
@@ -670,9 +670,9 @@ KIR 的验证入口直接属于 operation，按合同分布在
 
 [ContractionAxes.h](include/Intent/Analysis/ContractionAxes.h) 统一 contraction 的 reduction/batch 配对、free axes 与操作数轴到结果轴的位置关系。CPU construction 和 GPU 当前 IR 查询共用这份纯轴关系；GPU 的 projection、vector realization 与 provider 原生矩阵检查消费相同结果。结果位置按正式 operand axis 推导，同一 source 或 dimension 在两边出现不代表同一个结果轴。该分析不读取 SSA、不选择 packing/tile，也不替各 provider 扩大原生 rank 或 dtype 支持。
 
-同一接口中的 `ProductContractionAxes::get` 从两个操作数到乘积公共域的投影、已证明的逻辑 unit 轴及归约轴，推导 contraction 配对、保留的原操作数轴和结果排列。CPU 的 [ContractionSources](lib/Dialect/CPU/Transforms/ContractionSources.cpp) 与 GPU 的 [ContractionSources](lib/Dialect/GPU/Transforms/Contraction/ContractionSources.cpp) 共用它识别乘法后求和的轴关系。CPU 的显式 contraction 查询也使用这个核心，但不将合法的 `K=1` 配对当成广播消除。调用方分别证明数值合同、唯一数值消费者和存储或 SSA 关系；物理 tile 大小为 1 不构成逻辑 singleton 的证明。新增共同轴规则改此分析；存储快照、方向选择、blocking 与目标支持改各自消费者。
+同一接口中的 `ProductContractionAxes::get` 从两个操作数到乘积公共域的投影、已证明的逻辑 unit 轴及归约轴，推导 contraction 配对、保留的原操作数轴和结果排列。CPU 的 [ContractionSources](lib/Dialect/CPU/Transforms/Contraction/ContractionSources.cpp) 与 GPU 的 [ContractionSources](lib/Dialect/GPU/Transforms/Contraction/ContractionSources.cpp) 共用它识别乘法后求和的轴关系。CPU 的显式 contraction 查询也使用这个核心，但不将合法的 `K=1` 配对当成广播消除。调用方分别证明数值合同、唯一数值消费者和存储或 SSA 关系；物理 tile 大小为 1 不构成逻辑 singleton 的证明。新增共同轴规则改此分析；存储快照、方向选择、blocking 与目标支持改各自消费者。
 
-[IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
+[IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/Vector/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
 
 该核心只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
 
@@ -926,44 +926,97 @@ Intent 将可参数化的 block 条件写入当前 IR，保留真实 view 检查
 
 CPU 的值构造、存储物化、候选绑定与执行变换有各自的入口。[共享 pipeline](lib/Dialect/CPU/Transforms/Passes.cpp) 依次完成 target 绑定、tensor SSA 优化与 bufferization、buffer source 规范化、候选形成、region 实现、供数与分块、task 形成。`CPUProgramStage` 区分值程序、buffer 程序和已实现程序；后两者不接受残留 tensor，最后一层也不接受尚未实现的 structured computation。Mojo 和 Weft 共用这些 CPU 阶段，provider 的微程序及机器表示仍各自实现。
 
+[CPU Transforms](lib/Dialect/CPU/Transforms/) 的目录同时表达实现归属与 pass 边界：
+
+| 目录 | 负责的当前 IR 改写或复用接口 |
+|---|---|
+| `Configuration/` | target facts、有限 profile、完整候选绑定与已实现候选去重 |
+| `Implementation/` | 微程序注册与需求接口、函数级输入供应、共享准备和量化计算分组 |
+| `Contraction/` | 乘法归约规范化、矩阵输入视图、contraction 分块 |
+| `Collective/` | slice reduce/scan、标量归约、histogram 与归约遍历融合 |
+| `Region/` | 分段计算分组与 region realization |
+| `Storage/` | 值到 buffer 转换、ownership lowering、私有存储复用与中间 buffer 融合 |
+| `Structure/` | 普通 structured computation 的融合、恒值折叠、实现展开及 loop 构造 |
+| `Task/` | workset 分组、通用分块、task partition 与 captures 隔离 |
+| `Vector/` | provider 可复用的循环向量化与横向归约机制 |
+
+跨模块接口位于 `include/Intent/Dialect/CPU/Transforms/` 的对应子目录；调用方包含
+所需的具体头文件。[Passes.h](include/Intent/Dialect/CPU/Transforms/Passes.h) 只提供
+标准 pass factories 与 pipeline 入口，不再间接提供全部转换函数和分析类型。
+`lib/` 中的窗口、整数来源和连续访问头文件是所属实现的私有
+协作接口，provider 不通过相对路径包含它们。Vector 机制按 provider 需要调用，
+不为了目录对称把 Mojo SIMD 展开加入共同 CPU pipeline。
+
+各组的 `Passes.cpp` 将完整变换接到标准 MLIR PassManager；顶层 `Passes.cpp`
+只组合这些入口及原生 `canonicalize`、`cse`。候选选择前的 source 规范化与选择后的
+供数、分块、task 形成分别有可独立调度的入口；后者直接读取当前 IR 的 configuration
+与 implementation binding。新增优化先判断它能否独立保持完整程序：能闭合的变换在
+所属组注册 pass，依赖同一改写过程的内部修补仍留在该组，不要求调用方补齐隐含次序。
+
+职责参考是本地 Triton `third_party/nvidia/backend/compiler.py:273–285` 对 TTIR
+passes 的显式组合，以及 `lib/Dialect/Triton/Transforms/Combine.cpp:297–315` 中
+变换自身的完整实现。TileLang `tilelang/cpu/pipeline.py:40–67` 同样在 CPU pipeline
+中分开 reducer、tile lowering、allocation 与 vectorization。Intent 的 CPU 初始
+输入还需要形成 task/block 程序；这里复用组织方式，不采用它们的 GPU layout 或
+thread-binding 合同。
+
 [KIRToCPU](lib/Conversion/KIRToCPU/KIRToCPU.cpp) 将普通值构造成标准 tensor/linalg SSA。Tuple/record 展平为逐分量的 scalar/tensor；`if/for/while` 直接携带这些值，helper 用真实返回值表达计算结果，不提前分配普通结果槽或两套循环状态槽。External view 和作者显式的 mutable buffer 保留 memref；[Read/Write](include/Intent/Dialect/CPU/IR/CPUValueOps.td) 明确表达内存与不可变值之间的 effect 边界。输出动态 shape 由 `tensor.empty` init 保存，不在旁表中恢复。
 
-[Bufferization](lib/Dialect/CPU/Transforms/Bufferization.cpp) 是唯一值到存储边界，复用 MLIR One-Shot、tensor/linalg/SCF 的原生模型与 ownership deallocation。只读输入可以互相 alias，不能给每次读取附加 `to_tensor restrict`；只有当前 ABI 证明可写参数与输入分离时才借用只读存储，其 tensor 不允许被原地覆盖。可变读取在原 effect 位置形成快照。值融合只能移动满足 effect 条件的计算，不能把捕获 mutable load 的 tensor body 当成纯计算。
+Construction driver 验证 immutable KIR，并把同一个 `CanonicalKernelAnalysis`
+交给私有 [Construction.h](lib/Conversion/KIRToCPU/Construction.h) 上下文。转换期间的
+SSA、product、domain 与 dimension 映射只有一份，完成后由独立 physical module
+承接全部执行事实；后续 passes 不持有这个上下文。新增 canonical operation 的 CPU
+转换在 [Construction.cpp](lib/Conversion/KIRToCPU/Construction.cpp) 的 typed dispatch
+接入，并实现于对应模块：
 
-[CollectiveBufferization](lib/Dialect/CPU/Transforms/CollectiveBufferization.cpp) 负责 CPU collective 的 SSA 结果与 helper 签名转换；buffer 形式随后由现有 region、scan、reduction 与量化实现消费。新增 CPU structured operation 时，先明确 source/result、shape init、helper 参数与 effects，再实现 bufferizable 接口，不在 construction、Mojo 和 Weft 各写一套结果分配。已有标准 tensor 或 SCF 能表达的值关系直接复用标准操作；provider 专属 packing 继续归实现与 input supply。
+| 模块 | 构造责任 |
+|---|---|
+| `Values.cpp` | 标量/张量值、product 展平、domain 与运行时维度绑定 |
+| `Access.cpp` | indexed read/write、作者 mutable buffer、原子与 scatter effects |
+| `Arithmetic.cpp`、`Tensor.cpp` | 数值合同、pointwise 和显式 tensor 形状运算 |
+| `Collectives.cpp` | helper region、reduce/scan、分段 region 与 histogram |
+| `Contractions.cpp` | 普通、稀疏、scaled 与量化 contraction |
+| `ControlFlow.cpp` | ordered if/for/while 与 parallel workset |
+
+这些构造模块不选择 provider 实现、分块或存储复用；这类改变当前程序的决定进入
+上面的 CPU transform 组。
+
+[Bufferization](lib/Dialect/CPU/Transforms/Storage/Bufferization.cpp) 是唯一值到存储边界，复用 MLIR One-Shot、tensor/linalg/SCF 的原生模型与 ownership deallocation。只读输入可以互相 alias，不能给每次读取附加 `to_tensor restrict`；只有当前 ABI 证明可写参数与输入分离时才借用只读存储，其 tensor 不允许被原地覆盖。可变读取在原 effect 位置形成快照。值融合只能移动满足 effect 条件的计算，不能把捕获 mutable load 的 tensor body 当成纯计算。
+
+[CollectiveBufferization](lib/Dialect/CPU/Transforms/Storage/CollectiveBufferization.cpp) 负责 CPU collective 的 SSA 结果与 helper 签名转换；buffer 形式随后由现有 region、scan、reduction 与量化实现消费。新增 CPU structured operation 时，先明确 source/result、shape init、helper 参数与 effects，再实现 bufferizable 接口，不在 construction、Mojo 和 Weft 各写一套结果分配。已有标准 tensor 或 SCF 能表达的值关系直接复用标准操作；provider 专属 packing 继续归实现与 input supply。
 
 值融合保留 MLIR 的 single-use profitability 条件，避免把共享 producer 复制到每个消费者；额外检查 payload effects，并将归约融合留给保存 CPU 数值许可的变换。不能在添加自定义 legality callback 时意外丢失原生代价条件。[RegionPredicates](lib/Dialect/CPU/Analysis/RegionPredicates.cpp) 按实际 source/capture 坐标关系收集比较，不依赖一个独立的 mask buffer 或单输出 generic；实例化与恒值分析消费同一组 predicate SSA。
 
 普通 reduce 在 construction 中统一形成 `cpu.slice_reduce`，保存 sources、逐分量 identities、captures、shape init、SSA results、归约轴和完整 combine。标量 helper 保留多分量 SSA 计算；完整 slice helper 也先返回真实值，在 bufferization 时形成显式借用的 state/member/capture/destination 参数，不在 construction 提前生成归约循环。作者 product 的各分量可以有不同 rank 和保留形状，但归约 member axes 必须一致；负 axis 在每个分量上归一后必须指向同一组 canonical 位置。
 
-[SliceCollectives.cpp](lib/Dialect/CPU/Transforms/SliceCollectives.cpp) 在候选选择前消费当前 CPU IR：同 free-axis 域、可逐元素提升的 scalar combine 形成原 `linalg.generic`；完整 slice combine 形成多归约轴遍历及逐分量私有 state/next slots，全部分量更新完成后再提交下一状态，最终写回 outputs。空域保留 identities；scalar helper 的不同 free-axis 域未获得明确提升关系时拒绝，不把未知动态 extent 当成相等。该模块和 slice scan 共用成员 subview、scratch、copy 与 helper 实例化，scan 仍独立保持 prefix、方向和 inclusive 合同。[CollectiveHelpers.h](include/Intent/Dialect/CPU/IR/CollectiveHelpers.h) 为 scan、slice reduction 和分段 region 提供 helper 的输入只读、局部 scratch 与调用方 destination 验证；嵌套 helper 按 operation 的实际 operands/effects 检查，不把其 formal arguments 当成外部存储。
+[SliceCollectives.cpp](lib/Dialect/CPU/Transforms/Collective/SliceCollectives.cpp) 在候选选择前消费当前 CPU IR：同 free-axis 域、可逐元素提升的 scalar combine 形成原 `linalg.generic`；完整 slice combine 形成多归约轴遍历及逐分量私有 state/next slots，全部分量更新完成后再提交下一状态，最终写回 outputs。空域保留 identities；scalar helper 的不同 free-axis 域未获得明确提升关系时拒绝，不把未知动态 extent 当成相等。该模块和 slice scan 共用成员 subview、scratch、copy 与 helper 实例化，scan 仍独立保持 prefix、方向和 inclusive 合同。[CollectiveHelpers.h](include/Intent/Dialect/CPU/IR/CollectiveHelpers.h) 为 scan、slice reduction 和分段 region 提供 helper 的输入只读、局部 scratch 与调用方 destination 验证；嵌套 helper 按 operation 的实际 operands/effects 检查，不把其 formal arguments 当成外部存储。
 
-[NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/NormalizeReductions.cpp) 随后从当前单轴 generic 和私有 rank-zero 结果槽形成标量 SSA `cpu.reduce`：初始化、全部使用与生命周期必须闭合，才删除结果槽。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为 scalar SSA 与 shaped DPS 提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
+[NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/Collective/NormalizeReductions.cpp) 随后从当前单轴 generic 和私有 rank-zero 结果槽形成标量 SSA `cpu.reduce`：初始化、全部使用与生命周期必须闭合，才删除结果槽。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为 scalar SSA 与 shaped DPS 提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
 
 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h) 统一当前 extent 的判等、表达式和常数上界查询；[IR ShapeRelations](include/Intent/Dialect/CPU/IR/ShapeRelations.h) 从公共接口取得同一 dimension 的代表及静态约束，也供入口 `memref.dim` 规范化使用。[registerExtentRelations](lib/Dialect/CPU/Analysis/ExtentRelations.cpp) 由 [Compiler Registration](lib/Compiler/Registration.cpp) 注册 CPU helper、ABI 与缺失的描述符 ValueBounds 模型，复用 MLIR 已有的 memref/SCF 模型。未知关系保留为 unknown，不把任意可能 wrap 的 index 算术当作无界整数；extent 相等不代表 offset、stride 或访问坐标相同。
 
 只读证明可以沿 helper formal 查询实际参数的尺寸，不能据此把外部 SSA 插入隔离 region。用于改写的 `queryExtentValue` 停在当前 block argument 和尺寸 SSA，只返回已有值或常量；消费者仍检查 dominance。共同查询在 IR 改写后重新执行，不维护独立 shape 表。
 
-普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
+普通 contraction 的 construction 只形成完整 `linalg.generic` 索引映射、显式零初始化及原数值运算，不选择 dot、batch 循环或 packing。[Contractions analysis](include/Intent/Dialect/CPU/Analysis/Contractions.h) 从当前索引图和乘加 body 查询共享轴语义；[NormalizeContractions.cpp](lib/Dialect/CPU/Transforms/Contraction/NormalizeContractions.cpp) 在候选选择前形成 dot、矩阵和 batch 程序，并按实际 strides 决定能否使用视图。转置或 unit 轴投影的输入快照稳定时，矩阵可直接消费派生视图；非 unit 广播保留显式计算，无法通过视图表达的轴合并仍形成显式 pack 与 lifetime。实现所需的 panel 准备继续由 implementation requirements 与 input supply 负责，不能把整块转置重新藏进 construction。
 
-同一 source 规范化阶段先调用私有 `normalizeContractionSources`，将满足条件的 f32 乘法与零初始化普通求和组合为显式乘加 contraction，再由上述 normalizer 和 implementation registry 处理。它仅穿过纯轴投影与 unit views，用 [Storage analysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 证明读取快照稳定，不跨越数值 cast 或其它计算；没有独立 free 轴的逐行点积仍交给普通归约路径。只有一侧 free 轴时，还要求能够形成连续矩阵列，否则保留原 producer-fused reduction，避免为了单个向量结果物化和打包矩阵。源识别、投影视图折叠和零初始化证明集中在相邻 `ContractionSources.cpp`，矩阵展平、batch 循环与 pack 保留在 `NormalizeContractions.cpp`。修改其中一个阶段不需要在 provider serializer 新增算子分支。
+`intent-cpu-normalize-contractions` 先调用 `normalizeContractionSources`，将满足条件的 f32 乘法与零初始化普通求和组合为显式乘加 contraction，再由上述 normalizer 和 implementation registry 处理。它仅穿过纯轴投影与 unit views，用 [Storage analysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 证明读取快照稳定，不跨越数值 cast 或其它计算；没有独立 free 轴的逐行点积仍交给普通归约路径。只有一侧 free 轴时，还要求能够形成连续矩阵列，否则保留原 producer-fused reduction，避免为了单个向量结果物化和打包矩阵。源识别、投影视图折叠和零初始化证明集中在相邻 `ContractionSources.cpp`，矩阵展平、batch 循环与 pack 保留在 `NormalizeContractions.cpp`。修改其中一个阶段不需要在 provider serializer 新增算子分支。
 
-Region 展开后，模板参数变成具体 views，可以用同一存储证明再次折叠矩阵输入；私有 `foldContractionInputs` 保持已绑定 implementation、计算和配置。`ContractionRequirements::unitInnerStride` 显式保存所选实现的输入布局条件，候选选择、绑定、lookup 与该改写共用检查；例如 Mojo direct 的 RHS 必须保持单位内层 stride。条件不成立时保留原物化，不重新选实现，也不把 Region 参数假定为 noalias。
+Region 展开后，模板参数变成具体 views，可以用同一存储证明再次折叠矩阵输入；`intent-cpu-fold-contraction-inputs` 调用 [Contraction.h](include/Intent/Dialect/CPU/Transforms/Contraction/Contraction.h) 中的 `foldContractionInputs`，保持已绑定 implementation、计算和配置。`ContractionRequirements::unitInnerStride` 显式保存所选实现的输入布局条件，候选选择、绑定、lookup 与该改写共用检查；例如 Mojo direct 的 RHS 必须保持单位内层 stride。条件不成立时保留原物化，不重新选实现，也不把 Region 参数假定为 noalias。
 
 | 需要的能力 | 模块 | 使用方式 |
 |---|---|---|
-| 值优化与存储物化 | [Bufferization.h](include/Intent/Dialect/CPU/Transforms/Bufferization.h) | `bufferizeValues` 完整关闭值程序；原生接口负责 alias、in-place、copy 与 ownership，不用未建模操作兜底 |
+| 值优化与存储物化 | [Bufferization.h](include/Intent/Dialect/CPU/Transforms/Storage/Bufferization.h) | `bufferizeValues` 完整关闭值程序；原生接口负责 alias、in-place、copy 与 ownership，不用未建模操作兜底 |
 | 均匀存储内容 | [UniformValues.h](include/Intent/Dialect/CPU/Analysis/UniformValues.h) | `UniformMemoryAnalysis` 为普通折叠与 region predicate 共享读取、view 归一和 effect 失效；多输出先在同一输入快照求值，再同时发布结果 |
 | 原生内存与控制流翻译 | [NativeSource.h](include/Intent/Serialization/NativeSource.h) | Mojo、Weft host 与 BANG C 共同处理标准 descriptor、视图、地址和 SCF 传递；目标保留分配与访存 API，serializer 不决定生命周期 |
-| Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
+| Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contraction/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
 | Weft task 局部存储 | [TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
-| 外层与局部参数 | [Configuration.h](include/Intent/Dialect/CPU/Transforms/Configuration.h) | 外层 task/block 参数与 implementation 的 local binding 分开，不通过完整 Passes.h 获取配置类型 |
-| 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |
-| 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
-| 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
+| 外层与局部参数 | [Configuration.h](include/Intent/Dialect/CPU/Transforms/Configuration/Configuration.h) | 外层 task/block 参数与 implementation 的 local binding 分开，不通过完整 Passes.h 获取配置类型 |
+| 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/Configuration/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |
+| 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configuration/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
+| 实现绑定与展开接口 | [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation/Implementation.h)、[Implementation.cpp](lib/Dialect/CPU/Transforms/Implementation/Implementation.cpp) | `bind` 一次提交 operation binding、函数配置与实现摘要；供数与展开消费同一个选择 |
 | 存储来源、别名、生命周期与读快照 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `StorageAnalysis` 统一查询 `origins`、`aliases`、`lifetime`、`effects`、`disjoint` 与读取稳定性；消费标准 MLIR flow/effect 接口及显式 ABI，不移动 allocation 或决定 packing |
 | 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 委托共同 ExtentRelations 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸 |
-| 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
+| 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/Implementation/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/Storage/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
 扩展 CPU implementation 时，通过 `registry.add<Op...>(implementation)` 声明操作族；共同 registry 不再维护一份需要绑定的操作名单。可选 `applicable` 进一步限定当前实例的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，核对实现身份、绑定参数及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
 
@@ -977,15 +1030,15 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 
 `inputRequirements` 是只读查询，候选期与后续供数变换都可以调用。`checkInputRequirement` / `checkInputRequirements` 共享 operand、panel、alignment 与显式 widening 的证明，实际物化时依据当前 IR 重查。跨阶段只传递正式 binding，不缓存另一份供数计划。输入已经满足实现要求、无需额外准备时可以返回空需求；空需求只表示不需要外围 preparation，不说明它一定更快。
 
-[ImplementationInputs.h](include/Intent/Dialect/CPU/Transforms/ImplementationInputs.h)
+[ImplementationInputs.h](include/Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h)
 公开函数级输入供应构造的三个入口：`prepare`、`prepareCaptured`、`prepareGroup`。
 CPU passes 与 Mojo 共用同一上下文的准备和复用状态；内部 prepared windows、guards
 及缓存结构由 `.cpp` 中的单一实现持有。仅供 CPU 内部使用的窗口分析留在
-[InputWindows.h](lib/Dialect/CPU/Transforms/InputWindows.h)。Mojo/Weft 共用的基础
-index、算术与 loop 构造放在 [LoopBuilders.h](include/Intent/Dialect/CPU/Transforms/LoopBuilders.h)，
+[InputWindows.h](lib/Dialect/CPU/Transforms/Implementation/InputWindows.h)。Mojo/Weft 共用的基础
+index、算术与 loop 构造放在 [LoopBuilders.h](include/Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h)，
 provider 通过公开 include 使用它们，不跨层包含 CPU 的私有源码路径。
 
-[ImplementationInputs.cpp](lib/Dialect/CPU/Transforms/ImplementationInputs.cpp) 的 group supply 将配置容量与当前 source 维度的已证明上界取小，只收缩未拆成 panel 的维度；panel 宽度、对齐、有效写入窗口及生命周期保持原合同。Mojo 的 group panel 预算检查使用同一上界查询。配置容量是分块上限，不能代替当前 IR 已有的更紧界；有效窗口宽度也不能代替实现要求的固定 panel pitch。Weft 当前不请求这类 group preparation，不因此宣称它使用了同一 packing 路径。
+[ImplementationInputs.cpp](lib/Dialect/CPU/Transforms/Implementation/ImplementationInputs.cpp) 的 group supply 将配置容量与当前 source 维度的已证明上界取小，只收缩未拆成 panel 的维度；panel 宽度、对齐、有效写入窗口及生命周期保持原合同。Mojo 的 group panel 预算检查使用同一上界查询。配置容量是分块上限，不能代替当前 IR 已有的更紧界；有效窗口宽度也不能代替实现要求的固定 panel pitch。Weft 当前不请求这类 group preparation，不因此宣称它使用了同一 packing 路径。
 
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
@@ -1032,6 +1085,10 @@ buffer 内容；`readStable` 还检查 producer 与 consumer 的执行范围，�
 其余 `bufferization.dealloc` 保留条件、别名去重及 retained buffers，直到 provider 的
 `lowerOwnership` 用标准 conversion/inliner 消费。释放的 effects 通过统一接口可见，
 不在每个优化消费者中分别加白名单。
+统一 [Registration.cpp](lib/Compiler/Registration.cpp) 注册 MLIR 的 Func inliner
+extension，使 ownership conversion 产生的局部 helper 能由原生 inliner 展开到
+当前 entry。MLIR 20 的 `Dialect/Func/Extensions/InlinerExtension.h:8–22` 将这项
+接口与 dialect 注册分开；仅安装 `FuncDialect` 和 inliner pass 不足以启用它。
 移动、替换或删除相关 operations 后重建分析。多个只读查询可复用同一 snapshot，
 不能跨实际 rewrite 缓存它。Read 的借用决定在完整值程序上形成，再交原生
 bufferization 消费，避免在构造到一半的控制流中启动整个函数的存储分析。
@@ -1040,7 +1097,7 @@ bufferization 消费，避免在构造到一半的控制流中启动整个函数
 operation effects 证明读取移动。Intent CPU 还要证明显式 allocation/free 和 helper
 调用边界，实际循环与物化改写继续由各 CPU pass 决定。
 
-[IntegerSources.cpp](lib/Dialect/CPU/Transforms/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
+[IntegerSources.cpp](lib/Dialect/CPU/Transforms/Structure/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/Structure/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
 
 输出转发也使用这份存储查询，并保留目标的 disjoint、dominance 和 effect 检查。identity layout 与显式静态 strides 若具有相同 shape、元素类型、memory space、offset 和 strides，可通过标准 `memref.cast` 保持派生 view 的输入类型；两个未知动态 strides 不构成等价证明。这样，unit-axis 视图等正常 lowering 结构不会仅因类型拼写不同而强制保留中间结果拷贝。
 
@@ -1050,9 +1107,9 @@ Mojo 并行任务的 [serializer](lib/Target/Mojo/Serialization/Serializer.cpp) 
 
 职责对照：本地 Triton `include/triton/Dialect/Triton/IR/TritonOps.td:214–239` 将 load 的 memory effect 与 tensor result 同时保存在 IR；`third_party/nvidia/backend/compiler.py:273–285` 在 TTIR 进行 combine/canonicalize，`:415–422` 才进入目标资源分配。Intent CPU 同样先保存值依赖，再决定存储；具体复用的是 MLIR 的 CPU bufferization，而非套用 Triton 的 GPU layout。MLIR 20 `BufferizationOps.td:414–423` 的 restrict 合同不能从“输入只读”推出，故输入读取由上述明确边界建模。
 
-Mojo 最终合法化先验证完整 native surface，再清除已由具体循环、向量和资源兑现的逐操作 implementation binding；实现摘要继续保留供产物检查。随后通过 [FinalizedCandidates.h](include/Intent/Dialect/CPU/Transforms/FinalizedCandidates.h) 删除结构完全相同的候选。比较保留完整 ABI、类型、SSA、嵌套任务、effects 和数值属性，仅忽略位置、顶层 entry 名字及已经消费完的配置/实现摘要；保留 profile 顺序中的第一个代表，serializer 和 runtime 从剩余函数形成源码与候选集合。这个入口不能用于尚未消费向量化或分块参数的程序，也不按生成源码文本或算子名字合并。Weft 已将 task 分离到另一个模块，不能只比较 host、忽略 callee 名字后套用此入口。
+Mojo 最终合法化先验证完整 native surface，再清除已由具体循环、向量和资源兑现的逐操作 implementation binding；实现摘要继续保留供产物检查。随后通过 [FinalizedCandidates.h](include/Intent/Dialect/CPU/Transforms/Configuration/FinalizedCandidates.h) 删除结构完全相同的候选。比较保留完整 ABI、类型、SSA、嵌套任务、effects 和数值属性，仅忽略位置、顶层 entry 名字及已经消费完的配置/实现摘要；保留 profile 顺序中的第一个代表，serializer 和 runtime 从剩余函数形成源码与候选集合。这个入口不能用于尚未消费向量化或分块参数的程序，也不按生成源码文本或算子名字合并。Weft 已将 task 分离到另一个模块，不能只比较 host、忽略 callee 名字后套用此入口。
 
-CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。私有 [VectorReductions.h](lib/Dialect/CPU/Transforms/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
+CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/Vector/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。公共 [VectorReductions.h](include/Intent/Dialect/CPU/Transforms/Vector/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
 
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
@@ -1106,7 +1163,7 @@ view 并写回 destination；新增 native implementation 不再修改 driver �
 - `lib/Target/<provider>/Serialization/` 打印已经决定的 kernel 程序和接口 facts，不重新选择 ownership、workspace、pipeline 或调优参数，也不生成另一套通用 host 参数检查和输出分配代码。
 - `python/intent/runtime/` 消费这些 facts 并执行；provider 适配实际原生调用，公共 binder 处理参数、输出与工作区。无法兑现的能力明确报错，不改变算法或隐藏失败。
 
-CPU 的 implementation registry 是明确的局部扩展点。职责参考是本地 Triton `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:212–243`：driver 注册对应操作的 lowering，具体实现消费转换上下文。Intent 的 [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h) 还负责 CPU 有限候选、供数要求及已选绑定的后续展开；这不是让 leaf 重新选择完整算法。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
+CPU 的 implementation registry 是明确的局部扩展点。职责参考是本地 Triton `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:212–243`：driver 注册对应操作的 lowering，具体实现消费转换上下文。Intent 的 [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation/Implementation.h) 还负责 CPU 有限候选、供数要求及已选绑定的后续展开；这不是让 leaf 重新选择完整算法。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
 
 ### GPU 接口与 Python 产品边界
 
@@ -1479,7 +1536,7 @@ dsa_input=/path/to/existing-dsa-production-cache/input.mlir
 
 去掉 `--mlir-print-ir-tree-dir` 会把快照写到 stderr；`--mlir-print-ir-before-all` / `--mlir-print-ir-after-all` 可查看已接入 instrumentation 的所有阶段。若增加 `--mlir-print-ir-module-scope`，同时传 `--mlir-disable-threading`。`--mlir-timing` 是编译 pass 时间，不能当作 kernel 执行时间。
 
-CPU 同样复用已有生产 input 与原 target/capability/profile 参数。共享阶段名为 `intent-cpu-normalize-source`、`intent-cpu-materialize-configurations`、`intent-cpu-realize-regions`、`intent-cpu-form-input-supply`、`intent-cpu-form-tasks`；例如对 `intent-cpu-materialize-configurations` 打印前后 IR，可看到单个未绑定函数变为具有完整 binding 的候选函数。Mojo 阶段名为 `intent-mojo-materialize-program`、`intent-mojo-fuse-private-computations`、`intent-mojo-vectorize-program`、`intent-mojo-finalize-program`。独立使用时须传入所需 pass options，并由相同 dialect registration 安装 context 内的 provider interface；前置 IR 合同仍需成立。
+CPU 同样复用已有生产 input 与原 target/capability/profile 参数。完整共享 pass 列表及输入条件见 [CPU Passes.td](include/Intent/Dialect/CPU/Transforms/Passes.td)。例如 `intent-cpu-materialize-configurations` 将单个未绑定函数变为具有完整 binding 的候选函数；`intent-cpu-prepare-inputs`、`intent-cpu-block-computations`、`intent-cpu-partition-tasks` 可分别打印供数、分块与任务形成的前后 IR，`intent-cpu-isolate-tasks` 闭合显式 captures。Mojo 阶段名为 `intent-mojo-materialize-program`、`intent-mojo-fuse-private-computations`、`intent-mojo-vectorize-program`、`intent-mojo-finalize-program`。独立使用时须传入所需 pass options，并由相同 dialect registration 安装 context 内的 provider interface；前置 IR 合同仍需成立。`intent-cpu-pipeline` 仍是完整默认入口，其展开顺序直接由标准 PassManager 执行。
 
 查看 provider 阶段时，沿用同一输入、目标 options 和 tuning profile 的完整编译命令，去掉 `--stop-after-shared`，同时指定 `--ir-output` 与 `--source-output`。例如既有 [cuTile official_fmha](experiments/gpu/providers/cutile/attention.py) 编译 [flash_gqa_attention_fwd](examples/kernels/streaming/attention.py) 时，在原命令追加 `--mlir-print-ir-before=intent-cutile-native-program --mlir-print-ir-after=intent-cutile-native-program --mlir-print-debuginfo`，即可对照原生 form 形成前后的 IR 并显示作者位置；对应 Triton 阶段名是 `intent-triton-native-forms`。最终合法化分别看 `intent-cutile-finalize-program` 与 `intent-triton-finalize-program`。这些阶段名用于同一完整 pipeline 的诊断，不表示可以跳过其输入依赖和 tuning profiles 单独调用。
 

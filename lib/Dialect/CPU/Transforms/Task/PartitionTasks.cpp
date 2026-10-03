@@ -1,0 +1,642 @@
+#include "Intent/Dialect/CPU/Transforms/Task/Tasks.h"
+#include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/IR/CPUOps.h"
+#include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/RegionUtils.h"
+#include "llvm/ADT/SetVector.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+
+using namespace mlir;
+
+namespace intent::cpu {
+namespace {
+
+void partitionScalarSums(func::FuncOp function, int64_t grain) {
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  if (capabilities.getWorkers() <= 1) return;
+  int64_t limit = std::min(grain, capabilities.getPrivateBytes() / 4 / capabilities.getWorkers()) * capabilities.getWorkers();
+  if (!limit) return;
+  SmallVector<ReduceOp> reductions(function.front().getOps<ReduceOp>());
+  for (ReduceOp operation : reductions) {
+    if (!operation.getResult().getType().isF32() || !operation.getOrder().getAdjacentReassociation() ||
+        !matchPattern(operation.getInitial(), m_PosZeroFloat())) continue;
+    Block &body = operation.getCombine().front();
+    auto combine = body.getTerminator()->getOperand(0).getDefiningOp<arith::AddFOp>();
+    if (!combine || !body.getArgument(0).hasOneUse() ||
+        !llvm::is_contained(combine->getOperands(), body.getArgument(0))) continue;
+    OpBuilder b(operation);
+    Location loc = operation.getLoc();
+    Value zero = index(b, loc, 0), one = index(b, loc, 1);
+    Value count = b.create<arith::CeilDivSIOp>(loc, operation.getExtent(), index(b, loc, 4096));
+    count = b.create<arith::MinSIOp>(loc, index(b, loc, limit),
+        b.create<arith::MaxSIOp>(loc, one, count));
+    Value width = b.create<arith::DivSIOp>(loc, operation.getExtent(), count);
+    Value remainder = b.create<arith::RemSIOp>(loc, operation.getExtent(), count);
+    Value partials = b.create<memref::AllocOp>(loc, MemRefType::get({limit}, b.getF32Type()));
+    auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+    {
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(tasks.getBody());
+      Value group = tasks.getInductionVars()[0];
+      Value begin = add(b, loc, multiply(b, loc, group, width), b.create<arith::MinSIOp>(loc, group, remainder));
+      Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, group, remainder);
+      Value size = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, one, zero));
+      SmallVector<Value> inputs;
+      for (auto [input, attr] : llvm::zip(operation.getInputs(), operation.getIndexingMaps())) {
+        auto type = dyn_cast<MemRefType>(input.getType());
+        if (!type) { inputs.push_back(input); continue; }
+        SmallVector<OpFoldResult> offsets, sizes, strides(type.getRank(), b.getIndexAttr(1));
+        for (AffineExpr expression : cast<AffineMapAttr>(attr).getValue().getResults()) {
+          bool varying = isa<AffineDimExpr>(expression);
+          offsets.push_back(varying ? OpFoldResult(begin) : OpFoldResult(b.getIndexAttr(0)));
+          sizes.push_back(varying ? OpFoldResult(size) : OpFoldResult(b.getIndexAttr(1)));
+        }
+        inputs.push_back(b.create<memref::SubViewOp>(loc, input, offsets, sizes, strides));
+      }
+      auto partial = b.create<ReduceOp>(loc, operation.getResult().getType(), size,
+          operation.getInitial(), inputs, operation.getIndexingMaps(), operation.getOrder());
+      partial->setAttr("intent_cpu.implementation", operation->getAttr("intent_cpu.implementation"));
+      IRMapping mapping;
+      operation.getCombine().cloneInto(&partial.getCombine(), mapping);
+      b.create<memref::StoreOp>(loc, partial.getResult(), partials, ValueRange{group});
+    }
+    auto result = b.create<ReduceOp>(loc, b.getF32Type(), count, operation.getInitial(), ValueRange{partials},
+        b.getArrayAttr({AffineMapAttr::get(b.getMultiDimIdentityMap(1))}), operation.getOrder());
+    result->setAttr("intent_cpu.implementation", operation->getAttr("intent_cpu.implementation"));
+    {
+      OpBuilder::InsertionGuard guard(b);
+      Block *merge = &result.getCombine().emplaceBlock();
+      merge->addArguments(TypeRange{b.getF32Type(), b.getF32Type()}, {loc, loc});
+      b.setInsertionPointToStart(merge);
+      b.create<YieldOp>(loc, b.create<arith::AddFOp>(loc, merge->getArgument(0), merge->getArgument(1)).getResult());
+    }
+    b.create<memref::DeallocOp>(loc, partials);
+    operation.replaceAllUsesWith(result.getResult());
+    operation.erase();
+  }
+}
+
+}
+
+LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations,
+                                      ArrayRef<Value> leadingExtents) {
+  SmallVector<linalg::GenericOp> computations(function.front().getOps<linalg::GenericOp>());
+  for (auto operation : computations) {
+    StorageAnalysis storage(function);
+    if (!operation.getNumLoops() || operation.getNumResults() || operation.getOutputs().empty() ||
+        operation.getIteratorTypesArray()[0] != utils::IteratorType::parallel) continue;
+    if (!leadingExtents.empty() && isMatrixContraction(operation)) continue;
+    auto maps = operation.getIndexingMapsArray();
+    if (llvm::any_of(maps, [](AffineMap map) {
+          return map.getNumSymbols() || llvm::any_of(map.getResults(), [](AffineExpr expression) {
+            return !isa<AffineDimExpr, AffineConstantExpr>(expression);
+          });
+        }) || llvm::any_of(ArrayRef<AffineMap>(maps).drop_front(operation.getNumDpsInputs()),
+                           [](AffineMap map) {
+                             if (!map.getNumResults() || map.getResult(0) != getAffineDimExpr(0, map.getContext())) return true;
+                             return llvm::any_of(map.getResults().drop_front(), [](AffineExpr expression) {
+                               auto dimension = dyn_cast<AffineDimExpr>(expression);
+                               return dimension && dimension.getPosition() == 0;
+                             });
+                           })) continue;
+    bool independent = true;
+    for (auto [number, destination] : llvm::enumerate(operation.getOutputs())) {
+      for (Value other : operation.getOutputs().drop_front(number + 1))
+        independent &= storage.disjoint(destination, other);
+      for (auto [inputNumber, input] : llvm::enumerate(operation.getInputs())) {
+        if (!isa<MemRefType>(input.getType())) continue;
+        independent &= storage.disjoint(input, destination) ||
+            (input == destination && maps[inputNumber] == maps[operation.getNumDpsInputs() + number]);
+      }
+    }
+    for (Operation &body : operation.getRegion().front().without_terminator()) {
+      if (isMemoryEffectFree(&body)) continue;
+      auto load = dyn_cast<memref::LoadOp>(body);
+      if (!load) { independent = false; break; }
+      for (Value output : operation.getOutputs())
+        independent &= storage.disjoint(load.getMemref(), output);
+    }
+    if (!independent) continue;
+    OpBuilder b(operation);
+    Location loc = operation.getLoc();
+    Value extent = b.createOrFold<memref::DimOp>(loc, operation.getOutputs()[0], 0);
+    if (!leadingExtents.empty() && !llvm::any_of(leadingExtents, [&](Value candidate) {
+          auto constant = getConstantIntValue(extent);
+          return extent == candidate || (constant && constant == getConstantIntValue(candidate));
+        })) continue;
+    int64_t rows = 1;
+    if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation")) {
+      auto implementation = implementations.lookup(operation);
+      if (failed(implementation)) return failure();
+      if ((*implementation)->worksetRows) rows = (*implementation)->worksetRows(operation, binding);
+      if (rows <= 0) return operation.emitError("implementation requires a positive leading parallel workset");
+    }
+    if (!leadingExtents.empty() && rows != 1) continue;
+    Value zero = index(b, loc, 0), one = index(b, loc, 1);
+    Value window = index(b, loc, rows);
+    Value count = rows == 1 ? extent : b.create<arith::CeilDivSIOp>(loc, extent, window);
+    auto workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+    b.setInsertionPointToStart(workset.getBody());
+    Value row = rows == 1 ? workset.getInductionVars()[0]
+                         : multiply(b, loc, workset.getInductionVars()[0], window);
+    OpFoldResult rowCount = b.getIndexAttr(1);
+    if (rows != 1)
+      rowCount = b.create<arith::MinSIOp>(loc, window, b.create<arith::SubIOp>(loc, extent, row)).getResult();
+    SmallVector<Value> inputs, outputs;
+    for (auto [number, operand] : llvm::enumerate(operation->getOperands())) {
+      Value selected = operand;
+      if (auto type = dyn_cast<MemRefType>(operand.getType())) {
+        SmallVector<OpFoldResult> offsets, sizes, strides(type.getRank(), b.getIndexAttr(1));
+        for (auto [axis, expression] : llvm::enumerate(maps[number].getResults())) {
+          auto dimension = dyn_cast<AffineDimExpr>(expression);
+          bool leading = dimension && dimension.getPosition() == 0;
+          offsets.push_back(leading ? OpFoldResult(row) : OpFoldResult(b.getIndexAttr(0)));
+          sizes.push_back(leading ? rowCount
+              : type.isDynamicDim(axis) ? OpFoldResult(b.create<memref::DimOp>(loc, operand, axis).getResult())
+                                        : OpFoldResult(b.getIndexAttr(type.getDimSize(axis))));
+        }
+        selected = b.create<memref::SubViewOp>(loc, operand, offsets, sizes, strides);
+      }
+      (number < static_cast<size_t>(operation.getNumDpsInputs()) ? inputs : outputs).push_back(selected);
+    }
+    auto tile = b.create<linalg::GenericOp>(loc, inputs, outputs, maps, operation.getIteratorTypesArray(),
+        [&](OpBuilder &nested, Location location, ValueRange arguments) {
+          IRMapping mapping;
+          Block &body = operation.getRegion().front();
+          mapping.map(body.getArguments(), arguments);
+          for (Operation &instruction : body.without_terminator()) {
+            if (auto coordinate = dyn_cast<linalg::IndexOp>(instruction); coordinate && coordinate.getDim() == 0) {
+              Value coordinateRow = row;
+              if (rows != 1)
+                coordinateRow = add(nested, location, row, nested.create<linalg::IndexOp>(location, 0));
+              mapping.map(coordinate.getResult(), coordinateRow);
+            } else nested.clone(instruction, mapping);
+          }
+          SmallVector<Value> results;
+          for (Value value : body.getTerminator()->getOperands()) results.push_back(mapping.lookupOrDefault(value));
+          nested.create<linalg::YieldOp>(location, results);
+        });
+    tile->setAttrs(operation->getAttrs());
+    operation.erase();
+  }
+  return success();
+}
+
+namespace {
+
+LogicalResult partition(scf::ParallelOp root, int64_t grain) {
+  auto function = root->getParentOfType<func::FuncOp>();
+  DominanceInfo dominance(function);
+  StorageAnalysis analysis(function);
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  auto rectangular = [&](scf::ParallelOp parallel) {
+    for (auto [begin, end, step] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(), parallel.getStep()))
+      if (!matchPattern(begin, m_Zero()) || !matchPattern(step, m_One()) || !dominance.dominates(end, root))
+        return false;
+    return true;
+  };
+  auto duplicable = [&](Operation *operation) {
+    if (operation->getNumRegions()) return false;
+    if (isMemoryEffectFree(operation)) return true;
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      auto view = analysis.externalView(load.getMemref());
+      return view && view.getAccess() == 0 && interface.getDisjointOutputs();
+    }
+    return false;
+  };
+  SmallVector<scf::ParallelOp> nest;
+  scf::ParallelOp current = root;
+  while (current) {
+    if (current.getNumResults()) return current.emitError("CPU task reduction is not implemented");
+    nest.push_back(current);
+    scf::ParallelOp child;
+    bool flatten = true;
+    for (Operation &operation : current.getBody()->without_terminator()) {
+      if (auto parallel = dyn_cast<scf::ParallelOp>(&operation)) {
+        if (child) { flatten = false; break; }
+        child = parallel;
+      }
+    }
+    if (child) {
+      for (Operation &operation : current.getBody()->without_terminator())
+        if (&operation != child && !duplicable(&operation)) flatten = false;
+    }
+    current = child && flatten && rectangular(child) ? child : scf::ParallelOp();
+  }
+  SmallVector<Value> extents, coordinates;
+  for (scf::ParallelOp parallel : nest) {
+    for (auto [begin, end, step, iv] : llvm::zip(parallel.getLowerBound(), parallel.getUpperBound(),
+                                               parallel.getStep(), parallel.getInductionVars())) {
+      if (!matchPattern(begin, m_Zero()) || !matchPattern(step, m_One()) ||
+          !dominance.dominates(end, root))
+        return parallel.emitError("CPU tasks require a rectangular zero-based unit-step workset");
+      extents.push_back(end);
+      coordinates.push_back(iv);
+    }
+  }
+  OpBuilder b(root);
+  Location loc = root.getLoc();
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value size = one;
+  for (Value extent : extents) size = multiply(b, loc, size, extent);
+  Value chunk = index(b, loc, grain);
+  Value taskCount = b.create<arith::CeilDivSIOp>(loc, size, chunk);
+  auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{taskCount}, ValueRange{one});
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(tasks.getBody());
+    Value begin = multiply(b, loc, tasks.getInductionVars()[0], chunk);
+    Value end = b.create<arith::MinSIOp>(loc, add(b, loc, begin, chunk), size);
+    auto clonePoint = [&](ValueRange point) {
+      IRMapping mapping;
+      mapping.map(ValueRange(coordinates), point);
+      std::function<void(scf::ParallelOp)> cloneBody = [&](scf::ParallelOp parallel) {
+        for (Operation &operation : parallel.getBody()->without_terminator()) {
+          if (auto child = dyn_cast<scf::ParallelOp>(&operation); child && llvm::is_contained(nest, child)) cloneBody(child);
+          else b.clone(operation, mapping);
+        }
+      };
+      cloneBody(root);
+    };
+    if (extents.size() == 1) {
+      loop(b, loc, begin, end, 1, [&](Value linear) { clonePoint(ValueRange{linear}); });
+    } else {
+      Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, end);
+      auto active = b.create<scf::IfOp>(loc, nonempty, false);
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(active.thenBlock());
+      auto decode = [&](Value ordinal) {
+        SmallVector<Value> point(extents.size());
+        for (int64_t axis = extents.size() - 1; axis >= 0; --axis) {
+          point[axis] = axis == 0 ? ordinal
+              : Value(b.create<arith::RemSIOp>(loc, ordinal, extents[axis]));
+          if (axis) ordinal = b.create<arith::DivSIOp>(loc, ordinal, extents[axis]);
+        }
+        return point;
+      };
+      auto first = decode(begin);
+      auto last = decode(b.create<arith::SubIOp>(loc, end, one));
+      SmallVector<Value> lastEnds, point(extents.size());
+      for (Value coordinate : last) lastEnds.push_back(add(b, loc, coordinate, one));
+      Value boundary = b.create<arith::ConstantOp>(loc, b.getBoolAttr(true));
+      std::function<void(unsigned, Value, Value)> traverse = [&](unsigned axis, Value firstPrefix, Value lastPrefix) {
+        Value lower = b.createOrFold<arith::SelectOp>(loc, firstPrefix, first[axis], zero);
+        Value upper = b.createOrFold<arith::SelectOp>(loc, lastPrefix, lastEnds[axis], extents[axis]);
+        loop(b, loc, lower, upper, 1, [&](Value coordinate) {
+          point[axis] = coordinate;
+          if (axis + 1 == extents.size()) { clonePoint(point); return; }
+          Value atFirst = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, coordinate, first[axis]);
+          Value atLast = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, coordinate, last[axis]);
+          traverse(axis + 1, b.createOrFold<arith::AndIOp>(loc, firstPrefix, atFirst),
+              b.createOrFold<arith::AndIOp>(loc, lastPrefix, atLast));
+        });
+      };
+      traverse(0, boundary, boundary);
+    }
+  }
+  SmallVector<scf::ParallelOp> nested;
+  tasks.walk<WalkOrder::PostOrder>([&](scf::ParallelOp parallel) {
+    if (parallel != tasks) nested.push_back(parallel);
+  });
+  for (scf::ParallelOp parallel : nested) {
+    if (parallel.getNumResults()) return parallel.emitError("CPU task reduction is not implemented");
+    OpBuilder nestedBuilder(parallel);
+    IRMapping mapping;
+    std::function<void(unsigned)> traverse = [&](unsigned axis) {
+      if (axis == parallel.getNumLoops()) {
+        for (Operation &operation : parallel.getBody()->without_terminator())
+          nestedBuilder.clone(operation, mapping);
+        return;
+      }
+      auto loop = nestedBuilder.create<scf::ForOp>(parallel.getLoc(), parallel.getLowerBound()[axis],
+          parallel.getUpperBound()[axis], parallel.getStep()[axis]);
+      OpBuilder::InsertionGuard guard(nestedBuilder);
+      nestedBuilder.setInsertionPointToStart(loop.getBody());
+      mapping.map(parallel.getInductionVars()[axis], loop.getInductionVar());
+      traverse(axis + 1);
+    };
+    traverse(0);
+    parallel.erase();
+  }
+  root.erase();
+  return success();
+}
+
+void foldDisjointCompareExchange(func::FuncOp function, scf::ParallelOp root) {
+  if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults()) return;
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  if (!interface || !interface.getDisjointOutputs()) return;
+  SmallVector<AtomicCompareExchangeOp> exchanges;
+  root.walk([&](AtomicCompareExchangeOp operation) { exchanges.push_back(operation); });
+  if (exchanges.size() != 1) return;
+  auto exchange = exchanges.front();
+  auto element = dyn_cast<IntegerType>(exchange.getOldValue().getType());
+  if (exchange.getOrdering() != AtomicOrdering::Relaxed || !element || !element.isSignless()) return;
+  StorageAnalysis physical(function);
+  Value point = root.getInductionVars()[0];
+  auto projection = [&](Value memory, ValueRange indices) -> Value {
+    while (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
+    if (auto view = memory.getDefiningOp<memref::SubViewOp>()) {
+      if (view.getSourceType().getRank() != 1 ||
+          view.getMixedOffsets()[0] != OpFoldResult(point) ||
+          getConstantIntValue(view.getMixedSizes()[0]) != 1 ||
+          getConstantIntValue(view.getMixedStrides()[0]) != 1 ||
+          !(indices.empty() || (indices.size() == 1 && matchPattern(indices[0], m_Zero())))) return {};
+      memory = view.getSource();
+    } else if (indices.size() != 1 || indices[0] != point) return {};
+    auto type = cast<MemRefType>(memory.getType());
+    auto external = physical.externalView(memory);
+    if (type.getRank() != 1 || !type.getLayout().isIdentity() ||
+        memory != physical.uniqueOrigin(memory) || !external || external.getAccess() == 0) return {};
+    return memory;
+  };
+  Value target = projection(exchange.getTarget(), exchange.getIndices());
+  if (!target || physical.externalView(target).getAccess() != 2) return;
+  SmallVector<std::pair<memref::LoadOp, Value>> loads;
+  SmallVector<std::pair<memref::StoreOp, Value>> stores;
+  SmallVector<Operation *> aliases;
+  bool valid = true;
+  root.walk([&](Operation *operation) {
+    if (operation == root || operation == exchange || isa<scf::ReduceOp>(operation)) return;
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      if (physical.isReadOnly(load.getMemref())) return;
+      if (Value memory = projection(load.getMemref(), load.getIndices())) loads.emplace_back(load, memory);
+      else valid = false;
+      return;
+    }
+    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      if (Value memory = projection(store.getMemref(), store.getIndices())) stores.emplace_back(store, memory);
+      else valid = false;
+      return;
+    }
+    if (isa<memref::SubViewOp, memref::CastOp>(operation)) { aliases.push_back(operation); return; }
+    if (isa<memref::DimOp>(operation)) return;
+    if (!isMemoryEffectFree(operation) || operation->getNumRegions() ||
+        llvm::any_of(operation->getOperandTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
+        llvm::any_of(operation->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) valid = false;
+  });
+  if (!valid) return;
+
+  // Every writable address belongs to this point, and readonly ABI inputs
+  // cannot overlap it. No other participant can observe the relaxed CAS.
+  OpBuilder b(exchange);
+  Location loc = exchange.getLoc();
+  Value old = b.create<memref::LoadOp>(loc, target, ValueRange{point});
+  Value success = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, old, exchange.getExpected());
+  Value value = b.create<arith::SelectOp>(loc, success, exchange.getDesired(), old);
+  b.create<memref::StoreOp>(loc, value, target, ValueRange{point});
+  exchange.getOldValue().replaceAllUsesWith(old);
+  exchange.getSuccess().replaceAllUsesWith(success);
+  exchange.erase();
+  for (auto [load, memory] : loads) {
+    b.setInsertionPoint(load);
+    load.replaceAllUsesWith(b.create<memref::LoadOp>(load.getLoc(), memory, ValueRange{point}).getResult());
+    load.erase();
+  }
+  for (auto [store, memory] : stores) {
+    b.setInsertionPoint(store);
+    b.create<memref::StoreOp>(store.getLoc(), store.getValue(), memory, ValueRange{point});
+    store.erase();
+  }
+  for (Operation *alias : llvm::reverse(aliases))
+    if (alias->use_empty()) alias->erase();
+}
+
+scf::ParallelOp partitionAtomicRows(func::FuncOp function, scf::ParallelOp root, int64_t grain) {
+  if (root->getBlock() != &function.front() || root.getNumLoops() != 1 || root.getNumResults() ||
+      !matchPattern(root.getLowerBound()[0], m_Zero()) || !matchPattern(root.getStep()[0], m_One())) return {};
+  auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  if (!interface || !interface.getDisjointOutputs()) return {};
+  SmallVector<AtomicRMWOp> updates;
+  root.walk([&](AtomicRMWOp update) { updates.push_back(update); });
+  if (updates.size() != 1) return {};
+  auto update = updates.front();
+  auto target = cast<MemRefType>(update.getTarget().getType());
+  StorageAnalysis physical(function);
+  auto external = physical.externalView(update.getTarget());
+  if (update.getOrdering() != AtomicOrdering::Relaxed || update.getKind() != AtomicRMWKind::Add ||
+      !update.getValue().getType().isF32() || !update->getResult(0).use_empty() ||
+      target.getRank() < 2 || !target.getLayout().isIdentity() || !external || external.getAccess() != 2 ||
+      update.getTarget() != physical.uniqueOrigin(update.getTarget()) ||
+      !update->getParentOfType<scf::ForOp>()) return {};
+
+  bool valid = true;
+  root.walk([&](Operation *operation) {
+    if (operation == root || operation == update || isa<scf::YieldOp, scf::ReduceOp>(operation)) return;
+    if (auto loop = dyn_cast<scf::ForOp>(operation)) {
+      valid &= loop.getNumResults() == 0;
+      return;
+    }
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
+      valid &= physical.isReadOnly(load.getMemref());
+      return;
+    }
+    if (isa<memref::SubViewOp, memref::CastOp, memref::DimOp>(operation)) return;
+    if (!isMemoryEffectFree(operation) || operation->getNumRegions() ||
+        llvm::any_of(operation->getOperandTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
+        llvm::any_of(operation->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) valid = false;
+  });
+  if (!valid) return {};
+
+  // Only the row coordinate is evaluated by every owner. Loads must already
+  // execute once per original iteration; nested scalar dependencies must be
+  // safe even when a feature loop is empty.
+  llvm::SetVector<Operation *> dependencies;
+  std::function<bool(Value)> collect = [&](Value value) {
+    if (value == root.getInductionVars()[0]) return true;
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      return !root->isAncestor(argument.getOwner()->getParentOp());
+    Operation *definition = value.getDefiningOp();
+    if (!definition || !root->isAncestor(definition)) return true;
+    if (dependencies.contains(definition)) return true;
+    if (auto load = dyn_cast<memref::LoadOp>(definition)) {
+      if (load->getBlock() != root.getBody() || !physical.isReadOnly(load.getMemref())) return false;
+    } else if (!isMemoryEffectFree(definition) || !isSpeculatable(definition) || definition->getNumRegions() ||
+               llvm::any_of(definition->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) return false;
+    if (definition->getBlock() != root.getBody() &&
+        !isa<arith::ConstantOp, arith::IndexCastOp, arith::IndexCastUIOp,
+             arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp>(definition)) return false;
+    if (!llvm::all_of(definition->getOperands(), collect)) return false;
+    dependencies.insert(definition);
+    return true;
+  };
+  Value row = update.getIndices().front();
+  if (!collect(row)) return {};
+
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  OpBuilder b(root);
+  Location loc = root.getLoc();
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value rows = b.create<memref::DimOp>(loc, update.getTarget(), 0);
+  Value count = b.create<arith::CeilDivSIOp>(loc, rows, index(b, loc, grain));
+  count = b.create<arith::MaxSIOp>(loc, one,
+      b.create<arith::MinSIOp>(loc, count, index(b, loc, capabilities.getWorkers())));
+  Value width = b.create<arith::DivSIOp>(loc, rows, count);
+  Value remainder = b.create<arith::RemSIOp>(loc, rows, count);
+  auto owners = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+  owners->setDiscardableAttrs(root->getDiscardableAttrDictionary());
+  b.setInsertionPointToStart(owners.getBody());
+  Value owner = owners.getInductionVars()[0];
+  Value begin = add(b, loc, multiply(b, loc, owner, width),
+      b.create<arith::MinSIOp>(loc, owner, remainder));
+  Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, owner, remainder);
+  Value end = add(b, loc, begin, add(b, loc, width, b.create<arith::SelectOp>(loc, extra, one, zero)));
+  auto tokens = b.create<scf::ForOp>(loc, root.getLowerBound()[0], root.getUpperBound()[0], root.getStep()[0]);
+  b.setInsertionPointToStart(tokens.getBody());
+  IRMapping mapping;
+  mapping.map(root.getInductionVars()[0], tokens.getInductionVar());
+  for (Operation *dependency : dependencies) b.clone(*dependency, mapping);
+  Value selected = mapping.lookupOrDefault(row);
+  Value lower = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, selected, begin);
+  Value upper = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, selected, end);
+  auto active = b.create<scf::IfOp>(loc, b.create<arith::AndIOp>(loc, lower, upper), false);
+  b.setInsertionPointToStart(active.thenBlock());
+  for (Operation &operation : root.getBody()->without_terminator())
+    if (!dependencies.contains(&operation)) b.clone(operation, mapping);
+
+  // Every physical destination row now has one task owner. Keep every
+  // original f32 update in token order, without a partial sum or reassociation.
+  auto local = mapping.lookup(update->getResult(0)).getDefiningOp<AtomicRMWOp>();
+  b.setInsertionPoint(local);
+  Value old = b.create<memref::LoadOp>(loc, local.getTarget(), local.getIndices());
+  Value sum = b.create<arith::AddFOp>(loc, old, local.getValue());
+  b.create<memref::StoreOp>(loc, sum, local.getTarget(), local.getIndices());
+  local.erase();
+  root.erase();
+  return owners;
+}
+
+void foldSequentialAtomicAdds(func::FuncOp function) {
+  SmallVector<AtomicRMWOp> updates;
+  function.walk([&](AtomicRMWOp update) {
+    if (update.getOrdering() != AtomicOrdering::Relaxed || update.getKind() != AtomicRMWKind::Add ||
+        !isa<FloatType>(update.getValue().getType())) return;
+    // CPU task dispatches join before continuation; only sequential control
+    // may enclose an update with no concurrent invocation-local participant.
+    for (Operation *parent = update->getParentOp(); parent != function; parent = parent->getParentOp())
+      if (!isa<scf::ForOp, scf::IfOp>(parent)) return;
+    updates.push_back(update);
+  });
+  for (auto update : updates) {
+    OpBuilder b(update);
+    Location loc = update.getLoc();
+    Value old = b.create<memref::LoadOp>(loc, update.getTarget(), update.getIndices());
+    Value sum = b.create<arith::AddFOp>(loc, old, update.getValue());
+    b.create<memref::StoreOp>(loc, sum, update.getTarget(), update.getIndices());
+    update.getOldValue().replaceAllUsesWith(old);
+    update.erase();
+  }
+}
+
+}
+
+LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
+  partitionScalarSums(function, grain);
+  if (failed(exposeStructuredWorksets(function, implementations))) return failure();
+  SmallVector<scf::ParallelOp> roots;
+  function.walk([&](scf::ParallelOp operation) {
+    if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);
+  });
+  for (scf::ParallelOp root : roots) {
+    foldDisjointCompareExchange(function, root);
+    auto owners = partitionAtomicRows(function, root, grain);
+    // Atomic row worksets have already consumed the grain and worker budget.
+    if (failed(partition(owners ? owners : root, owners ? 1 : grain))) return failure();
+  }
+  foldSequentialAtomicAdds(function);
+  return success();
+}
+
+LogicalResult isolateTasks(func::FuncOp function) {
+  SmallVector<QuantizeOp> preparations;
+  function.walk([&](QuantizeOp operation) {
+    if (!operation->getParentOfType<scf::ParallelOp>() &&
+        !operation->getParentOfType<TasksOp>() &&
+        !operation->getParentOfType<TaskDispatchOp>())
+      preparations.push_back(operation);
+  });
+  for (auto preparation : preparations) {
+    OpBuilder b(preparation);
+    auto loc = preparation.getLoc();
+    auto task = b.create<scf::ParallelOp>(loc, ValueRange{index(b, loc, 0)},
+        ValueRange{index(b, loc, 1)}, ValueRange{index(b, loc, 1)});
+    preparation->moveBefore(task.getBody()->getTerminator());
+  }
+  SmallVector<scf::ParallelOp> operations;
+  function.walk([&](scf::ParallelOp operation) { operations.push_back(operation); });
+  for (auto parallel : operations) {
+    if (parallel.getNumLoops() != 1 || parallel.getNumResults() ||
+        !matchPattern(parallel.getLowerBound()[0], m_Zero()) ||
+        !matchPattern(parallel.getStep()[0], m_One()))
+      return parallel.emitError("task isolation requires the partitioned one-dimensional workset");
+    llvm::SetVector<Value> used;
+    getUsedValuesDefinedAbove(parallel.getRegion(), used);
+    SmallVector<Value> captures;
+    for (Value value : used)
+      if (!value.getDefiningOp<arith::ConstantOp>()) captures.push_back(value);
+    OpBuilder b(parallel);
+    auto tasks = b.create<TasksOp>(parallel.getLoc(), parallel.getUpperBound()[0], captures);
+    Block *body = new Block;
+    tasks.getBody().push_back(body);
+    body->addArgument(b.getIndexType(), parallel.getLoc());
+    IRMapping mapping;
+    mapping.map(parallel.getInductionVars()[0], body->getArgument(0));
+    for (Value capture : captures)
+      mapping.map(capture, body->addArgument(capture.getType(), capture.getLoc()));
+    b.setInsertionPointToStart(body);
+    for (Value value : used)
+      if (auto constant = value.getDefiningOp<arith::ConstantOp>()) b.clone(*constant, mapping);
+    for (Operation &operation : parallel.getBody()->without_terminator()) b.clone(operation, mapping);
+    b.create<TaskYieldOp>(parallel.getLoc());
+    parallel.erase();
+  }
+  return success();
+}
+
+LogicalResult materializeTaskDispatches(func::FuncOp function) {
+  auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  SmallVector<TasksOp> operations;
+  function.walk([&](TasksOp tasks) { operations.push_back(tasks); });
+  for (auto tasks : operations) {
+    OpBuilder b(tasks);
+    Location loc = tasks.getLoc();
+    Value workers = b.create<arith::MaxSIOp>(loc, index(b, loc, 1),
+        b.create<arith::MinSIOp>(loc, tasks.getCount(), index(b, loc, capabilities.getWorkers())));
+    Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, tasks.getCount(), index(b, loc, 0));
+    auto active = b.create<scf::IfOp>(loc, nonempty, false);
+    b.setInsertionPointToStart(active.thenBlock());
+    Value width = b.create<arith::DivSIOp>(loc, tasks.getCount(), workers);
+    Value remainder = b.create<arith::RemSIOp>(loc, tasks.getCount(), workers);
+    auto dispatch = b.create<TaskDispatchOp>(loc, workers, workers);
+    Block *body = &dispatch.getBody().emplaceBlock();
+    body->addArgument(b.getIndexType(), loc);
+    IRMapping mapping;
+    Block &original = tasks.getBody().front();
+    for (auto [argument, capture] : llvm::zip(original.getArguments().drop_front(), tasks.getCaptures()))
+      mapping.map(argument, capture);
+    b.setInsertionPointToStart(body);
+    Value ordinal = body->getArgument(0);
+    Value extraBefore = b.create<arith::MinSIOp>(loc, ordinal, remainder);
+    Value begin = add(b, loc, multiply(b, loc, ordinal, width), extraBefore);
+    Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, remainder);
+    Value count = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, index(b, loc, 1), index(b, loc, 0)));
+    loop(b, loc, begin, add(b, loc, begin, count), 1, [&](Value task) {
+      mapping.map(original.getArgument(0), task);
+      for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
+    });
+    b.create<TaskYieldOp>(loc);
+    tasks.erase();
+  }
+  return success();
+}
+
+}

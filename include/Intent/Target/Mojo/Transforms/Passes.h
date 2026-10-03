@@ -3,7 +3,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 namespace intent::mojo {
 #define GEN_PASS_DECL
 #include "Intent/Target/Mojo/Transforms/Passes.h.inc"

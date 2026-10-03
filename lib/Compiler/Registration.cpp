@@ -6,13 +6,14 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/IR/ImplementationProvider.h"
-#include "Intent/Dialect/CPU/Transforms/Implementation.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
-#include "Intent/Dialect/CPU/Transforms/Bufferization.h"
+#include "Intent/Dialect/CPU/Transforms/Storage/Bufferization.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Transforms/Passes.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/StringMap.h"
@@ -43,6 +44,7 @@ private:
 
 void registerDialects(DialectRegistry &registry) {
   registerAllDialects(registry);
+  func::registerInlinerExtension(registry);
   cpu::registerExtentRelations(registry);
   cpu::registerStorageInterfaces(registry);
   cpu::registerValueBufferizationInterfaces(registry);
