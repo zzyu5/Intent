@@ -2,9 +2,10 @@
 #include "RegionSources.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -276,8 +277,16 @@ Type boundProjectionType(Type original, Type actual,
                          target.getOwner());
 }
 
-void bindClonedRanges(Operation *root) {
-  root->walk([&](MakeRangeOp range) {
+void bindClonedRanges(Operation *source, const IRMapping &mapping,
+                      OpBuilder::InsertPoint insertion, Operation *previous) {
+  source->walk([&](MakeRangeOp original) {
+    Value mapped = mapping.lookupOrNull(original.getResult());
+    auto range = mapped ? mapped.getDefiningOp<MakeRangeOp>() : MakeRangeOp{};
+    if (!range || range == original) return;
+    Operation *created = insertion.getBlock()->findAncestorOpInBlock(*range);
+    if (!created || (previous && !previous->isBeforeInBlock(created)) ||
+        (insertion.getPoint() != insertion.getBlock()->end() &&
+         !created->isBeforeInBlock(&*insertion.getPoint()))) return;
     auto originalExtent =
         range.getExtent().getDefiningOp<arith::ConstantIndexOp>();
     bool coveredIntroducedUnitDomain =
@@ -322,8 +331,21 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     reason = "helper has no physical yield";
     return failure();
   }
-  IRMapping localMapping;
-  IRMapping &mapping = resultMapping ? *resultMapping : localMapping;
+  // Keep the invocation's published mapping and insertion block unchanged if
+  // any later field projection or tail binding rejects the reconstructed helper.
+  IRMapping mapping = resultMapping ? *resultMapping : IRMapping{};
+  auto insertion = builder.saveInsertionPoint();
+  Operation *previous = insertion.getPoint() == insertion.getBlock()->begin()
+      ? nullptr : &*std::prev(insertion.getPoint());
+  auto rollback = llvm::make_scope_exit([&] {
+    auto end = insertion.getPoint();
+    while (end != insertion.getBlock()->begin()) {
+      Operation *operation = &*std::prev(end);
+      if (operation == previous) break;
+      operation->erase();
+    }
+    builder.restoreInsertionPoint(insertion);
+  });
   SmallVector<ExtentBinding> extentBindings;
   for (auto [argument, value] :
        llvm::zip(region.front().getArguments(), arguments)) {
@@ -435,14 +457,15 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     for (Value result : operation.getResults())
       selectedTypes.push_back(bindPhysicalExtents(result.getType(), extentBindings,
                                                  &operation));
-    Operation *clone = builder.clone(operation, mapping);
-    if (failed(rewriteClonedPhysicalTypes(
-            &operation, clone,
+    auto cloneInsertion = builder.saveInsertionPoint();
+    Operation *clonePrevious = cloneInsertion.getPoint() == cloneInsertion.getBlock()->begin()
+        ? nullptr : &*std::prev(cloneInsertion.getPoint());
+    auto cloned = cloneWithPhysicalSchema(
+            builder, &operation, mapping,
             [&](Value original) {
               return bindPhysicalExtents(original.getType(), extentBindings,
                                          original.getDefiningOp());
             },
-            {},
             [&](OpOperand &operand, unsigned sourceAxis, OpResult result,
                 unsigned resultAxis) {
               auto sourceType = dyn_cast<FragmentType>(operand.get().getType());
@@ -456,14 +479,15 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
                   boundAxis(resultType, resultAxis, extentBindings,
                             result.getOwner());
               return input && output && sameBoundDomain(*input, *output);
-            }))) {
+            });
+    if (failed(cloned)) {
       reason = "helper operands cannot transport the declared fragment schema";
       return failure();
     }
-    bindClonedRanges(clone);
+    bindClonedRanges(&operation, mapping, cloneInsertion, clonePrevious);
     for (unsigned index = 0; index < operation.getNumResults(); ++index) {
       Value originalValue = operation.getResult(index);
-      auto projected = projectBound(originalValue, clone->getResult(index));
+      auto projected = projectBound(originalValue, (*cloned)[index]);
       if (failed(projected)) return failure();
       mapping.map(originalValue, *projected);
       auto original = dyn_cast<FragmentType>(operation.getResult(index).getType());
@@ -488,7 +512,7 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
       }
     }
     for (auto [source, result] :
-         llvm::zip(operation.getResults(), clone->getResults())) {
+         llvm::zip(operation.getResults(), *cloned)) {
       if (source == conjunctSource) {
         Value mapped = mapping.lookupOrNull(source);
         FailureOr<Value> combined = conjoin(mapped ? mapped : result);
@@ -511,6 +535,8 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     if (failed(projected)) return failure();
     results.push_back(*projected);
   }
+  if (resultMapping) *resultMapping = std::move(mapping);
+  rollback.release();
   return results;
 }
 

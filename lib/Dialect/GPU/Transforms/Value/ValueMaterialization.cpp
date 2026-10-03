@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -427,8 +428,11 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
         return failure();
       mapping.map(operand, *projected);
     }
-    projection = builder.clone(*definition, mapping);
-    projection->getResult(0).setType(target);
+    auto rebuilt = cloneWithSchema(builder, definition, mapping,
+                                    TypeRange{target});
+    if (failed(rebuilt))
+      return failure();
+    return rebuilt->front();
   }
   if (!projection)
     return failure();

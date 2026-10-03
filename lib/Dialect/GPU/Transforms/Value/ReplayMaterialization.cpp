@@ -3,7 +3,7 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
-#include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
@@ -30,6 +30,31 @@ using namespace mlir;
 
 namespace intent::gpu {
 namespace {
+
+class ReplayInsertion {
+public:
+  explicit ReplayInsertion(OpBuilder &builder)
+      : builder(builder), insertion(builder.saveInsertionPoint()),
+        previous(insertion.getPoint() == insertion.getBlock()->begin()
+            ? nullptr : &*std::prev(insertion.getPoint())) {}
+  ~ReplayInsertion() {
+    if (committed) return;
+    auto end = insertion.getPoint();
+    while (end != insertion.getBlock()->begin()) {
+      Operation *operation = &*std::prev(end);
+      if (operation == previous) break;
+      operation->erase();
+    }
+    builder.restoreInsertionPoint(insertion);
+  }
+  void commit() { committed = true; }
+
+private:
+  OpBuilder &builder;
+  OpBuilder::InsertPoint insertion;
+  Operation *previous;
+  bool committed = false;
+};
 
 bool availableAtInsertionPoint(Value value, OpBuilder &builder,
                                DominanceInfo &dominance) {
@@ -104,9 +129,9 @@ public:
     if (auto load = dyn_cast<LoadOp>(producer);
         load && !canReplayReadAt(load, insertionAnchor))
       return failure();
-    Operation *clone = builder.clone(*producer, mapping);
-    mapping.map(value, clone->getResult(0));
-    return clone->getResult(0);
+    auto cloned = cloneWithSchema(builder, producer, mapping, producer->getResultTypes());
+    if (failed(cloned)) return failure();
+    return (*cloned)[0];
   }
   if (!kernel)
     return failure();
@@ -204,73 +229,14 @@ public:
     }
   }
   IRMapping cloneMapping(mapping);
-  Value accumulator;
-  if (auto contract = dyn_cast<ContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  else if (auto contract = dyn_cast<ScaledContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  else if (auto contract = dyn_cast<SparseContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  if (accumulator) {
-    Value current = mapping.lookupOrDefault(accumulator);
-    if (current.getType() != targetType) {
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, location, current, targetType);
-      if (failed(projected)) {
-        producer->emitOpError(
-            "replayed structured value accumulator cannot adopt its result schema");
-        return failure();
-      }
-      cloneMapping.map(accumulator, *projected);
-    }
-  }
-  if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp, LoadOp>(producer)) {
-    for (Value operand : producer->getOperands()) {
-      if (auto load = dyn_cast<LoadOp>(producer);
-          load && operand != load.getValid() && operand != load.getFill())
-        continue;
-      Value current = cloneMapping.lookupOrDefault(operand);
-      auto fragment = dyn_cast<FragmentType>(current.getType());
-      if (!fragment)
-        continue;
-      auto operandTarget = FragmentType::get(
-          targetType.getContext(), fragment.getElementType(),
-          targetType.getShape(), targetType.getAxisMaps(),
-          targetType.getValidity(), targetType.getOwner());
-      if (current.getType() == operandTarget)
-        continue;
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, location, current, operandTarget);
-      if (failed(projected)) {
-        InFlightDiagnostic diagnostic = producer->emitOpError(
-            "replayed operand cannot adopt the selected range relation")
-            << "; operand=" << current.getType()
-            << "; target=" << operandTarget;
-        if (Operation *definition = current.getDefiningOp())
-          diagnostic << "; operand_producer=" << definition->getName()
-                     << "; operand_location=" << definition->getLoc();
-        auto selectedOperand =
-            PhysicalProgramAnalysis(kernel).rangeAxes(operand, roots);
-        diagnostic << "; selected_operand_axes="
-                   << selectedOperand.fragmentAxes.size();
-        return failure();
-      }
-      cloneMapping.map(operand, *projected);
-    }
-  }
   if (auto load = dyn_cast<LoadOp>(producer);
       load && !canReplayReadAt(load, insertionAnchor))
     return failure();
-  Operation *clone = builder.clone(*producer, cloneMapping);
-  auto resultType = dyn_cast<FragmentType>(clone->getResult(0).getType());
-  if (!resultType) {
-    clone->emitOpError("replayed value did not preserve a fragment result");
-    return failure();
-  }
-  clone->getResult(0).setType(targetType);
+  auto cloned = cloneWithSchema(builder, producer, cloneMapping, TypeRange{targetType});
+  if (failed(cloned)) return failure();
   if (!mapping.lookupOrNull(value))
-    mapping.map(value, clone->getResult(0));
-  return clone->getResult(0);
+    mapping.map(value, (*cloned)[0]);
+  return (*cloned)[0];
 
   }
 
@@ -304,11 +270,13 @@ private:
 FailureOr<Value> materializeReplayedRanges(
     OpBuilder &builder, Location location, Value value,
     PhysicalExprAttr blockedExtent, ArrayRef<MakeRangeOp> roots,
-    Value replacement, IRMapping &mapping, Operation *insertionAnchor) {
+    Value replacement, IRMapping &resultMapping, Operation *insertionAnchor) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel || roots.empty() || !insertionAnchor ||
       !builder.getInsertionBlock())
     return failure();
+  IRMapping mapping(resultMapping);
+  ReplayInsertion insertion(builder);
   auto source = sourceAxisIdentity(roots.front());
   auto dimension = queryRangeDimension(roots.front());
   if (failed(dimension) || !llvm::all_of(roots, [&](MakeRangeOp root) {
@@ -327,17 +295,23 @@ FailureOr<Value> materializeReplayedRanges(
     return failure();
   RangeValueReplay materialization(builder, location, kernel, blockedExtent,
                                    replacement, mapping, insertionAnchor);
-  return materialization.replay(value, roots);
+  auto result = materialization.replay(value, roots);
+  if (failed(result)) return failure();
+  resultMapping = std::move(mapping);
+  insertion.commit();
+  return result;
 }
 
 FailureOr<Value> materializeReplayedValue(
     OpBuilder &builder, Location location, Value value,
     PhysicalSourceAxis source, PhysicalExprAttr blockedExtent,
-    IRMapping &mapping, Operation *insertionAnchor,
+    IRMapping &resultMapping, Operation *insertionAnchor,
     ReplayMaterializationOptions options) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel || !insertionAnchor || !builder.getInsertionBlock())
     return failure();
+  IRMapping mapping(resultMapping);
+  ReplayInsertion insertion(builder);
   PhysicalProgramAnalysis analysis(kernel);
   DominanceInfo dominance(kernel);
   auto available = [&](Value current) {
@@ -622,20 +596,19 @@ FailureOr<Value> materializeReplayedValue(
           return failure();
         cloneMapping.map(operand, *replayed);
       }
-      Operation *clone = builder.clone(*producer, cloneMapping);
-      if (failed(rewriteClonedPhysicalTypes(producer, clone, [&](Value original) {
+      auto cloned = cloneWithPhysicalSchema(builder, producer, cloneMapping, [&](Value original) {
             return replaceReplayType(original.getType());
-          })))
-        return failure();
+          });
+      if (failed(cloned)) return failure();
       for (auto [original, result] :
-           llvm::zip(producer->getResults(), clone->getResults())) {
+           llvm::zip(producer->getResults(), *cloned)) {
         if (!mapping.lookupOrNull(original))
           mapping.map(original, result);
       }
       auto result = dyn_cast<OpResult>(current);
-      if (!result || result.getResultNumber() >= clone->getNumResults())
+      if (!result || result.getResultNumber() >= cloned->size())
         return failure();
-      Value replayed = clone->getResult(result.getResultNumber());
+      Value replayed = (*cloned)[result.getResultNumber()];
       return replayed;
     }
     if (!fragment) {
@@ -654,9 +627,10 @@ FailureOr<Value> materializeReplayedValue(
           return failure();
         operands.map(operand, *replayed);
       }
-      Operation *clone = builder.clone(*producer, operands);
-      mapping.map(current, clone->getResult(0));
-      return clone->getResult(0);
+      auto cloned = cloneWithSchema(builder, producer, operands, producer->getResultTypes());
+      if (failed(cloned)) return failure();
+      mapping.map(current, (*cloned)[0]);
+      return (*cloned)[0];
     }
     if (!projection) {
       Operation *producer = current.getDefiningOp();
@@ -676,9 +650,11 @@ FailureOr<Value> materializeReplayedValue(
       }
       if (!changed && available(current))
         return current;
-      Operation *clone = builder.clone(*producer, cloneMapping);
-      remember(current, clone->getResult(0), std::nullopt);
-      return clone->getResult(0);
+      auto cloned = cloneWithPhysicalSchema(builder, producer, cloneMapping,
+          [](Value original) { return original.getType(); });
+      if (failed(cloned)) return failure();
+      remember(current, (*cloned)[0], std::nullopt);
+      return (*cloned)[0];
     }
     unsigned axis = *projection;
     Operation *producer = current.getDefiningOp();
@@ -884,11 +860,11 @@ FailureOr<Value> materializeReplayedValue(
           if (batch.lhs == inputAxis && failed(replayAxis(1, batch.rhs)))
             return failure();
       IRMapping cloneMapping(mapping);
-      Operation *clone = builder.clone(*producer, cloneMapping);
-      clone->setOperands(operands);
-      clone->getResult(0).setType(replaceReplayAxis(fragment, axis));
-      remember(current, clone->getResult(0), projection);
-      return clone->getResult(0);
+      auto cloned = cloneWithSchema(builder, producer, operands, cloneMapping,
+                                   TypeRange{replaceReplayAxis(fragment, axis)});
+      if (failed(cloned)) return failure();
+      remember(current, (*cloned)[0], projection);
+      return (*cloned)[0];
     }
 
     if (isa<BroadcastOp, SplatOp>(producer)) {
@@ -971,25 +947,10 @@ FailureOr<Value> materializeReplayedValue(
       if (failed(refined))
         return failure();
       pointwiseType = *refined;
-      for (Value operand : producer->getOperands()) {
-        Value replayed = cloneMapping.lookupOrDefault(operand);
-        Type element = replayed.getType();
-        if (auto type = dyn_cast<FragmentType>(element))
-          element = type.getElementType();
-        auto target = FragmentType::get(
-            kernel.getContext(), element, pointwiseType.getShape(),
-            pointwiseType.getAxisMaps(), pointwiseType.getValidity(),
-            pointwiseType.getOwner());
-        auto projected = projectPhysicalValueToSchema(builder, location, replayed, target);
-        if (failed(projected))
-          return failure();
-        cloneMapping.map(operand, *projected);
-      }
     }
-    Operation *clone = builder.clone(*producer, cloneMapping);
-    bool structuredResults = pureBranch || isa<ReduceOp, ScanOp>(clone);
+    bool structuredResults = pureBranch || isa<ReduceOp, ScanOp>(producer);
     bool introducedUnitAxis = isIntroducedReshapeUnitAxis(current, axis);
-    if (failed(rewriteClonedPhysicalTypes(producer, clone, [&](Value original) -> Type {
+    auto cloned = cloneWithPhysicalSchema(builder, producer, cloneMapping, [&](Value original) -> Type {
           bool directResult = original.getDefiningOp() == producer;
           Type type = original.getType();
           if (!directResult)
@@ -1006,17 +967,17 @@ FailureOr<Value> materializeReplayedValue(
           if (!selected || axis >= selected.getShape().size())
             return {};
           return introducedUnitAxis ? type : replaceReplayAxis(selected, axis);
-        })))
-      return failure();
-    for (auto [original, cloned] :
-         llvm::zip(producer->getResults(), clone->getResults())) {
+        });
+    if (failed(cloned)) return failure();
+    for (auto [original, resultValue] :
+         llvm::zip(producer->getResults(), *cloned)) {
       if (!hasMultipleReplayAxes(original.getType()))
-        mapping.map(original, cloned);
+        mapping.map(original, resultValue);
     }
     auto result = dyn_cast<OpResult>(current);
-    if (!result || result.getResultNumber() >= clone->getNumResults())
+    if (!result || result.getResultNumber() >= cloned->size())
       return failure();
-    Value clonedValue = clone->getResult(result.getResultNumber());
+    Value clonedValue = (*cloned)[result.getResultNumber()];
     auto clonedType = dyn_cast<FragmentType>(clonedValue.getType());
     if (!clonedType || axis >= clonedType.getShape().size())
       return failure();
@@ -1025,7 +986,10 @@ FailureOr<Value> materializeReplayedValue(
   };
 
   FailureOr<Value> result = materialize(value, options.fragmentAxis);
-  return projectionFailed ? FailureOr<Value>(failure()) : result;
+  if (projectionFailed || failed(result)) return failure();
+  resultMapping = std::move(mapping);
+  insertion.commit();
+  return result;
 }
 
 } // namespace intent::gpu

@@ -2,6 +2,7 @@
 #include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
@@ -398,9 +399,10 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
       return failure();
     value = *projected;
   } else {
-    Operation *replacement = builder.clone(*producer, mapping);
-    replacement->getResult(0).setType(resultType);
-    value = replacement->getResult(0);
+    auto replacement = cloneWithSchema(builder, producer, mapping, TypeRange{resultType});
+    if (failed(replacement))
+      return failure();
+    value = replacement->front();
   }
   if (gather.getValid())
     value = builder.create<SelectOp>(gather.getLoc(), resultType, gather.getValid(),

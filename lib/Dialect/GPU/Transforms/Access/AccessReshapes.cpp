@@ -1,6 +1,7 @@
 #include "AccessComposition.h"
 #include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -80,6 +81,7 @@ bool composeReshapedPointwise(ReshapeOp reshape) {
   }
   OpBuilder builder(reshape);
   IRMapping mapping;
+  SmallVector<Operation *> projectedOperands;
   for (Value operand : producer->getOperands()) {
     auto fragment = dyn_cast<FragmentType>(operand.getType());
     if (!fragment || mapping.contains(operand))
@@ -87,13 +89,17 @@ bool composeReshapedPointwise(ReshapeOp reshape) {
     auto target = FragmentType::get(
         result.getContext(), fragment.getElementType(), result.getShape(),
         result.getAxisMaps(), result.getValidity(), result.getOwner());
-    mapping.map(operand, builder.create<ReshapeOp>(
-                             reshape.getLoc(), target, operand,
-                             reshape.getReassociation()).getResult());
+    auto projected = builder.create<ReshapeOp>(
+        reshape.getLoc(), target, operand, reshape.getReassociation());
+    projectedOperands.push_back(projected);
+    mapping.map(operand, projected.getResult());
   }
-  Operation *replacement = builder.clone(*producer, mapping);
-  replacement->getResult(0).setType(result);
-  reshape.getResult().replaceAllUsesWith(replacement->getResult(0));
+  auto replacement = cloneWithSchema(builder, producer, mapping, TypeRange{result});
+  if (failed(replacement)) {
+    for (Operation *projected : llvm::reverse(projectedOperands)) projected->erase();
+    return false;
+  }
+  reshape.getResult().replaceAllUsesWith(replacement->front());
   reshape.erase();
   return true;
 }
@@ -1055,10 +1061,10 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
         mapping.map(value, *projected);
       return projected;
     }
-    Operation *clone = builder.clone(*producer, mapping);
-    clone->getResult(0).setType(target);
-    mapping.map(value, clone->getResult(0));
-    return clone->getResult(0);
+    auto cloned = cloneWithSchema(builder, producer, mapping, TypeRange{target});
+    if (failed(cloned))
+      return failure();
+    return cloned->front();
   };
   FailureOr<Value> payload = replayEpilogue(store.getValue());
   if (failed(payload))

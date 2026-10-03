@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -15,30 +16,6 @@ using namespace mlir;
 
 namespace intent::gpu::reduction {
 namespace {
-
-void retargetHelperSourceExtent(Region &region, PhysicalSourceAxis source,
-                                PhysicalExprAttr logicalExtent,
-                                PhysicalExprAttr physicalExtent) {
-  auto retarget = [&](Value value) {
-    auto fragment = dyn_cast<FragmentType>(value.getType());
-    if (!fragment)
-      return;
-    PhysicalAxisProjection projected = queryFragmentAxis(fragment, source);
-    if (!projected.isExact() ||
-        fragment.getShape()[projected.fragmentAxis] != logicalExtent)
-      return;
-    value.setType(
-        replaceExtent(fragment, projected.fragmentAxis, physicalExtent));
-  };
-  for (Block &block : region) {
-    for (BlockArgument argument : block.getArguments())
-      retarget(argument);
-    block.walk([&](Operation *operation) {
-      for (Value result : operation->getResults())
-        retarget(result);
-    });
-  }
-}
 
 FailureOr<Value> clonePaddedProducer(
     OpBuilder &builder, Location location, Value value,
@@ -304,14 +281,19 @@ FailureOr<Value> clonePaddedProducer(
     if (!mapping.lookupOrNull(operand) && *replayed != operand)
       mapping.map(operand, *replayed);
   }
-  Operation *clone = builder.clone(*producer, mapping);
-  if (auto clonedReduce = dyn_cast<ReduceOp>(clone))
-    retargetHelperSourceExtent(clonedReduce.getCombine(), reductionSource,
-                               logicalExtent, physicalExtent);
   auto paddedType = replaceExtent(fragment, reductionAxis, physicalExtent);
-  clone->getResult(0).setType(paddedType);
-  mapping.map(value, clone->getResult(0));
-  return clone->getResult(0);
+  auto cloned = cloneWithPhysicalSchema(builder, producer, mapping,
+      [&](Value original) -> Type {
+        if (original == value) return paddedType;
+        auto type = dyn_cast<FragmentType>(original.getType());
+        if (!type) return original.getType();
+        auto axis = queryFragmentAxis(type, reductionSource);
+        if (!axis.isExact() || type.getShape()[axis.fragmentAxis] != logicalExtent)
+          return type;
+        return replaceExtent(type, axis.fragmentAxis, physicalExtent);
+      });
+  if (failed(cloned)) return failure();
+  return mapping.lookup(value);
 }
 
 } // namespace

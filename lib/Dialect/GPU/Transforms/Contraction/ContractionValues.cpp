@@ -3,6 +3,7 @@
 #include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
@@ -848,8 +849,9 @@ FailureOr<Value> materializeStorePath(
       }
       mapping.map(operand, *replayed);
     }
-    Operation *clone = builder.clone(*operation, mapping);
-    clone->getResult(0).setType(schema(operation->getResult(0).getType()));
+    Type result = schema(operation->getResult(0).getType());
+    if (failed(cloneWithSchema(builder, operation, mapping, TypeRange{result})))
+      return failure();
   }
   Value result = mapping.lookupOrNull(path.store.getValue());
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());

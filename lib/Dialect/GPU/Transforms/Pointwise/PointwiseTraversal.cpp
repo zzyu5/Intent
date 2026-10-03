@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/MathExtras.h"
@@ -515,37 +516,24 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         }
       }
     }
-    Operation *clone = builder.clone(*producer, mapping);
-    for (auto [original, cloned] :
-         llvm::zip(producer->getResults(), clone->getResults())) {
-      cloned.setType(replaceTraversalExtent(
-          original.getType(), source, traversalDimensions, blockedExtent));
-      if (!mapping.lookupOrNull(original))
-        mapping.map(original, cloned);
-    }
-    bool structuredControl = isa<scf::IfOp, scf::ForOp>(clone);
+    auto cloned = cloneWithPhysicalSchema(builder, producer, mapping,
+        [&](Value original) {
+          return replaceTraversalExtent(original.getType(), source,
+                                         traversalDimensions, blockedExtent);
+        });
+    if (failed(cloned)) return failure();
+    replayed = (*cloned)[selectedResult.getResultNumber()];
+    bool structuredControl = isa<scf::IfOp, scf::ForOp>(producer);
     llvm::SmallPtrSet<Operation *, 8> controlRanges;
     for (MakeRangeOp sourceRange : controlSourceRanges)
       if (Value mappedRange = mapping.lookupOrNull(sourceRange.getResult()))
         if (auto range = mappedRange.getDefiningOp<MakeRangeOp>())
           controlRanges.insert(range);
     llvm::DenseMap<Value, Value> controlTails;
-    if (isa<ReduceOp, ScanOp, RegionFoldOp, RegionScanOp>(clone) || structuredControl)
-      for (Region &region : clone->getRegions())
+    if (isa<ReduceOp, ScanOp, RegionFoldOp, RegionScanOp>(producer) || structuredControl)
+      for (Region &region : replayed.getDefiningOp()->getRegions())
         for (Block &block : region) {
-          for (BlockArgument argument : block.getArguments())
-            argument.setType(replaceTraversalExtent(
-                argument.getType(), source, traversalDimensions, blockedExtent));
           WalkResult walked = block.walk([&](Operation *nested) -> WalkResult {
-            for (Region &region : nested->getRegions())
-              for (Block &block : region)
-                for (BlockArgument argument : block.getArguments())
-                  argument.setType(replaceTraversalExtent(
-                      argument.getType(), source, traversalDimensions, blockedExtent));
-            for (Value nestedResult : nested->getResults())
-              nestedResult.setType(replaceTraversalExtent(
-                  nestedResult.getType(), source, traversalDimensions,
-                  blockedExtent));
             auto range = dyn_cast<MakeRangeOp>(nested);
             FailureOr<int64_t> dimension =
                 range ? queryRangeDimension(range)
@@ -598,7 +586,6 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     if (!controlTails.empty() && failed(addTailValidity(kernel, controlTails,
                                                        /*includeStores=*/false)))
       return failure();
-    replayed = clone->getResult(selectedResult.getResultNumber());
   }
   if (!mapping.lookupOrNull(value))
     mapping.map(value, replayed);

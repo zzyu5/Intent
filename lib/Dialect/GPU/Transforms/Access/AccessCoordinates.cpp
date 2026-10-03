@@ -1,6 +1,7 @@
 #include "AccessComposition.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
@@ -86,18 +87,16 @@ FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
     mapping.map(value, *projected);
     return *projected;
   }
-  Operation *clone = builder.clone(*producer, mapping);
-  for (Value result : clone->getResults()) {
-    auto original = dyn_cast<FragmentType>(result.getType());
-    if (!original)
-      continue;
-    result.setType(FragmentType::get(
+  SmallVector<Type> types;
+  for (Type type : producer->getResultTypes()) {
+    auto original = dyn_cast<FragmentType>(type);
+    types.push_back(original ? Type(FragmentType::get(
         target.getContext(), original.getElementType(), target.getShape(),
-        target.getAxisMaps(), target.getValidity(), target.getOwner()));
+        target.getAxisMaps(), target.getValidity(), target.getOwner())) : type);
   }
-  Value result = clone->getResult(0);
-  mapping.map(value, result);
-  return result;
+  if (failed(cloneWithSchema(builder, producer, mapping, types)))
+    return failure();
+  return mapping.lookup(value);
 }
 
 FailureOr<Value> replayScalarValue(OpBuilder &builder, Value value,
@@ -135,13 +134,14 @@ FailureOr<Value> replayScalarValue(OpBuilder &builder, Value value,
     if (*replacement != operand && !mapping.lookupOrNull(operand))
       mapping.map(operand, *replacement);
   }
-  Operation *clone = builder.clone(*producer, mapping);
-  for (Value result : clone->getResults())
-    if (auto resultType = dyn_cast<FragmentType>(result.getType()))
-      result.setType(resultType.getElementType());
-  Value result = clone->getResult(0);
-  mapping.map(value, result);
-  return result;
+  SmallVector<Type> types;
+  for (Type type : producer->getResultTypes()) {
+    auto fragment = dyn_cast<FragmentType>(type);
+    types.push_back(fragment ? fragment.getElementType() : type);
+  }
+  if (failed(cloneWithSchema(builder, producer, mapping, types)))
+    return failure();
+  return mapping.lookup(value);
 }
 
 FailureOr<Value> combinePredicates(OpBuilder &builder, Location location,

@@ -25,98 +25,6 @@ void setPhysicalValueType(Value value, Type type, ValueTypeChangeCallback change
     changed(value, previous);
 }
 
-LogicalResult rewriteClonedPhysicalTypes(
-    Operation *source, Operation *clone,
-    llvm::function_ref<Type(Value)> transform, ValueTypeChangeCallback changed,
-    ClonedAxisRefinement refineBroadcast) {
-  struct Snapshot {
-    Operation *source;
-    Operation *clone;
-    SmallVector<SmallVector<FragmentOperandRelation>, 1> relations;
-  };
-  SmallVector<Snapshot, 0> snapshots;
-  std::function<LogicalResult(Operation *, Operation *)> capture =
-      [&](Operation *original, Operation *copy) -> LogicalResult {
-        if (original->getName() != copy->getName() ||
-            original->getNumResults() != copy->getNumResults() ||
-            original->getNumRegions() != copy->getNumRegions())
-          return copy->emitOpError(
-              "cloned schema has a different operation structure");
-        Snapshot snapshot{original, copy, {}};
-        if (isa<FragmentOpInterface>(original))
-          for (OpResult result : original->getResults()) {
-            auto relation = queryFragmentOperandRelations(result);
-            if (failed(relation))
-              return original->emitOpError(
-                  "source operation has no complete fragment relation");
-            snapshot.relations.push_back(std::move(*relation));
-          }
-        snapshots.push_back(std::move(snapshot));
-        for (auto [before, after] :
-             llvm::zip(original->getRegions(), copy->getRegions())) {
-          if (before.getBlocks().size() != after.getBlocks().size())
-            return copy->emitOpError(
-                "cloned schema has a different region structure");
-          for (auto [oldBlock, newBlock] : llvm::zip(before, after)) {
-            if (oldBlock.getNumArguments() != newBlock.getNumArguments() ||
-                oldBlock.getOperations().size() !=
-                    newBlock.getOperations().size())
-              return copy->emitOpError(
-                  "cloned schema has a different block structure");
-            for (auto [oldOp, newOp] : llvm::zip(oldBlock, newBlock))
-              if (failed(capture(&oldOp, &newOp)))
-                return failure();
-          }
-        }
-        return success();
-      };
-  if (failed(capture(source, clone)))
-    return failure();
-  auto rewrite = [&](Value before, Value after) -> LogicalResult {
-    Type type = transform(before);
-    if (!type)
-      return clone->emitOpError("unsupported cloned physical value schema");
-    setPhysicalValueType(after, type, changed);
-    return success();
-  };
-  for (const Snapshot &snapshot : snapshots) {
-    for (auto [before, after] :
-         llvm::zip(snapshot.source->getResults(), snapshot.clone->getResults()))
-      if (failed(rewrite(before, after)))
-        return failure();
-    for (auto [before, after] :
-         llvm::zip(snapshot.source->getRegions(), snapshot.clone->getRegions()))
-      for (auto [oldBlock, newBlock] : llvm::zip(before, after))
-        for (auto [oldArgument, newArgument] :
-             llvm::zip(oldBlock.getArguments(), newBlock.getArguments()))
-          if (failed(rewrite(oldArgument, newArgument)))
-            return failure();
-    for (auto [index, relations] : llvm::enumerate(snapshot.relations)) {
-      auto original =
-          dyn_cast<FragmentType>(snapshot.source->getResult(index).getType());
-      auto actual =
-          dyn_cast<FragmentType>(snapshot.clone->getResult(index).getType());
-      if (!original || !actual)
-        continue;
-      auto transported = transportFragmentResultType(
-          relations, snapshot.clone->getOperandTypes(), actual,
-          [&](unsigned operand, unsigned sourceAxis, unsigned resultAxis) {
-            return refineBroadcast &&
-                   refineBroadcast(snapshot.source->getOpOperand(operand),
-                                   sourceAxis,
-                                   snapshot.source->getResult(index),
-                                   resultAxis);
-          });
-      if (failed(transported))
-        return snapshot.clone->emitOpError(
-            "cloned operands cannot transport the source fragment relation");
-      setPhysicalValueType(snapshot.clone->getResult(index), *transported,
-                           changed);
-    }
-  }
-  return success();
-}
-
 namespace {
 struct SchemaChanges {
   ValueTypeChangeCallback callback;
@@ -207,6 +115,34 @@ LogicalResult projectControlGroup(Operation *operation,
 bool hasSchemaBoundary(Operation *operation) {
   return isa<MakeRecordOp, ExtractOp, RegionFoldOp, RegionScanOp,
              RegionBranchOpInterface, BranchOpInterface>(operation);
+}
+
+LogicalResult verifySelectedControlSchemas(Operation *operation) {
+  auto groups = controlGroups(operation);
+  if (failed(groups))
+    return failure();
+  for (const ControlSchemaGroup &group : *groups) {
+    Type type = group.targets.front().getType();
+    if (llvm::any_of(group.targets,
+                     [&](Value target) { return target.getType() != type; }))
+      return operation->emitOpError(
+          "selected control slots disagree on their physical schema");
+  }
+  return success();
+}
+
+LogicalResult projectSelectedControlSchemas(Operation *operation,
+                                             OpBuilder::Listener *listener) {
+  if (failed(verifySelectedControlSchemas(operation)))
+    return failure();
+  auto groups = controlGroups(operation);
+  if (failed(groups))
+    return failure();
+  for (const ControlSchemaGroup &group : *groups)
+    if (failed(projectControlGroup(operation, group,
+                                    group.targets.front().getType(), {}, listener)))
+      return failure();
+  return success();
 }
 
 LogicalResult projectSchemaBoundary(Value target,

@@ -2,13 +2,14 @@
 #include "RegionSources.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace mlir;
 
@@ -79,17 +80,16 @@ FailureOr<Type> slicedType(Type type, ArrayRef<SliceRelation> relations,
   return type;
 }
 
-LogicalResult rewriteSlicedClone(Operation *source, Operation *clone,
-                                ArrayRef<SliceRelation> relations,
-                                PhysicalExprAttr extent) {
-  return rewriteClonedPhysicalTypes(
-      source, clone,
+FailureOr<SmallVector<Value>> cloneSlicedOperation(
+    OpBuilder &builder, Operation *source, IRMapping &mapping,
+    ArrayRef<SliceRelation> relations, PhysicalExprAttr extent) {
+  return cloneWithPhysicalSchema(
+      builder, source, mapping,
       [&](Value original) -> Type {
         auto selected = slicedType(original.getType(), relations, extent,
                                    original.getDefiningOp());
         return succeeded(selected) ? *selected : Type{};
       },
-      {},
       [&](OpOperand &operand, unsigned sourceAxis, OpResult result,
           unsigned resultAxis) {
         auto sourceType = dyn_cast<FragmentType>(operand.get().getType());
@@ -293,15 +293,10 @@ FailureOr<Value> materializeScanConsumerValue(
         definition->getName().getStringRef().str();
     return failure();
   }
-  Operation *clone = builder.clone(*definition, mapping);
-  if (failed(rewriteSlicedClone(definition, clone, relations, sliceExtent))) {
+  auto cloned = cloneSlicedOperation(builder, definition, mapping, relations, sliceExtent);
+  if (failed(cloned)) {
     reason = "region-scan output address cannot transport its sliced schema";
     return failure();
-  }
-  for (auto [original, result] :
-       llvm::zip(definition->getResults(), clone->getResults())) {
-    if (!mapping.lookupOrNull(original))
-      mapping.map(original, result);
   }
   Value result = mapping.lookupOrNull(value);
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
@@ -311,10 +306,23 @@ FailureOr<Value> materializeScanConsumerValue(
 
 LogicalResult cloneScanOutputConsumers(
     OpBuilder &builder, Location location, ArrayRef<Operation *> consumers,
-    IRMapping &mapping, ArrayRef<SliceRelation> relations,
+    IRMapping &resultMapping, ArrayRef<SliceRelation> relations,
     PhysicalExprAttr sliceExtent,
     Value segmentTail, RegionScanOp scan, Value offset, Value segment,
     std::string &reason) {
+  IRMapping mapping(resultMapping);
+  auto insertion = builder.saveInsertionPoint();
+  Operation *previous = insertion.getPoint() == insertion.getBlock()->begin()
+      ? nullptr : &*std::prev(insertion.getPoint());
+  auto rollback = llvm::make_scope_exit([&] {
+    auto end = insertion.getPoint();
+    while (end != insertion.getBlock()->begin()) {
+      Operation *operation = &*std::prev(end);
+      if (operation == previous) break;
+      operation->erase();
+    }
+    builder.restoreInsertionPoint(insertion);
+  });
   DominanceInfo dominance(scan->getParentOfType<func::FuncOp>());
   for (Operation *operation : consumers) {
     for (Value operand : operation->getOperands()) {
@@ -358,17 +366,13 @@ LogicalResult cloneScanOutputConsumers(
         replacement->setAttr(originAttr, origin);
       continue;
     }
-    Operation *clone = builder.clone(*operation, mapping);
-    if (failed(rewriteSlicedClone(operation, clone, relations, sliceExtent))) {
+    if (failed(cloneSlicedOperation(builder, operation, mapping, relations, sliceExtent))) {
       reason = "region-scan output consumer cannot transport its sliced schema";
       return failure();
     }
-    for (auto [original, result] :
-         llvm::zip(operation->getResults(), clone->getResults())) {
-      if (!mapping.lookupOrNull(original))
-        mapping.map(original, result);
-    }
   }
+  resultMapping = std::move(mapping);
+  rollback.release();
   return success();
 }
 

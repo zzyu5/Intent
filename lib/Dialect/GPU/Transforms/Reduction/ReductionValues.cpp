@@ -83,14 +83,19 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   }
   IRMapping mapping;
   for (auto [argument, value] :
-       llvm::zip(region.front().getArguments(), arguments))
+       llvm::zip(region.front().getArguments(), arguments)) {
+    if (argument.getType() != value.getType()) {
+      reason = "combine invocation does not match its selected formal schema";
+      return failure();
+    }
     mapping.map(argument, value);
+  }
   for (Operation &operation : region.front().without_terminator()) {
-    Operation *clone = builder.clone(operation, mapping);
-    for (auto [source, result] :
-         llvm::zip(operation.getResults(), clone->getResults()))
-      if (!mapping.lookupOrNull(source))
-        mapping.map(source, result);
+    if (failed(cloneWithPhysicalSchema(builder, &operation, mapping,
+                                       [](Value value) { return value.getType(); }))) {
+      reason = "combine operation cannot preserve its selected schema";
+      return failure();
+    }
   }
   SmallVector<Value> results;
   for (Value value : yield.getValues()) {
