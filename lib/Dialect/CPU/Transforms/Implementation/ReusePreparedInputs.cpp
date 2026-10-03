@@ -171,31 +171,23 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
       llvm::SmallDenseSet<Value> groupInputs;
       bool groupDependent = false;
       for (Operation &operation : body->without_terminator()) {
-        llvm::SetVector<Operation *> needed;
-        bool usesQuotient = false;
-        std::function<bool(Value)> invariant = [&](Value value) {
-          if (value == quotient.getResult()) { usesQuotient = true; return true; }
-          if (groupInputs.contains(value) || llvm::is_contained(outerCoordinates, value)) return true;
-          Operation *scope = value.getParentRegion()->getParentOp();
-          if (scope != loop && !loop->isAncestor(scope)) return true;
-          Operation *definition = value.getDefiningOp();
-          if (!definition || definition->getBlock() != body || definition->getNumRegions() ||
-              !isMemoryEffectFree(definition)) return false;
-          if (needed.contains(definition)) return true;
-          if (!llvm::all_of(definition->getOperands(), invariant)) return false;
-          needed.insert(definition);
-          return true;
-        };
+        SmallVector<Value> frontier{quotient.getResult()};
+        llvm::append_range(frontier, outerCoordinates);
+        llvm::append_range(frontier, groupInputs);
         if (auto view = dyn_cast<memref::SubViewOp>(operation);
             view && requestedWindows.count(view.getResult()) && storage.isReadOnly(view)) {
           bool stable = storage.preserves(loop, view);
           if (stable && llvm::any_of(requestedWindows[view], [&](memref::SubViewOp window) {
                 return hasIndependentWindowCoordinates(window, loop, quotient.getResult());
-              }) && invariant(view.getResult())) {
+              })) {
+            auto needed = inputWindowDependencies(ValueRange{view.getResult()}, loop, frontier);
+            if (!needed || llvm::any_of(needed->operations, [&](Operation *dependency) {
+                  return dependency->getBlock() != body;
+                })) continue;
             // Share only the invariant descriptor here. The selected input
             // supply retains its original guards when it later fills storage.
-            dependencies.insert(needed.begin(), needed.end());
-            groupDependent |= usesQuotient;
+            dependencies.insert(needed->operations.begin(), needed->operations.end());
+            groupDependent |= llvm::is_contained(needed->frontier, quotient.getResult());
           }
           continue;
         }
@@ -208,11 +200,14 @@ LogicalResult groupScopedInputs(func::FuncOp function, const ImplementationRegis
         auto operands = producer.getDpsInputs();
         inputs.insert(operands.begin(), operands.end());
         inputs.insert(prepared->allocation->operand_begin(), prepared->allocation->operand_end());
-        if (!llvm::all_of(inputs, invariant)) continue;
-        dependencies.insert(needed.begin(), needed.end());
+        auto needed = inputWindowDependencies(inputs.getArrayRef(), loop, frontier);
+        if (!needed || llvm::any_of(needed->operations, [&](Operation *dependency) {
+              return dependency->getBlock() != body;
+            })) continue;
+        dependencies.insert(needed->operations.begin(), needed->operations.end());
         preparations.push_back(*prepared);
         groupInputs.insert(prepared->allocation.getResult());
-        groupDependent |= usesQuotient;
+        groupDependent |= llvm::is_contained(needed->frontier, quotient.getResult());
       }
       if (!groupDependent) continue;
       OpBuilder builder(loop);

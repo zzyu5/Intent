@@ -10,7 +10,6 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -132,17 +131,8 @@ FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, Imple
   if (!binding) return false;
   int64_t width = implementationParameter(binding, "vector_width");
   int64_t replicas = implementationParameter(binding, "register_replicas");
-  DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
-  Operation *scope = operation;
-  for (Operation *parent = operation->getParentOp(); isa<scf::ForOp, scf::ParallelOp, TaskDispatchOp>(parent);
-       parent = parent->getParentOp()) {
-    if (!dominance.dominates(rhs, parent)) break;
-    scope = parent;
-  }
   int64_t panelSize = width * replicas;
   InputRequirement requirement{1, outputType.getElementType(), 1, panelSize, width * 4, InputReuse::Consumers, panelSize};
-  auto supplied = inputs.prepareCaptured(operation, load, requirement, scope);
-  if (failed(supplied)) return failure();
   OpBuilder b(operation);
   Location loc = operation.getLoc();
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
@@ -154,8 +144,13 @@ FailureOr<bool> materializeIndexedContraction(linalg::GenericOp operation, Imple
   Value nonempty = b.create<arith::AndIOp>(loc,
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, depth, zero),
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, columns, zero));
+  nonempty = b.create<arith::AndIOp>(loc, nonempty,
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, rows, zero));
   auto active = b.create<scf::IfOp>(loc, nonempty, false);
-  b.setInsertionPointToStart(active.thenBlock());
+  operation->moveBefore(active.thenBlock()->getTerminator());
+  auto supplied = inputs.prepareCaptured(operation, load, requirement);
+  if (failed(supplied)) return failure();
+  b.setInsertionPoint(operation);
   constexpr int64_t rowWindow = indexedRowWindow;
   // Bound gathered RHS payload per row to 16 KiB and preparation to 192 KiB.
   int64_t reductionWindow = std::min<int64_t>(512, 4096 / panelSize);

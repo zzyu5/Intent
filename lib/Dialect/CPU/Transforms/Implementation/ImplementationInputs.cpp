@@ -10,8 +10,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -21,24 +19,35 @@ struct ImplementationInputs::Impl {
   explicit Impl(func::FuncOp function) : function(function) {}
 
   FailureOr<SmallVector<InputSupply>> prepare(linalg::GenericOp operation,
-      ArrayRef<InputRequirement> requirements, const Implementation &implementation);
+      ArrayRef<InputRequirement> requirements);
   FailureOr<InputSupply> prepareCaptured(linalg::GenericOp operation,
-      memref::LoadOp input, const InputRequirement &requirement, Operation *scope);
+      memref::LoadOp input, const InputRequirement &requirement);
   FailureOr<SmallVector<InputSupply>> prepareGroup(OpBuilder &builder,
       linalg::GenericOp operation, const ContractionTile &tile,
       ConfigurationAttr configuration, ArrayRef<InputRequirement> requirements);
 
   std::optional<InputSupply> prepareWindow(Value source, const InputRequirement &requirement,
       linalg::GenericOp operation);
+  struct PreparationScope {
+    Operation *owner;
+    SmallVector<Operation *> dependencies;
+    bool guarded = false;
+    std::optional<InputWindowBounds> bounds;
+  };
   void guardLoop(scf::ForOp loop);
-  Operation *consumerScope(Value source, linalg::GenericOp operation,
-      const InputRequirement &requirement, const Implementation &implementation);
-  InputSupply materialize(Value source, const InputRequirement &requirement, Operation *scope);
+  PreparationScope findPreparationScope(Value source, linalg::GenericOp operation,
+      const InputRequirement &requirement,
+      const ConsumerWindow *window = nullptr);
+  void placePreparation(const PreparationScope &scope);
+  InputSupply materialize(Value source, const InputRequirement &requirement,
+                          Operation *scope, Operation *readPoint = nullptr);
 
   struct Prepared {
     Value source;
     InputRequirement requirement;
     memref::AllocOp allocation;
+    memref::AllocOp initialized;
+    Operation *scope;
   };
   struct PreparedWindow {
     Value source;
@@ -48,6 +57,9 @@ struct ImplementationInputs::Impl {
     scf::ForOp scope;
     memref::AllocOp storage;
     memref::AllocOp initialized;
+    Value begin;
+    AffineMap lower, upper;
+    ValueDimList lowerOperands, upperOperands;
   };
   func::FuncOp function;
   SmallVector<Prepared> prepared;
@@ -62,22 +74,33 @@ bool sameRepresentation(const InputRequirement &first, const InputRequirement &s
       first.panelSize == second.panelSize && first.alignment == second.alignment && first.reuse == second.reuse;
 }
 
-memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
-    const InputRequirement &requirement, SmallVectorImpl<Value> &sourceSizes, bool transposed = false) {
+SmallVector<OpFoldResult> sourceExtents(OpBuilder &b, Location loc, Value source) {
   auto type = cast<MemRefType>(source.getType());
-  auto sourceAxis = [&](unsigned axis) { return transposed ? 1 - axis : axis; };
-  for (int64_t axis = 0; axis < type.getRank(); ++axis)
-    sourceSizes.push_back(b.create<memref::DimOp>(loc, source, sourceAxis(axis)));
+  SmallVector<OpFoldResult> sizes;
+  for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+    if (type.isDynamicDim(axis))
+      sizes.push_back(b.createOrFold<memref::DimOp>(loc, source, axis));
+    else sizes.push_back(b.getIndexAttr(type.getDimSize(axis)));
+  }
+  return sizes;
+}
+
+memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc,
+    ArrayRef<OpFoldResult> capacities, const InputRequirement &requirement) {
+  SmallVector<Value> sourceSizes;
+  for (OpFoldResult extent : capacities)
+    sourceSizes.push_back(getValueOrCreateConstantIndexOp(b, loc, extent));
   Value panel = index(b, loc, requirement.panelSize);
   Value count = b.create<arith::CeilDivSIOp>(loc, sourceSizes[requirement.panelAxis], panel);
-  int64_t staticExtent = type.getDimSize(sourceAxis(requirement.panelAxis));
+  int64_t staticExtent = getConstantIntValue(capacities[requirement.panelAxis])
+                            .value_or(ShapedType::kDynamic);
   SmallVector<int64_t> shape{ShapedType::isDynamic(staticExtent) ? ShapedType::kDynamic
       : static_cast<int64_t>(llvm::divideCeil(static_cast<uint64_t>(staticExtent),
                                             static_cast<uint64_t>(requirement.panelSize)))};
   SmallVector<Value> sizes{count};
-  for (int64_t axis = 0; axis < type.getRank(); ++axis) {
+  for (unsigned axis = 0; axis < capacities.size(); ++axis) {
     if (axis == requirement.panelAxis) continue;
-    shape.push_back(type.getDimSize(sourceAxis(axis)));
+    shape.push_back(getConstantIntValue(capacities[axis]).value_or(ShapedType::kDynamic));
     sizes.push_back(sourceSizes[axis]);
   }
   shape.push_back(requirement.panelSize);
@@ -89,38 +112,60 @@ memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc, Value source,
   return storage;
 }
 
-bool panelAligned(OpFoldResult offset, int64_t panel) {
-  if (panel == 1) return true;
-  llvm::DenseMap<Value, bool> known;
-  std::function<bool(OpFoldResult)> aligned = [&](OpFoldResult value) {
-    if (auto constant = getConstantIntValue(value)) return *constant % panel == 0;
-    if (!llvm::isPowerOf2_64(panel)) return false;
-    Value dynamic = cast<Value>(value);
-    auto found = known.find(dynamic);
-    if (found != known.end()) return found->second;
-    bool result = false;
-    if (auto argument = dyn_cast<BlockArgument>(dynamic)) {
-      if (auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-          loop && argument == loop.getInductionVar())
-        result = aligned(loop.getLowerBound()) && aligned(loop.getStep());
-    } else if (auto product = dynamic.getDefiningOp<arith::MulIOp>()) {
-      result = aligned(product.getLhs()) || aligned(product.getRhs());
-    } else if (auto subtract = dynamic.getDefiningOp<arith::SubIOp>()) {
-      auto remainder = subtract.getRhs().getDefiningOp<arith::RemSIOp>();
-      auto divisor = remainder ? getConstantIntValue(remainder.getRhs()) : std::nullopt;
-      result = remainder && remainder.getLhs() == subtract.getLhs() && divisor &&
-          *divisor > 0 && *divisor % panel == 0;
-      result |= aligned(subtract.getLhs()) && aligned(subtract.getRhs());
-    } else if (auto select = dynamic.getDefiningOp<arith::SelectOp>()) {
-      result = aligned(select.getTrueValue()) && aligned(select.getFalseValue());
-    } else if (Operation *operation = dynamic.getDefiningOp();
-        isa_and_nonnull<arith::AddIOp, arith::MinSIOp, arith::MaxSIOp>(operation)) {
-      result = llvm::all_of(operation->getOperands(), [&](Value operand) { return aligned(operand); });
-    }
-    known[dynamic] = result;
-    return result;
+void copyRepresentation(OpBuilder &b, Location loc, Value source,
+    Value storage, const InputRequirement &requirement, Operation *point) {
+  auto type = cast<MemRefType>(source.getType());
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value panel = index(b, loc, requirement.panelSize);
+  SmallVector<Value> sourceSizes;
+  for (int64_t axis = 0; axis < type.getRank(); ++axis)
+    sourceSizes.push_back(b.create<memref::DimOp>(loc, source, axis));
+  Value extent = sourceSizes[requirement.panelAxis];
+  auto copyPanel = [&](Value ordinal, Value width) {
+    SmallVector<Value> logical(type.getRank()), physical{ordinal};
+    Value begin = multiply(b, loc, ordinal, panel);
+    std::function<void(unsigned)> axes = [&](unsigned axis) {
+      if (axis == static_cast<unsigned>(type.getRank())) {
+        loop(b, loc, zero, width, 1, [&](Value lane) {
+          logical[requirement.panelAxis] = add(b, loc, begin, lane);
+          physical.push_back(lane);
+          Value value = b.create<memref::LoadOp>(loc, source, logical);
+          if (value.getType() != requirement.elementType)
+            value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
+          b.create<memref::StoreOp>(loc, value, storage, physical);
+          physical.pop_back();
+        });
+      } else if (axis == requirement.panelAxis) {
+        axes(axis + 1);
+      } else {
+        loop(b, loc, zero, sourceSizes[axis], 1, [&](Value coordinate) {
+          logical[axis] = coordinate;
+          physical.push_back(coordinate);
+          axes(axis + 1);
+          physical.pop_back();
+        });
+      }
+    };
+    axes(0);
   };
-  return aligned(offset);
+  Value full = b.create<arith::DivSIOp>(loc, extent, panel);
+  Value tail = b.create<arith::RemSIOp>(loc, extent, panel);
+  if (point->getParentOfType<scf::ForOp>() || point->getParentOfType<scf::ParallelOp>() ||
+      point->getParentOfType<TasksOp>() || point->getParentOfType<TaskDispatchOp>()) {
+    loop(b, loc, zero, full, 1, [&](Value ordinal) { copyPanel(ordinal, panel); });
+  } else {
+    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{full}, ValueRange{one});
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(parallel.getBody());
+    copyPanel(parallel.getInductionVars()[0], panel);
+  }
+  auto hasTail = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, tail, zero);
+  auto remainder = b.create<scf::IfOp>(loc, hasTail, false);
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(remainder.thenBlock());
+    copyPanel(full, tail);
+  }
 }
 
 } // namespace
@@ -130,16 +175,51 @@ ImplementationInputs::ImplementationInputs(func::FuncOp function)
 
 ImplementationInputs::~ImplementationInputs() = default;
 
+bool ImplementationInputs::hasReusableScope(linalg::GenericOp operation,
+    ArrayRef<InputRequirement> requirements) {
+  StorageAnalysis storage(impl->function);
+  auto interface = impl->function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
+  for (const InputRequirement &requirement : requirements) {
+    if (requirement.reuse != InputReuse::Consumers) continue;
+    Value source = operation.getInputs()[requirement.operand];
+    if (interface && interface.getDisjointOutputs()) {
+      if (auto window = consumerWindow(source, requirement, operation);
+          window && storage.isReadOnly(window->view.getSource())) {
+        if (impl->findPreparationScope(window->view.getSource(), operation,
+                requirement, &*window).owner != operation)
+          return true;
+      }
+    }
+    if (impl->findPreparationScope(source, operation, requirement).owner != operation)
+      return true;
+  }
+  return false;
+}
+
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(
-    linalg::GenericOp operation, ArrayRef<InputRequirement> requirements,
-    const Implementation &implementation) {
-  return impl->prepare(operation, requirements, implementation);
+    linalg::GenericOp operation, ArrayRef<InputRequirement> requirements) {
+  return impl->prepare(operation, requirements);
 }
 
 FailureOr<InputSupply> ImplementationInputs::prepareCaptured(
     linalg::GenericOp operation, memref::LoadOp input,
-    const InputRequirement &requirement, Operation *scope) {
-  return impl->prepareCaptured(operation, input, requirement, scope);
+    const InputRequirement &requirement) {
+  return impl->prepareCaptured(operation, input, requirement);
+}
+
+FailureOr<InputSupply> ImplementationInputs::prepareAt(Value window,
+    ValueRange begins, const InputRequirement &requirement, Operation *scope) {
+  auto type = dyn_cast<MemRefType>(window.getType());
+  DominanceInfo dominance(impl->function);
+  if (!type || begins.size() != static_cast<size_t>(type.getRank()) ||
+      !dominance.properlyDominates(window, scope) ||
+      llvm::any_of(begins, [&](Value begin) {
+        return !dominance.properlyDominates(begin, scope);
+      }))
+    return scope->emitError("selected input window and origins must dominate its preparation scope"), failure();
+  InputSupply supply = impl->materialize(window, requirement, scope);
+  supply.begins.assign(begins.begin(), begins.end());
+  return supply;
 }
 
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(
@@ -148,72 +228,9 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(
   return impl->prepareGroup(builder, operation, tile, configuration, requirements);
 }
 
-std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequirement &requirement,
-                                            Operation *consumer) {
-  if (requirement.reuse != InputReuse::Consumers || requirement.panelAxis >= 2 ||
-      requirement.panelSize <= 0 || requirement.windowAlignment <= 0) return std::nullopt;
-  auto view = source.getDefiningOp<memref::SubViewOp>();
-  bool transposed = false;
-  if (!view && source.getDefiningOp<memref::AllocOp>()) {
-    StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
-    auto swap = AffineMap::getPermutationMap(ArrayRef<unsigned>{1, 0}, source.getContext());
-    for (Operation *user : source.getUsers()) {
-      auto producer = dyn_cast<linalg::GenericOp>(user);
-      if (!producer || producer.getNumResults() || producer.getInputs().size() != 1 ||
-          producer.getOutputs().size() != 1 || producer.getOutputs()[0] != source ||
-          producer.getIteratorTypesArray() != SmallVector<utils::IteratorType>{
-              utils::IteratorType::parallel, utils::IteratorType::parallel}) continue;
-      Block &body = producer.getRegion().front();
-      auto maps = producer.getIndexingMapsArray();
-      if (body.getOperations().size() != 1 || body.getTerminator()->getOperand(0) != body.getArgument(0) ||
-          !maps[0].isPermutation() || !maps[1].isPermutation() ||
-          maps[0].compose(inversePermutation(maps[1])) != swap ||
-          !storage.unchangedBetween(source, producer, consumer)) continue;
-      view = producer.getInputs()[0].getDefiningOp<memref::SubViewOp>();
-      if (view) { transposed = true; break; }
-    }
-  }
-  if (!view || view.getType().getRank() != 2 || view.getSourceType().getRank() != 2 ||
-      llvm::any_of(view.getMixedStrides(), [](OpFoldResult stride) { return getConstantIntValue(stride) != 1; }))
-    return std::nullopt;
-  auto full = [&](unsigned axis) {
-    return getConstantIntValue(view.getMixedOffsets()[axis]) == 0 &&
-        haveEqualExtents(ValueBoundsConstraintSet::Variable(view.getSource(), axis),
-                         ValueBoundsConstraintSet::Variable(view.getMixedSizes()[axis]));
-  };
-  unsigned axis;
-  if (full(1)) axis = 0;
-  else if (full(0)) axis = 1;
-  else return std::nullopt;
-  unsigned panelAxis = transposed ? 1 - requirement.panelAxis : requirement.panelAxis;
-  if (axis == panelAxis && getConstantIntValue(view.getMixedSizes()[axis]) != 1 &&
-      !panelAligned(view.getMixedOffsets()[axis], requirement.windowAlignment)) return std::nullopt;
-  return ConsumerWindow{view, axis, transposed};
-}
-
-bool hasIndependentWindowCoordinates(memref::SubViewOp window, Operation *scope, Value groupCoordinate) {
-  llvm::SmallPtrSet<Operation *, 16> checked;
-  std::function<bool(Value)> independent = [&](Value value) {
-    if (value == groupCoordinate) return true;
-    Operation *owner = value.getParentRegion()->getParentOp();
-    if (owner != scope && !scope->isAncestor(owner)) return true;
-    if (auto argument = dyn_cast<BlockArgument>(value)) {
-      auto inner = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-      return inner && inner != scope && scope->isAncestor(inner) && argument == inner.getInductionVar();
-    }
-    Operation *definition = value.getDefiningOp();
-    if (!definition || definition->getNumRegions() || !isMemoryEffectFree(definition)) return false;
-    if (!checked.insert(definition).second) return true;
-    return llvm::all_of(definition->getOperands(), independent);
-  };
-  // Inner traversals still identify actual source rows. A window that advances
-  // directly with this consumer loop does not provide reuse across its iterations.
-  auto invariant = [&](OpFoldResult value) { return isa<Attribute>(value) || independent(cast<Value>(value)); };
-  return llvm::all_of(window.getMixedOffsets(), invariant) && llvm::all_of(window.getMixedSizes(), invariant);
-}
 
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepare(linalg::GenericOp operation,
-    ArrayRef<InputRequirement> requirements, const Implementation &implementation) {
+    ArrayRef<InputRequirement> requirements) {
   if (auto reason = checkInputRequirements(operation, requirements))
     return operation.emitError(*reason), failure();
   SmallVector<InputSupply> supplies;
@@ -222,9 +239,10 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepare(linalg::
     if (requirement.reuse == InputReuse::Group) continue;
     if (auto supply = prepareWindow(source, requirement, operation)) supplies.push_back(*supply);
     else {
-      Operation *scope = consumerScope(source, operation, requirement, implementation);
-      if (auto loop = dyn_cast<scf::ForOp>(scope)) guardLoop(loop);
-      supplies.push_back(materialize(source, requirement, scope));
+      auto scope = findPreparationScope(source, operation, requirement);
+      placePreparation(scope);
+      supplies.push_back(materialize(source, requirement, scope.owner,
+                                     scope.guarded ? operation : nullptr));
     }
   }
   return supplies;
@@ -254,42 +272,44 @@ std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value sourc
   OpBuilder b(operation);
   auto sizes = view.getMixedSizes(), offsets = view.getMixedOffsets();
 
-  DominanceInfo dominance(function);
-  scf::ForOp scope;
-  for (Operation *parent = operation->getParentOp(); parent != function; parent = parent->getParentOp()) {
-    if (isa<scf::IfOp>(parent)) continue;
-    auto candidate = dyn_cast<scf::ForOp>(parent);
-    if (!candidate || candidate.getNumResults()) break;
-    auto step = getConstantIntValue(candidate.getStep());
-    if (!step || *step <= 0 || !candidate->isAncestor(view) || !dominance.dominates(base, candidate)) continue;
-    if (!hasIndependentWindowCoordinates(view, candidate)) continue;
-    if (storage.preserves(candidate, base)) scope = candidate;
-  }
+  auto placement = findPreparationScope(base, operation, requirement, &*window);
+  auto scope = dyn_cast<scf::ForOp>(placement.owner);
   if (!scope) return std::nullopt;
+  const auto &bounds = *placement.bounds;
 
   PreparedWindow *prepared = nullptr;
   for (auto &candidate : windows)
     if (candidate.source == base && candidate.scope == scope && candidate.axis == axis &&
-        candidate.transposed == window->transposed && sameRepresentation(candidate.requirement, requirement)) {
+        candidate.transposed == window->transposed && sameRepresentation(candidate.requirement, requirement) &&
+        candidate.lower == bounds.lower && candidate.upper == bounds.upper &&
+        candidate.lowerOperands == bounds.lowerOperands && candidate.upperOperands == bounds.upperOperands) {
       prepared = &candidate;
       break;
     }
   Location loc = operation.getLoc();
   if (!prepared) {
-    guardLoop(scope);
+    placePreparation(placement);
     b.setInsertionPoint(scope);
-    SmallVector<Value> sourceSizes;
-    auto storage = allocateRepresentation(b, loc, base, requirement, sourceSizes, window->transposed);
+    Value lower = materializeInputWindowBound(b, loc, bounds.lower, bounds.lowerOperands);
+    Value upper = materializeInputWindowBound(b, loc, bounds.upper, bounds.upperOperands);
+    Value extent = b.create<arith::SubIOp>(loc, upper, lower);
+    auto capacities = sourceExtents(b, loc, base);
+    capacities[axis] = extent;
+    if (window->transposed) std::swap(capacities[0], capacities[1]);
+    // Capacity is an independent scratch envelope, not an access to a larger
+    // source view. Only the original guarded window below is ever read.
+    auto storage = allocateRepresentation(b, loc, capacities, requirement);
     auto initialized = b.create<memref::AllocOp>(loc, MemRefType::get({ShapedType::kDynamic}, b.getI1Type()),
-        ValueRange{sourceSizes[logicalAxis]});
+        ValueRange{extent});
     Value zero = index(b, loc, 0), clear = b.create<arith::ConstantIntOp>(loc, 0, 1);
-    loop(b, loc, zero, sourceSizes[logicalAxis], 1, [&](Value row) {
+    loop(b, loc, zero, extent, 1, [&](Value row) {
       b.create<memref::StoreOp>(loc, clear, initialized, row);
     });
     b.setInsertionPointAfter(scope);
     b.create<memref::DeallocOp>(loc, initialized);
     b.create<memref::DeallocOp>(loc, storage);
-    windows.push_back({base, requirement, axis, window->transposed, scope, storage, initialized});
+    windows.push_back({base, requirement, axis, window->transposed, scope, storage,
+        initialized, lower, bounds.lower, bounds.upper, bounds.lowerOperands, bounds.upperOperands});
     prepared = &windows.back();
   }
   b.setInsertionPoint(operation);
@@ -301,7 +321,7 @@ std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value sourc
   // A marker covers one complete source slice, including only its valid tail.
   // Fill at the original consumer so guards never introduce extra input reads.
   loop(b, loc, zero, count, 1, [&](Value row) {
-    Value coordinate = add(b, loc, begin, row);
+    Value coordinate = b.create<arith::SubIOp>(loc, add(b, loc, begin, row), prepared->begin);
     Value initialized = b.create<memref::LoadOp>(loc, prepared->initialized, coordinate);
     Value needed = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, initialized, clear);
     auto fill = b.create<scf::IfOp>(loc, needed, false);
@@ -331,66 +351,87 @@ std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value sourc
     b.create<memref::StoreOp>(loc, ready, prepared->initialized, coordinate);
   });
   SmallVector<Value> begins(2, zero);
-  begins[logicalAxis] = b.create<arith::SubIOp>(loc, zero, begin);
+  begins[logicalAxis] = b.create<arith::SubIOp>(loc, prepared->begin, begin);
   return InputSupply{requirement.operand, requirement.panelAxis, requirement.panelSize, prepared->storage, std::move(begins)};
 }
 
-Operation *ImplementationInputs::Impl::consumerScope(Value source, linalg::GenericOp operation,
-    const InputRequirement &requirement, const Implementation &implementation) {
-  if (auto branch = dyn_cast<scf::IfOp>(operation->getParentOp()); branch && !branch.getElseRegion().empty()) {
-    StorageAnalysis storage(function);
-    if (storage.isReadOnly(source) && storage.preserves(branch, source) &&
-        DominanceInfo(function).dominates(source, branch)) {
-      auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-      auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration");
-      Block *other = operation->getParentRegion() == &branch.getThenRegion() ? branch.elseBlock() : branch.thenBlock();
-      // Both successors must unconditionally require the same read-only
-      // snapshot. Enclosing guards, including empty-work guards, stay intact.
-      for (auto candidate : other->getOps<linalg::GenericOp>()) {
-        if (!isMatrixContraction(candidate) || candidate->hasAttr("intent_cpu.microtile") ||
-            candidate->getAttrOfType<ImplementationAttr>("intent_cpu.implementation") != binding) continue;
-        for (auto requested : implementation.inputRequirements(candidate, configuration, binding))
-          if (requested.operand < candidate.getInputs().size() &&
-              candidate.getInputs()[requested.operand] == source && sameRepresentation(requirement, requested)) return branch;
-      }
-    }
-  }
-  auto loop = dyn_cast<scf::ForOp>(operation->getParentOp());
-  if (!loop || loop.getNumResults()) return operation;
-  auto step = getConstantIntValue(loop.getStep());
-  if (!step || *step <= 0 || !DominanceInfo(function).dominates(source, loop)) return operation;
+ImplementationInputs::Impl::PreparationScope
+ImplementationInputs::Impl::findPreparationScope(Value source, linalg::GenericOp operation,
+    const InputRequirement &requirement, const ConsumerWindow *window) {
+  PreparationScope scope{operation, {}, false, std::nullopt};
+  bool crossesGuard = false;
   StorageAnalysis storage(function);
-  return storage.preserves(loop, source) ? loop.getOperation() : operation;
+  DominanceInfo dominance(function);
+  for (Operation *parent = operation->getParentOp(); parent != function; parent = parent->getParentOp()) {
+    // Lazy storage may surround a guard; its input reads remain at the original
+    // guarded use. Eager preparation must retain that execution condition.
+    if (isa<scf::IfOp>(parent)) {
+      crossesGuard = true;
+      continue;
+    }
+    auto loop = dyn_cast<scf::ForOp>(parent);
+    if (!loop || loop.getNumResults()) break;
+    auto step = getConstantIntValue(loop.getStep());
+    if (!step || *step <= 0 || !storage.preserves(loop, source)) break;
+    if (window) {
+      if (!dominance.properlyDominates(source, loop) ||
+          !loop->isAncestor(window->view) ||
+          !hasIndependentWindowCoordinates(window->view, loop)) continue;
+      auto candidate = boundInputWindow(*window, loop, requirement);
+      if (!candidate) continue;
+      scope.bounds = std::move(*candidate);
+    } else {
+      // A descriptor created only under a guard need not describe a valid
+      // allocation on the other path, even when its construction is pure.
+      if (crossesGuard && !dominance.properlyDominates(source, loop)) break;
+      auto candidate = inputWindowDependencies(ValueRange{source}, loop);
+      if (!candidate) break;
+      scope.dependencies = std::move(candidate->operations);
+    }
+    scope.owner = loop;
+    scope.guarded = crossesGuard;
+    // A guard on the outer loop does not prove an inner loop executes. Only
+    // cross another loop when every already-crossed traversal is nonempty.
+    if (!window && !crossesGuard && !ValueBoundsConstraintSet::compare(
+            ValueBoundsConstraintSet::Variable(loop.getLowerBound()),
+            ValueBoundsConstraintSet::LT,
+            ValueBoundsConstraintSet::Variable(loop.getUpperBound()))) break;
+  }
+  return scope;
+}
+
+void ImplementationInputs::Impl::placePreparation(const PreparationScope &scope) {
+  if (auto loop = dyn_cast<scf::ForOp>(scope.owner)) guardLoop(loop);
+  for (Operation *dependency : scope.dependencies) dependency->moveBefore(scope.owner);
 }
 
 FailureOr<InputSupply> ImplementationInputs::Impl::prepareCaptured(linalg::GenericOp operation,
-    memref::LoadOp input, const InputRequirement &requirement, Operation *scope) {
+    memref::LoadOp input, const InputRequirement &requirement) {
   if (input->getBlock() != &operation.getRegion().front() ||
-      (scope != operation && !scope->isAncestor(operation)) || requirement.reuse != InputReuse::Consumers)
+      requirement.reuse != InputReuse::Consumers)
     return operation.emitError("captured input supply requires its consumer load and enclosing scope"), failure();
   Value source = input.getMemref();
-  DominanceInfo dominance(function);
-  StorageAnalysis storage(function);
-  if (!dominance.dominates(source, scope) ||
-      (scope != operation &&
-       (!storage.isReadOnly(source) || !storage.preserves(scope, source))))
-    return operation.emitError("captured input supply cannot preserve its scoped read snapshot"), failure();
   if (auto reason = checkInputRequirement(source, input.getResult(), requirement))
     return operation.emitError(*reason), failure();
-  return materialize(source, requirement, scope);
+  auto scope = findPreparationScope(source, operation, requirement);
+  placePreparation(scope);
+  return materialize(source, requirement, scope.owner, scope.guarded ? operation : nullptr);
 }
 
-InputSupply ImplementationInputs::Impl::materialize(Value source, const InputRequirement &requirement, Operation *scope) {
+InputSupply ImplementationInputs::Impl::materialize(Value source, const InputRequirement &requirement,
+                                                    Operation *scope, Operation *readPoint) {
   StorageAnalysis analysis(function);
   DominanceInfo dominance(function);
   auto type = cast<MemRefType>(source.getType());
   memref::AllocOp storage;
+  memref::AllocOp initialized;
   for (auto &previous : prepared) {
     Operation *consumer = previous.allocation->getBlock()->findAncestorOpInBlock(*scope);
     if (previous.source != source || previous.requirement.panelAxis != requirement.panelAxis ||
         previous.requirement.elementType != requirement.elementType ||
         previous.requirement.panelSize != requirement.panelSize ||
         previous.requirement.alignment < requirement.alignment ||
+        (previous.initialized && (!readPoint || previous.scope != scope)) ||
         !consumer || !dominance.dominates(previous.allocation.getOperation(), scope) ||
         !previous.allocation->isBeforeInBlock(consumer) ||
         (previous.allocation->getBlock() != scope->getBlock() && !analysis.isReadOnly(source)) ||
@@ -398,65 +439,37 @@ InputSupply ImplementationInputs::Impl::materialize(Value source, const InputReq
     auto lifetime = analysis.lifetime(previous.allocation);
     if (!lifetime || !lifetime->aliases.complete) continue;
     storage = previous.allocation;
+    initialized = previous.initialized;
     if (lifetime->end->isBeforeInBlock(consumer)) lifetime->end->moveAfter(consumer);
     break;
   }
   if (!storage) {
     OpBuilder b(scope);
     Location loc = scope->getLoc();
-    Value zero = index(b, loc, 0), one = index(b, loc, 1), panel = index(b, loc, requirement.panelSize);
-    SmallVector<Value> sourceSizes;
-    storage = allocateRepresentation(b, loc, source, requirement, sourceSizes);
-    Value extent = sourceSizes[requirement.panelAxis];
-
-    auto copyPanel = [&](Value ordinal, Value width) {
-      SmallVector<Value> logical(type.getRank()), physical{ordinal};
-      Value begin = multiply(b, loc, ordinal, panel);
-      std::function<void(unsigned)> axes = [&](unsigned axis) {
-        if (axis == static_cast<unsigned>(type.getRank())) {
-          loop(b, loc, zero, width, 1, [&](Value lane) {
-            logical[requirement.panelAxis] = add(b, loc, begin, lane);
-            physical.push_back(lane);
-            Value value = b.create<memref::LoadOp>(loc, source, logical);
-            if (value.getType() != requirement.elementType)
-              value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
-            b.create<memref::StoreOp>(loc, value, storage, physical);
-            physical.pop_back();
-          });
-        } else if (axis == requirement.panelAxis) {
-          axes(axis + 1);
-        } else {
-          loop(b, loc, zero, sourceSizes[axis], 1, [&](Value coordinate) {
-            logical[axis] = coordinate;
-            physical.push_back(coordinate);
-            axes(axis + 1);
-            physical.pop_back();
-          });
-        }
-      };
-      axes(0);
-    };
-    Value full = b.create<arith::DivSIOp>(loc, extent, panel);
-    Value tail = b.create<arith::RemSIOp>(loc, extent, panel);
-    if (scope->getParentOfType<scf::ForOp>() || scope->getParentOfType<scf::ParallelOp>() ||
-        scope->getParentOfType<TasksOp>() || scope->getParentOfType<TaskDispatchOp>()) {
-      loop(b, loc, zero, full, 1, [&](Value ordinal) { copyPanel(ordinal, panel); });
-    } else {
-      auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{full}, ValueRange{one});
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(parallel.getBody());
-      copyPanel(parallel.getInductionVars()[0], panel);
-    }
-    auto hasTail = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, tail, zero);
-    auto remainder = b.create<scf::IfOp>(loc, hasTail, false);
-    {
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(remainder.thenBlock());
-      copyPanel(full, tail);
-    }
+    storage = allocateRepresentation(b, loc, sourceExtents(b, loc, source), requirement);
+    if (readPoint) {
+      initialized = b.create<memref::AllocOp>(loc, MemRefType::get({}, b.getI1Type()));
+      b.create<memref::StoreOp>(loc, b.create<arith::ConstantIntOp>(loc, 0, 1),
+                                initialized, ValueRange{});
+    } else copyRepresentation(b, loc, source, storage, requirement, scope);
     b.setInsertionPointAfter(scope);
+    if (initialized) b.create<memref::DeallocOp>(loc, initialized);
     b.create<memref::DeallocOp>(loc, storage);
-    prepared.push_back({source, requirement, storage});
+    prepared.push_back({source, requirement, storage, initialized, scope});
+  }
+  if (initialized) {
+    // A full-descriptor snapshot can share the enclosing loop's lifetime while
+    // preserving the exact execution guard of its first actual consumer.
+    OpBuilder b(readPoint);
+    Location loc = readPoint->getLoc();
+    Value ready = b.create<memref::LoadOp>(loc, initialized, ValueRange{});
+    Value needed = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+        ready, b.create<arith::ConstantIntOp>(loc, 0, 1));
+    auto fill = b.create<scf::IfOp>(loc, needed, false);
+    b.setInsertionPointToStart(fill.thenBlock());
+    copyRepresentation(b, loc, source, storage, requirement, readPoint);
+    b.create<memref::StoreOp>(loc, b.create<arith::ConstantIntOp>(loc, 1, 1),
+                              initialized, ValueRange{});
   }
   OpBuilder b(scope);
   SmallVector<Value> begins(type.getRank(), index(b, scope->getLoc(), 0));

@@ -26,6 +26,57 @@ Value subview(OpBuilder &b, Location loc, Value source,
   return b.create<memref::SubViewOp>(loc, source, offsets, sizes, strides);
 }
 
+struct InputCohort {
+  InputRequirement requirement;
+  unsigned freeAxis;
+};
+
+std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
+    ArrayRef<InputRequirement> requirements, const Configuration &configuration,
+    CapabilitiesAttr capabilities, StorageAnalysis &storage) {
+  // Two supplied operands have different reuse axes. Keep their actual shared
+  // representations rather than repeatedly preparing one to share the other.
+  if (requirements.size() != 1 || requirements.front().reuse != InputReuse::Consumers)
+    return std::nullopt;
+  auto requirement = requirements.front();
+  Value source = operation.getInputs()[requirement.operand];
+  auto type = cast<MemRefType>(source.getType());
+  auto map = operation.getIndexingMapsArray()[requirement.operand];
+  if (type.getRank() != 2 || !map.isProjectedPermutation() ||
+      map.getNumResults() != 2 || requirement.panelAxis >= 2)
+    return std::nullopt;
+  SmallVector<int64_t> capacities;
+  std::optional<unsigned> freeAxis;
+  bool reduction = false;
+  for (AffineExpr expression : map.getResults()) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension || dimension.getPosition() > 2) return std::nullopt;
+    unsigned axis = dimension.getPosition();
+    if (axis == 2) reduction = true;
+    else freeAxis = axis;
+    capacities.push_back(axis == 0 ? configuration.tileM
+                         : axis == 1 ? configuration.tileN : configuration.tileK);
+  }
+  if (!freeAxis || !reduction ||
+      llvm::any_of(operation.getInputs(), [&](Value input) {
+        return !storage.disjoint(input, operation.getOutputs()[0]);
+      })) return std::nullopt;
+  // Bound this one preparation, including panel padding. Other local storage
+  // remains subject to the existing implementation/resource checks.
+  int64_t bits = requirement.elementType.isIndex()
+      ? 64 : requirement.elementType.getIntOrFloatBitWidth();
+  int64_t bytes = (bits + 7) / 8;
+  if (bytes <= 0 || requirement.panelSize <= 0) return std::nullopt;
+  int64_t elements = capabilities.getPrivateBytes() / bytes;
+  int64_t extent = capacities[requirement.panelAxis];
+  int64_t panels = extent / requirement.panelSize + (extent % requirement.panelSize != 0);
+  if (panels > elements / requirement.panelSize) return std::nullopt;
+  int64_t packed = panels * requirement.panelSize;
+  if (packed <= 0 || capacities[1 - requirement.panelAxis] > elements / packed)
+    return std::nullopt;
+  return InputCohort{requirement, *freeAxis};
+}
+
 LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                     const ImplementationRegistry &implementations, ImplementationInputs &inputs,
                     bool parallelTiles = false) {
@@ -48,8 +99,11 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
        isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp()));
   Value initial = initialization->value;
   auto requirements = (*implementation)->inputRequirements(operation, shared, binding);
-  auto supplies = inputs.prepare(operation, requirements, **implementation);
-  if (failed(supplies)) return failure();
+  if (auto reason = checkInputRequirements(operation, requirements))
+    return operation.emitError(*reason);
+  auto capabilities = operation->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  bool serialTiles = !parallelTiles && (operation->getParentOfType<scf::ForOp>() ||
+                                       operation->getParentOfType<scf::ParallelOp>());
   int64_t groupM = 0, groupN = 0;
   for (auto requirement : requirements) {
     if (requirement.reuse != InputReuse::Group) continue;
@@ -66,6 +120,31 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   Value mSize = b.create<memref::DimOp>(loc, lhs, 0);
   Value nSize = b.create<memref::DimOp>(loc, rhs, 1);
   Value kSize = b.create<memref::DimOp>(loc, lhs, 1);
+  Value nonempty = b.create<arith::AndIOp>(loc,
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, mSize, zero),
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, nSize, zero));
+  nonempty = b.create<arith::AndIOp>(loc, nonempty,
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, kSize, zero));
+  auto active = b.create<scf::IfOp>(loc, nonempty, !keepInitialization);
+  if (!keepInitialization) {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(active.elseBlock());
+    auto emptyReduction = b.create<scf::IfOp>(loc,
+        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero), false);
+    b.setInsertionPointToStart(emptyReduction.thenBlock());
+    b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
+  }
+  operation->moveBefore(active.thenBlock()->getTerminator());
+  b.setInsertionPoint(operation);
+  StorageAnalysis activeStorage(operation->getParentOfType<func::FuncOp>());
+  auto cohort = inputs.hasReusableScope(operation, requirements)
+      ? std::nullopt : inputCohort(operation, requirements, config, capabilities, activeStorage);
+  SmallVector<InputSupply> supplies;
+  if (!cohort) {
+    auto prepared = inputs.prepare(operation, requirements);
+    if (failed(prepared)) return failure();
+    supplies = std::move(*prepared);
+  }
   Value bm = index(b, loc, config.tileM), bn = index(b, loc, config.tileN);
   Value bk = index(b, loc, config.tileK);
   Value mTasks = b.create<arith::CeilDivSIOp>(loc, mSize, bm);
@@ -79,39 +158,32 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     nTasks = add(b, loc, fullN, b.create<arith::RemSIOp>(loc, nSize, bn));
   }
   LogicalResult status = success();
-  auto tile = [&](Value mBegin, Value nBegin, Value mCount, Value nCount) {
-    Value outputTile = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
-    Value empty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero);
-    if (!keepInitialization) {
-      auto initializeEmpty = b.create<scf::IfOp>(loc, empty, false);
+  auto tileBlock = [&](Value mBegin, Value nBegin, Value mCount, Value nCount,
+                       Value kBegin, Value depth, bool first) {
+    auto group = [&](Value begin, Value extent, int64_t size,
+                     const std::function<void(Value, Value)> &body) {
+      if (!size) { body(begin, extent); return; }
+      Value step = index(b, loc, size);
+      Value full = multiply(b, loc, b.create<arith::DivSIOp>(loc, extent, step), step);
+      loop(b, loc, zero, full, size, [&](Value offset) { body(add(b, loc, begin, offset), step); });
+      Value tail = b.create<arith::SubIOp>(loc, extent, full);
+      auto branch = b.create<scf::IfOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, tail, zero), false);
       OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(initializeEmpty.thenBlock());
-      b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{outputTile});
-    }
-    auto kBlock = [&](Value kBegin, Value depth, bool first) {
-      auto group = [&](Value begin, Value extent, int64_t size,
-                       const std::function<void(Value, Value)> &body) {
-        if (!size) { body(begin, extent); return; }
-        Value step = index(b, loc, size);
-        Value full = multiply(b, loc, b.create<arith::DivSIOp>(loc, extent, step), step);
-        loop(b, loc, zero, full, size, [&](Value offset) { body(add(b, loc, begin, offset), step); });
-        Value tail = b.create<arith::SubIOp>(loc, extent, full);
-        auto branch = b.create<scf::IfOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, tail, zero), false);
-        OpBuilder::InsertionGuard guard(b);
-        b.setInsertionPointToStart(branch.thenBlock());
-        body(add(b, loc, begin, full), tail);
-      };
-      group(mBegin, mCount, groupM, [&](Value m, Value rows) {
-        group(nBegin, nCount, groupN, [&](Value n, Value columns) {
-          ContractionTile tile{lhs, rhs, output, initial, m, rows, n, columns, kBegin, depth, first, {}};
-          auto local = inputs.prepareGroup(b, operation, tile, shared, requirements);
-          if (failed(local)) { status = failure(); return; }
-          llvm::append_range(*local, *supplies);
-          tile.inputs = *local;
-          if (failed((*implementation)->formTile(b, operation, tile, shared, binding))) status = failure();
-        });
-      });
+      b.setInsertionPointToStart(branch.thenBlock());
+      body(add(b, loc, begin, full), tail);
     };
+    group(mBegin, mCount, groupM, [&](Value m, Value rows) {
+      group(nBegin, nCount, groupN, [&](Value n, Value columns) {
+        ContractionTile tile{lhs, rhs, output, initial, m, rows, n, columns, kBegin, depth, first, {}};
+        auto local = inputs.prepareGroup(b, operation, tile, shared, requirements);
+        if (failed(local)) { status = failure(); return; }
+        llvm::append_range(*local, supplies);
+        tile.inputs = *local;
+        if (failed((*implementation)->formTile(b, operation, tile, shared, binding))) status = failure();
+      });
+    });
+  };
+  auto reduction = [&](llvm::function_ref<void(Value, Value, bool)> kBlock) {
     if ((*implementation)->contraction.staticReductionExtent) {
       Value fullEnd = b.create<arith::SubIOp>(loc, kSize, b.create<arith::RemSIOp>(loc, kSize, bk));
       Value firstEnd = b.create<arith::MinSIOp>(loc, fullEnd, bk);
@@ -133,30 +205,97 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       loop(b, loc, firstEnd, kSize, config.tileK, [&](Value k) { dynamicBlock(k, false); });
     }
   };
-  auto emitTile = [&](Value m, Value n) {
+  auto coordinate = [&](unsigned axis, Value ordinal,
+                        llvm::function_ref<void(Value, Value)> body) {
+    Value size = axis == 0 ? mSize : nSize;
+    Value block = axis == 0 ? bm : bn;
     if (!staticParallel) {
-      Value mBegin = multiply(b, loc, m, bm), nBegin = multiply(b, loc, n, bn);
-      Value mCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, mSize, mBegin), bm);
-      Value nCount = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, nSize, nBegin), bn);
-      tile(mBegin, nBegin, mCount, nCount);
+      Value begin = multiply(b, loc, ordinal, block);
+      Value count = b.create<arith::MinSIOp>(loc,
+          b.create<arith::SubIOp>(loc, size, begin), block);
+      body(begin, count);
       return;
     }
-    auto bounded = [&](Value ordinal, Value full, Value block,
-                       const std::function<void(Value, Value)> &body) {
-      Value complete = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, full);
-      auto branch = b.create<scf::IfOp>(loc, complete, true);
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(branch.thenBlock());
-      body(multiply(b, loc, ordinal, block), block);
-      b.setInsertionPointToStart(branch.elseBlock());
-      Value begin = add(b, loc, multiply(b, loc, full, block), b.create<arith::SubIOp>(loc, ordinal, full));
-      body(begin, one);
-    };
-    bounded(m, fullM, bm, [&](Value mBegin, Value mCount) {
-      bounded(n, fullN, bn, [&](Value nBegin, Value nCount) { tile(mBegin, nBegin, mCount, nCount); });
+    Value full = axis == 0 ? fullM : fullN;
+    Value complete = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, full);
+    auto branch = b.create<scf::IfOp>(loc, complete, true);
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(branch.thenBlock());
+    body(multiply(b, loc, ordinal, block), block);
+    b.setInsertionPointToStart(branch.elseBlock());
+    Value begin = add(b, loc, multiply(b, loc, full, block), b.create<arith::SubIOp>(loc, ordinal, full));
+    body(begin, one);
+  };
+  auto emitTile = [&](Value m, Value n) {
+    coordinate(0, m, [&](Value mBegin, Value mCount) {
+      coordinate(1, n, [&](Value nBegin, Value nCount) {
+        reduction([&](Value kBegin, Value depth, bool first) {
+          tileBlock(mBegin, nBegin, mCount, nCount, kBegin, depth, first);
+        });
+      });
     });
   };
-  if (!parallelTiles && (operation->getParentOfType<scf::ForOp>() || operation->getParentOfType<scf::ParallelOp>())) {
+  if (cohort) {
+    unsigned freeAxis = cohort->freeAxis, reuseAxis = 1 - freeAxis;
+    Value freeTasks = freeAxis == 0 ? mTasks : nTasks;
+    Value reuseTasks = reuseAxis == 0 ? mTasks : nTasks;
+    Value span = reuseTasks;
+    if (!serialTiles) {
+      // Share as many independent tiles as possible while retaining at least
+      // min(original tile count, workers) independent tasks. All divisors are
+      // positive inside the complete M/N/K execution guard above.
+      Value needed = b.create<arith::CeilDivSIOp>(loc,
+          index(b, loc, capabilities.getWorkers()), freeTasks);
+      span = b.create<arith::MaxSIOp>(loc, one,
+          b.create<arith::DivSIOp>(loc, reuseTasks, needed));
+    }
+    Value groups = b.create<arith::CeilDivSIOp>(loc, reuseTasks, span);
+    auto emitCohort = [&](Value free, Value group) {
+      Value groupBegin = multiply(b, loc, group, span);
+      Value groupCount = b.create<arith::MinSIOp>(loc, span,
+          b.create<arith::SubIOp>(loc, reuseTasks, groupBegin));
+      Value groupEnd = add(b, loc, groupBegin, groupCount);
+      coordinate(freeAxis, free, [&](Value freeBegin, Value freeCount) {
+        // Every output tile sees the same ascending K chunks and first flag.
+        // Only independent output tiles are interleaved to share preparation.
+        reduction([&](Value kBegin, Value depth, bool first) {
+          SmallVector<Value> begins(2), counts(2);
+          auto map = operation.getIndexingMapsArray()[cohort->requirement.operand];
+          for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
+            bool paired = cast<AffineDimExpr>(expression).getPosition() == 2;
+            begins[axis] = paired ? kBegin : freeBegin;
+            counts[axis] = paired ? depth : freeCount;
+          }
+          Value source = operation.getInputs()[cohort->requirement.operand];
+          Value window = subview(b, loc, source,
+              SmallVector<OpFoldResult>(begins.begin(), begins.end()),
+              SmallVector<OpFoldResult>(counts.begin(), counts.end()));
+          auto consumers = b.create<scf::ForOp>(loc, groupBegin, groupEnd, one);
+          auto supply = inputs.prepareAt(window, begins, cohort->requirement, consumers);
+          if (failed(supply)) { status = failure(); return; }
+          supplies.assign(1, *supply);
+          OpBuilder::InsertionGuard guard(b);
+          b.setInsertionPointToStart(consumers.getBody());
+          coordinate(reuseAxis, consumers.getInductionVar(), [&](Value reuseBegin, Value reuseCount) {
+            tileBlock(freeAxis == 0 ? freeBegin : reuseBegin,
+                      freeAxis == 1 ? freeBegin : reuseBegin,
+                      freeAxis == 0 ? freeCount : reuseCount,
+                      freeAxis == 1 ? freeCount : reuseCount,
+                      kBegin, depth, first);
+          });
+        });
+      });
+    };
+    if (serialTiles) {
+      loop(b, loc, zero, freeTasks, 1, [&](Value free) { emitCohort(free, zero); });
+    } else {
+      auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
+          ValueRange{freeTasks, groups}, ValueRange{one, one});
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPointToStart(parallel.getBody());
+      emitCohort(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
+    }
+  } else if (serialTiles) {
     loop(b, loc, zero, mTasks, 1, [&](Value m) {
       loop(b, loc, zero, nTasks, 1, [&](Value n) { emitTile(m, n); });
     });

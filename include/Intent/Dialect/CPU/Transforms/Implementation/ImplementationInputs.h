@@ -16,12 +16,19 @@ public:
   explicit ImplementationInputs(mlir::func::FuncOp function);
   ~ImplementationInputs();
 
+  bool hasReusableScope(mlir::linalg::GenericOp operation,
+                        llvm::ArrayRef<InputRequirement> requirements);
+
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepare(
       mlir::linalg::GenericOp operation,
-      llvm::ArrayRef<InputRequirement> requirements,
-      const Implementation &implementation);
+      llvm::ArrayRef<InputRequirement> requirements);
   mlir::FailureOr<InputSupply> prepareCaptured(
       mlir::linalg::GenericOp operation, mlir::memref::LoadOp input,
+      const InputRequirement &requirement);
+  // Prepare this actual descriptor at its selected owner, without widening
+  // the window or moving it to a different traversal. Begins use source axes.
+  mlir::FailureOr<InputSupply> prepareAt(
+      mlir::Value window, mlir::ValueRange begins,
       const InputRequirement &requirement, mlir::Operation *scope);
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepareGroup(
       mlir::OpBuilder &builder, mlir::linalg::GenericOp operation,
