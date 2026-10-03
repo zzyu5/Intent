@@ -1,4 +1,5 @@
 #include "Pointwise.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
@@ -61,12 +62,25 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       PhysicalExprAttr blockedExtent,
                                       Value blockedRange, Value blockedValidity,
                                       Operation *insertionAnchor,
-                                      IRMapping &mapping) {
+                                      IRMapping &mapping,
+                                      const ReplayPolicy *policy) {
   if (Value replacement = mapping.lookupOrNull(value))
     return replacement;
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   if (!kernel)
     return failure();
+  std::optional<ReplayPolicy> localPolicy;
+  if (!policy) {
+    localPolicy.emplace(kernel, ValueRange{value}, ArrayRef<Operation *>{insertionAnchor},
+                        [&](Value current) { return containsTraversal(current, source, traversalDimensions); });
+    policy = &*localPolicy;
+  }
+  for (int64_t dimension : traversalDimensions)
+    if (failed(policy->bindSlices(builder, value, source, dimension, blockedExtent,
+                                  blockedRange, insertionAnchor, mapping, {},
+                                  traversalDimensions)))
+      return failure();
+  if (Value replacement = mapping.lookupOrNull(value)) return replacement;
   auto blocked = blockedRange.getDefiningOp<MakeRangeOp>();
   FailureOr<int64_t> blockedDimension =
       blocked ? queryRangeDimension(blocked) : FailureOr<int64_t>(failure());
@@ -274,7 +288,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
         IRMapping operandMapping;
         auto replayed = replayPointwiseValue(
             builder, operand, inputSource, dimensions, blockedExtent,
-            blockedRange, blockedValidity, insertionAnchor, operandMapping);
+            blockedRange, blockedValidity, insertionAnchor, operandMapping, policy);
         if (failed(replayed))
           return failure();
         auto expected = replaceTraversalExtent(
@@ -363,7 +377,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
     }
     FailureOr<Value> replacement = replayPointwiseValue(
         builder, operand, operandSource, operandDimensions, blockedExtent,
-        blockedRange, blockedValidity, insertionAnchor, mapping);
+        blockedRange, blockedValidity, insertionAnchor, mapping, policy);
     if (failed(replacement))
       return failure();
     if (*replacement != operand && !mapping.lookupOrNull(operand))
@@ -757,6 +771,14 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   }
   SmallVector<scf::ForOp> materializedLoops;
   for (SmallVector<StoreOp> &group : storeGroups) {
+  SmallVector<Value> replayRoots;
+  SmallVector<Operation *> replacedConsumers;
+  for (StoreOp store : group) {
+    replayRoots.push_back(store.getValue());
+    replacedConsumers.push_back(store);
+  }
+  ReplayPolicy replayPolicy(kernel, replayRoots, replacedConsumers,
+      [&](Value current) { return containsTraversal(current, logicalSource, payloadTraversalDimensions); });
   OpBuilder builder(group.front());
   Operation *loopInsertionAnchor = group.front().getOperation();
   Value stop = range.getLogicalStop();
@@ -801,7 +823,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
               nested, store.getValue(), logicalSource,
               payloadTraversalDimensions,
               chunkExtent,
-              blocked, tail, loopInsertionAnchor, mapping);
+              blocked, tail, loopInsertionAnchor, mapping, &replayPolicy);
           if (failed(payload)) {
             bodyFailed = true;
             failureReason = "write payload cannot be replayed in the internal tile loop";
@@ -812,7 +834,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
             FailureOr<Value> replayed = replayPointwiseValue(
                 nested, coordinate, logicalSource, *traversalDimensions,
                 chunkExtent, blocked,
-                tail, loopInsertionAnchor, mapping);
+                tail, loopInsertionAnchor, mapping, &replayPolicy);
             if (failed(replayed)) {
               bodyFailed = true;
               failureReason =
@@ -854,7 +876,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                 nested, store.getValid(), logicalSource,
                 payloadTraversalDimensions,
                 chunkExtent,
-                blocked, tail, loopInsertionAnchor, mapping);
+                blocked, tail, loopInsertionAnchor, mapping, &replayPolicy);
             if (failed(existing)) {
               bodyFailed = true;
               failureReason = "write validity cannot be replayed in the tile loop";
@@ -1394,11 +1416,10 @@ LogicalResult PointwiseRewrite::realizeWritebacks() {
             store.getValue(), source, PhysicalReplayScope::ValueGraph,
             /*allowAccesses=*/true, store.getOperation(), replayBindings,
             dimension);
-        llvm::SmallPtrSet<Operation *, 32> materializationVisited;
+        ReplayPolicy reuse(kernel, ValueRange{store.getValue()}, {store.getOperation()});
         bool materializedFork =
-            replay.crossesAccess && hasMaterializedReductionStoreFork(
-                                        store.getValue(), store, source,
-                                        dimension, materializationVisited);
+            replay.crossesAccess && reuse.preservesSharedTraversal(
+                                        store.getValue(), source, dimension);
         auto reduction = analysis.reductionDependency(store.getValue(), source, dimension);
         // A bounded value that already depends on the complete traversal is
         // retained SSA. Reblocking its writeback needlessly rebuilds that graph.

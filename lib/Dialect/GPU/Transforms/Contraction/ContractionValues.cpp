@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "ContractionDetail.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
@@ -189,6 +190,15 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     mapping.map(value, *sliced);
     return sliced;
   }
+  if (llvm::any_of(value.getUsers(), [&](Operation *user) {
+        return user == insertionAnchor || insertionAnchor->isAncestor(user);
+      })) {
+    ReplayPolicy reuse(kernel, ValueRange{value}, {insertionAnchor}, [&](Value current) {
+      return queryFragmentAxis(current.getType(), source, *dimension).isExact();
+    });
+    if (failed(reuse.bindSlices(builder, value, source, *dimension, blockedExtent,
+                                replacement, insertionAnchor, mapping))) return failure();
+  }
   FailureOr<Value> result = materializeReplayedRanges(
       builder, location, value, blockedExtent, roots, replacement, mapping,
       insertionAnchor);
@@ -309,6 +319,15 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     for (Operation *blocker : replay.blockers)
       diagnostic << "; blocker=" << blocker->getName();
     return failure();
+  }
+  if (llvm::any_of(value.getUsers(), [&](Operation *user) {
+        return user == insertionAnchor || insertionAnchor->isAncestor(user);
+      })) {
+    ReplayPolicy reuse(kernel, ValueRange{value}, {insertionAnchor}, [&](Value current) {
+      return queryFragmentAxis(current.getType(), source, *dimension).isExact();
+    });
+    if (failed(reuse.bindSlices(builder, value, source, *dimension, blockedExtent,
+                                replacement, insertionAnchor, mapping))) return failure();
   }
   return materializeReplayedRanges(builder, location, value, blockedExtent,
                                   ArrayRef<MakeRangeOp>(root), replacement,

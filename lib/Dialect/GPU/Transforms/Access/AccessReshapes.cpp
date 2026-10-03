@@ -1,4 +1,5 @@
 #include "AccessComposition.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
@@ -798,6 +799,12 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     outputAxes.push_back(axis);
   if (!canReplayEpilogue(store.getValue(), std::move(outputAxes)))
     return false;
+  ReplayPolicy reuse(kernel, ValueRange{store.getValue()}, {store.getOperation()});
+  // This rewrite changes the complete reassociation frame. Retain a profitable
+  // shared epilogue in its existing frame rather than cloning it for one store.
+  if (llvm::any_of(checked, [&](const auto &entry) {
+        return reuse.retains(entry.first, store);
+      })) return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   if (!input)
     return false;

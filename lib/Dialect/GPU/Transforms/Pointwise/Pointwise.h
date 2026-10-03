@@ -14,6 +14,8 @@
 #include <functional>
 #include <optional>
 
+namespace intent::gpu { class ReplayPolicy; }
+
 namespace intent::gpu::pointwise {
 using namespace mlir;
 
@@ -138,7 +140,8 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
                                       PhysicalExprAttr blockedExtent,
                                       Value blockedRange, Value blockedValidity,
                                       Operation *insertionAnchor,
-                                      IRMapping &mapping);
+                                      IRMapping &mapping,
+                                      const ReplayPolicy *policy = nullptr);
 bool storeUsesRange(StoreOp store, MakeRangeOp range);
 std::optional<int64_t> storeAxisForRange(StoreOp store, MakeRangeOp range);
 FailureOr<SmallVector<int64_t>>
@@ -146,16 +149,6 @@ traversalDimensionsForStores(ArrayRef<StoreOp> stores, MakeRangeOp range);
 FailureOr<int64_t> reuseTraversalDimension(func::FuncOp kernel,
                                            ArrayRef<StoreOp> stores,
                                            MakeRangeOp range);
-bool reachesDifferentStore(Value value, StoreOp current,
-                           PhysicalSourceAxis source, int64_t dimension,
-                           llvm::SmallPtrSetImpl<Operation *> &visited);
-bool reachesReduction(Value value, PhysicalSourceAxis source,
-                      int64_t dimension,
-                      llvm::SmallPtrSetImpl<Operation *> &visited);
-bool isExpensiveReplayProducer(Value value);
-bool hasMaterializedReductionStoreFork(
-    Value value, StoreOp current, PhysicalSourceAxis source, int64_t dimension,
-    llvm::SmallPtrSetImpl<Operation *> &visited);
 std::optional<unsigned> repeatedReductionOutputAxis(
     Value value, MakeRangeOp range);
 LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel);

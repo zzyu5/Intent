@@ -1,4 +1,5 @@
 #include "AccessComposition.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -248,6 +249,9 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
            BroadcastOp, SplatOp, ReshapeOp>(producer) ||
       gather.getSourceAxes().size() != source.getShape().size())
     return false;
+  ReplayPolicy reuse(gather->getParentOfType<func::FuncOp>(),
+                     ValueRange{gather.getSource()}, {gather.getOperation()});
+  if (reuse.retains(gather.getSource(), gather)) return false;
   if (auto binary = dyn_cast<BinaryOp>(producer);
       binary && !isa<FloatType>(source.getElementType())) {
     // Masked operands below are filled with zero. Do not introduce undefined

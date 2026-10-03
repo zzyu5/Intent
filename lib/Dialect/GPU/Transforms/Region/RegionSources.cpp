@@ -1,4 +1,5 @@
 #include "RegionSources.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
@@ -142,22 +143,33 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
                                 SmallVectorImpl<std::shared_ptr<IRMapping>>
                                     &sourceMappings,
                                 Operation *insertionAnchor, std::string &reason) {
+  SmallVector<Value> roots;
+  for (const auto &plan : plans) roots.push_back(plan.source);
+  ReplayPolicy reuse(insertionAnchor->getParentOfType<func::FuncOp>(), roots,
+                     {insertionAnchor}, [&](Value current) {
+    return llvm::any_of(plans, [&](const SourcePlan &plan) {
+      auto type = cast<FragmentType>(plan.source.getType());
+      auto axis = cast<AxisMapAttr>(type.getAxisMaps()[plan.sourceAxis]);
+      return queryFragmentAxis(current.getType(), plan.sourceIdentity, axis.getDimensionId()).isExact();
+    });
+  });
   for (auto [planIndex, plan] : llvm::enumerate(plans)) {
     if (planIndex >= sliceTypes.size() ||
         plan.sourceAxis >= sliceTypes[planIndex].getAxisMaps().size()) {
       reason = "source slice has no helper-local segment coordinate mapping";
       return failure();
     }
-    // Repeated occurrences of the same author value share one replay graph.
-    // Equal provenance is not enough: two distinct values may carry different
-    // validity, fill, or producer relations even when they traverse the same
-    // logical source axis.
+    // A shared mapping can reuse common SSA prefixes of distinct source values
+    // only under the same actual roots and complete selected coordinate schema.
+    // Producer/value identity remains the mapping key; provenance alone is not.
     std::optional<unsigned> sharedRelation;
     for (unsigned previous = 0; previous < planIndex; ++previous) {
       const SourcePlan &candidate = plans[previous];
-      bool sameSliceSchema =
-          candidate.source == plan.source &&
-          sliceTypes[previous] == sliceTypes[planIndex];
+      auto previousType = sliceTypes[previous], currentType = sliceTypes[planIndex];
+      bool sameSliceSchema = previousType.getShape() == currentType.getShape() &&
+          previousType.getAxisMaps() == currentType.getAxisMaps() &&
+          previousType.getValidity() == currentType.getValidity() &&
+          previousType.getOwner() == currentType.getOwner();
       if (sameSliceSchema &&
           candidate.sourceIdentity == plan.sourceIdentity &&
           candidate.sourceAxis == plan.sourceAxis &&
@@ -259,6 +271,11 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
             location, type, *predicate, *replayed, fill));
       }
     } else {
+      auto dimension = cast<AxisMapAttr>(
+          cast<FragmentType>(plan.source.getType()).getAxisMaps()[plan.sourceAxis]).getDimensionId();
+      if (failed(reuse.bindSlices(builder, plan.source, plan.sourceIdentity, dimension,
+                                  sliceExtent, mapping.lookup(plan.ranges.front()->getResult(0)),
+                                  insertionAnchor, mapping, segmentMapping))) return failure();
       replayed = materializeReplayedValue(
           builder, location, plan.source, plan.sourceIdentity, sliceExtent,
           mapping, insertionAnchor, replayOptions);

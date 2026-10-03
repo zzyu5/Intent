@@ -1,4 +1,5 @@
 #include "AccessComposition.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -28,6 +29,8 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
 
   auto input = cast<FragmentType>(reduce.getSources().front().getType());
   auto kernel = gather->getParentOfType<func::FuncOp>();
+  ReplayPolicy reuse(kernel, ValueRange{gather.getSource()}, {gather.getOperation()});
+  if (reuse.retains(gather.getSource(), gather)) return false;
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<Value> freeCoordinates(output.getShape().size());
   for (auto [coordinate, axis] :
