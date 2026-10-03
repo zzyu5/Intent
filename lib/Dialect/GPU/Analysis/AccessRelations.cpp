@@ -1,8 +1,7 @@
 #include "AccessRelations.h"
 #include "IndexBounds.h"
 #include "ScalarExpressions.h"
-#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
-#include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "llvm/ADT/STLExtras.h"
@@ -336,41 +335,8 @@ bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {
 bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   if (matchesResourceExtent(value, resource, axis))
     return true;
-  std::optional<int64_t> bound = integerConstant(value);
-  PhysicalExprAttr provenBound =
-      queryNonNegativeIndexUpperBound(stripScalarIdentity(value));
-  if (!bound && provenBound && provenBound.getKind() ==
-                                  PhysicalExprKind::Constant)
-    bound = provenBound.getValue();
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
-  if (!extent)
-    return false;
-  func::FuncOp kernel = resource.getParentRegion()
-                            ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
-                            : func::FuncOp();
-  PhysicalExprAttr exact = queryLaunchExpression(stripScalarIdentity(value));
-  if ((exact && configurationExpressionAtMost(kernel, exact, extent)) ||
-      (provenBound && configurationExpressionAtMost(kernel, provenBound, extent)))
-    return true;
-  auto kind = extent.getKind();
-  if (kind == PhysicalExprKind::Constant)
-    return bound && *bound >= 0 && *bound <= extent.getValue();
-  if (kind != PhysicalExprKind::Parameter)
-    return false;
-  FailureOr<ParameterAttr> parameter =
-      kernel ? queryParameterBySymbol(kernel, extent.getParameterReference().getName())
-             : FailureOr<ParameterAttr>(failure());
-  if (failed(parameter))
-    return false;
-  if (parameter->getCategory() ==
-      ParameterCategory::Coverage)
-    if (auto covered = parameter->getBinding().getCoverageBound();
-        covered && (queryLaunchExpression(value) == covered ||
-                    provenBound == covered))
-      return true;
-  return bound && *bound >= 0 &&
-         llvm::all_of(parameter->getCandidates().asArrayRef(),
-                      [&](int64_t candidate) { return *bound <= candidate; });
+  return extent && IndexRelations().atMost(stripScalarIdentity(value), extent);
 }
 
 bool derivesFromAccessCoordinate(Value value, Value coordinate) {
@@ -413,35 +379,14 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
                                    unsigned axis) {
   if (axis == 0 && linearizedGatherWithinResource(coordinate, resource))
     return true;
+  if (IndexRelations().coordinateInBounds(
+          coordinate, resourceExtentExpression(resource, axis))) return true;
   coordinate = stripIntegerIndexCasts(coordinate);
   // Reassociation and permutation preserve the set of coordinate values.
   if (auto reshape = coordinate.getDefiningOp<ReshapeOp>())
     return coordinateRangeWithinResource(reshape.getValue(), resource, axis);
   if (auto transpose = coordinate.getDefiningOp<TransposeOp>())
     return coordinateRangeWithinResource(transpose.getValue(), resource, axis);
-  if (PhysicalExprAttr upper = queryNonNegativeIndexUpperBound(coordinate)) {
-    auto maximum = constantPhysicalExpression(upper);
-    auto extent = constantPhysicalExpression(
-        resourceExtentExpression(resource, axis));
-    // Scalar loop coordinates remain bounded after a proven mask folds away.
-    // The query's bound is inclusive; the resource extent is exclusive.
-    if (maximum && extent && *maximum >= 0 && *maximum < *extent)
-      return true;
-  }
-  if (auto subtract = coordinate.getDefiningOp<BinaryOp>();
-      subtract && subtract.getOperatorKind() == BinaryOperator::Subtract) {
-    auto range = stripIntegerIndexCasts(subtract.getLhs()).getDefiningOp<MakeRangeOp>();
-    if (range && isUnitStepValue(range.getStep()) &&
-        sameScalarExpression(stripBroadcast(subtract.getRhs()), range.getStart()) &&
-        matchesResourceExtent(range.getExtent(), resource, axis))
-      return true;
-  }
-  if (std::optional<int64_t> constant = integerConstant(coordinate)) {
-    PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
-    auto kernel = resource.getParentRegion()->getParentOfType<func::FuncOp>();
-    auto bounds = positiveExtentBounds(kernel, extent);
-    return bounds && *constant >= 0 && *constant < bounds->first;
-  }
   if (auto select = coordinate.getDefiningOp<SelectOp>()) {
     if (!coordinateRangeWithinResource(select.getFalseValue(), resource, axis))
       return false;
@@ -512,41 +457,11 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
     inspectPredicate(select.getCondition());
     return lower && upper;
   }
-  auto range = coordinate.getDefiningOp<MakeRangeOp>();
-  if (!range || !isUnitStepValue(range.getStep()) ||
-      !coordinateKnownNonNegative(coordinate))
-    return false;
-  if (integerConstant(range.getStart()) == 0 &&
-      upperBoundWithinResource(range.getExtent(), resource, axis))
-    return true;
-  if (Value limit = queryCompleteTileLimit(range);
-      limit && upperBoundWithinResource(limit, resource, axis))
-    return true;
-  PhysicalExprAttr resourceExtent = resourceExtentExpression(resource, axis);
-  if (!resourceExtent ||
-      resourceExtent.getKind() !=
-          PhysicalExprKind::Constant)
-    return false;
-  std::optional<int64_t> start = integerConstant(range.getStart());
-  std::optional<int64_t> extent = integerConstant(range.getExtent());
-  return start && extent && *start >= 0 && *extent >= 0 &&
-         static_cast<__int128>(*start) + *extent <= resourceExtent.getValue();
+  return false;
 }
 
 bool hasExactPhysicalRangeCoverage(Value coordinate, Value upperBound) {
-  coordinate = stripBroadcast(coordinate);
-  upperBound = stripScalarIdentity(upperBound);
-  auto range = coordinate.getDefiningOp<MakeRangeOp>();
-  auto add = upperBound.getDefiningOp<BinaryOp>();
-  if (!range || !add || add.getOperatorKind() != BinaryOperator::Add ||
-      !isUnitStepValue(range.getStep()))
-    return false;
-  Value extent;
-  if (sameScalarExpression(add.getLhs(), range.getStart()))
-    extent = add.getRhs();
-  else if (sameScalarExpression(add.getRhs(), range.getStart()))
-    extent = add.getLhs();
-  return extent && sameScalarExpression(extent, range.getExtent());
+  return IndexRelations().hasExactRangeEndpoint(coordinate, upperBound);
 }
 
 } // namespace detail

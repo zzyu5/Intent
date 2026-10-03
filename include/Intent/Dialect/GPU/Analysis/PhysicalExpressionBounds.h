@@ -16,5 +16,13 @@ std::optional<mlir::ConstantIntRanges>
 queryPhysicalExpressionRange(PhysicalExprAttr expression,
                              mlir::func::FuncOp kernel);
 
+// Signed ordering over current typed host expressions. Mathematical rewrites
+// require checked operand evaluation; this does not create runtime guards or
+// turn execution-local coordinate facts into host-visible assumptions.
+bool physicalExpressionAtMost(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
+                              mlir::func::FuncOp kernel);
+bool physicalExpressionLessThan(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
+                                mlir::func::FuncOp kernel);
+
 } // namespace intent::gpu
 #endif

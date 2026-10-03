@@ -13,6 +13,7 @@ struct IndexBounds {
 
 mlir::Value stripIntegerIndexCasts(mlir::Value value);
 bool coordinateKnownNonNegative(mlir::Value coordinate);
+bool coordinateKnownPositive(mlir::Value coordinate);
 std::optional<std::pair<int64_t, int64_t>>
 nonNegativeExtentBounds(mlir::func::FuncOp kernel, PhysicalExprAttr extent);
 std::optional<std::pair<int64_t, int64_t>>

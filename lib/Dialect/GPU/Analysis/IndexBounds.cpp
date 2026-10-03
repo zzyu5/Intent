@@ -2,6 +2,8 @@
 #include "PhysicalProgramDetail.h"
 #include "ScalarExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
@@ -19,6 +21,75 @@ using namespace detail;
 
 namespace {
 
+Value coordinateSource(Value value) {
+  while (true) {
+    Value original = value;
+    value = stripIntegerIndexCasts(value);
+    if (auto reshape = value.getDefiningOp<ReshapeOp>())
+      value = reshape.getValue();
+    else if (auto transpose = value.getDefiningOp<TransposeOp>())
+      value = transpose.getValue();
+    if (value == original) return value;
+  }
+}
+
+bool isIndexCoordinate(Value value) {
+  if (!value) return false;
+  Type type = value.getType();
+  if (auto fragment = dyn_cast<FragmentType>(type)) type = fragment.getElementType();
+  return type.isIndex();
+}
+
+Value completeTileLimit(MakeRangeOp range) {
+  auto type = cast<FragmentType>(range.getResult().getType());
+  if (!type.getElementType().isIndex() || type.getShape().size() != 1 ||
+      integerConstant(range.getStep()) != 1) return {};
+  IndexRelations relations;
+  for (Operation *owner = range->getParentOp(); owner; owner = owner->getParentOp()) {
+    auto loop = dyn_cast<scf::ForOp>(owner);
+    if (!loop || !relations.same(range.getStart(), loop.getInductionVar()) ||
+        integerConstant(loop.getLowerBound()) != 0 || !relations.positive(loop.getStep()))
+      continue;
+    auto width = queryLaunchExpression(loop.getStep());
+    if (!width || type.getShape()[0] != width ||
+        !relations.same(range.getExtent(), loop.getStep())) continue;
+    Value limit = relations.alignedBound(loop.getUpperBound(), loop.getStep());
+    // The complete aligned iteration contains precisely [iv, iv + width).
+    // Both its lower bound and its representable exclusive endpoint follow
+    // together; independent interval arithmetic need not rediscover that fact.
+    if (limit && relations.nonnegative(limit)) return limit;
+  }
+  return {};
+}
+
+Value ordinalExtent(Value coordinate) {
+  auto subtract = coordinate.getDefiningOp<BinaryOp>();
+  if (!subtract || subtract.getOperatorKind() != BinaryOperator::Subtract)
+    return {};
+  auto range = coordinateSource(subtract.getLhs()).getDefiningOp<MakeRangeOp>();
+  if (!range || integerConstant(range.getStep()) != 1 ||
+      !sameScalarExpression(stripBroadcast(subtract.getRhs()), range.getStart()) ||
+      !IndexRelations().nonnegative(range.getExtent())) return {};
+  // (start + lane) - start preserves the lane even if the intermediate wraps.
+  return range.getExtent();
+}
+
+bool isRangeEndpoint(MakeRangeOp range, Value value) {
+  auto add = stripScalarIdentity(value).getDefiningOp<BinaryOp>();
+  if (!add || add.getOperatorKind() != BinaryOperator::Add ||
+      !value.getType().isIndex() || integerConstant(range.getStep()) != 1 ||
+      !IndexRelations().nonnegative(range.getExtent())) return false;
+  auto same = [&](Value lhs, Value rhs) { return IndexRelations().same(lhs, rhs); };
+  bool matches = (same(add.getLhs(), range.getStart()) && same(add.getRhs(), range.getExtent())) ||
+                 (same(add.getRhs(), range.getStart()) && same(add.getLhs(), range.getExtent()));
+  return matches && (integerOperationDoesNotWrap(add.getResult()) || completeTileLimit(range));
+}
+
+func::FuncOp containingKernel(Value value) {
+  return value && value.getParentRegion()
+      ? value.getParentRegion()->getParentOfType<func::FuncOp>() : func::FuncOp();
+}
+
 bool valueKnownPositive(Value value, unsigned depth);
 
 bool valueKnownNonNegative(Value value, unsigned depth);
@@ -31,21 +102,8 @@ bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
              llvm::all_of(mapping->extents, [&](Value bound) {
                return valueKnownNonNegative(bound, depth + 1);
              });
-  auto multiply = value.getDefiningOp<BinaryOp>();
-  if (!multiply || multiply.getOperatorKind() != BinaryOperator::Multiply)
-    return false;
-  // For x >= 0 and s > 0, floor(x / s) * s <= x.
-  for (auto [quotient, step] :
-       {std::pair{multiply.getLhs(), multiply.getRhs()},
-        std::pair{multiply.getRhs(), multiply.getLhs()}}) {
-    auto divide = quotient.getDefiningOp<BinaryOp>();
-    if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-        divide.getRhs() == step && valueKnownPositive(step, depth + 1) &&
-        valueKnownNonNegative(divide.getLhs(), depth + 1) &&
-        valueBelowDelinearizeExtent(divide.getLhs(), extent, depth + 1))
-      return true;
-  }
-  return false;
+  Value dividend = IndexRelations().roundedDownSource(value);
+  return dividend && valueBelowDelinearizeExtent(dividend, extent, depth + 1);
 }
 
 bool valueKnownPositive(Value value, unsigned depth = 0) {
@@ -226,9 +284,17 @@ Value stripIntegerIndexCasts(Value value) {
 }
 
 bool coordinateKnownNonNegative(Value coordinate) {
+  coordinate = coordinateSource(coordinate);
+  if (ordinalExtent(coordinate)) return true;
+  if (auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      range && completeTileLimit(range)) return true;
   if (queryNonNegativeIndexUpperBound(coordinate))
     return true;
   return valueKnownNonNegative(coordinate);
+}
+
+bool coordinateKnownPositive(Value coordinate) {
+  return valueKnownPositive(coordinate);
 }
 
 std::optional<std::pair<int64_t, int64_t>>
@@ -552,27 +618,68 @@ IndexBounds queryIndexBounds(Value value) {
                   ? expression(PhysicalExprKind::FloorDiv, 0, {lhs.upper, divisor})
                   : PhysicalExprAttr()};
     }
-    if (binary.getOperatorKind() == BinaryOperator::Multiply) {
-      // Aligning a non-negative index down cannot overflow or exceed that index.
-      // Other products require the explicit no-overflow proof above.
-      for (auto [quotient, factor] :
-           {std::pair{binary.getLhs(), binary.getRhs()},
-            std::pair{binary.getRhs(), binary.getLhs()}}) {
-        auto divide = quotient.getDefiningOp<BinaryOp>();
-        if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-            sameScalarExpression(divide.getRhs(), factor) && positiveDivisor(factor)) {
-          Bounds dividend = bound(divide.getLhs(), depth + 1);
-          if (dividend.nonNegative)
-            return dividend;
-        }
-      }
-    }
+    if (Value dividend = IndexRelations().roundedDownSource(current))
+      return bound(dividend, depth + 1);
     return numericBounds();
   };
   return bound(value, 0);
 }
 
 } // namespace detail
+
+bool IndexRelations::coordinateLessThan(Value coordinate, Value limit) const {
+  if (!isIndexCoordinate(coordinate) || !limit) return false;
+  coordinate = coordinateSource(coordinate);
+  limit = stripScalarIdentity(limit);
+  if (!limit.getType().isIndex()) return false;
+  if (coordinate.getType().isIndex() && lessThan(coordinate, limit)) return true;
+  auto left = queryIntegerRange(coordinate), right = queryIntegerRange(limit);
+  if (left && right && left->smax().slt(right->smin())) return true;
+  if (Value extent = ordinalExtent(coordinate))
+    if (atMost(extent, limit)) return true;
+  if (auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      range && integerConstant(range.getStep()) == 1) {
+    if (Value end = completeTileLimit(range); end && atMost(end, limit)) return true;
+    if (integerConstant(range.getStart()) == 0 && nonnegative(range.getExtent()) &&
+        atMost(range.getExtent(), limit)) return true;
+    if (isRangeEndpoint(range, limit)) return true;
+  }
+  auto expression = queryLaunchExpression(limit);
+  return expression && coordinateLessThan(coordinate, expression);
+}
+
+bool IndexRelations::coordinateLessThan(Value coordinate, PhysicalExprAttr limit) const {
+  if (!isIndexCoordinate(coordinate) || !limit) return false;
+  coordinate = coordinateSource(coordinate);
+  auto kernel = containingKernel(coordinate);
+  if (!kernel) return false;
+  if (auto exact = queryLaunchExpression(coordinate);
+      exact && configurationExpressionLessThan(kernel, exact, limit)) return true;
+  if (Value extent = ordinalExtent(coordinate))
+    if (atMost(extent, limit)) return true;
+  if (auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      range && integerConstant(range.getStep()) == 1) {
+    if (Value end = completeTileLimit(range); end && atMost(end, limit)) return true;
+    if (integerConstant(range.getStart()) == 0 && nonnegative(range.getExtent()) &&
+        atMost(range.getExtent(), limit)) return true;
+  }
+  auto bound = queryIndexBounds(coordinate);
+  if (bound.upper && configurationExpressionLessThan(kernel, bound.upper, limit))
+    return true;
+  auto left = queryIntegerRange(coordinate);
+  auto right = queryPhysicalExpressionRange(limit, kernel);
+  return left && right && left->smax().slt(right->smin());
+}
+
+bool IndexRelations::coordinateInBounds(Value coordinate, PhysicalExprAttr extent) const {
+  return nonnegative(coordinate) && coordinateLessThan(coordinate, extent);
+}
+
+bool IndexRelations::hasExactRangeEndpoint(Value coordinate, Value limit) const {
+  if (!isIndexCoordinate(coordinate) || !limit) return false;
+  auto range = coordinateSource(coordinate).getDefiningOp<MakeRangeOp>();
+  return range && isRangeEndpoint(range, limit);
+}
 
 bool isKnownPositiveExtent(PhysicalExprAttr extent, func::FuncOp kernel) {
   auto range = queryPhysicalExpressionRange(extent, kernel);

@@ -28,58 +28,21 @@ std::optional<int64_t> integer(Value value) {
              ? std::optional<int64_t>(constant.getInt()) : std::nullopt;
 }
 
-Value completeTileLimit(MakeRangeOp range, IndexRelations &relations) {
-  auto type = cast<FragmentType>(range.getResult().getType());
-  if (!type.getElementType().isIndex() || type.getShape().size() != 1 ||
-      integer(range.getStep()) != 1)
-    return {};
-  for (Operation *owner = range->getParentOp(); owner; owner = owner->getParentOp()) {
-    auto loop = dyn_cast<scf::ForOp>(owner);
-    if (!loop || !relations.same(range.getStart(), loop.getInductionVar()) ||
-        integer(loop.getLowerBound()) != 0 || !relations.positive(loop.getStep()))
-      continue;
-    auto width = queryLaunchExpression(loop.getStep());
-    if (!width || type.getShape()[0] != width ||
-        !relations.same(range.getExtent(), loop.getStep()))
-      continue;
-    Value limit = relations.alignedBound(loop.getUpperBound(), loop.getStep());
-    // For 0 <= iv < limit and an aligned limit, iv + [0, step) stays below
-    // limit without signed overflow. No fact about a partial final tile is used.
-    if (limit && relations.nonnegative(limit))
-      return limit;
-  }
-  return {};
-}
-
 } // namespace
 
-Value queryCompleteTileLimit(MakeRangeOp range) {
-  IndexRelations relations;
-  return completeTileLimit(range, relations);
-}
-
 std::optional<bool> proveRangeComparison(CompareOp comparison) {
-  if (comparison.getLhs().getType().isIndex() &&
-      comparison.getPredicate() == ComparePredicate::Ge &&
-      integer(comparison.getRhs()) == 0 &&
-      queryNonNegativeIndexUpperBound(comparison.getLhs()))
-    return true;
-  Value source = withoutProjection(comparison.getLhs());
+  Value source = comparison.getLhs();
   Value bound = withoutProjection(comparison.getRhs());
-  auto range = source.getDefiningOp<MakeRangeOp>();
-  if (!range || !bound.getType().isIndex())
+  if (!bound.getType().isIndex())
     return std::nullopt;
   IndexRelations relations;
-  Value limit = queryCompleteTileLimit(range);
-  if (!limit)
-    return std::nullopt;
   if (comparison.getPredicate() == ComparePredicate::Lt &&
-      relations.atMost(limit, bound))
+      relations.coordinateLessThan(source, bound))
     return true;
   if (comparison.getPredicate() == ComparePredicate::Ge) {
-    if (relations.atMost(limit, bound))
+    if (relations.coordinateLessThan(source, bound))
       return false;
-    if (integer(bound) == 0)
+    if (integer(bound) == 0 && relations.nonnegative(source))
       return true;
   }
   return std::nullopt;

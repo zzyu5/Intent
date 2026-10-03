@@ -1,45 +1,12 @@
 #include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 
 using namespace mlir;
 
 namespace intent::gpu {
-namespace {
-
-bool expressionAtMost(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
-                      unsigned depth = 0) {
-  if (!lhs || !rhs || depth >= 32) return false;
-  if (lhs == rhs) return true;
-  auto left = constantPhysicalExpression(lhs);
-  auto right = constantPhysicalExpression(rhs);
-  if (left && right) return *left <= *right;
-  if (lhs.getOperands().size() == 2) {
-    auto first = cast<PhysicalExprAttr>(lhs.getOperands()[0]);
-    auto second = cast<PhysicalExprAttr>(lhs.getOperands()[1]);
-    if (lhs.getKind() == PhysicalExprKind::Minimum)
-      return expressionAtMost(first, rhs, depth + 1) ||
-             expressionAtMost(second, rhs, depth + 1);
-    if (lhs.getKind() == PhysicalExprKind::Maximum)
-      return expressionAtMost(first, rhs, depth + 1) &&
-             expressionAtMost(second, rhs, depth + 1);
-  }
-  if (rhs.getOperands().size() == 2) {
-    auto first = cast<PhysicalExprAttr>(rhs.getOperands()[0]);
-    auto second = cast<PhysicalExprAttr>(rhs.getOperands()[1]);
-    if (rhs.getKind() == PhysicalExprKind::Maximum)
-      return expressionAtMost(lhs, first, depth + 1) ||
-             expressionAtMost(lhs, second, depth + 1);
-    if (rhs.getKind() == PhysicalExprKind::Minimum)
-      return expressionAtMost(lhs, first, depth + 1) &&
-             expressionAtMost(lhs, second, depth + 1);
-  }
-  return false;
-}
-
-} // namespace
-
 FailureOr<PhysicalExprAttr>
 instantiateConfigurationExpression(PhysicalExprAttr expression,
                                    DictionaryAttr bindings) {
@@ -77,14 +44,20 @@ instantiateConfigurationExpression(PhysicalExprAttr expression,
   return result;
 }
 
-bool configurationExpressionAtMost(func::FuncOp kernel, PhysicalExprAttr lhs,
-                                   PhysicalExprAttr rhs) {
+namespace {
+
+bool configurationExpressionOrder(func::FuncOp kernel, PhysicalExprAttr lhs,
+                                  PhysicalExprAttr rhs, bool strict) {
   if (!kernel || !lhs || !rhs) return false;
+  auto ordered = [&](PhysicalExprAttr left, PhysicalExprAttr right) {
+    return strict ? physicalExpressionLessThan(left, right, kernel)
+                  : physicalExpressionAtMost(left, right, kernel);
+  };
   auto empty = DictionaryAttr::get(kernel.getContext());
   auto symbolicLeft = instantiateConfigurationExpression(lhs, empty);
   auto symbolicRight = instantiateConfigurationExpression(rhs, empty);
   if (failed(symbolicLeft) || failed(symbolicRight)) return false;
-  if (expressionAtMost(*symbolicLeft, *symbolicRight)) return true;
+  if (ordered(*symbolicLeft, *symbolicRight)) return true;
   auto configurations =
       kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
   if (!configurations || configurations.getRows().empty() ||
@@ -107,10 +80,22 @@ bool configurationExpressionAtMost(func::FuncOp kernel, PhysicalExprAttr lhs,
     }
     auto left = instantiateConfigurationExpression(lhs, row);
     auto right = instantiateConfigurationExpression(rhs, row);
-    if (failed(left) || failed(right) || !expressionAtMost(*left, *right))
+    if (failed(left) || failed(right) || !ordered(*left, *right))
       return false;
   }
   return true;
+}
+
+} // namespace
+
+bool configurationExpressionAtMost(func::FuncOp kernel, PhysicalExprAttr lhs,
+                                   PhysicalExprAttr rhs) {
+  return configurationExpressionOrder(kernel, lhs, rhs, false);
+}
+
+bool configurationExpressionLessThan(func::FuncOp kernel, PhysicalExprAttr lhs,
+                                     PhysicalExprAttr rhs) {
+  return configurationExpressionOrder(kernel, lhs, rhs, true);
 }
 
 } // namespace intent::gpu

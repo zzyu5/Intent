@@ -3,6 +3,7 @@
 #include "PhysicalProgramDetail.h"
 #include "ScalarExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -495,7 +496,7 @@ PhysicalProgramAnalysis::accessBounds(Operation *access) {
                                       sourceAxis)) {
       bounds[sourceAxis].lower = true;
       bounds[sourceAxis].upper = true;
-    } else if (coordinateKnownNonNegative(coordinate)) {
+    } else if (IndexRelations().nonnegative(coordinate)) {
       bounds[sourceAxis].lower = true;
     }
   }

@@ -10,10 +10,6 @@ namespace intent::gpu {
 // An absent result leaves the original predicate and all its users intact.
 std::optional<bool> proveRangeComparison(CompareOp comparison);
 
-// Exclusive bound for every lane of a complete, nonnegative physical tile.
-// Recompute from the current range and enclosing loop; absent means unproven.
-mlir::Value queryCompleteTileLimit(MakeRangeOp range);
-
 // Inclusive upper bound and comparison limit, both specialization expressions.
 // This is an implication guard: upper < limit implies the original comparison;
 // it does not assert that arbitrary runtime shapes satisfy that relationship.

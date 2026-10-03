@@ -22,6 +22,19 @@ public:
   bool nonnegative(mlir::Value value) const;
   bool positive(mlir::Value value) const;
   bool atMost(mlir::Value lhs, mlir::Value rhs) const;
+  bool lessThan(mlir::Value lhs, mlir::Value rhs) const;
+  bool atMost(mlir::Value lhs, PhysicalExprAttr rhs) const;
+
+  // Every represented lane must satisfy the relation. These queries combine
+  // current loop/range correlations with fixed-width integer facts; independent
+  // intervals are sufficient evidence, never a prerequisite for a relation.
+  bool coordinateLessThan(mlir::Value coordinate, mlir::Value limit) const;
+  bool coordinateLessThan(mlir::Value coordinate, PhysicalExprAttr limit) const;
+  bool coordinateInBounds(mlir::Value coordinate, PhysicalExprAttr extent) const;
+  bool hasExactRangeEndpoint(mlir::Value coordinate, mlir::Value limit) const;
+
+  // Return the dividend of a proved nonnegative round-down expression.
+  mlir::Value roundedDownSource(mlir::Value value) const;
   bool powerOfTwo(mlir::Value value) const;
   bool multipleOf(mlir::Value value, mlir::Value divisor) const;
 
@@ -35,8 +48,6 @@ public:
   // ordering is proven. This does not prove that an entire loop is nonempty.
   mlir::Value alignedBound(mlir::Value value, mlir::Value step) const;
 
-private:
-  bool atMost(mlir::Value lhs, mlir::Value rhs, unsigned depth) const;
 };
 
 } // namespace intent::gpu

@@ -1,6 +1,9 @@
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Analysis/IntegerRelations.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -83,7 +86,9 @@ bool IndexRelations::same(Value lhs, Value rhs) const {
 }
 
 bool IndexRelations::nonnegative(Value value) const {
-  if (!value || !value.getType().isIndex())
+  Type type = value ? value.getType() : Type();
+  if (auto fragment = dyn_cast_or_null<FragmentType>(type)) type = fragment.getElementType();
+  if (!type || !type.isIndex())
     return false;
   if (auto range = queryIntegerRange(value); range && range->smin().isNonNegative())
     return true;
@@ -99,59 +104,120 @@ bool IndexRelations::positive(Value value) const {
   auto expression = queryLaunchExpression(value);
   auto owner = value.getDefiningOp();
   auto kernel = owner ? owner->getParentOfType<func::FuncOp>() : func::FuncOp();
-  return expression && kernel && isKnownPositiveExtent(expression, kernel);
+  return (expression && kernel && isKnownPositiveExtent(expression, kernel)) ||
+         detail::coordinateKnownPositive(value);
 }
+
+namespace {
+
+PhysicalExprAttr physical(OpFoldResult node) {
+  return dyn_cast_or_null<PhysicalExprAttr>(dyn_cast<Attribute>(node));
+}
+
+IntegerOrder<OpFoldResult> indexOrder(const IndexRelations &relations,
+                                    func::FuncOp kernel) {
+  IntegerOrderCallbacks<OpFoldResult> callbacks;
+  callbacks.signedWidth = [](OpFoldResult node) -> unsigned {
+    if (auto value = dyn_cast<Value>(node)) return value.getType().isIndex() ? 64 : 0;
+    return physical(node) ? 64 : 0;
+  };
+  callbacks.binary = [](OpFoldResult node) -> std::optional<IntegerOrderBinary<OpFoldResult>> {
+    IntegerOrderKind kind;
+    if (auto value = dyn_cast<Value>(node)) {
+      auto binary = value.getDefiningOp<BinaryOp>();
+      if (!binary) return std::nullopt;
+      switch (binary.getOperatorKind()) {
+      case BinaryOperator::Add: kind = IntegerOrderKind::Add; break;
+      case BinaryOperator::Subtract: kind = IntegerOrderKind::Subtract; break;
+      case BinaryOperator::Multiply: kind = IntegerOrderKind::Multiply; break;
+      case BinaryOperator::FloorDivide: kind = IntegerOrderKind::FloorDivide; break;
+      case BinaryOperator::Minimum: kind = IntegerOrderKind::Minimum; break;
+      case BinaryOperator::Maximum: kind = IntegerOrderKind::Maximum; break;
+      default: return std::nullopt;
+      }
+      return IntegerOrderBinary<OpFoldResult>{kind, binary.getLhs(), binary.getRhs()};
+    }
+    auto expression = physical(node);
+    if (!expression || expression.getOperands().size() != 2) return std::nullopt;
+    switch (expression.getKind()) {
+    case PhysicalExprKind::Add: kind = IntegerOrderKind::Add; break;
+    case PhysicalExprKind::Subtract: kind = IntegerOrderKind::Subtract; break;
+    case PhysicalExprKind::Multiply: kind = IntegerOrderKind::Multiply; break;
+    case PhysicalExprKind::FloorDiv: kind = IntegerOrderKind::FloorDivide; break;
+    case PhysicalExprKind::Minimum: kind = IntegerOrderKind::Minimum; break;
+    case PhysicalExprKind::Maximum: kind = IntegerOrderKind::Maximum; break;
+    default: return std::nullopt;
+    }
+    return IntegerOrderBinary<OpFoldResult>{kind, expression.getOperands()[0], expression.getOperands()[1]};
+  };
+  callbacks.constant = [&relations, kernel](OpFoldResult node) {
+    if (auto value = dyn_cast<Value>(node)) return relations.constant(value);
+    return relations.constant(physical(node), kernel);
+  };
+  auto expression = [](OpFoldResult node) {
+    if (auto value = dyn_cast<Value>(node)) return queryLaunchExpression(value);
+    return physical(node);
+  };
+  callbacks.same = [&relations, expression](OpFoldResult lhs, OpFoldResult rhs) {
+    auto left = dyn_cast<Value>(lhs), right = dyn_cast<Value>(rhs);
+    if (left && right) return relations.same(left, right);
+    auto a = expression(lhs), b = expression(rhs);
+    return a && b && a == b;
+  };
+  callbacks.nonnegative = [&relations, kernel](OpFoldResult node) {
+    if (auto value = dyn_cast<Value>(node)) return relations.nonnegative(value);
+    auto range = queryPhysicalExpressionRange(physical(node), kernel);
+    return range && range->smin().isNonNegative();
+  };
+  callbacks.positive = [&relations, kernel](OpFoldResult node) {
+    if (auto value = dyn_cast<Value>(node)) return relations.positive(value);
+    auto range = queryPhysicalExpressionRange(physical(node), kernel);
+    return range && range->smin().isStrictlyPositive();
+  };
+  callbacks.noSignedWrap = [kernel](OpFoldResult node) {
+    if (auto value = dyn_cast<Value>(node)) return integerOperationDoesNotWrap(value);
+    return bool(queryPhysicalExpressionRange(physical(node), kernel));
+  };
+  callbacks.knownOrder = [kernel, expression](OpFoldResult lhs, OpFoldResult rhs, bool strict) {
+    auto left = dyn_cast<Value>(lhs), right = dyn_cast<Value>(rhs);
+    auto a = left ? queryIntegerRange(left) : queryPhysicalExpressionRange(physical(lhs), kernel);
+    auto b = right ? queryIntegerRange(right) : queryPhysicalExpressionRange(physical(rhs), kernel);
+    if (a && b && (strict ? a->smax().slt(b->smin()) : a->smax().sle(b->smin()))) return true;
+    auto first = expression(lhs), second = expression(rhs);
+    return first && second && (strict ? configurationExpressionLessThan(kernel, first, second)
+                                     : configurationExpressionAtMost(kernel, first, second));
+  };
+  return IntegerOrder<OpFoldResult>(std::move(callbacks));
+}
+
+func::FuncOp kernelOf(Value value) {
+  return value && value.getParentRegion()
+      ? value.getParentRegion()->getParentOfType<func::FuncOp>() : func::FuncOp();
+}
+
+} // namespace
 
 bool IndexRelations::atMost(Value lhs, Value rhs) const {
-  return atMost(lhs, rhs, 0);
+  if (!lhs || !rhs) return false;
+  return indexOrder(*this, kernelOf(lhs)).atMost(lhs, rhs);
 }
 
-bool IndexRelations::atMost(Value lhs, Value rhs, unsigned depth) const {
-  if (!lhs || !rhs || !lhs.getType().isIndex() || !rhs.getType().isIndex() ||
-      depth >= 32)
-    return false;
-  if (same(lhs, rhs))
-    return true;
-  auto left = constant(lhs), right = constant(rhs);
-  if (left && right)
-    return *left <= *right;
-  if (left && *left == 0 && nonnegative(rhs))
-    return true;
-  auto leftRange = queryIntegerRange(lhs), rightRange = queryIntegerRange(rhs);
-  if (leftRange && rightRange && leftRange->smax().sle(rightRange->smin()))
-    return true;
-  auto compare = [&](Value a, Value b) { return atMost(a, b, depth + 1); };
-  if (auto binary = lhs.getDefiningOp<BinaryOp>()) {
-    if (binary.getOperatorKind() == BinaryOperator::Minimum)
-      return compare(binary.getLhs(), rhs) || compare(binary.getRhs(), rhs);
-    if (binary.getOperatorKind() == BinaryOperator::Maximum)
-      return compare(binary.getLhs(), rhs) && compare(binary.getRhs(), rhs);
-    if (binary.getOperatorKind() == BinaryOperator::Subtract &&
-        nonnegative(binary.getLhs()) && nonnegative(binary.getRhs()))
-      // The difference of two nonnegative signed values fits the signed type.
-      return compare(binary.getLhs(), rhs);
-    if (binary.getOperatorKind() == BinaryOperator::Multiply)
-      for (auto [quotient, factor] :
-           {std::pair{binary.getLhs(), binary.getRhs()},
-            std::pair{binary.getRhs(), binary.getLhs()}}) {
-        auto divide = quotient.getDefiningOp<BinaryOp>();
-        if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-            same(divide.getRhs(), factor) && positive(factor) &&
-            nonnegative(divide.getLhs()) && compare(divide.getLhs(), rhs))
-          return true;
-      }
-  }
-  if (auto binary = rhs.getDefiningOp<BinaryOp>()) {
-    if (binary.getOperatorKind() == BinaryOperator::Maximum)
-      return compare(lhs, binary.getLhs()) || compare(lhs, binary.getRhs());
-    if (binary.getOperatorKind() == BinaryOperator::Minimum)
-      return compare(lhs, binary.getLhs()) && compare(lhs, binary.getRhs());
-    if (binary.getOperatorKind() == BinaryOperator::Add &&
-        integerOperationDoesNotWrap(binary.getResult()))
-      return (nonnegative(binary.getRhs()) && compare(lhs, binary.getLhs())) ||
-             (nonnegative(binary.getLhs()) && compare(lhs, binary.getRhs()));
-  }
-  return false;
+bool IndexRelations::lessThan(Value lhs, Value rhs) const {
+  if (!lhs || !rhs) return false;
+  return indexOrder(*this, kernelOf(lhs)).lessThan(lhs, rhs);
+}
+
+bool IndexRelations::atMost(Value lhs, PhysicalExprAttr rhs) const {
+  if (!lhs || !rhs) return false;
+  if (indexOrder(*this, kernelOf(lhs)).atMost(lhs, rhs)) return true;
+  auto upper = queryNonNegativeIndexUpperBound(lhs);
+  return upper && configurationExpressionAtMost(kernelOf(lhs), upper, rhs);
+}
+
+Value IndexRelations::roundedDownSource(Value value) const {
+  if (!value) return {};
+  auto rounded = indexOrder(*this, kernelOf(value)).roundDown(value);
+  return rounded ? dyn_cast<Value>(rounded->dividend) : Value();
 }
 
 bool IndexRelations::powerOfTwo(Value value) const {
@@ -288,16 +354,9 @@ Value IndexRelations::alignedBound(Value value, Value step) const {
   auto operation = value.getDefiningOp<BinaryOp>();
   if (!operation)
     return {};
-  if (operation.getOperatorKind() == BinaryOperator::Multiply)
-    for (auto [quotient, factor] :
-         {std::pair{operation.getLhs(), operation.getRhs()},
-          std::pair{operation.getRhs(), operation.getLhs()}}) {
-      auto divide = quotient.getDefiningOp<BinaryOp>();
-      if (divide && divide.getOperatorKind() == BinaryOperator::FloorDivide &&
-          same(factor, step) && same(divide.getRhs(), step) && positive(step) &&
-          nonnegative(divide.getLhs()))
-        return value;
-    }
+  if (auto rounded = indexOrder(*this, kernelOf(value)).roundDown(value))
+    if (Value divisor = dyn_cast<Value>(rounded->divisor); divisor && same(divisor, step))
+      return value;
   if (operation.getOperatorKind() == BinaryOperator::Minimum)
     for (auto [candidate, other] :
          {std::pair{operation.getLhs(), operation.getRhs()},

@@ -1,7 +1,7 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
 official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,1.683168,1.927568,1.775696,1.145202,1.054973,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,,,,,,adapter_preparation_failed,generated_provider_program_verification_failed,"Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer","Intent cuTile compiler failed with exit code 6:; loc(""<stdin>"":17:11): error: 'intent_gpu.scaled_contract' op cuTile E8M0 scaled MMA requires compute capability 10.0 or newer"
-dense_gemm,M4096-N14336-K4096-fp16,1.581680,1.249840,1.349088,0.790198,0.852946,pass,pass,Intent target=triton; source corpus=cutile.,
+dense_gemm,M4096-N14336-K4096-fp16,1.609184,1.249840,1.346560,0.776692,0.836797,pass,pass,Intent target=triton; source corpus=cutile.,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,3.097600,3.486504,4.374440,1.125550,1.412203,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用预计算 block ownership,同算法；source 使用预计算 block ownership
 layer_norm,8192x4096-bf16,0.446112,0.050552,0.051344,0.114645,0.115092,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 额外写 Mean/Rstd,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.139768,0.128016,0.130176,0.915918,0.931372,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 FTZ 与近似除法,同算法；source 使用 FTZ 与近似除法
