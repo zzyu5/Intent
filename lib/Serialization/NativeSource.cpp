@@ -182,6 +182,18 @@ const OperationEmitters<NativeSourceEmitter> &NativeSourceEmitter::metadataEmitt
       out.alias(operation.getResult(), operation.getSource());
       return success();
     });
+    table.add<memref::TransposeOp>(memoryTypes,
+        [](memref::TransposeOp operation, NativeSourceEmitter &out) {
+      const auto source = out.memories.at(operation.getIn());
+      MemoryDescriptor target{source.base, source.offset, {}, {}};
+      for (AffineExpr expression : operation.getPermutation().getResults()) {
+        unsigned axis = cast<AffineDimExpr>(expression).getPosition();
+        target.sizes.push_back(source.sizes[axis]);
+        target.strides.push_back(source.strides[axis]);
+      }
+      out.memories[operation.getResult()] = std::move(target);
+      return success();
+    });
     table.add<memref::ExtractStridedMetadataOp>(memoryTypes,
         [](memref::ExtractStridedMetadataOp operation, NativeSourceEmitter &out) {
       const auto source = out.memories.at(operation.getSource());

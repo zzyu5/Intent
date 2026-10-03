@@ -2,6 +2,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   PhysicalProgram.cpp
   Contractions.cpp
   Storage.cpp
+  ViewRelations.cpp
   Ownership.cpp
   ExtentRelations.cpp
   AxisRelations.cpp
@@ -13,6 +14,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   MLIRIntentAnalysis
   MLIRAnalysis
   MLIRArithDialect
+  MLIRDialectUtils
   MLIRBufferizationTransforms
   MLIRBufferizationDialect
   MLIRCallInterfaces

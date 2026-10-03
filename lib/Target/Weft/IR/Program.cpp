@@ -1,6 +1,7 @@
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/Serialization/HostSource.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/SymbolTable.h"
@@ -164,13 +165,21 @@ LogicalResult verifyProgram(ModuleOp program) {
     }
     auto accesses = taskCallAccesses(kernel);
     if (failed(accesses)) return failure();
-    bool called = false, wrongEntry = false, wrongAccess = false;
+    bool called = false, wrongEntry = false, wrongAccess = false,
+         wrongLayout = false;
     modules->host.walk([&](cpu::InvokeOp call) {
       if (call.getCallee() != declaration.getName()) return;
       called = true;
       wrongEntry |= call->getParentOfType<func::FuncOp>() != entry;
       wrongAccess |= call.getAccessesAttr() != *accesses;
+      for (Value argument : call.getArguments()) {
+        if (!isa<MemRefType>(argument.getType()) ||
+            cpu::isContiguousDescriptor(argument)) continue;
+        call.emitError("native task argument requires a proved contiguous descriptor; its Weft view ABI does not carry strides");
+        wrongLayout = true;
+      }
     });
+    if (wrongLayout) return failure();
     if (!called || wrongEntry)
       return declaration.emitError("Weft task declaration must be called by its bound host entry");
     if (wrongAccess)

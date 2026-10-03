@@ -93,6 +93,8 @@ LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
     Value capture = position == 0 ? tasks.getBody().front().getArgument(0) : tasks.getCaptures()[position - 1];
     names.push_back(b.getStringAttr(position == 0 ? "coordinate" : "capture_" + std::to_string(position - 1)));
     if (auto memory = dyn_cast<MemRefType>(capture.getType())) {
+      if (!cpu::isContiguousDescriptor(capture))
+        return tasks.emitError("native task capture requires a proved contiguous descriptor");
       auto ids = memoryAxes(capture);
       llvm::SmallSet<int64_t, 8> unique(ids.begin(), ids.end());
       if (unique.size() != ids.size())
