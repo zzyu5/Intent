@@ -93,7 +93,8 @@ class ProgramContract:
     @classmethod
     def read(cls, source: str, metadata: dict) -> ProgramContract:
         from intent.compiler.options import CompileOptions
-        from intent.targets.specification import GPUCompilationTarget, read_compilation_target
+        from intent.targets.specification import read_compilation_target
+        from intent.targets.provider import provider as get_provider
         from .native import NativeABI
 
         if not isinstance(source, str) or not source.strip():
@@ -103,23 +104,14 @@ class ProgramContract:
             provider = name_field(data["provider"], "provider")
             name_field(data["entry_name"], "generated entry name")
             target = read_compilation_target(provider, data["target"])
+            adapter = get_provider(provider)
             options = CompileOptions.read(data["compile_options"])
-            if isinstance(target, GPUCompilationTarget):
+            if adapter.family == "gpu":
                 from .gpu.interface import GPUInterface
-                from .cutile.contract import CuTileFacts
-                from .triton.contract import TritonFacts
-
                 abi = GPUInterface(data)
-                reader = {"triton": TritonFacts, "cutile": CuTileFacts}[provider]
-                facts = reader.read(data[provider], abi)
             else:
-                from .bangc.contract import BangCFacts
-                from .mojo.contract import MojoFacts
-                from .weft.contract import WeftFacts
-
                 abi = NativeABI.read(data)
-                reader = {"mojo": MojoFacts, "weft": WeftFacts, "bangc": BangCFacts}[provider]
-                facts = reader.read(source, data, abi)
+            facts = adapter.read_facts(source, data, abi)
         except KeyError as error:
             raise ValueError(
                 f"generated program lacks required field {error}; regenerate it from the original Intent definition or KIR"

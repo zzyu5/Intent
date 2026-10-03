@@ -5,9 +5,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from typing import TYPE_CHECKING
 
-from intent.runtime import CompiledArtifact
+from .provider import EnvironmentCheck, Provider
 from .specification import CPUCompilationTarget, require_matching_target
+
+if TYPE_CHECKING:
+    from intent.runtime import CompiledArtifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +40,8 @@ class ResolvedMojoTarget:
         )
 
     def materialize(self, program) -> CompiledArtifact:
-        from intent.runtime.mojo import materialize_mojo_artifact
         require_matching_target(program.target, self.compilation)
-        return materialize_mojo_artifact(program.source, program.ir, program._contract, self)
+        return _bind(program, self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,3 +80,34 @@ class MojoTarget:
                                             private_bytes=self.private_bytes)
         return ResolvedMojoTarget(executable, triple, configuration["--target-cpu"], features,
                                   compilation, self.build_threads)
+
+
+def resolve_c_compiler(environment) -> str:
+    from intent.compiler.toolchain import CompilationStageError
+    executable = shutil.which("cc", path=environment.get("PATH"))
+    if executable is None:
+        raise CompilationStageError("native_toolchain_resolution",
+                                    "Mojo floating-point environment compilation requires a C compiler (cc)")
+    return executable
+
+
+def _read_facts(source, metadata, abi):
+    from intent.runtime.mojo.contract import MojoFacts
+    return MojoFacts.read(source, metadata, abi)
+
+
+def _bind(program, target):
+    from intent.runtime.mojo import materialize_mojo_artifact
+    return materialize_mojo_artifact(program.source, program.ir, program._contract, target)
+
+
+def _c_compiler():
+    return {"path": resolve_c_compiler(os.environ),
+            "scope": "Executable discovery only; compilation was not performed"}
+
+
+def _environment_checks(target):
+    return (EnvironmentCheck("FP environment compiler", "provider_toolchain", _c_compiler),)
+
+
+PROVIDER = Provider("cpu", MojoTarget, _read_facts, _bind, _environment_checks)

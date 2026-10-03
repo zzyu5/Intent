@@ -1,8 +1,7 @@
 """Explicitly enabled compilation tools, separate from the read-only manual."""
 from pathlib import Path
-
-from .compilation import (compile_request, describe as describe_interface, doctor, generate_ir_request,
-                          materialize_request, optimize_request, read_artifact as read_artifact_file)
+from .compilation import describe as describe_interface, read_artifact as read_artifact_file
+from .requests import request_async
 
 
 def main() -> None:
@@ -49,13 +48,12 @@ def main() -> None:
         It can change rounding/underflow/overflow but does not enable global fast
         math or FTZ. The online switch controls optimization, not permission.
         """
-        # Run synchronously in the server event loop: module loading temporarily
-        # owns sys.path/stdout, so concurrent compilation requests must not overlap.
-        return compile_request(Path(program_path), kernel, target, target_options=target_options,
-                               constexprs=constexprs, compiler=compiler,
-                               tuning_config=tuning_config, materialize=materialize, stage=stage,
-                               target_facts=target_facts, export_directory=export_directory,
-                               options=options)
+        return await request_async("compile", dict(
+            program=str(Path(program_path).expanduser().absolute()), kernel=kernel,
+            target=target, target_options=target_options,
+            constexprs=constexprs, compiler=compiler, tuning_config=tuning_config,
+            materialize=materialize, stage=stage, target_facts=target_facts,
+            export_directory=export_directory, options=options))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def generate_from_ir(ir_file: str, name: str, target: str,
@@ -71,10 +69,10 @@ def main() -> None:
         with the selected target's capabilities. Its compile options are preserved
         from IR, not reselected by this tool. This does not launch a kernel.
         """
-        return generate_ir_request(ir_file, name, target, input_stage=input_stage,
-                                   target_options=target_options, compiler=compiler,
-                                   materialize=materialize, target_facts=target_facts,
-                                   export_directory=export_directory)
+        return await request_async("generate_from_ir", dict(
+            ir_file=ir_file, name=name, target=target, input_stage=input_stage,
+            target_options=target_options, compiler=compiler, materialize=materialize,
+            target_facts=target_facts, export_directory=export_directory))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def materialize(program_directory: str, target: str, target_options: dict | None = None) -> dict:
@@ -83,7 +81,8 @@ def main() -> None:
         Target capabilities must agree with the saved compiler facts. This may
         compile/load native code, but neither recompiles KIR nor launches a kernel.
         """
-        return materialize_request(program_directory, target, target_options=target_options)
+        return await request_async("materialize", dict(
+            directory=program_directory, target=target, target_options=target_options))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
     async def optimize(ir_file: str, pipeline: str, optimizer: str | None = None) -> dict:
@@ -93,7 +92,7 @@ def main() -> None:
         and diagnostic paths. Pass prerequisites belong to the input/current IR;
         this does not materialize or launch a kernel or establish correctness.
         """
-        return optimize_request(ir_file, pipeline, optimizer=optimizer)
+        return await request_async("optimize", dict(ir_file=ir_file, pipeline=pipeline, optimizer=optimizer))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     async def environment(target: str | None = None, target_options: dict | None = None,
@@ -105,7 +104,8 @@ def main() -> None:
         selected runtime dependencies. This does not establish numerical
         correctness or device execution, or support for a particular program.
         """
-        return doctor(target, target_options=target_options, compiler=compiler, target_facts=target_facts)
+        return await request_async("environment", dict(
+            target=target, target_options=target_options, compiler=compiler, target_facts=target_facts))
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
     async def describe(target: str | None = None) -> dict:

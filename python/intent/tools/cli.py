@@ -163,6 +163,8 @@ def main() -> None:
             print(f"  exported program: {result['export_directory']}")
         if result.get("program_stdout"):
             print(result["program_stdout"], file=sys.stderr, end="")
+        if result.get("program_stderr"):
+            print(result["program_stderr"], file=sys.stderr, end="")
         if arguments.command == "compile":
             print("The tool did not launch the selected kernel; module-level Python code executes normally.")
         else:

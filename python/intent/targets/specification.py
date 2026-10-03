@@ -40,7 +40,8 @@ class GPUCompilationTarget:
     capabilities: GPUCapabilities
 
     def __post_init__(self) -> None:
-        if self.provider not in {"triton", "cutile"}:
+        from .provider import provider
+        if provider(self.provider).family != "gpu":
             raise ValueError(f"unsupported GPU source provider: {self.provider}")
         if not isinstance(self.capabilities, GPUCapabilities):
             raise TypeError("GPU compilation requires GPUCapabilities")
@@ -68,7 +69,8 @@ class CPUCompilationTarget:
     private_bytes: int = 262144
 
     def __post_init__(self) -> None:
-        if self.provider not in {"mojo", "weft"}:
+        from .provider import provider
+        if provider(self.provider).family != "cpu":
             raise ValueError(f"unsupported CPU source provider: {self.provider}")
         if any(type(value) is not int for value in (self.vector_bits, self.workers, self.private_bytes)) or type(self.matrix_i8_i32) is not bool:
             raise TypeError("CPU budgets must be integers and matrix_i8_i32 must be boolean")
@@ -150,6 +152,9 @@ def read_compilation_target(provider: str, facts: dict) -> CompilationTarget:
         raise TypeError("compiler target facts must be a JSON object")
     values = dict(facts)
     family = values.pop("family")
+    from .provider import provider as get_provider
+    if get_provider(provider).family != family:
+        raise ValueError(f"unsupported compiler target family/provider: {family}/{provider}")
     if family == "gpu":
         capabilities = GPUCapabilities(**values.pop("capabilities"))
         if values:
@@ -160,7 +165,7 @@ def read_compilation_target(provider: str, facts: dict) -> CompilationTarget:
         if values.keys() != expected:
             raise ValueError(f"CPU target requires exactly these fields: {', '.join(sorted(expected))}")
         return CPUCompilationTarget(provider, **values)
-    if family == "dsa" and provider == "bangc":
+    if family == "dsa":
         expected = {field.name for field in fields(DSACompilationTarget)} - {"shapes", "strides"}
         if values.keys() != expected:
             raise ValueError(f"DSA target requires exactly these fields: {', '.join(sorted(expected))}")

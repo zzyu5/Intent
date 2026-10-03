@@ -6,7 +6,6 @@ import base64
 import json
 import os
 from pathlib import Path
-import shutil
 from threading import Lock
 from uuid import uuid4
 
@@ -97,10 +96,8 @@ def benchmark_exports(candidate: MojoCandidate, abi: NativeABI) -> str:
 
 
 def _compile_fp_environment(environment: dict[str, str]) -> tuple[Path, bytes]:
-    executable = shutil.which("cc", path=environment.get("PATH"))
-    if executable is None:
-        raise CompilationStageError("native_toolchain_resolution",
-                                    "Mojo floating-point environment compilation requires a C compiler (cc)")
+    from intent.targets.mojo import resolve_c_compiler
+    executable = resolve_c_compiler(environment)
     compiler = file_identity(Path(executable))
     source = Path(__file__).with_name("fp_environment.c").read_text(encoding="utf-8")
     options = ("-O2", "-fPIC", "-c")

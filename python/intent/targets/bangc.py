@@ -3,9 +3,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from collections.abc import Mapping
 from pathlib import Path
+import os
+import shutil
+from typing import TYPE_CHECKING
 
-from intent.runtime import CompiledArtifact
+from .provider import EnvironmentCheck, Provider
 from .specification import DSACompilationTarget, require_matching_target
+
+if TYPE_CHECKING:
+    from intent.runtime import CompiledArtifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,9 +22,8 @@ class ResolvedBangCTarget:
     compiler: str | None
 
     def materialize(self, program) -> CompiledArtifact:
-        from intent.runtime.bangc import materialize_bangc_artifact
         require_matching_target(program.target, self.compilation)
-        return materialize_bangc_artifact(program.source, program.ir, program._contract, self)
+        return _bind(program, self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +64,58 @@ class BangCTarget:
             self.architecture, self.tile, self.tile_m, self.tile_n, self.tile_k,
             self.region_tile, self.tasks, self.local_bytes, shapes, strides)
         return ResolvedBangCTarget(
-            compilation, self.device, str(self.neuware),
-            str(self.compiler) if self.compiler is not None else None,
+            compilation, self.device, str(Path(self.neuware).expanduser().resolve()),
+            os.path.expanduser(str(self.compiler)) if self.compiler is not None else None,
         )
+
+
+def resolve_toolchain(target, environment) -> tuple[str, Path]:
+    from intent.compiler.toolchain import CompilationStageError
+    neuware = Path(target.neuware).expanduser().resolve()
+    selected = target.compiler or environment.get("INTENT_BANGC_CNCC") or str(neuware / "bin/cncc")
+    executable = shutil.which(os.path.expanduser(selected), path=environment.get("PATH", os.defpath))
+    if executable is None:
+        raise CompilationStageError(
+            "native_toolchain_resolution",
+            "CNCC was not found; set BangCTarget(compiler=...) or INTENT_BANGC_CNCC",
+        )
+    return str(Path(executable).resolve()), neuware
+
+
+def _read_facts(source, metadata, abi):
+    from intent.runtime.bangc.contract import BangCFacts
+    return BangCFacts.read(source, metadata, abi)
+
+
+def _bind(program, target):
+    from intent.runtime.bangc import materialize_bangc_artifact
+    return materialize_bangc_artifact(program.source, program.ir, program._contract, target)
+
+
+def _environment_checks(target):
+    if target is None:
+        return ()
+
+    def toolchain():
+        executable, neuware = resolve_toolchain(target, os.environ)
+        library = neuware / "lib64/libcnrt.so"
+        if not library.is_file():
+            raise FileNotFoundError(f"CNRT runtime library is missing: {library}")
+        return {"compiler": executable, "runtime": str(library)}
+
+    def device():
+        import ctypes
+        from intent.runtime.bangc.buffer import runtime
+
+        count = ctypes.c_uint()
+        runtime(target.neuware).invoke("cnrtGetDeviceCount", ctypes.byref(count))
+        if target.device >= count.value:
+            raise ValueError(f"MLU device {target.device} is unavailable; CNRT reports {count.value} devices")
+        return {"device": target.device, "visible_devices": count.value,
+                "scope": "Runtime enumeration only; hardware compatibility and execution were not checked"}
+
+    return (EnvironmentCheck("NeuWare tools", "provider_toolchain", toolchain),
+            EnvironmentCheck("MLU device", "device", device))
+
+
+PROVIDER = Provider("dsa", BangCTarget, _read_facts, _bind, _environment_checks)

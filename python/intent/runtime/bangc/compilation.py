@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 
 from intent.compiler.cache import file_identity
 from intent.compiler.toolchain import CompilationStageError
+from intent.targets.bangc import resolve_toolchain
 from ..native_artifact import (
     NativeArtifact, NativeBuildResult, build_native_artifact,
     run_native_command, write_source,
@@ -16,15 +16,7 @@ from ..native_artifact import (
 def compile_library(source: str, target) -> NativeArtifact:
     """Produce an immutable CNCC artifact without opening a library or device."""
     environment = dict(os.environ)
-    selected = target.compiler or environment.get("INTENT_BANGC_CNCC") or str(Path(target.neuware) / "bin/cncc")
-    executable = shutil.which(selected, path=environment.get("PATH", os.defpath))
-    if executable is None:
-        raise CompilationStageError(
-            "native_toolchain_resolution",
-            "CNCC was not found; set BangCTarget(compiler=...) or INTENT_BANGC_CNCC",
-        )
-    executable = str(Path(executable).resolve())
-    neuware = Path(target.neuware).expanduser().resolve()
+    executable, neuware = resolve_toolchain(target, environment)
     library_dir = str(neuware / "lib64")
     options = (f"--neuware-path={neuware}", f"--bang-mlu-arch={target.compilation.architecture}", "-O2", "-fPIC", "-shared",
                "-std=c++14", "-ffp-contract=off", "-I" + str(neuware / "include"),

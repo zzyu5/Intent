@@ -1,60 +1,15 @@
 """Shared implementation for the public command line and compile MCP."""
 from __future__ import annotations
 
-from contextlib import contextmanager, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import MISSING, asdict, fields, is_dataclass
 import importlib
-import importlib.util
 import inspect
-from itertools import count
 import io
-import os
 from pathlib import Path
-import shutil
-import sys
 
 from .backends import BACKENDS, backend, make_target
-
-_MODULE_IDS = count()
-
-
-@contextmanager
-def _definition(program: str | Path, symbol: str):
-    from intent.api import KernelDefinition
-
-    if not symbol.isidentifier():
-        raise ValueError("kernel must be a module-level Python identifier")
-    path = Path(program).expanduser()
-    module_name = None
-    if isinstance(program, Path) or path.suffix == ".py" or "/" in program:
-        path = path.resolve(strict=True)
-        if not path.is_file() or path.suffix != ".py":
-            raise ValueError("program must name an existing Python file")
-        module_name = f"_intent_user_program_{next(_MODULE_IDS)}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise ValueError(f"Cannot load Python program {path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        previous = list(sys.path)
-        try:
-            sys.path.insert(0, str(path.parent))
-            spec.loader.exec_module(module)
-        except BaseException:
-            del sys.modules[module_name]
-            raise
-        finally:
-            sys.path[:] = previous
-    else:
-        module = importlib.import_module(program)
-    try:
-        definition = getattr(module, symbol)
-        if not isinstance(definition, KernelDefinition):
-            raise TypeError(f"{program}:{symbol} is not an @intent.kernel definition")
-        yield definition
-    finally:
-        if module_name is not None:
-            del sys.modules[module_name]
+from intent.targets.provider import provider as get_provider
 
 
 def _files(directory: Path | None) -> dict[str, str]:
@@ -175,7 +130,7 @@ def describe(target: str | None = None) -> dict:
     try:
         names = (target,) if target is not None else tuple(BACKENDS)
         result["backends"] = {name: {**backend(name),
-            "target": _declaration(getattr(intent, backend(name)["target"]))} for name in names}
+            "target": _declaration(get_provider(name).target)} for name in names}
         result["api"] = {name: _declaration(getattr(intent, name)) for name in (
             "compile", "generate", "compile_ir", "generate_from_ir", "optimize_ir", "CompileOptions",
             "GPUCompilationTarget", "GPUCapabilities", "CPUCompilationTarget", "DSACompilationTarget",
@@ -220,6 +175,21 @@ def compile_request(program: str | Path, kernel: str, target: str | None = None,
     Loading the Python module executes its ordinary top-level host code. Native
     JIT/tuning may remain deferred after materialization, depending on provider.
     """
+    from .requests import request
+    selected_program = str(program.expanduser().absolute()) if isinstance(program, Path) else program
+    return request("compile", dict(program=selected_program, kernel=kernel, target=target,
+        target_options=target_options, constexprs=constexprs, compiler=compiler,
+        tuning_config=tuning_config, materialize=materialize, stage=stage,
+        target_facts=target_facts, export_directory=export_directory, options=options))
+
+
+def _compile_request(program: str, kernel: str, target: str | None = None, *,
+                     target_options: dict | None = None, constexprs: dict | None = None,
+                     compiler: str | None = None, tuning_config: str | None = None,
+                     materialize: bool = False, stage: str = "provider",
+                     target_facts: dict | None = None, export_directory: str | None = None,
+                     options: dict | None = None) -> dict:
+    from .worker import load_definition
     import intent
     from intent.compiler.toolchain import CompilerStage
 
@@ -247,7 +217,8 @@ def compile_request(program: str | Path, kernel: str, target: str | None = None,
             raise ValueError("runtime target options require materialization when explicit compiler facts are supplied")
         current_stage = "program_loading"
         # User module prints must not corrupt JSON output or the MCP transport.
-        with redirect_stdout(transcript), _definition(program, kernel) as definition:
+        with redirect_stdout(transcript):
+            definition = load_definition(program, kernel)
             result["definition"] = asdict(definition.source)
             selected = None
             if target is not None:
@@ -432,12 +403,6 @@ def doctor(target: str | None = None, *, target_options: dict | None = None, com
             check(name, "python_package", lambda name=name: python_module(name))
     else:
         result["scope"] = "Compiler and explicit compiler facts only; provider SDK, runtime device and execution were not checked"
-    if target == "cutile" and target_facts is None:
-        def tile_compiler():
-            from cuda.tile._compile import _find_compiler_bin
-            return {"path": _find_compiler_bin().path, "resolver": "cuda.tile"}
-        check("cuTile native compiler", "provider_toolchain", tile_compiler)
-
     resolved = None
     def resolve():
         nonlocal resolved
@@ -448,36 +413,11 @@ def doctor(target: str | None = None, *, target_options: dict | None = None, com
                 "facts": asdict(resolved) if is_dataclass(resolved) else {}}
 
     check("target", "target_resolution", resolve)
-    if target == "weft":
-        result["scope"] = "Weft source generation prerequisites only; the external AOT toolchain and RISC-V device were not checked"
-    if target == "bangc" and target_facts is None and resolved is not None:
-        def neuware():
-            path = shutil.which(resolved.compiler or os.environ.get("INTENT_BANGC_CNCC") or
-                                str(Path(resolved.neuware) / "bin/cncc"))
-            if path is None:
-                raise FileNotFoundError("BANG C compiler is unavailable; select compiler and neuware paths")
-            library = Path(resolved.neuware) / "lib64/libcnrt.so"
-            if not library.is_file():
-                raise FileNotFoundError(f"CNRT runtime library is missing: {library}")
-            return {"compiler": path, "runtime": str(library)}
-        check("NeuWare tools", "provider_toolchain", neuware)
-        def mlu_device():
-            import ctypes
-            from intent.runtime.bangc.buffer import runtime
-
-            count = ctypes.c_uint()
-            runtime(resolved.neuware).invoke("cnrtGetDeviceCount", ctypes.byref(count))
-            if resolved.device >= count.value:
-                raise ValueError(f"MLU device {resolved.device} is unavailable; CNRT reports {count.value} devices")
-            return {"device": resolved.device, "visible_devices": count.value,
-                    "scope": "Runtime enumeration only; hardware compatibility and execution were not checked"}
-        check("MLU device", "device", mlu_device)
-    if target == "mojo" and target_facts is None:
-        def c_compiler():
-            path = shutil.which("cc")
-            if path is None:
-                raise FileNotFoundError("Mojo floating-point environment compilation requires a C compiler (cc)")
-            return {"path": path, "scope": "Executable discovery only; compilation was not performed"}
-        check("FP environment compiler", "provider_toolchain", c_compiler)
+    adapter = get_provider(target)
+    if target_facts is None:
+        if adapter.environment_scope is not None:
+            result["scope"] = adapter.environment_scope
+        for item in adapter.environment_checks(resolved):
+            check(item.name, item.category, item.action)
     result["status"] = "available" if all(item["status"] == "available" for item in checks) else "unavailable"
     return result
