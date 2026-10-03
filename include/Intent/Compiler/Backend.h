@@ -2,7 +2,7 @@
 #define INTENT_COMPILER_BACKEND_H
 
 #include "Intent/Compiler/Compiler.h"
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/PassManager.h"
 #include <variant>

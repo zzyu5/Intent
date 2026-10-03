@@ -1,6 +1,6 @@
 #ifndef INTENT_TARGET_CUTILE_TRANSFORMS_LEGALIZE_H
 #define INTENT_TARGET_CUTILE_TRANSFORMS_LEGALIZE_H
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/IR/BuiltinOps.h"
 namespace intent::cutile {
 // Shared GPU input is verified and its buffers/workspaces are executable.

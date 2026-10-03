@@ -5,7 +5,7 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"

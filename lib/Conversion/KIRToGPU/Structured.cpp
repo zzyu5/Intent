@@ -1,7 +1,7 @@
 #include "Construction.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 using namespace mlir;

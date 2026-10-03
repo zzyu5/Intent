@@ -3,7 +3,7 @@
 #include "Intent/Analysis/ProductSchema.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 using namespace mlir;

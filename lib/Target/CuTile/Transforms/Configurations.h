@@ -2,7 +2,7 @@
 #define INTENT_TARGET_CUTILE_TRANSFORMS_CONFIGURATIONS_H
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 namespace intent::cutile {
 inline constexpr llvm::StringLiteral accessFormParameter = "CUTILE_ACCESS_FORM";

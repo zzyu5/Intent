@@ -1,7 +1,7 @@
 #include "NativeAccess.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/APFloat.h"
 

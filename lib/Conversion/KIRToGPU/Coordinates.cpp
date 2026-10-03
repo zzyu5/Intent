@@ -3,7 +3,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
-#include "Intent/Dialect/GPU/Transforms/Traversal.h"
+#include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 
 using namespace mlir;

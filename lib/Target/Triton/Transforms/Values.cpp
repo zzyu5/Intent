@@ -4,7 +4,7 @@
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
-#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"

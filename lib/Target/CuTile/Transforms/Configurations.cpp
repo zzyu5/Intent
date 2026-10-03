@@ -1,9 +1,9 @@
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 
 #include "Configurations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Transforms/Resources.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/Resources.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
 #include "llvm/Support/MathExtras.h"

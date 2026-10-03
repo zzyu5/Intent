@@ -3,7 +3,7 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
-#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"

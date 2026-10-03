@@ -4,7 +4,7 @@
 #include "mlir/IR/Verifier.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include <cassert>
 

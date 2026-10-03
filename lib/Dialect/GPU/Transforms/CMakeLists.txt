@@ -1,63 +1,79 @@
 add_mlir_library(MLIRIntentGPUTransforms
-  RealizeContractionBlocking.cpp
-  ContractionAnalysis.cpp
-  ContractionValues.cpp
-  ContractionSources.cpp
-  ContractionProjection.cpp
-  ContractionTraversal.cpp
-  ContractionBlocking.cpp
-  RealizeVectorContractions.cpp
-  RealizeAccessComposition.cpp
-  AccessCoordinates.cpp
-  AccessExpressions.cpp
-  AccessLoads.cpp
-  AccessGathers.cpp
-  AccessGatherProjection.cpp
-  AccessReductions.cpp
-  AccessReshapes.cpp
-  PredicateScalarControl.cpp
-  RealizePointwiseBlocking.cpp
-  PointwiseAnalysis.cpp
-  PointwiseCoverage.cpp
-  PointwiseTraversal.cpp
-  PointwiseOwnership.cpp
-  RealizeScanConsumers.cpp
-  MaterializeRetainedValues.cpp
-  VectorizeBufferLoops.cpp
-  PromoteBufferValues.cpp
-  SchedulePrivateStores.cpp
-  RealizeOnlineReduction.cpp
-  RealizeRegionFold.cpp
-  RealizeReductionBlocking.cpp
-  ReductionAnalysis.cpp
-  ReductionParameters.cpp
-  ReductionValues.cpp
-  ReductionReads.cpp
-  ReductionCoverage.cpp
-  ReductionDecomposition.cpp
-  ReductionTraversal.cpp
-  RefineProgramMapping.cpp
-  ExecutionGroups.cpp
-  EliminateCommonValues.cpp
-  SimplifyRangePredicates.cpp
-  LowerWorkspace.cpp
-  FuseIndependentTraversals.cpp
-  MaterializeConfigTuples.cpp
-  ConfigurationAnalysis.cpp
-  ConfigurationProfiles.cpp
-  ConfigurationConstraints.cpp
-  TuningProfiles.cpp
-  OnlineSummary.cpp
+  Access/AccessCoordinates.cpp
+  Access/AccessExpressions.cpp
+  Access/AccessGatherProjection.cpp
+  Access/AccessGathers.cpp
+  Access/AccessLoads.cpp
+  Access/AccessReductions.cpp
+  Access/AccessReshapes.cpp
+  Access/RealizeAccessComposition.cpp
+
+  Contraction/ContractionAnalysis.cpp
+  Contraction/ContractionBlocking.cpp
+  Contraction/ContractionProjection.cpp
+  Contraction/ContractionSources.cpp
+  Contraction/ContractionTraversal.cpp
+  Contraction/ContractionValues.cpp
+  Contraction/RealizeContractionBlocking.cpp
+  Contraction/RealizeVectorContractions.cpp
+
+  Pointwise/PointwiseAnalysis.cpp
+  Pointwise/PointwiseCoverage.cpp
+  Pointwise/PointwiseLifting.cpp
+  Pointwise/PointwiseOwnership.cpp
+  Pointwise/PointwiseTraversal.cpp
+  Pointwise/PointwiseWorksets.cpp
+  Pointwise/RealizePointwiseBlocking.cpp
+
+  Reduction/OnlineSummary.cpp
+  Reduction/RealizeOnlineReduction.cpp
+  Reduction/RealizeReductionBlocking.cpp
+  Reduction/RealizeScanConsumers.cpp
+  Reduction/ReductionAnalysis.cpp
+  Reduction/ReductionCoverage.cpp
+  Reduction/ReductionDecomposition.cpp
+  Reduction/ReductionParameters.cpp
+  Reduction/ReductionReads.cpp
+  Reduction/ReductionTraversal.cpp
+  Reduction/ReductionValues.cpp
+
+  Region/RealizeRegionFold.cpp
+  Region/RegionCloning.cpp
+  Region/RegionScanOutputs.cpp
+  Region/RegionSources.cpp
+
+  Control/FuseIndependentTraversals.cpp
+  Control/PredicateScalarControl.cpp
+  Control/PredicatedCloning.cpp
+  Control/Traversal.cpp
+  Control/VectorizeBufferLoops.cpp
+
+  Value/EliminateCommonValues.cpp
+  Value/ExecutionSchema.cpp
+  Value/ReplayMaterialization.cpp
+  Value/SchemaMutation.cpp
+  Value/SimplifyRangePredicates.cpp
+  Value/ValueMaterialization.cpp
+  Value/ValueRelations.cpp
+
+  Storage/LowerWorkspace.cpp
+  Storage/MaterializeRetainedValues.cpp
+  Storage/PromoteBufferValues.cpp
+  Storage/SchedulePrivateStores.cpp
+
+  Mapping/ExecutionGroups.cpp
+  Mapping/ProgramInterface.cpp
+  Mapping/RefineProgramMapping.cpp
+
+  Configuration/ConfigurationAnalysis.cpp
+  Configuration/ConfigurationConstraints.cpp
+  Configuration/ConfigurationProfiles.cpp
+  Configuration/MaterializeConfigTuples.cpp
+  Configuration/PhysicalParameters.cpp
+  Configuration/Resources.cpp
+  Configuration/TuningProfiles.cpp
+
   Passes.cpp
-  ValueMaterialization.cpp
-  ReplayMaterialization.cpp
-  RegionSources.cpp
-  ValueRelations.cpp
-  SchemaMutation.cpp
-  Traversal.cpp
-  PhysicalParameters.cpp
-  ProgramInterface.cpp
-  Resources.cpp
   VerifyGPUProgram.cpp
 
   DEPENDS

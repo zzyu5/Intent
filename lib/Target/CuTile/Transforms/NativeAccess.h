@@ -1,7 +1,7 @@
 #ifndef INTENT_TARGET_CUTILE_TRANSFORMS_NATIVEACCESS_H
 #define INTENT_TARGET_CUTILE_TRANSFORMS_NATIVEACCESS_H
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Transforms/TuningProfiles.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"

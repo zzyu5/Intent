@@ -6,8 +6,8 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
-#include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
-#include "Intent/Dialect/GPU/Transforms/Resources.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/Resources.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include <limits>

@@ -6,7 +6,7 @@
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
-#include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include <algorithm>
