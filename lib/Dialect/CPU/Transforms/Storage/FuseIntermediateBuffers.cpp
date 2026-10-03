@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -155,32 +156,17 @@ void forwardDestinations(func::FuncOp function) {
   }
 }
 
-bool canReplay(Value value, Operation *root, llvm::SmallPtrSetImpl<Operation *> &seen) {
-  Operation *operation = value.getDefiningOp();
-  if (!operation || !root->isAncestor(operation)) return true;
-  if (!seen.insert(operation).second) return true;
-  if (operation->getNumRegions() || operation->getNumResults() != 1 ||
-      (!isMemoryEffectFree(operation) && !isa<memref::LoadOp>(operation))) return false;
-  return llvm::all_of(operation->getOperands(), [&](Value input) { return canReplay(input, root, seen); });
-}
-
-Value replay(Value value, Operation *root, OpBuilder &builder, IRMapping &mapping) {
-  if (mapping.contains(value)) return mapping.lookup(value);
-  Operation *operation = value.getDefiningOp();
-  if (!operation || !root->isAncestor(operation)) return value;
-  for (Value input : operation->getOperands())
-    mapping.map(input, replay(input, root, builder, mapping));
-  builder.clone(*operation, mapping);
-  return mapping.lookup(value);
-}
-
 bool dependsOn(Value value, Value coordinate, Operation *root) {
   if (value == coordinate) return true;
   Operation *operation = value.getDefiningOp();
-  return operation && root->isAncestor(operation) &&
-      llvm::any_of(operation->getOperands(), [&](Value operand) {
-        return dependsOn(operand, coordinate, root);
-      });
+  if (!operation || !root->isAncestor(operation)) return false;
+  // Captures and yields of an intact control region contribute to dependence,
+  // even when its condition is independent of the vectorized coordinate.
+  return operation->walk([&](Operation *nested) -> WalkResult {
+    for (Value operand : nested->getOperands())
+      if (dependsOn(operand, coordinate, root)) return WalkResult::interrupt();
+    return WalkResult::advance();
+  }).wasInterrupted();
 }
 
 bool canReplayVector(Value value, Value coordinate, Operation *root) {
@@ -198,7 +184,8 @@ bool canReplayVector(Value value, Value coordinate, Operation *root) {
           return dependsOn(index, coordinate, root);
         });
   }
-  return operation->hasTrait<OpTrait::Elementwise>() &&
+  return operation && !operation->getNumRegions() && operation->getNumResults() == 1 &&
+      operation->hasTrait<OpTrait::Elementwise>() &&
       llvm::all_of(operation->getOperandTypes(), [](Type type) {
         return isa<FloatType, IntegerType, IndexType>(type);
       }) && llvm::all_of(operation->getOperands(), [&](Value operand) {
@@ -206,27 +193,33 @@ bool canReplayVector(Value value, Value coordinate, Operation *root) {
       });
 }
 
-Value replayVector(Value value, Value coordinate, Operation *root, int64_t width,
+Value replayVector(const ProducerReplay &payload, Value value, Value coordinate,
+                   Operation *root, int64_t width,
                    OpBuilder &builder, IRMapping &scalars, IRMapping &vectors) {
   if (vectors.contains(value)) return vectors.lookup(value);
   auto type = VectorType::get({width}, value.getType());
   Location loc = root->getLoc();
+  auto scalar = [&](Value value) {
+    auto replayed = materializeProducerValue(payload, value, builder, scalars);
+    assert(succeeded(replayed) && "vector adapter requires a proven scalar payload");
+    return *replayed;
+  };
   Value result;
   if (value == coordinate) {
     Value start = builder.create<vector::BroadcastOp>(loc, type, scalars.lookup(value));
     result = builder.create<arith::AddIOp>(loc, start, builder.create<vector::StepOp>(loc, type));
   } else if (!dependsOn(value, coordinate, root)) {
-    result = builder.create<vector::BroadcastOp>(loc, type, replay(value, root, builder, scalars));
+    result = builder.create<vector::BroadcastOp>(loc, type, scalar(value));
   } else if (auto load = value.getDefiningOp<memref::LoadOp>()) {
     SmallVector<Value> indices;
-    for (Value index : load.getIndices()) indices.push_back(replay(index, root, builder, scalars));
+    for (Value index : load.getIndices()) indices.push_back(scalar(index));
     result = builder.create<vector::LoadOp>(loc, type,
-        replay(load.getMemref(), root, builder, scalars), indices);
+        scalar(load.getMemref()), indices);
   } else {
     Operation *operation = value.getDefiningOp();
     IRMapping mapping;
     for (Value operand : operation->getOperands())
-      mapping.map(operand, replayVector(operand, coordinate, root, width, builder, scalars, vectors));
+      mapping.map(operand, replayVector(payload, operand, coordinate, root, width, builder, scalars, vectors));
     Operation *cloned = builder.clone(*operation, mapping);
     cloned->getResult(0).setType(type);
     result = cloned->getResult(0);
@@ -342,41 +335,30 @@ bool fuse(memref::AllocOp allocation) {
       if (!extent || *extent != allocation.getType().getDimSize(axis)) return false;
     }
   }
-  bool otherEffect = false;
-  root->walk([&](Operation *operation) {
-    if (operation == store || isa<scf::ForOp, scf::YieldOp, memref::LoadOp>(operation)) return;
-    if (!isMemoryEffectFree(operation)) otherEffect = true;
-  });
-  if (otherEffect) return false;
-  llvm::SmallPtrSet<Operation *, 16> seen;
-  if (!canReplay(store.getValue(), root, seen)) return false;
+  auto function = allocation->getParentOfType<func::FuncOp>();
+  StorageAnalysis storage(function);
+  // Erasing the traversal also erases operations outside the replayed value
+  // slice. Their effects must be known reads, apart from this exact store.
+  auto effects = storage.effects(root);
+  if (!effects.complete || effects.ordered) return false;
+  for (const StorageEffect &entry : effects.entries)
+    if (entry.operation != store && !isa<MemoryEffects::Read>(entry.effect.getEffect()))
+      return false;
+  SmallVector<Value> frontier;
+  for (auto loop : loops) frontier.push_back(loop.getInductionVar());
+  auto payload = analyzeProducerValue(store.getValue(), root, frontier, storage);
+  if (failed(payload)) return false;
   for (Operation *load : loads)
     if (isa<vector::LoadOp>(load) && (loops.empty() ||
         !canReplayVector(store.getValue(), loops.back().getInductionVar(), root))) return false;
   if (consumers.size() != 1) {
     auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
-    if (!integer(store.getValue().getType()) || llvm::any_of(seen, [&](Operation *operation) {
-          return (!isMemoryEffectFree(operation) && !isa<memref::LoadOp>(operation)) ||
-              !llvm::all_of(operation->getResultTypes(), integer);
+    if (!integer(store.getValue().getType()) || llvm::any_of(payload->nodes, [&](Operation *operation) {
+          return !llvm::all_of(operation->getResultTypes(), integer);
         })) return false;
   }
-  auto function = allocation->getParentOfType<func::FuncOp>();
-  StorageAnalysis storage(function);
-  for (Operation *operation : seen) {
-    if (auto read = dyn_cast<memref::LoadOp>(operation)) {
-      // canReplay already proves the local descriptor can be cloned. Prove
-      // stability of its backing storage without requiring that descriptor's
-      // original SSA value to dominate a consumer outside the producer.
-      Value backing = storage.uniqueOrigin(read.getMemref());
-      if (!backing) return false;
-      if (!llvm::all_of(loads, [&](Operation *consumer) {
-            return storage.readStable(backing, root, consumer);
-          })) return false;
-    }
-  }
-  DominanceInfo dominance(function);
   for (Operation *load : loads)
-    if (root->isAncestor(load) || !dominance.dominates(root, load)) return false;
+    if (!canReplayProducerAt(*payload, root, load, storage)) return false;
   for (Operation *load : loads) {
     IRMapping mapping;
     ValueRange indices = isa<memref::LoadOp>(load) ? cast<memref::LoadOp>(load).getIndices()
@@ -387,9 +369,13 @@ bool fuse(memref::AllocOp allocation) {
     Value replacement;
     if (auto vector = dyn_cast<vector::LoadOp>(load)) {
       IRMapping vectors;
-      replacement = replayVector(store.getValue(), loops.back().getInductionVar(), root,
+      replacement = replayVector(*payload, store.getValue(), loops.back().getInductionVar(), root,
           vector.getVectorType().getDimSize(0), builder, mapping, vectors);
-    } else replacement = replay(store.getValue(), root, builder, mapping);
+    } else {
+      auto replayed = materializeProducerValue(*payload, store.getValue(), builder, mapping);
+      assert(succeeded(replayed) && "buffer replay must bind the complete coordinate frontier");
+      replacement = *replayed;
+    }
     load->getResult(0).replaceAllUsesWith(replacement);
     load->erase();
   }

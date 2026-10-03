@@ -35,6 +35,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Structure/FoldUniformComputations.cpp
   Structure/FuseStructuredComputations.cpp
   Structure/IntegerSources.cpp
+  Structure/ProducerReplay.cpp
   Structure/MaterializeStructuredComputations.cpp
   Structure/Passes.cpp
 

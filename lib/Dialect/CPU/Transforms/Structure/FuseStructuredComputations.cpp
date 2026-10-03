@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "IntegerSources.h"
 #include "ContiguousAccesses.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -21,59 +22,46 @@ namespace intent::cpu {
 
 namespace {
 
-linalg::GenericOp pointwiseProducer(Value buffer, Operation *consumer,
-                                    StorageAnalysis &storage) {
-  if (!buffer.getDefiningOp<memref::AllocOp>()) return {};
+struct PointwiseProducer {
+  linalg::GenericOp operation;
+  ProducerReplay payload;
+};
+
+std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *consumer,
+                                                  StorageAnalysis &storage) {
+  if (!buffer.getDefiningOp<memref::AllocOp>()) return std::nullopt;
   linalg::GenericOp producer;
   for (Operation *user : buffer.getUsers()) {
     if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
       if (!llvm::is_contained(generic.getOutputs(), buffer)) {
-        if (user != consumer) return {};
+        if (user != consumer) return std::nullopt;
         continue;
       }
-      if (producer) return {};
+      if (producer) return std::nullopt;
       producer = generic;
     } else if (isa<ReduceOp>(user)) {
-      if (user != consumer) return {};
-    } else if (!isa<memref::DimOp, memref::DeallocOp>(user)) return {};
+      if (user != consumer) return std::nullopt;
+    } else if (!isa<memref::DimOp, memref::DeallocOp>(user)) return std::nullopt;
   }
   if (!producer || producer == consumer || producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer) || producer.getOutputs().size() != 1 ||
       producer.getNumResults() || producer.getNumReductionLoops() ||
-      !producer.getIndexingMapsArray().back().isIdentity()) return {};
+      !producer.getIndexingMapsArray().back().isIdentity()) return std::nullopt;
   Block &body = producer.getRegion().front();
-  if (!body.getArguments().back().use_empty()) return {};
-  SmallVector<Value> reads;
-  for (Operation &operation : body.without_terminator()) {
-    if (operation.getNumRegions()) return {};
-    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-      if (isa<ReduceOp>(consumer)) return {};
-      reads.push_back(load.getMemref());
-    }
-    else if (!isMemoryEffectFree(&operation)) return {};
-  }
-  for (Value input : producer.getInputs())
-    if (isa<MemRefType>(input.getType())) reads.push_back(input);
-  if (auto reduce = dyn_cast<ReduceOp>(consumer))
-    for (Operation &operation : reduce.getCombine().front().without_terminator())
+  if (!body.getArguments().back().use_empty()) return std::nullopt;
+  // CPU Reduce's scalar combine has a deliberately narrower contract than a
+  // linalg payload. Do not import regions or explicit reads into that ABI.
+  if (isa<ReduceOp>(consumer))
+    for (Operation &operation : body.without_terminator())
       if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
-        return {};
+        return std::nullopt;
+  auto payload = analyzeLinalgProducer(producer, storage);
+  if (failed(payload)) return std::nullopt;
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
-  for (Value read : reads) {
-    Value observed = read;
-    if (Operation *descriptor = read.getDefiningOp();
-        descriptor && producer->isProperAncestor(descriptor)) {
-      // The complete pure payload, including local views, is cloned by
-      // fuseOne. Only the underlying storage must outlive the old payload.
-      observed = storage.uniqueOrigin(read);
-      if (!observed) return {};
-    }
-    if (!storage.readStable(observed, producer, consumer)) return {};
-    if (!generic) continue;
-    for (Value output : generic.getOutputs())
-      if (!storage.disjoint(read, output)) return {};
-  }
-  return producer;
+  ValueRange outputs = generic ? ValueRange(generic.getOutputs()) : ValueRange{};
+  if (!canReplayProducerAt(*payload, producer, consumer, storage, outputs))
+    return std::nullopt;
+  return PointwiseProducer{producer, std::move(*payload)};
 }
 
 void eraseUnusedProducer(linalg::GenericOp producer) {
@@ -109,7 +97,8 @@ void eraseUnusedProducer(linalg::GenericOp producer) {
 }
 
 bool fuseOne(Operation *consumer, unsigned inputNumber,
-             linalg::GenericOp producer) {
+             const PointwiseProducer &source) {
+  auto producer = source.operation;
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
   auto reduce = dyn_cast<ReduceOp>(consumer);
   ValueRange oldInputs = generic ? ValueRange(generic.getInputs()) : ValueRange(reduce.getInputs());
@@ -118,8 +107,10 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
           return cast<AffineMapAttr>(a).getValue();
         }));
   auto producerMaps = producer.getIndexingMapsArray();
-  if (reduce && !producer.getRegion().front().getOps<linalg::IndexOp>().empty()) return false;
-  for (auto index : producer.getRegion().front().getOps<linalg::IndexOp>())
+  SmallVector<linalg::IndexOp> indices;
+  producer.getRegion().walk([&](linalg::IndexOp index) { indices.push_back(index); });
+  if (reduce && !indices.empty()) return false;
+  for (auto index : indices)
     if (!isa<AffineDimExpr, AffineConstantExpr>(oldMaps[inputNumber].getResult(index.getDim())))
       return false;
   SmallVector<Value> inputs;
@@ -158,16 +149,17 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
       Block &body = producer.getRegion().front();
       for (unsigned j = 0; j < producer.getInputs().size(); ++j)
         producerMapping.map(body.getArgument(j), target.getArgument(current++));
-      for (Operation &operation : body.without_terminator()) {
-        if (auto index = dyn_cast<linalg::IndexOp>(operation)) {
-          AffineExpr coordinate = oldMaps[inputNumber].getResult(index.getDim());
-          Value value;
-          if (auto dimension = dyn_cast<AffineDimExpr>(coordinate))
-            value = b.create<linalg::IndexOp>(index.getLoc(), dimension.getPosition());
-          else value = b.create<arith::ConstantIndexOp>(index.getLoc(), cast<AffineConstantExpr>(coordinate).getValue());
-          producerMapping.map(index.getResult(), value);
-        } else b.clone(operation, producerMapping);
+      for (auto index : indices) {
+        AffineExpr coordinate = oldMaps[inputNumber].getResult(index.getDim());
+        Value value;
+        if (auto dimension = dyn_cast<AffineDimExpr>(coordinate))
+          value = b.create<linalg::IndexOp>(index.getLoc(), dimension.getPosition());
+        else value = b.create<arith::ConstantIndexOp>(index.getLoc(), cast<AffineConstantExpr>(coordinate).getValue());
+        producerMapping.map(index.getResult(), value);
       }
+      LogicalResult cloned = cloneProducerPayload(source.payload, b, producerMapping);
+      assert(succeeded(cloned) && "structured replay must bind the complete payload frontier");
+      (void)cloned;
       mapping.map(oldBody.getArgument(prefix + i),
           producerMapping.lookupOrDefault(body.getTerminator()->getOperand(0)));
     }
@@ -181,10 +173,11 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
     maps.push_back(oldMaps.back());
     auto replacement = builder.create<linalg::GenericOp>(generic.getLoc(), inputs,
         generic.getOutputs(), maps, generic.getIteratorTypesArray(),
-        [&](OpBuilder &b, Location loc, ValueRange) {
-          Value value = populate(b, *b.getInsertionBlock(), generic.getRegion().front(), 0);
-          b.create<linalg::YieldOp>(loc, value);
-        });
+        [](OpBuilder &, Location, ValueRange) {});
+    Block &body = replacement.getRegion().front();
+    builder.setInsertionPointToStart(&body);
+    Value value = populate(builder, body, generic.getRegion().front(), 0);
+    builder.create<linalg::YieldOp>(generic.getLoc(), value);
     replacement->setDiscardableAttrs(llvm::to_vector(generic->getDiscardableAttrs()));
     generic.erase();
   } else {
@@ -367,14 +360,13 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
   do {
     changed = false;
     SmallVector<Operation *> consumers;
+    StorageAnalysis payloadStorage(function);
     function.walk([&](Operation *operation) {
       if (isa<ReduceOp>(operation)) consumers.push_back(operation);
       else if (auto generic = dyn_cast<linalg::GenericOp>(operation);
                generic && !isMatrixContraction(generic) && !generic.getNumResults() &&
-               generic.getOutputs().size() == 1 &&
-               llvm::all_of(generic.getRegion().front().without_terminator(), [](Operation &nested) {
-                 return !nested.getNumRegions() && (isa<memref::LoadOp>(nested) || isMemoryEffectFree(&nested));
-               })) {
+               generic.getOutputs().size() == 1) {
+        if (failed(analyzeLinalgProducer(generic, payloadStorage))) return;
         if (generic.getNumReductionLoops()) {
           llvm::SmallBitVector outputAxes(generic.getNumLoops());
           for (AffineExpr expression : generic.getIndexingMapsArray().back().getResults()) {
@@ -396,7 +388,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
       for (auto [number, input] : llvm::enumerate(inputs)) {
         auto producer = pointwiseProducer(input, consumer, analysis);
         if (!producer) continue;
-        changed = fuseOne(consumer, number, producer);
+        changed = fuseOne(consumer, number, *producer);
         break;
       }
       if (changed) break;

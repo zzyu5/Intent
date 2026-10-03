@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentCPUAnalysis
   Contractions.cpp
   Storage.cpp
   ViewRelations.cpp
+  ProducerReplay.cpp
   Ownership.cpp
   ExtentRelations.cpp
   AxisRelations.cpp

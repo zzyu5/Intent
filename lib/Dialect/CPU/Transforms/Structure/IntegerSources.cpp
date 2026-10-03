@@ -3,10 +3,9 @@
 #include "IntegerSources.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
 
@@ -21,7 +20,12 @@ bool projectedCoordinates(AffineMap map) {
   });
 }
 
-std::optional<linalg::GenericOp> integerProducer(memref::LoadOp load,
+struct IntegerProducer {
+  linalg::GenericOp operation;
+  ProducerReplay payload;
+};
+
+std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
                                                StorageAnalysis &storage) {
   if (!integer(load.getType())) return std::nullopt;
   auto allocation = load.getMemref().getDefiningOp<memref::AllocOp>();
@@ -49,36 +53,27 @@ std::optional<linalg::GenericOp> integerProducer(memref::LoadOp load,
 
   Operation *consumer = producer->getBlock()->findAncestorOpInBlock(*load);
   if (!consumer || consumer == producer || !producer->isBeforeInBlock(consumer)) return std::nullopt;
-  auto function = producer->getParentOfType<func::FuncOp>();
-  DominanceInfo dominance(function);
-  auto stable = [&](Value memory) {
-    if (!storage.disjoint(memory, allocation) || !dominance.dominates(memory, load)) return false;
-    return storage.readStable(memory, producer, load);
-  };
   for (auto [number, input] : llvm::enumerate(producer.getInputs())) {
     if (body.getArgument(number).use_empty()) continue;
     if (auto type = dyn_cast<MemRefType>(input.getType())) {
-      if (!integer(type.getElementType()) || !stable(input)) return std::nullopt;
-    } else if (!integer(input.getType()) || !dominance.dominates(input, load)) return std::nullopt;
+      if (!integer(type.getElementType())) return std::nullopt;
+    } else if (!integer(input.getType())) return std::nullopt;
   }
-  for (Operation &operation : body.without_terminator()) {
-    if (operation.getNumRegions() || !llvm::all_of(operation.getResultTypes(), integer)) return std::nullopt;
-    if (auto read = dyn_cast<memref::LoadOp>(operation)) {
-      if (!stable(read.getMemref())) return std::nullopt;
-    } else if (!isMemoryEffectFree(&operation) ||
-               (!isa<linalg::IndexOp>(operation) && !llvm::all_of(operation.getOperandTypes(), integer))) {
-      return std::nullopt;
-    }
-    for (Value operand : operation.getOperands()) {
-      if (auto argument = dyn_cast<BlockArgument>(operand); argument && argument.getOwner() == &body) continue;
-      if (operand.getDefiningOp() && operand.getDefiningOp()->getBlock() == &body) continue;
-      if (!dominance.dominates(operand, load)) return std::nullopt;
-    }
-  }
-  return producer;
+  auto payload = analyzeLinalgProducer(producer, storage);
+  if (failed(payload) ||
+      !canReplayProducerAt(*payload, producer, load, storage, ValueRange{allocation}))
+    return std::nullopt;
+  // Integer-only rematerialization is a policy of this consumer, independent
+  // of the common control/effect/read-stability contract.
+  for (Operation *operation : payload->nodes)
+    if (!llvm::all_of(operation->getResultTypes(), integer) ||
+        (!isa<memref::LoadOp, linalg::IndexOp>(operation) &&
+         !llvm::all_of(operation->getOperandTypes(), integer))) return std::nullopt;
+  return IntegerProducer{producer, std::move(*payload)};
 }
 
-void replay(memref::LoadOp load, linalg::GenericOp producer) {
+void replay(memref::LoadOp load, const IntegerProducer &source) {
+  auto producer = source.operation;
   OpBuilder builder(load);
   Location loc = load.getLoc();
   auto maps = producer.getIndexingMapsArray();
@@ -100,11 +95,12 @@ void replay(memref::LoadOp load, linalg::GenericOp producer) {
     }
     mapping.map(body.getArgument(number), value);
   }
-  for (Operation &operation : body.without_terminator()) {
-    if (auto index = dyn_cast<linalg::IndexOp>(operation))
-      mapping.map(index.getResult(), coordinates[index.getDim()]);
-    else builder.clone(operation, mapping);
-  }
+  body.walk([&](linalg::IndexOp index) {
+    mapping.map(index.getResult(), coordinates[index.getDim()]);
+  });
+  LogicalResult cloned = cloneProducerPayload(source.payload, builder, mapping);
+  assert(succeeded(cloned) && "integer replay must bind the complete payload frontier");
+  (void)cloned;
   load.replaceAllUsesWith(mapping.lookupOrDefault(body.getTerminator()->getOperand(0)));
   load.erase();
 }
