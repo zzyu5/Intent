@@ -191,6 +191,13 @@ target、数值策略和 GPU/Native ABI，再调用对应 provider 目录的 `co
 解析其执行事实。Triton descriptor 参数、cuTile 编译配置、Mojo 候选源码区间、
 Weft host/task 绑定及 BANG C extent 绑定由其实际消费者拥有，无需 SDK 即可读取。
 Runtime 接收这一份已解析合同，不再各自从原始 metadata 重建参数和候选。
+每个 [targets/](python/intent/targets/) 模块的 `PROVIDER` 连接自己的 family、目标类、
+产物 reader、运行绑定与环境检查；公共 `ProgramContract`、目标构造和 doctor 消费
+这一个 adapter，不各自维护后端分派表。安装所需的纯标准库声明仍只在
+[tools/backends.py](python/intent/tools/backends.py)，供安装脚本与已安装 CLI 共用。
+Adapter 导入不加载 SDK，实际 binding/probe 才导入其依赖。
+这个职责对应本地 Triton `python/triton/backends/__init__.py:32–62` 的 backend/driver
+连接；Intent 目前显式注册内置 provider，不因此声称已经支持外部插件发现。
 `program.metadata` 返回用于检查的副本，修改它不改变产物或已经绑定的运行时。
 不兼容的字段应明确报错；重新生成需要调用方保留原 Intent definition 或 KIR，
 保存的 provider source 不承担恢复原算法或跨目标重新编译的职责。
@@ -883,7 +890,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 均匀存储内容 | [UniformValues.h](include/Intent/Dialect/CPU/Analysis/UniformValues.h) | `UniformMemoryAnalysis` 为普通折叠与 region predicate 共享读取、view 归一和 effect 失效；多输出先在同一输入快照求值，再同时发布结果 |
 | 原生内存与控制流翻译 | [NativeSource.h](include/Intent/Serialization/NativeSource.h) | Mojo、Weft host 与 BANG C 共同处理标准 descriptor、视图、地址和 SCF 传递；目标保留分配与访存 API，serializer 不决定生命周期 |
 | Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
-| Weft task 局部存储 | [TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
+| Weft task 局部存储 | [TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
 | 外层与局部参数 | [Configuration.h](include/Intent/Dialect/CPU/Transforms/Configuration.h) | 外层 task/block 参数与 implementation 的 local binding 分开，不通过完整 Passes.h 获取配置类型 |
 | 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |
 | 完整候选形成 | [Configurations.cpp](lib/Dialect/CPU/Transforms/Configurations.cpp) | 从当前 computations 枚举有限 implementation portfolio；保留合法性筛选、顺序与去重，候选成为独立的完整函数 |
@@ -892,7 +899,9 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 当前描述符的维度上界 | [Analysis/Storage.h](include/Intent/Dialect/CPU/Analysis/Storage.h) | `constantDimensionUpperBound` 委托共同 ExtentRelations 查询闭合常数上界；未知界不作为收缩依据，不使用观察到的运行时尺寸 |
 | 供数与私有计算复用 | [ReusePreparedInputs.cpp](lib/Dialect/CPU/Transforms/ReusePreparedInputs.cpp)、[FuseIntermediateBuffers.cpp](lib/Dialect/CPU/Transforms/FuseIntermediateBuffers.cpp) | 在共同存储证明之外，分别检查坐标、effect、读取稳定性与计算可重放性，实际改写 current IR |
 
-扩展 CPU implementation 时，`applicable` 描述它承接的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，核对实现身份、绑定参数及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
+扩展 CPU implementation 时，通过 `registry.add<Op...>(implementation)` 声明操作族；共同 registry 不再维护一份需要绑定的操作名单。可选 `applicable` 进一步限定当前实例的计算语义，`check` 查询当前 capability 与 configuration，合法时返回 `std::nullopt`，否则返回具体拒绝原因。`candidates` 与 `bind` 共用布局、provider 条件、参数和供数检查；无合法候选时，诊断定位阻断的 computation，并列出 profile 行的实际参数与原因。`lookup` 服务于已绑定且经过变换的程序，核对实现身份、绑定参数及当前计算和输入布局，不重新选择实现或用原始配置要求检查已经缩小的微块。
+
+实际展开也由该实现注册：`materialize` 解释自己的参数后调用共同结构化构造；`expand` 通过 `ImplementationExpansion` 取得当前 native builder、借用视图或读取值，并明确写入 destination 或绑定 SSA result。共同 driver 不按计算名称裁剪参数、猜测输出位置或解释 provider 参数。后端原语的选型和编码仍属于 provider，不把整个算子组织移入局部实现。
 
 绑定参数使用同一 `ImplementationParameter` 声明生成与验证：本地 profile 参数、别名、
 常量和已有 shared extent 的有限派生分别声明来源，合法域也放在该声明中。
@@ -961,19 +970,19 @@ operation effects 证明读取移动。Intent CPU 还要证明显式 allocation/
 
 输出转发也使用这份存储查询，并保留目标的 disjoint、dominance 和 effect 检查。identity layout 与显式静态 strides 若具有相同 shape、元素类型、memory space、offset 和 strides，可通过标准 `memref.cast` 保持派生 view 的输入类型；两个未知动态 strides 不构成等价证明。这样，unit-axis 视图等正常 lowering 结构不会仅因类型拼写不同而强制保留中间结果拷贝。
 
-Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开、私有计算融合、向量化和最终原生合法化，具体阶段在相邻 [Legalize.cpp](lib/Target/Mojo/Transforms/Legalize.cpp)。向量宽度来自已绑定 implementation；scratch 提升复用 CPU 的存储证明；算术、原子更新和浮点环境在最终 surface 验证前闭合。Weft 保留 Canonical Weft IR 的 structured 输入边界，不经过 Mojo 的 SIMD 展开。
+Mojo 的 [Passes.cpp](lib/Target/Mojo/Transforms/Passes.cpp) 调度实现展开、私有计算融合、向量化和最终原生合法化，具体阶段在相邻 [Legalize.cpp](lib/Target/Mojo/Transforms/Legalize.cpp)。[Implementations.cpp](lib/Target/Mojo/Transforms/Implementations.cpp) 解释向量与 scan 参数，并将后续循环需要的 `mojo.vector` binding 写到新建循环；`vectorize` 回调消费当前循环的 binding。辅助 copy/fill 和普通作者循环使用已正式选择的函数 implementation，不从 `intent_cpu.implementations` 摘要的首项推断执行策略。循环融合要求 binding 相容并保留它；共同 materializer 只接收明确的宽度，Weft host 显式请求标量展开。Scratch 提升复用 CPU 的存储证明；算术、原子更新和浮点环境在最终 surface 验证前闭合。Weft device 保留 Canonical Weft IR 的 structured 输入边界，不经过 Mojo 的 SIMD 展开。
 
 Mojo 并行任务的 [serializer](lib/Target/Mojo/Serialization/Serializer.cpp) 从当前 task region 的实际外部 SSA 使用形成闭包捕获；memref 捕获完整 descriptor。它不维护另一份“当前可见变量”名单，避免捕获无关或尚未赋值的控制流结果。闭包只改变源码绑定，不改变 task 的执行范围与数据依赖。
 
 职责对照：本地 Triton `include/triton/Dialect/Triton/IR/TritonOps.td:214–239` 将 load 的 memory effect 与 tensor result 同时保存在 IR；`third_party/nvidia/backend/compiler.py:273–285` 在 TTIR 进行 combine/canonicalize，`:415–422` 才进入目标资源分配。Intent CPU 同样先保存值依赖，再决定存储；具体复用的是 MLIR 的 CPU bufferization，而非套用 Triton 的 GPU layout。MLIR 20 `BufferizationOps.td:414–423` 的 restrict 合同不能从“输入只读”推出，故输入读取由上述明确边界建模。
 
-Mojo 最终合法化完成后通过 [FinalizedCandidates.h](include/Intent/Dialect/CPU/Transforms/FinalizedCandidates.h) 删除结构完全相同的候选。比较保留完整 ABI、类型、SSA、嵌套任务、effects 和数值属性，仅忽略位置、顶层 entry 名字及已经消费完的配置/实现摘要；保留 profile 顺序中的第一个代表，serializer 和 runtime 从剩余函数形成源码与候选集合。这个入口不能用于尚未消费向量化或分块参数的程序，也不按生成源码文本或算子名字合并。Weft 已将 task 分离到另一个模块，不能只比较 host、忽略 callee 名字后套用此入口。
+Mojo 最终合法化先验证完整 native surface，再清除已由具体循环、向量和资源兑现的逐操作 implementation binding；实现摘要继续保留供产物检查。随后通过 [FinalizedCandidates.h](include/Intent/Dialect/CPU/Transforms/FinalizedCandidates.h) 删除结构完全相同的候选。比较保留完整 ABI、类型、SSA、嵌套任务、effects 和数值属性，仅忽略位置、顶层 entry 名字及已经消费完的配置/实现摘要；保留 profile 顺序中的第一个代表，serializer 和 runtime 从剩余函数形成源码与候选集合。这个入口不能用于尚未消费向量化或分块参数的程序，也不按生成源码文本或算子名字合并。Weft 已将 task 分离到另一个模块，不能只比较 host、忽略 callee 名字后套用此入口。
 
 CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrderAttr`。Construction 从源操作合同建立许可，fusion 取参与计算的许可交集，partition 与 materialization 保留它；不能由末尾恰好有一个 add 推断整个计算可重排。[VectorizeLoops.cpp](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 在访问独立且允许重排时跨块保留向量累加器，最后才做横向归约；初始 accumulator 只合入一次。私有 [VectorReductions.h](lib/Dialect/CPU/Transforms/VectorReductions.h) 为该路径和多输出归约提供同一套 tuple 横向树，调用者负责初始化、captures 与顺序合法性。Weft 直接消费自己的原生归约能力，不经过这一 SIMD 展开。
 
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
-Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) 将逻辑访问反投影到原 Slice/Subview，缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
+Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[TaskViews.cpp](lib/Target/Weft/Transforms/TaskViews.cpp) 将逻辑访问反投影到原 Slice/Subview，[TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) 缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
 
 View 大小相等与动态 shape 来源统一查询 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h)，不在 Weft 再递归解读 Dim、Subview、allocation 和 task captures。Weft 仍负责 offset/stride 与轴投影资格，以及将查询结果映射到真实 native shape：本地 shape 可使用已证明常量，动态 host descriptor 则仍绑定已有公共 shape 参数，其余表达式不能凭相等证明获得新的运行时符号。存储轴来源相同不代表切片长度相等，不能以 `AxisRelations` 代替 extent 查询。
 
@@ -993,8 +1002,20 @@ access、alias 和 shape symbols，生成 native ABI，不保存一份需与 IR 
 Intent 的 Weft 路径继续使用 CPU tasks、普通 host 调用和原有同步合同，不采用 GPU launch/grid。
 
 修改 Weft host 的 task 派发、capture 装箱或跨模块连接时，进入
-[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp)；task 内的存储、控制与 SSA 映射在
-`TaskLowering`，标准标量运算及其命名轴值域转换在相邻 `ScalarValues`。
+[Legalize.cpp](lib/Target/Weft/Transforms/Legalize.cpp)。Task 内转换使用相邻私有模块：
+
+| 模块 | 职责 |
+|---|---|
+| [TaskLowering.cpp](lib/Target/Weft/Transforms/TaskLowering.cpp) | task/kernel 构造、operation driver 与最终接口提交 |
+| [TaskViews.cpp](lib/Target/Weft/Transforms/TaskViews.cpp) | 原存储 view、命名轴与 extent 投影 |
+| [TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) | 局部值、读写、窗口物化与输出提交 |
+| [TaskControl.cpp](lib/Target/Weft/Transforms/TaskControl.cpp) | if/for/while 的 aliases、迭代状态和结果交接 |
+| [TaskComputations.cpp](lib/Target/Weft/Transforms/TaskComputations.cpp) | generic/reduce/scalar 转换及已选 implementation 的 expansion context |
+
+这些文件共享 [TaskConversion.h](lib/Target/Weft/Transforms/TaskConversion.h) 声明的一份状态，
+没有第二份值映射或独立调度顺序。标准标量运算及命名轴值域转换在相邻 `ScalarValues`。
+量化实现从 [Quantization.cpp](lib/Target/Weft/Transforms/Quantization.cpp) 自己取得所需
+view 并写回 destination；新增 native implementation 不再修改 driver 的量化类型分派。
 转换状态属于单个 CPU function；存储分析在每个 task lowering
 开始时重建，因为此前的 task 可能已经移除。Task ABI 的读写与 encoded 格式查询共同
 存储事实；只有当前 task 内的 allocation 才能成为其局部 SSA，捕获的外层 allocation
@@ -1011,7 +1032,7 @@ Intent 的 Weft 路径继续使用 CPU tasks、普通 host 调用和原有同步
 - `lib/Target/<provider>/Serialization/` 打印已经决定的 kernel 程序和接口 facts，不重新选择 ownership、workspace、pipeline 或调优参数，也不生成另一套通用 host 参数检查和输出分配代码。
 - `python/intent/runtime/` 消费这些 facts 并执行；provider 适配实际原生调用，公共 binder 处理参数、输出与工作区。无法兑现的能力明确报错，不改变算法或隐藏失败。
 
-CPU 的 implementation registry 是明确的局部扩展点。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
+CPU 的 implementation registry 是明确的局部扩展点。职责参考是本地 Triton `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp:212–243`：driver 注册对应操作的 lowering，具体实现消费转换上下文。Intent 的 [Implementation.h](include/Intent/Dialect/CPU/Transforms/Implementation.h) 还负责 CPU 有限候选、供数要求及已选绑定的后续展开；这不是让 leaf 重新选择完整算法。GPU provider 通常复用下层 compiler 的 primitives 与布局机制，不需要为了目录形式对称再建一套同名 leaf 系统。
 
 ### GPU 接口与 Python 产品边界
 
@@ -1322,6 +1343,14 @@ Python 依赖，外部编译器和设备由实际 target/doctor 检查。普通�
 `intent read-artifact <返回的文件路径> --offset 0 --limit 16000 --json` 可分页读取
 真实 IR、源码或日志，不执行文件内容。compiler MCP 提供相同 describe/environment/
 read_artifact 入口，使仅使用 MCP 的客户端也能从编译诊断继续读取服务器上的产物。
+
+CLI 的源码编译与 compiler MCP 的编译、续编译、物化、优化和环境检查通过
+[requests.py](python/intent/tools/requests.py) 调用同一个单请求
+[worker.py](python/intent/tools/worker.py)。源码及其普通 Python 依赖在请求进程中导入，
+进程结束后不把 `sys.modules` 或 SDK 状态留给下一次 MCP 请求。MCP 异步等待 worker，
+取消请求时回收该请求及其 native compiler 子进程；独立结果文件将工具响应与源码的
+stdout/stderr 分开。编译缓存、导出目录与诊断文件仍由原公开编译 API 持有，
+不会随临时通信目录删除。直接调用 `intent.compile/generate` 仍是进程内 Python API。
 
 定位失败时看 `CompilationStageError.stage`、`cache_directory`、`candidate` 与
 `artifacts`。Native 编译失败保留实际 attempt 目录及异常 cause，不被 materialize
