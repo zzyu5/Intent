@@ -1,7 +1,7 @@
 kernel,case,generated_p50_ms,source_p50_ms,ratio,status,note
-i8_gemv_bias,M1-N4096-K4096-i8-i32-IME1-1core,208.910847,960.038397,0.217607,pass,K1/X60 CPU3 VLEN256 IME1；i8×i8→i32+bias，同次两侧对精确整数 reference；完整 native 调用含内部分配与 packing，外部输出分配不计时；64 MiB eviction，10 次中位数。
+i8_gemv_bias,M1-N4096-K4096-i8-i32-IME1-1core,209.670277,960.649279,0.218259,pass,K1/X60 CPU3 VLEN256 IME1；i8×i8→i32+bias，同次两侧对精确整数 reference；完整 native 调用含内部分配与 packing，外部输出分配不计时；64 MiB eviction，10 次中位数。
 i8_gemm_bias,M128-N4096-K4096-i8-i32-IME1-1core,7108.150407,31085.990122,0.228661,pass,K1/X60 CPU3 VLEN256 IME1；i8×i8→i32+bias，同次两侧对精确整数 reference；完整 native 调用含内部分配与 packing，外部输出分配不计时；64 MiB eviction，10 次中位数。
-causal_attention_f32,B8-S128-D32-f32-1core,2.166129,109.330508,0.019813,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
-causal_linear_attention_f32,B8-S128-D32-f32-1core,1.143994,1.904247,0.600759,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
-q4_k_projection,N4096-K4096-Q4_K-f32-1core,5.890144,5.219421,1.128505,pass,单核；generated RVV / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。
+causal_attention_f32,B8-S128-D32-f32-1core,,,,adapter_preparation_failed,"Native compiler exited with code 1:; loc(""/home/kingdom/phdworks/intentdsl/examples/kernels/streaming/attention_f32.py"":13:33): error: selected weft_riscv.binary engine scalar disagrees with propagated result carrier local"
+causal_linear_attention_f32,B8-S128-D32-f32-1core,1.186165,1.902868,0.623357,pass,单核 RVV；独立 Weft 同算法 source；完整 native invocation 含内部 workspace、状态与任务完成；不含外部输出分配。
+q4_k_projection,N4096-K4096-Q4_K-f32-1core,5.996586,5.105443,1.174548,pass,单核；generated RVV / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。
 q4_k_projection_ime,N4096-K4096-Q4_K-f32-IME1-1core,14.636841,14.286839,1.024498,pass,单核；generated RVV/IME1 合法实现选优 / source RVV；完整 native invocation 含 Q8_K 量化及内部 workspace 分配/释放；同算法、相同 cold-cache，10 次中位数。

@@ -322,6 +322,13 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 真正物化张量时才要求完整 `LocalShape`。这些映射不交给后续 pass 保存或重放；
 construction 的输出必须是含实际循环、存储和访问的完整 DSA program。
 
+完整行所需的公共维度容量义务保留在当前入口的
+`intent_dsa.full_extent_dimensions`。读取它使用
+[DSAOps.h](include/Intent/Dialect/DSA/IR/DSAOps.h) 的
+`queryFullExtentRequirements`：同一查询检查显式属性、公共维度身份和静态容量矛盾，
+由 DSA verifier 与 BANG serializer 共同消费。空集合须显式写出，缺失不能默认为空；
+动态输入的实际容量检查仍由已有 runtime 完成，不改变 native slots 或 metadata 格式。
+
 普通 collective 使用 `dsa.slice_reduce` 与 `dsa.scan` 保存完整 combine region。
 成员轴、实际有效长度、输入、初值、捕获和输出都是当前操作的属性或 SSA operands；
 helper 统一接收两组逐字段参数及显式 captures，通过 `dsa.collective_yield` 返回
@@ -1207,6 +1214,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 |---|---|---|
 | 值优化与存储物化 | [Bufferization.h](include/Intent/Dialect/CPU/Transforms/Storage/Bufferization.h) | `bufferizeValues` 完整关闭值程序；原生接口负责 alias、in-place、copy 与 ownership，不用未建模操作兜底 |
 | 均匀存储内容 | [UniformValues.h](include/Intent/Dialect/CPU/Analysis/UniformValues.h) | `UniformMemoryAnalysis` 为普通折叠与 region predicate 共享读取、view 归一和 effect 失效；多输出先在同一输入快照求值，再同时发布结果 |
+| Descriptor 几何与轴投影 | [ViewRelations.h](include/Intent/Dialect/CPU/Analysis/ViewRelations.h) | 查询实际 SSA descriptor 的连续 strides、offset 保持和轴置换/unit 轴关系；不以 storage origin 替代视图，不证明 ownership 或 noalias |
 | 原生内存与控制流翻译 | [NativeSource.h](include/Intent/Serialization/NativeSource.h) | Mojo、Weft host 与 BANG C 共同处理标准 descriptor、视图、地址和 SCF 传递；目标保留分配与访存 API，serializer 不决定生命周期 |
 | Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contraction/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
 | Weft task 局部存储 | [TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
@@ -1325,9 +1333,16 @@ CPU 归约的相邻重结合与元素重排许可统一保存于 `ReductionOrder
 
 Mojo 的矩阵 `formTile` 同样把该许可传给微块，后续实现不能仅因识别到 FMA 就扩大重排许可。矩阵寄存器组织属于 Mojo 原生实现，CPU source 识别和 GPU provider 不承担该 SIMD 决策。
 
-Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 证明标准 memref 描述符是否仅做轴置换或 unit 轴插删，并将纯 view capture 的定义链显式放回 task 内。原存储及所需标量进入 task ABI；[TaskViews.cpp](lib/Target/Weft/Transforms/TaskViews.cpp) 将逻辑访问反投影到原 Slice/Subview，[TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) 缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序，将轴重命名为当前循环轴，直接交给按命名轴归约的 OuterContract；位置相关的普通读写则显式投影到对应逻辑顺序。不能把非连续 capture 直接标成连续，也不能只改 shape 冒充转置。当前 Weft RISC-V 不能实现一般置换 Reshape；动态轴合并、非矩形 flatten 和任意 strided reinterpretation 也不在该桥接能力内，失败明确报告，不插入隐藏 copy。
+CPU 的 [ViewRelations.h](include/Intent/Dialect/CPU/Analysis/ViewRelations.h) 从标准 memref operands、metadata 和完整 control-flow incoming 查询几何。`queryViewAxisProjection` 证明 offset 保持的轴置换或 unit 轴插删，不要求 reinterpret 的 source 必须紧邻一次 metadata extraction；`isContiguousDescriptor` 证明实际 strides，允许非零 offset。两者不代替 Storage 的来源/lifetime 证明，也不向其它分析提供整数不回绕或总字节范围保证。
 
-View 大小相等与动态 shape 来源统一查询 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h)，不在 Weft 再递归解读 Dim、Subview、allocation 和 task captures。Weft 仍负责 offset/stride 与轴投影资格，以及将查询结果映射到真实 native shape：本地 shape 可使用已证明常量，动态 host descriptor 则仍绑定已有公共 shape 参数，其余表达式不能凭相等证明获得新的运行时符号。存储轴来源相同不代表切片长度相等，不能以 `AxisRelations` 代替 extent 查询。
+Weft 的私有 [Views.h](lib/Target/Weft/Transforms/Views.h) 只连接目标诊断和 capture 重建：纯 view 定义链放回 task 内，已计算的 scalar metadata 作为 captures；控制流选中的连续 descriptor 直接保留该 SSA，不挑一个 incoming 或 allocation origin 替代。capture、task lowering 和最终 [Invoke 验证](lib/Target/Weft/IR/Program.cpp) 共用上述连续性查询；host 传实际 base 加 offset，Weft ABI 不接收任意 strides。[TaskViews.cpp](lib/Target/Weft/Transforms/TaskViews.cpp) 仍将逻辑访问反投影到 Slice/Subview，[TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) 缓存原存储顺序的 Admit 快照。矩阵消费者保留该顺序并通过命名轴消费；位置相关的普通读写显式投影。动态轴合并、非矩形 flatten、任意 strided reinterpretation 和目标不能实现的 admitted tile permutation 继续明确拒绝，不插隐藏 copy。
+
+View 大小相等与动态 shape 来源统一查询 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h)，不在 Weft 再递归解读 Dim、Subview、allocation 和 task captures。Weft 将公共几何查询结果映射到现有 native view/shape 能力：本地 shape 可使用已证明常量，动态 host descriptor 则仍绑定已有公共 shape 参数，其余表达式不能凭相等证明获得新的运行时符号。存储轴来源相同不代表切片长度相等，不能以 `AxisRelations` 代替 extent 查询。
+
+这与本地 LLVM 20 的 `mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp:1059–1089`
+从实际 descriptor 与当前 reinterpret operands 取得地址和几何的职责一致。
+[NativeSource](lib/Serialization/NativeSource.cpp) 对标准 Transpose 只排列 descriptor 的
+sizes/strides，保留 base/offset；SCF 继续并行传递完整 descriptor，不从形状反推地址。
 
 Host 已计算的 size、stride 等标量直接作为 capture，不为取得一个 shape 值将整块无数据用途的 storage 带入 task。生成完整 Weft body 后，[TaskInterface.h](lib/Target/Weft/Transforms/TaskInterface.h) 的 `finalizeTaskInterface` 统一清理可删除的无用值、收缩 kernel 参数及其属性并验证；host 调用与 scalar box 只根据该入口返回的参数位置生成。形状符号和 domain 还绑定类型中的身份，不能只按 SSA use 数删除。修改 task capture 或目标 lowering 时复用这一完整入口，不能只裁剪 kernel 签名而保留旧 host 参数或另让 serializer 修补接口。
 
