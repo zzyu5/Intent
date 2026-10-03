@@ -1,6 +1,7 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/IR/ExecutionRelations.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -250,16 +251,8 @@ bool batchPointwiseTasks(func::FuncOp function) {
     if (!loop.getLowerBound().getDefiningOp<dsa::TaskIdOp>() ||
         !loop.getStep().getDefiningOp<dsa::TaskCountOp>() || !loop.getInitArgs().empty()) continue;
     Block *body = loop.getBody();
-    Value induction = loop.getInductionVar();
-    DenseMap<Value, bool> dependent;
-    std::function<bool(Value)> dependsOnRow = [&](Value value) {
-      if (value == induction) return true;
-      auto known = dependent.find(value);
-      if (known != dependent.end()) return known->second;
-      Operation *definition = value.getDefiningOp();
-      return dependent[value] = definition && definition->getBlock() == body &&
-          llvm::any_of(definition->getOperands(), dependsOnRow);
-    };
+    BlockArgument induction = cast<BlockArgument>(loop.getInductionVar());
+    ExecutionRelations execution(function);
     SmallVector<memref::AllocaOp> allocations;
     dsa::LoadTileOp load;
     dsa::StoreTileOp store;
@@ -289,7 +282,8 @@ bool batchPointwiseTasks(func::FuncOp function) {
           if (isa<MemRefType>(operand.getType())) {
             auto allocation = operand.getDefiningOp<memref::AllocaOp>();
             if (!allocation || allocation->getBlock() != body) eligible = false;
-          } else if (dependsOnRow(operand)) eligible = false;
+          } else if (execution.coordinateDependency(operand, induction) !=
+                     CoordinateDependency::Independent) eligible = false;
         }
         if (!eligible) break;
       } else if (auto stride = dyn_cast<dsa::StrideOp>(operation)) {

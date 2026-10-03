@@ -1,4 +1,5 @@
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
+#include "Intent/Dialect/DSA/IR/ExecutionRelations.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Analysis/BufferStorage.h"
 #include "Intent/Dialect/DSA/IR/MemoryEffects.h"
@@ -623,26 +624,7 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
   auto groupWidth = function->getAttrOfType<IntegerAttr>("intent_dsa.group_width");
   if (groupWidth && (groupWidth.getInt() != 4 || config.getTasks() < 4 || config.getTasks() % 4))
     return function.emitError("MLU370 cooperative execution requires four compute participants per group");
-  std::function<bool(Value)> uniform = [&](Value value) {
-    if (auto argument = dyn_cast<BlockArgument>(value)) {
-      if (argument.getOwner() == &function.front()) return true;
-      auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-      return loop && argument == loop.getInductionVar() &&
-          uniform(loop.getLowerBound()) && uniform(loop.getUpperBound()) && uniform(loop.getStep());
-    }
-    Operation *definition = value.getDefiningOp();
-    if (!definition) return false;
-    if (isa<GroupIdOp, GroupCountOp, arith::ConstantOp>(definition)) return true;
-    if (auto load = dyn_cast<LoadScalarOp>(definition)) {
-      auto source = dyn_cast<BlockArgument>(load.getSource());
-      auto view = source && source.getOwner() == &function.front()
-          ? intent::getPublicView(interface, source.getArgNumber()) : intent::ViewType();
-      return view && view.getAccess() == 0 && uniform(load.getOffset());
-    }
-    if (isa<memref::DimOp, StrideOp>(definition) || definition->getName().getDialectNamespace() == "arith")
-      return llvm::all_of(definition->getOperands(), uniform);
-    return false;
-  };
+  ExecutionRelations execution(function);
   auto walk = function.walk([&](Operation *op) {
     StringRef dialect = op->getName().getDialectNamespace();
     if (dialect != "intent_dsa" && dialect != "arith" && dialect != "math" &&
@@ -671,21 +653,12 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
         return WalkResult::interrupt();
       }
     }
-    if (auto gather = dyn_cast<GroupGatherRowsOp>(op); gather && !uniform(gather.getRows())) {
+    if (auto gather = dyn_cast<GroupGatherRowsOp>(op); gather && !execution.isUniform(gather.getRows())) {
       op->emitError("group gather row count must be uniform"); return WalkResult::interrupt();
     }
-    if (isa<GroupSynchronizeOp, GroupGatherRowsOp>(op)) {
-      for (Operation *parent = op->getParentOp(); parent && parent != function; parent = parent->getParentOp()) {
-        bool legal = true;
-        if (auto branch = dyn_cast<scf::IfOp>(parent)) legal = uniform(branch.getCondition());
-        else if (auto loop = dyn_cast<scf::ForOp>(parent))
-          legal = uniform(loop.getLowerBound()) && uniform(loop.getUpperBound()) && uniform(loop.getStep());
-        else legal = false;
-        if (!legal) {
-          op->emitError("execution-group barriers require uniform structured control");
-          return WalkResult::interrupt();
-        }
-      }
+    if (isa<GroupSynchronizeOp, GroupGatherRowsOp>(op) && !execution.hasUniformControl(op)) {
+      op->emitError("execution-group barriers require uniform structured control");
+      return WalkResult::interrupt();
     }
     if (auto allocation = dyn_cast<memref::AllocaOp>(op)) {
       auto type = allocation.getType();

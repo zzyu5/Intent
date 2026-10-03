@@ -1,8 +1,8 @@
 #include "PassSupport.h"
 #include "StoragePatterns.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
-#include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/DSA/IR/ExecutionRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
@@ -18,185 +18,6 @@ std::optional<int64_t> integer(Value value) {
   return std::nullopt;
 }
 
-// The relation is relative to four consecutive iterations of the current task
-// loop: value(group, lane) = value(group, 0) + lane * coefficient. Local memory
-// is followed through its actual writers, not through source-language origins.
-class GroupRelations {
-public:
-  explicit GroupRelations(scf::ForOp work)
-      : work(work), function(work->getParentOfType<func::FuncOp>()),
-        interface(intent::getPublicInterface(function)), storage(function) {}
-
-  StorageAnalysis &getStorage() { return storage; }
-
-  bool taskIdentity(Value value) const {
-    auto loop = work;
-    while (auto divide = value.getDefiningOp<arith::DivSIOp>()) {
-      if (!matchPattern(divide.getRhs(), m_One())) break;
-      value = divide.getLhs();
-    }
-    return value == loop.getInductionVar();
-  }
-
-  intent::ViewType readonlyView(Value value) const {
-    auto owner = function;
-    auto argument =
-        dyn_cast_or_null<BlockArgument>(storage.uniqueOrigin(value));
-    if (!argument || argument.getOwner() != &owner.front()) return {};
-    auto view = intent::getPublicView(interface, argument.getArgNumber());
-    return view && view.getAccess() == 0 ? view : intent::ViewType();
-  }
-
-  // These are the control expressions whose group-uniform form is retained by
-  // quotient rewriting below and checked again by the DSA program verifier.
-  bool uniformControl(Value value) {
-    if (auto known = control.find(value); known != control.end()) return known->second;
-    if (!activeControl.insert(value).second) return false;
-    auto infer = [&]() {
-      if (auto argument = dyn_cast<BlockArgument>(value)) {
-        if (argument.getOwner() == &function.front()) return true;
-        auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-        return loop && loop != work && argument == loop.getInductionVar() &&
-            uniformControl(loop.getLowerBound()) && uniformControl(loop.getUpperBound()) && uniformControl(loop.getStep());
-      }
-      Operation *definition = value.getDefiningOp();
-      if (!definition) return false;
-      if (isa<arith::ConstantOp>(definition)) return true;
-      if (auto divide = dyn_cast<arith::DivSIOp>(definition)) {
-        auto divisor = integer(divide.getRhs());
-        if (taskIdentity(divide.getLhs()) && divisor && *divisor > 0 && *divisor % 4 == 0) return true;
-      }
-      if (auto load = dyn_cast<LoadScalarOp>(definition))
-        return bool(readonlyView(load.getSource())) && uniformControl(load.getOffset());
-      return (isa<memref::DimOp, StrideOp>(definition) || isa<arith::ArithDialect>(definition->getDialect())) &&
-          llvm::all_of(definition->getOperands(), [&](Value input) { return uniformControl(input); });
-    };
-    bool result = infer();
-    activeControl.erase(value); control[value] = result;
-    return result;
-  }
-
-  bool uniformExecution(Operation *operation) {
-    for (Operation *parent = operation->getParentOp(); parent && parent != function; parent = parent->getParentOp()) {
-      if (parent == work) return true;
-      if (auto loop = dyn_cast<scf::ForOp>(parent)) {
-        if (!uniformControl(loop.getLowerBound()) || !uniformControl(loop.getUpperBound()) ||
-            !uniformControl(loop.getStep())) return false;
-      } else if (auto branch = dyn_cast<scf::IfOp>(parent)) {
-        if (!uniformControl(branch.getCondition())) return false;
-      } else return false;
-    }
-    return true;
-  }
-
-  std::optional<int64_t> laneCoefficient(Value value) {
-    if (auto known = coefficients.find(value); known != coefficients.end()) return known->second;
-    if (!activeValues.insert(value).second) return std::nullopt;
-    auto infer = [&]() -> std::optional<int64_t> {
-      if (uniformControl(value)) return 0;
-      if (taskIdentity(value)) return 1;
-      Operation *definition = value.getDefiningOp();
-      if (!definition) return std::nullopt;
-      if (auto remainder = dyn_cast<arith::RemSIOp>(definition)) {
-        auto divisor = integer(remainder.getRhs());
-        if (taskIdentity(remainder.getLhs()) && divisor && *divisor > 0 && *divisor % 4 == 0) return 1;
-      }
-      if (auto load = dyn_cast<memref::LoadOp>(definition))
-        return uniformBuffer(load.getMemref()) && llvm::all_of(load.getIndices(), [&](Value index) { return uniformValue(index); })
-            ? std::optional<int64_t>(0) : std::nullopt;
-      if (auto load = dyn_cast<LoadScalarOp>(definition))
-        return readonlyView(load.getSource()) && uniformValue(load.getOffset()) ? std::optional<int64_t>(0) : std::nullopt;
-      if (!isa<arith::ArithDialect>(definition->getDialect()) || definition->getNumRegions()) return std::nullopt;
-      if (llvm::all_of(definition->getOperands(), [&](Value input) { return uniformValue(input); })) return 0;
-      // DSA address indices implement Intent's signed 64-bit logical index.
-      return foldIntegerDifference(describeScalarValue(value),
-          [&](Value input) { return laneCoefficient(input); }, integer, /*indexBitWidth=*/64);
-    };
-    auto result = infer();
-    // Nonzero address differences are only propagated in the DSA address
-    // domain. Extending a wrapped narrow integer would not preserve them.
-    if (result && *result != 0 && !value.getType().isIndex() && !value.getType().isInteger(64)) result.reset();
-    activeValues.erase(value); coefficients[value] = result;
-    return result;
-  }
-
-private:
-  bool uniformValue(Value value) {
-    auto coefficient = laneCoefficient(value);
-    return coefficient && *coefficient == 0;
-  }
-
-  bool uniformBuffer(Value value) {
-    if (readonlyView(value)) return true;
-    value = storage.uniqueOrigin(value);
-    if (!value)
-      return false;
-    if (auto known = buffers.find(value); known != buffers.end()) return known->second;
-    if (!value.getDefiningOp<memref::AllocaOp>() || !activeBuffers.insert(value).second) return false;
-    auto infer = [&]() {
-      auto aliases = storage.aliases(value);
-      if (!aliases.complete)
-        return false;
-      for (Value alias : aliases.values) {
-        if (alias == value)
-          continue;
-        auto definition = alias.getDefiningOp();
-        // Group-uniform address projections must themselves use group-uniform
-        // coordinates; storage aliasing does not establish that relation.
-        if (!definition || definition->getNumRegions() ||
-            !isBufferStorageAliasOperation(definition))
-          return false;
-        for (Value parameter : definition->getOperands())
-          if (!isa<MemRefType>(parameter.getType()) && !uniformValue(parameter))
-            return false;
-      }
-      auto writers = storage.writers(value);
-      if (failed(writers))
-        return false;
-      bool written = false;
-      for (Operation *user : *writers) {
-        written = true;
-        if (!isa<memref::StoreOp, FillOp, IotaOp, LoadTileOp, GatherRowsOp,
-                 UnaryOp, BinaryOp, CastOp, SelectOp, CompareOp, CompareRangeOp,
-                 CompareRampOp, IndexBinaryOp, IndexLayoutOp, TransposeOp>(
-                user) ||
-            !uniformExecution(user))
-          return false;
-        auto effects = storage.effects(user);
-        if (!effects.complete || effects.ordered)
-          return false;
-        for (Value operand : user->getOperands()) {
-          if (!isa<MemRefType>(operand.getType())) {
-            if (!uniformValue(operand))
-              return false;
-            continue;
-          }
-          bool reads = false, writesOperand = false;
-          for (const auto &entry : effects.entries)
-            if (entry.effect.getValue() == operand) {
-              reads |= isa<MemoryEffects::Read>(entry.effect.getEffect());
-              writesOperand |=
-                  isa<MemoryEffects::Write>(entry.effect.getEffect());
-            }
-          if ((!writesOperand || reads) && !uniformBuffer(operand))
-            return false;
-        }
-      }
-      return written;
-    };
-    bool result = infer(); activeBuffers.erase(value); buffers[value] = result;
-    return result;
-  }
-
-  scf::ForOp work;
-  func::FuncOp function;
-  InterfaceAttr interface;
-  StorageAnalysis storage;
-  DenseMap<Value, bool> control, buffers;
-  DenseMap<Value, std::optional<int64_t>> coefficients;
-  DenseSet<Value> activeControl, activeBuffers, activeValues;
-};
-
 bool fourAligned(Value value) {
   if (auto constant = integer(value)) return *constant % 4 == 0;
   if (auto multiply = value.getDefiningOp<arith::MulIOp>())
@@ -204,9 +25,10 @@ bool fourAligned(Value value) {
   return false;
 }
 
-bool adjacentIntervals(GatherRowsOp gather, GroupRelations &relations) {
-  if (gather.getAsynchronous() || gather.getPlan() || !relations.uniformExecution(gather) ||
-      !relations.uniformControl(gather.getRows()) || !relations.uniformControl(gather.getColumns())) return false;
+bool adjacentIntervals(GatherRowsOp gather, ExecutionRelations &relations,
+                       StorageAnalysis &storage) {
+  if (gather.getAsynchronous() || gather.getPlan() || !relations.hasUniformControl(gather) ||
+      !relations.isUniform(gather.getRows()) || !relations.isUniform(gather.getColumns())) return false;
   auto source = cast<MemRefType>(gather.getSource().getType());
   auto output = cast<MemRefType>(gather.getOutput().getType());
   auto view = relations.readonlyView(gather.getSource());
@@ -227,12 +49,11 @@ bool adjacentIntervals(GatherRowsOp gather, GroupRelations &relations) {
   // Require one complete, current offset snapshot immediately before the read.
   // No other writer or alias can substitute older lane-dependent row addresses.
   Value offsets = gather.getRowOffsets();
-  auto &storage = relations.getStorage();
   auto allocation = offsets.getDefiningOp<memref::AllocaOp>();
   auto loop = dyn_cast_or_null<scf::ForOp>(gather->getPrevNode());
   if (!allocation || !loop || !loop.getInitArgs().empty() || !matchPattern(loop.getLowerBound(), m_Zero()) ||
       !matchPattern(loop.getStep(), m_One()) || loop.getUpperBound() != gather.getRows() ||
-      !relations.uniformExecution(loop)) return false;
+      !relations.hasUniformControl(loop)) return false;
   auto store = dyn_cast_or_null<memref::StoreOp>(storage.uniqueWriter(offsets));
   if (!store ||
       !detail::sameCompleteView(storage, store.getMemref(), offsets) ||
@@ -247,11 +68,16 @@ bool adjacentIntervals(GatherRowsOp gather, GroupRelations &relations) {
   if (!outputOrigin || !outputOrigin.getDefiningOp<memref::AllocaOp>() ||
       !storage.disjoint(outputOrigin, offsets))
     return false;
-  auto coefficient = relations.laneCoefficient(store.getValue());
+  auto coefficient = relations.participantCoefficient(store.getValue());
   return coefficient && *coefficient == columns;
 }
 
-void realizeGroup(scf::ForOp work, ArrayRef<GatherRowsOp> gathers, GroupRelations &relations) {
+void realizeGroup(scf::ForOp work, ArrayRef<GatherRowsOp> gathers, ExecutionRelations &relations) {
+  SmallVector<std::pair<arith::DivSIOp, int64_t>> quotients;
+  work.walk([&](arith::DivSIOp divide) {
+    if (auto divisor = relations.groupedQuotientDivisor(divide.getResult()))
+      quotients.emplace_back(divide, *divisor);
+  });
   auto function = work->getParentOfType<func::FuncOp>();
   OpBuilder b(work);
   Location loc = work.getLoc();
@@ -265,16 +91,11 @@ void realizeGroup(scf::ForOp work, ArrayRef<GatherRowsOp> gathers, GroupRelation
   Value local = b.create<LocalIdOp>(loc, b.getIndexType()), memory = b.create<IsMemoryCoreOp>(loc, b.getI1Type());
   Value lane = b.create<arith::SelectOp>(loc, memory, index(0), local);
   Value total = b.create<arith::DivSIOp>(loc, work.getUpperBound(), index(4));
-  SmallVector<arith::DivSIOp> quotients;
-  work.walk([&](arith::DivSIOp divide) {
-    auto divisor = integer(divide.getRhs());
-    if (relations.taskIdentity(divide.getLhs()) && divisor && *divisor > 0 && *divisor % 4 == 0) quotients.push_back(divide);
-  });
   work.setLowerBound(group); work.setUpperBound(total); work.setStep(groups);
   DenseSet<Operation *> groupOperations;
-  for (auto quotient : quotients) {
+  for (auto [quotient, divisor] : quotients) {
     b.setInsertionPoint(quotient);
-    auto grouped = b.create<arith::DivSIOp>(loc, originalTask, index(*integer(quotient.getRhs()) / 4));
+    auto grouped = b.create<arith::DivSIOp>(loc, originalTask, index(divisor));
     groupOperations.insert(grouped);
     quotient.replaceAllUsesWith(grouped.getResult()); quotient.erase();
   }
@@ -324,10 +145,11 @@ LogicalResult realizeCollectiveGatherSupply(func::FuncOp function) {
     if (query != work.getLowerBound() && query != work.getStep() && !query.use_empty()) isolated = false;
   });
   if (!isolated) return success();
-  GroupRelations relations(work);
+  ExecutionRelations relations(work, 4);
+  StorageAnalysis storage(function);
   SmallVector<GatherRowsOp> gathers;
   work.walk([&](GatherRowsOp gather) {
-    if (adjacentIntervals(gather, relations)) gathers.push_back(gather);
+    if (adjacentIntervals(gather, relations, storage)) gathers.push_back(gather);
   });
   if (!gathers.empty()) realizeGroup(work, gathers, relations);
   return success();
