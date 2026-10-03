@@ -1,7 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Vector/Vectorization.h"
+#include "ProducerVectorization.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "Intent/Dialect/CPU/Transforms/Vector/VectorReductions.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -11,46 +11,26 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SetVector.h"
 
 using namespace mlir;
 
 namespace intent::cpu {
 namespace {
 
-bool vectorElement(Type type) {
-  return type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
-      isa<Float8E4M3FNType, Float8E5M2Type>(type) ||
-      type.isIndex() || type.isSignlessInteger(1) || type.isSignlessInteger(8) ||
-      type.isSignlessInteger(16) || type.isSignlessInteger(32) || type.isSignlessInteger(64);
-}
-
-std::optional<int64_t> coefficient(Value value, scf::ForOp loop) {
-  if (value == loop.getInductionVar()) return 1;
-  Operation *op = value.getDefiningOp();
-  if (!op || !loop->isAncestor(op)) return 0;
-  // Intent CPU logical coordinates use the DSL's signed 64-bit index contract;
-  // the shared query does not assume a width for arbitrary MLIR index values.
-  auto folded = foldIntegerDifference(describeScalarValue(value),
-      [&](Value input) { return coefficient(input, loop); },
-      [](Value input) { return getConstantIntValue(input); }, /*indexBitWidth=*/64);
-  if (folded) return folded;
-  if (llvm::all_of(op->getOperands(), [&](Value input) {
-        auto c = coefficient(input, loop); return c && *c == 0;
-      })) return 0;
-  return std::nullopt;
-}
-
-bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInvariant,
-                SmallVectorImpl<Value> &guardedMemories) {
+bool contiguousStore(Value memory, ValueRange indices, scf::ForOp loop,
+                     const ProducerVectorization &producer,
+                     SmallVectorImpl<Value> &guardedMemories) {
   auto type = cast<MemRefType>(memory.getType());
-  if (!vectorElement(type.getElementType()) || type.getElementType().isInteger(1)) return false;
+  if (!ProducerVectorization::isElementType(type.getElementType()) ||
+      type.getElementType().isInteger(1)) return false;
   if (auto owner = memory.getDefiningOp(); owner && loop->isAncestor(owner)) return false;
   SmallVector<int64_t> strides;
   int64_t offset;
   if (failed(type.getStridesAndOffset(strides, offset))) return false;
   bool invariant = true;
   for (auto [axis, index] : llvm::enumerate(indices)) {
-    auto c = coefficient(index, loop);
+    auto c = producer.coefficient(index);
     if (!c) return false;
     if (*c != 0) {
       invariant = false;
@@ -60,86 +40,7 @@ bool contiguous(Value memory, ValueRange indices, scf::ForOp loop, bool allowInv
       } else if (strides[axis] != 1) return false;
     }
   }
-  return !invariant || allowInvariant;
-}
-
-class VectorBody {
-public:
-  VectorBody(scf::ForOp original, OpBuilder &builder, OpBuilder &invariants, Value iv, int64_t width)
-      : original(original), b(builder), invariants(invariants), width(width) {
-    mapping.map(original.getInductionVar(), iv);
-  }
-
-  static bool invariant(Value value, scf::ForOp loop) {
-    if (value == loop.getInductionVar() || llvm::is_contained(loop.getRegionIterArgs(), value)) return false;
-    Operation *op = value.getDefiningOp();
-    return !op || !loop->isAncestor(op) || llvm::all_of(op->getOperands(), [&](Value input) {
-      return invariant(input, loop);
-    });
-  }
-
-  Value scalar(Value value) {
-    if (mapping.contains(value)) return mapping.lookup(value);
-    Operation *op = value.getDefiningOp();
-    if (!op || !original->isAncestor(op)) return value;
-    for (Value input : op->getOperands()) mapping.map(input, scalar(input));
-    (invariant(value, original) ? invariants : b).clone(*op, mapping);
-    return mapping.lookup(value);
-  }
-
-  SmallVector<Value> indices(ValueRange inputs) {
-    SmallVector<Value> result;
-    for (Value input : inputs) result.push_back(scalar(input));
-    return result;
-  }
-
-  Value vector(Value value) {
-    if (vectors.count(value)) return vectors.lookup(value);
-    Location loc = original.getLoc();
-    Operation *op = value.getDefiningOp();
-    auto type = VectorType::get({width}, value.getType());
-    Value result;
-    if (value == original.getInductionVar()) {
-      Value start = b.create<vector::BroadcastOp>(loc, type, scalar(value));
-      Value lanes = b.create<vector::StepOp>(loc, type);
-      result = b.create<arith::AddIOp>(loc, start, lanes);
-    } else if (!op || !original->isAncestor(op) || coefficient(value, original) == 0) {
-      result = b.create<vector::BroadcastOp>(loc, type, scalar(value));
-    } else if (auto load = dyn_cast<memref::LoadOp>(op)) {
-      bool invariant = llvm::all_of(load.getIndices(), [&](Value input) {
-        return coefficient(input, original) == 0;
-      });
-      result = invariant
-          ? Value(b.create<vector::BroadcastOp>(loc, type, scalar(value)))
-          : Value(b.create<vector::LoadOp>(loc, type, load.getMemref(), indices(load.getIndices())));
-    } else {
-      IRMapping operationMapping;
-      for (Value input : op->getOperands())
-        operationMapping.map(input, vector(input));
-      Operation *cloned = b.clone(*op, operationMapping);
-      cloned->getResult(0).setType(type);
-      result = cloned->getResult(0);
-    }
-    vectors[value] = result;
-    return result;
-  }
-
-private:
-  scf::ForOp original;
-  OpBuilder &b;
-  OpBuilder &invariants;
-  int64_t width;
-  IRMapping mapping;
-  llvm::DenseMap<Value, Value> vectors;
-};
-
-bool dependsOnCarry(Value value, scf::ForOp loop) {
-  if (llvm::is_contained(loop.getRegionIterArgs(), value)) return true;
-  Operation *operation = value.getDefiningOp();
-  if (!operation || !loop->isAncestor(operation)) return false;
-  return llvm::any_of(operation->getOperands(), [&](Value input) {
-    return dependsOnCarry(input, loop);
-  });
+  return !invariant;
 }
 
 void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonempty = false) {
@@ -157,30 +58,58 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
       if (combine->getOperand(0) == carry) reductionInputs.push_back(combine->getOperand(1));
       else if (combine->getOperand(1) == carry) reductionInputs.push_back(combine->getOperand(0));
       else return;
-      if (dependsOnCarry(reductionInputs.back(), original)) return;
       combines.push_back(combine);
     }
   }
   SmallVector<memref::StoreOp> stores;
   SmallVector<memref::LoadOp> loads;
   SmallVector<Value> guardedMemories;
+  llvm::SmallSetVector<Value, 32> roots;
   for (Operation &operation : original.getBody()->without_terminator()) {
-    if (operation.getNumRegions()) return;
-    if (auto load = dyn_cast<memref::LoadOp>(&operation)) {
-      if (!contiguous(load.getMemref(), load.getIndices(), original, true, guardedMemories)) return;
-      loads.push_back(load);
-    } else if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
-      if (dependsOnCarry(store.getValue(), original) ||
-          !contiguous(store.getMemref(), store.getIndices(), original, false, guardedMemories)) return;
+    if (auto store = dyn_cast<memref::StoreOp>(&operation)) {
       stores.push_back(store);
-    } else if (!isMemoryEffectFree(&operation) || operation.getNumResults() != 1 ||
-               !vectorElement(operation.getResult(0).getType()) ||
-               (!operation.hasTrait<OpTrait::Elementwise>() &&
-                coefficient(operation.getResult(0), original) != 0)) return;
+      roots.insert(store.getValue());
+      roots.insert(store.getIndices().begin(), store.getIndices().end());
+    } else if (!llvm::is_contained(combines, &operation)) {
+      if (!operation.getNumResults() ||
+          !llvm::all_of(operation.getResultTypes(), ProducerVectorization::isElementType))
+        return;
+      roots.insert(operation.getResults().begin(), operation.getResults().end());
+    }
   }
   if (reductionInputs.empty() && stores.empty()) return;
   auto function = original->getParentOfType<func::FuncOp>();
   StorageAnalysis storage(function);
+  roots.insert(reductionInputs.begin(), reductionInputs.end());
+  SmallVector<Value> frontier{original.getInductionVar()};
+  llvm::append_range(frontier, original.getRegionIterArgs());
+  ProducerReplay payload{original, frontier, {}, {}, {}, {}};
+  auto appendUnique = [](auto &target, const auto &values) {
+    for (auto value : values)
+      if (!llvm::is_contained(target, value)) target.push_back(value);
+  };
+  for (Value value : roots) {
+    auto proof = analyzeProducerValue(value, original, frontier, storage);
+    if (failed(proof)) return;
+    appendUnique(payload.externalValues, proof->externalValues);
+    appendUnique(payload.reads, proof->reads);
+    appendUnique(payload.operations, proof->operations);
+    appendUnique(payload.nodes, proof->nodes);
+  }
+  ProducerVectorization producer(payload, original.getInductionVar());
+  for (Value value : roots) {
+    if (llvm::any_of(original.getRegionIterArgs(), [&](Value carry) {
+          return producer.dependsOn(value, carry);
+        }) || !producer.canWiden(value, &guardedMemories)) return;
+  }
+  // Carries participate only in the separately preserved reduction combiner.
+  // Every widened producer has been proved independent of those formals.
+  payload.frontier.resize(1);
+  for (Operation *operation : payload.nodes)
+    if (auto load = dyn_cast<memref::LoadOp>(operation)) loads.push_back(load);
+  for (auto store : stores)
+    if (!contiguousStore(store.getMemref(), store.getIndices(), original,
+                         producer, guardedMemories)) return;
   auto independent = [&](Value lhs, ValueRange lhsIndices, Value rhs, ValueRange rhsIndices) {
     if (lhs == rhs && lhsIndices == rhsIndices) return true;
     return storage.disjoint(lhs, rhs);
@@ -194,8 +123,9 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
   OpBuilder b(original);
   Location loc = original.getLoc();
   bool needsInvariantGuard = llvm::any_of(original.getBody()->without_terminator(), [&](Operation &op) {
-    return op.getNumResults() == 1 && !isSpeculatable(&op) &&
-        VectorBody::invariant(op.getResult(0), original);
+    return !isSpeculatable(&op) && llvm::any_of(op.getResults(), [&](Value value) {
+      return producer.isUniform(value);
+    });
   });
   if (!guardedMemories.empty() || (!nonempty && needsInvariantGuard)) {
     Value one = index(b, loc, 1), condition;
@@ -270,14 +200,33 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
     return results;
   };
   auto vectorBody = [&](Value coordinate, OpBuilder &invariants) {
-    VectorBody body(original, b, invariants, coordinate, logicalWidth);
+    IRMapping scalars, vectors;
+    scalars.map(original.getInductionVar(), coordinate);
+    auto vector = [&](Value value) {
+      auto result = producer.materialize(value, logicalWidth, b, scalars,
+                                         vectors, &invariants);
+      assert(succeeded(result) && "loop widening must bind the proven producer");
+      return *result;
+    };
+    auto indices = [&](ValueRange values) {
+      SmallVector<Value> result;
+      for (Value value : values) {
+        auto index = producer.materializeScalar(value, b, scalars, &invariants);
+        assert(succeeded(index) && "loop widening must bind the proven coordinate");
+        result.push_back(*index);
+      }
+      return result;
+    };
     for (Operation &operation : original.getBody()->without_terminator()) {
-      if (auto load = dyn_cast<memref::LoadOp>(&operation)) body.vector(load.getResult());
+      if (auto load = dyn_cast<memref::LoadOp>(&operation)) vector(load.getResult());
+      else if (auto branch = dyn_cast<scf::IfOp>(&operation))
+        for (Value result : branch.getResults()) vector(result);
       else if (auto store = dyn_cast<memref::StoreOp>(&operation))
-        b.create<vector::StoreOp>(loc, body.vector(store.getValue()), store.getMemref(), body.indices(store.getIndices()));
+        b.create<vector::StoreOp>(loc, vector(store.getValue()), store.getMemref(),
+                                  indices(store.getIndices()), store.getNontemporal());
     }
     SmallVector<Value> inputs;
-    for (Value input : reductionInputs) inputs.push_back(body.vector(input));
+    for (Value input : reductionInputs) inputs.push_back(vector(input));
     return inputs;
   };
   auto order = original->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");

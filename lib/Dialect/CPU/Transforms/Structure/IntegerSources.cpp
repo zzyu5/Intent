@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "IntegerSources.h"
+#include "../Storage/AccessAliases.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
@@ -107,10 +108,11 @@ void replay(memref::LoadOp load, const IntegerProducer &source) {
 
 } // namespace
 
-void foldIntegerSources(func::FuncOp function) {
+LogicalResult foldIntegerSources(func::FuncOp function) {
   bool changed;
   do {
     changed = false;
+    if (failed(foldPrivateAccessAliases(function))) return failure();
     SmallVector<memref::LoadOp> loads;
     function.walk([&](memref::LoadOp load) { if (integer(load.getType())) loads.push_back(load); });
     for (auto load : loads) {
@@ -124,6 +126,7 @@ void foldIntegerSources(func::FuncOp function) {
     }
     if (changed) eraseDeadPrivateBuffers(function);
   } while (changed);
+  return success();
 }
 
 } // namespace intent::cpu

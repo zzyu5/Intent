@@ -25,6 +25,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Region/Passes.cpp
   Region/RealizeRegions.cpp
 
+  Storage/AccessAliases.cpp
   Storage/Bufferization.cpp
   Storage/CollectiveBufferization.cpp
   Storage/FuseIntermediateBuffers.cpp
@@ -44,6 +45,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Task/PartitionTasks.cpp
   Task/Passes.cpp
 
+  Vector/ProducerVectorization.cpp
   Vector/VectorReductions.cpp
   Vector/VectorizeLoops.cpp
 
@@ -56,6 +58,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRIntentAnalysis
   MLIRIntentCPUDialect
   MLIRAnalysis
+  MLIRAffineToStandard
   MLIRArithDialect
   MLIRBufferizationDialect
   MLIRBufferizationTransforms

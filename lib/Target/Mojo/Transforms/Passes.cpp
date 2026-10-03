@@ -3,6 +3,7 @@
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Transforms/Configuration/FinalizedCandidates.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -54,6 +55,10 @@ public:
 class FusePrivateComputationsPass : public impl::MojoFusePrivateComputationsBase<FusePrivateComputationsPass> {
 public:
   using MojoFusePrivateComputationsBase::MojoFusePrivateComputationsBase;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    MojoFusePrivateComputationsBase::getDependentDialects(registry);
+    registry.insert<affine::AffineDialect>();
+  }
   void runOnOperation() final {
     auto module = getOperation();
     if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();

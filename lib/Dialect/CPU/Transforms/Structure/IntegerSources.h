@@ -7,7 +7,7 @@ namespace intent::cpu {
 
 // Replay pure integer element definitions at current-IR scalar reads before
 // private storage reuse can merge their independent value lifetimes.
-void foldIntegerSources(mlir::func::FuncOp function);
+mlir::LogicalResult foldIntegerSources(mlir::func::FuncOp function);
 
 } // namespace intent::cpu
 #endif

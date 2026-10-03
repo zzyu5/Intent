@@ -353,7 +353,7 @@ void forwardPointwiseCopies(func::FuncOp function) {
 }
 
 LogicalResult fuseStructuredComputations(func::FuncOp function) {
-  foldIntegerSources(function);
+  if (failed(foldIntegerSources(function))) return failure();
   foldContiguousAccesses(function);
   forwardCPUOutputs(function);
   bool changed;

@@ -1,4 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
+#include "AccessAliases.h"
+#include "../Vector/ProducerVectorization.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -15,6 +17,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include <optional>
 
 using namespace mlir;
 
@@ -156,78 +159,6 @@ void forwardDestinations(func::FuncOp function) {
   }
 }
 
-bool dependsOn(Value value, Value coordinate, Operation *root) {
-  if (value == coordinate) return true;
-  Operation *operation = value.getDefiningOp();
-  if (!operation || !root->isAncestor(operation)) return false;
-  // Captures and yields of an intact control region contribute to dependence,
-  // even when its condition is independent of the vectorized coordinate.
-  return operation->walk([&](Operation *nested) -> WalkResult {
-    for (Value operand : nested->getOperands())
-      if (dependsOn(operand, coordinate, root)) return WalkResult::interrupt();
-    return WalkResult::advance();
-  }).wasInterrupted();
-}
-
-bool canReplayVector(Value value, Value coordinate, Operation *root) {
-  if (value == coordinate || !dependsOn(value, coordinate, root)) return true;
-  Operation *operation = value.getDefiningOp();
-  if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-    auto type = load.getMemRefType();
-    SmallVector<int64_t> strides;
-    int64_t offset;
-    return type.getRank() && !type.getElementType().isInteger(1) &&
-        succeeded(type.getStridesAndOffset(strides, offset)) && strides.back() == 1 &&
-        !dependsOn(load.getMemref(), coordinate, root) &&
-        load.getIndices().back() == coordinate &&
-        llvm::none_of(load.getIndices().drop_back(), [&](Value index) {
-          return dependsOn(index, coordinate, root);
-        });
-  }
-  return operation && !operation->getNumRegions() && operation->getNumResults() == 1 &&
-      operation->hasTrait<OpTrait::Elementwise>() &&
-      llvm::all_of(operation->getOperandTypes(), [](Type type) {
-        return isa<FloatType, IntegerType, IndexType>(type);
-      }) && llvm::all_of(operation->getOperands(), [&](Value operand) {
-        return canReplayVector(operand, coordinate, root);
-      });
-}
-
-Value replayVector(const ProducerReplay &payload, Value value, Value coordinate,
-                   Operation *root, int64_t width,
-                   OpBuilder &builder, IRMapping &scalars, IRMapping &vectors) {
-  if (vectors.contains(value)) return vectors.lookup(value);
-  auto type = VectorType::get({width}, value.getType());
-  Location loc = root->getLoc();
-  auto scalar = [&](Value value) {
-    auto replayed = materializeProducerValue(payload, value, builder, scalars);
-    assert(succeeded(replayed) && "vector adapter requires a proven scalar payload");
-    return *replayed;
-  };
-  Value result;
-  if (value == coordinate) {
-    Value start = builder.create<vector::BroadcastOp>(loc, type, scalars.lookup(value));
-    result = builder.create<arith::AddIOp>(loc, start, builder.create<vector::StepOp>(loc, type));
-  } else if (!dependsOn(value, coordinate, root)) {
-    result = builder.create<vector::BroadcastOp>(loc, type, scalar(value));
-  } else if (auto load = value.getDefiningOp<memref::LoadOp>()) {
-    SmallVector<Value> indices;
-    for (Value index : load.getIndices()) indices.push_back(scalar(index));
-    result = builder.create<vector::LoadOp>(loc, type,
-        scalar(load.getMemref()), indices);
-  } else {
-    Operation *operation = value.getDefiningOp();
-    IRMapping mapping;
-    for (Value operand : operation->getOperands())
-      mapping.map(operand, replayVector(payload, operand, coordinate, root, width, builder, scalars, vectors));
-    Operation *cloned = builder.clone(*operation, mapping);
-    cloned->getResult(0).setType(type);
-    result = cloned->getResult(0);
-  }
-  vectors.map(value, result);
-  return result;
-}
-
 bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation) {
   auto type = allocation.getType();
   auto vector = load.getVectorType();
@@ -348,9 +279,12 @@ bool fuse(memref::AllocOp allocation) {
   for (auto loop : loops) frontier.push_back(loop.getInductionVar());
   auto payload = analyzeProducerValue(store.getValue(), root, frontier, storage);
   if (failed(payload)) return false;
-  for (Operation *load : loads)
-    if (isa<vector::LoadOp>(load) && (loops.empty() ||
-        !canReplayVector(store.getValue(), loops.back().getInductionVar(), root))) return false;
+  std::optional<ProducerVectorization> vectorization;
+  if (llvm::any_of(loads, [](Operation *load) { return isa<vector::LoadOp>(load); })) {
+    if (loops.empty()) return false;
+    vectorization.emplace(*payload, loops.back().getInductionVar());
+    if (!vectorization->canWiden(store.getValue())) return false;
+  }
   if (consumers.size() != 1) {
     auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
     if (!integer(store.getValue().getType()) || llvm::any_of(payload->nodes, [&](Operation *operation) {
@@ -369,8 +303,10 @@ bool fuse(memref::AllocOp allocation) {
     Value replacement;
     if (auto vector = dyn_cast<vector::LoadOp>(load)) {
       IRMapping vectors;
-      replacement = replayVector(*payload, store.getValue(), loops.back().getInductionVar(), root,
+      auto replayed = vectorization->materialize(store.getValue(),
           vector.getVectorType().getDimSize(0), builder, mapping, vectors);
+      assert(succeeded(replayed) && "buffer replay must bind the proven vector payload");
+      replacement = *replayed;
     } else {
       auto replayed = materializeProducerValue(*payload, store.getValue(), builder, mapping);
       assert(succeeded(replayed) && "buffer replay must bind the complete coordinate frontier");
@@ -417,6 +353,7 @@ LogicalResult fuseIntermediateBuffers(func::FuncOp function) {
   bool changed;
   do {
     changed = false;
+    if (failed(foldPrivateAccessAliases(function))) return failure();
     SmallVector<memref::AllocOp> allocations;
     function.walk([&](memref::AllocOp op) { allocations.push_back(op); });
     for (memref::AllocOp allocation : llvm::reverse(allocations))
