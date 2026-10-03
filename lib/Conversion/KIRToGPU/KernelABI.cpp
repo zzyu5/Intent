@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Conversion/LogicalShape.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "llvm/ADT/STLExtras.h"
@@ -135,7 +136,81 @@ FailureOr<PhysicalABI> buildPhysicalABI(
   return result;
 }
 
-FailureOr<PhysicalExprAttr> launchExpression(Value value, func::FuncOp function) {
+FailureOr<PhysicalExprAttr> launchExtentExpression(
+    CanonicalKernelAnalysis &canonicalAnalysis, Value value, unsigned axis,
+    func::FuncOp function, ArrayRef<unsigned> fieldPath) {
+  MLIRContext *context = value.getContext();
+  LogicalShapeReification reification;
+  reification.leaf = [&](const TensorExtentFact &extent)
+      -> FailureOr<OpFoldResult> {
+    if (extent.constant)
+      return OpFoldResult(expression(context, PhysicalExprKind::Constant,
+                                     *extent.constant));
+    if (extent.value) {
+      auto result = launchExpression(extent.value, canonicalAnalysis, function);
+      if (failed(result)) return failure();
+      return OpFoldResult(*result);
+    }
+    if (extent.domain) {
+      SmallVector<IterationAxis> axes;
+      if (failed(collectIterationAxes(extent.domain, axes)) ||
+          extent.axis >= axes.size())
+        return failure();
+      const IterationAxis &domain = axes[extent.axis];
+      auto begin = launchExpression(domain.start, canonicalAnalysis, function);
+      auto end = launchExpression(domain.stop, canonicalAnalysis, function);
+      auto step = domain.step
+          ? launchExpression(domain.step, canonicalAnalysis, function)
+          : FailureOr<PhysicalExprAttr>(
+                expression(context, PhysicalExprKind::Constant, 1));
+      if (failed(begin) || failed(end) || failed(step)) return failure();
+      if (begin->getKind() == PhysicalExprKind::Constant &&
+          begin->getValue() == 0 &&
+          step->getKind() == PhysicalExprKind::Constant &&
+          step->getValue() == 1 &&
+          (end->getKind() == PhysicalExprKind::Dimension ||
+           (end->getKind() == PhysicalExprKind::Constant && end->getValue() >= 0)))
+        return OpFoldResult(*end);
+      auto zero = expression(context, PhysicalExprKind::Constant, 0);
+      auto distance = binaryExpression(context, PhysicalExprKind::Subtract,
+                                       *end, *begin);
+      auto count = binaryExpression(context, PhysicalExprKind::CeilDiv,
+                                    distance, *step);
+      return OpFoldResult(binaryExpression(context, PhysicalExprKind::Maximum,
+                                            count, zero));
+    }
+    auto argument = dyn_cast_or_null<BlockArgument>(extent.source);
+    auto tensor = argument ? viewTensor(argument) : RankedTensorType();
+    if (!argument || !function ||
+        argument.getOwner() != &function.getBody().front() ||
+        !getSourceParameter(argument) || !extent.fieldPath.empty() || !tensor ||
+        extent.axis >= tensor.getRank())
+      return failure();
+    auto identities = dimensionIds(tensor);
+    if (!identities || identities[extent.axis] <= 0) return failure();
+    return OpFoldResult(dimensionExpression(function, identities[extent.axis]));
+  };
+  auto binary = [&](PhysicalExprKind kind, OpFoldResult lhs, OpFoldResult rhs)
+      -> FailureOr<OpFoldResult> {
+    return OpFoldResult(binaryExpression(
+        context, kind, cast<PhysicalExprAttr>(cast<Attribute>(lhs)),
+        cast<PhysicalExprAttr>(cast<Attribute>(rhs))));
+  };
+  reification.multiply = [&](OpFoldResult lhs, OpFoldResult rhs) {
+    return binary(PhysicalExprKind::Multiply, lhs, rhs);
+  };
+  reification.exactDivide = [&](OpFoldResult lhs, OpFoldResult rhs) {
+    return binary(PhysicalExprKind::FloorDiv, lhs, rhs);
+  };
+  auto result = reifyLogicalExtent(canonicalAnalysis, value, axis,
+                                  reification, fieldPath);
+  if (failed(result)) return failure();
+  return cast<PhysicalExprAttr>(cast<Attribute>(*result));
+}
+
+FailureOr<PhysicalExprAttr> launchExpression(
+    Value value, CanonicalKernelAnalysis &canonicalAnalysis,
+    func::FuncOp function) {
   MLIRContext *context = value.getContext();
   Operation *definition = value.getDefiningOp();
   if (!definition) {
@@ -159,42 +234,14 @@ FailureOr<PhysicalExprAttr> launchExpression(Value value, func::FuncOp function)
     return expression(context, PhysicalExprKind::Constant, integer.getInt());
   }
   if (auto dim = dyn_cast<intent::DimOp>(definition)) {
-    RankedTensorType tensor = viewTensor(dim.getSource());
-    if (tensor && dim.getAxis() < static_cast<uint64_t>(tensor.getRank()) &&
-        !tensor.isDynamicDim(dim.getAxis()))
-      return expression(context, PhysicalExprKind::Constant,
-                        tensor.getDimSize(dim.getAxis()));
-    if (tensor && dim.getDimension() > 0)
-      return dimensionExpression(function, dim.getDimension());
-    if (auto domain = dim.getSource().getDefiningOp<intent::DomainOp>()) {
-      FailureOr<PhysicalExprAttr> start =
-          launchExpression(domain.getBounds()[0], function);
-      FailureOr<PhysicalExprAttr> stop =
-          launchExpression(domain.getBounds()[1], function);
-      FailureOr<PhysicalExprAttr> step =
-          domain.getBounds().size() == 3
-              ? launchExpression(domain.getBounds()[2], function)
-              : FailureOr<PhysicalExprAttr>(
-                    expression(context, PhysicalExprKind::Constant, 1));
-      if (failed(start) || failed(stop) || failed(step))
-        return failure();
-      if (start->getKind() ==
-              PhysicalExprKind::Constant &&
-          start->getValue() == 0 &&
-          step->getKind() ==
-              PhysicalExprKind::Constant &&
-          step->getValue() == 1)
-        return *stop;
-      PhysicalExprAttr distance =
-          binaryExpression(context, PhysicalExprKind::Subtract, *stop, *start);
-      return binaryExpression(context, PhysicalExprKind::CeilDiv, distance,
-                              *step);
-    }
-    return failure();
+    return launchExtentExpression(canonicalAnalysis, dim.getSource(),
+                                  dim.getAxis(), function);
   }
   if (auto binary = dyn_cast<intent::BinaryOp>(definition)) {
-    FailureOr<PhysicalExprAttr> lhs = launchExpression(binary.getLhs(), function);
-    FailureOr<PhysicalExprAttr> rhs = launchExpression(binary.getRhs(), function);
+    FailureOr<PhysicalExprAttr> lhs =
+        launchExpression(binary.getLhs(), canonicalAnalysis, function);
+    FailureOr<PhysicalExprAttr> rhs =
+        launchExpression(binary.getRhs(), canonicalAnalysis, function);
     if (failed(lhs) || failed(rhs))
       return failure();
     PhysicalExprKind kind;

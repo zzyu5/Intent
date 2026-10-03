@@ -115,12 +115,12 @@ FailureOr<PhysicalABI> buildPhysicalABI(
 
 FailureOr<PhysicalExprAttr> launchExpression(
     Value value,
+    CanonicalKernelAnalysis &canonicalAnalysis,
     func::FuncOp function = {});
 
-FailureOr<PhysicalExprAttr> logicalExtentExpression(
-    CanonicalKernelAnalysis &canonicalAnalysis,
-    Value value,
-    unsigned axis);
+FailureOr<PhysicalExprAttr> launchExtentExpression(
+    CanonicalKernelAnalysis &canonicalAnalysis, Value value, unsigned axis,
+    func::FuncOp function, ArrayRef<unsigned> fieldPath = {});
 
 std::optional<int64_t> sourceExtentDimension(Value source);
 
@@ -174,7 +174,7 @@ public:
       OpBuilder &builder,
       llvm::DenseMap<Value, Value> values,
       ArrayRef<Value> views,
-      llvm::DenseMap<int64_t, Value> dimensions,
+      llvm::DenseMap<int64_t, Value> abiDimensions,
       llvm::DenseMap<StringAttr, Value> parameters,
       CanonicalKernelAnalysis &canonicalAnalysis,
       func::FuncOp physicalKernel);
@@ -224,9 +224,8 @@ private:
       Location location,
       PhysicalExprAttr expression);
 
-  FailureOr<PhysicalExprAttr> physicalShapeExpression(
-      Value value,
-      Operation *origin);
+  FailureOr<Value> logicalExtent(Location location, Value value, unsigned axis,
+                                 ArrayRef<unsigned> fieldPath = {});
 
   FailureOr<Value> asIndex(Location location, Value value);
 
@@ -241,8 +240,6 @@ private:
       Location location,
       Value resource,
       unsigned axis);
-
-  void bindExtentDimensions(ArrayAttr identities, Value extent);
 
   FailureOr<SmallVector<Value>> accessCoordinates(Operation *operation);
 
@@ -367,7 +364,8 @@ private:
   OpBuilder &builder;
   llvm::DenseMap<Value, Value> values;
   ArrayRef<Value> views;
-  llvm::DenseMap<int64_t, Value> dimensions;
+  // Only entry ABI dimension bindings; local shapes are value/axis relations.
+  llvm::DenseMap<int64_t, Value> abiDimensions;
   llvm::DenseMap<StringAttr, Value> parameters;
   CanonicalKernelAnalysis &canonicalAnalysis;
   func::FuncOp physicalKernel;

@@ -16,6 +16,15 @@ ArrayAttr getProductComponents(Type type) {
   return {};
 }
 
+Type getProductComponentType(Type type, ArrayRef<unsigned> fieldPath) {
+  for (unsigned field : fieldPath) {
+    auto components = getProductComponents(type);
+    if (!components || field >= components.size()) return {};
+    type = cast<TypeAttr>(components[field]).getValue();
+  }
+  return type;
+}
+
 namespace {
 
 void visitLeaves(Type type, SmallVectorImpl<unsigned> &path,

@@ -16,6 +16,8 @@ namespace intent {
 // declaration order, recursively; a non-product has one leaf and an empty tuple
 // has none. These are SSA component positions, never memory offsets.
 mlir::ArrayAttr getProductComponents(mlir::Type type);
+mlir::Type getProductComponentType(mlir::Type type,
+                                   llvm::ArrayRef<unsigned> fieldPath);
 
 void walkProductLeaves(
     mlir::Type type,

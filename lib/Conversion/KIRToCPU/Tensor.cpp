@@ -10,7 +10,7 @@ namespace intent::kir_to_cpu {
 LogicalResult Construction::lower(FullOp op) {
   Location loc = op.getLoc();
   auto tensor = cast<RankedTensorType>(op.getResult().getType());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   Value output = emptyTensor(tensor, *sizes, loc);
   auto fill = builder.create<linalg::FillOp>(loc, ValueRange{values.lookup(op.getInputs()[0])}, ValueRange{output});
@@ -21,7 +21,7 @@ LogicalResult Construction::lower(FullOp op) {
 LogicalResult Construction::lower(IndicesOp op) {
   Location loc = op.getLoc();
   auto type = cast<RankedTensorType>(op.getResult().getType());
-  auto sizes = extents(type, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   Value begin = constant(loc, 0), step = constant(loc, 1);
   int64_t axis = 0;
@@ -51,7 +51,7 @@ LogicalResult Construction::lower(IndicesOp op) {
 LogicalResult Construction::lower(JoinOp op) {
   Location loc = op.getLoc();
   auto tensor = cast<RankedTensorType>(op.getResult().getType());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   Value output = emptyTensor(tensor, *sizes, loc);
   SmallVector<AffineExpr> prefix;
@@ -76,7 +76,7 @@ LogicalResult Construction::lower(JoinOp op) {
 LogicalResult Construction::lower(BroadcastOp op) {
   Location loc = op.getLoc();
   auto tensor = cast<RankedTensorType>(op.getResult().getType());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   Value input = values.lookup(op.getInputs()[0]);
   Value output = emptyTensor(tensor, *sizes, loc);
@@ -95,7 +95,7 @@ LogicalResult Construction::tensorShape(Operation *operation) {
   Value input = values.lookup(operation->getOperand(0));
   auto source = cast<RankedTensorType>(input.getType());
   auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(operation->getResult(0), loc);
   if (failed(sizes)) return failure();
   if (isa<ReshapeOp>(operation)) {
     Value shape = builder.create<tensor::FromElementsOp>(loc,

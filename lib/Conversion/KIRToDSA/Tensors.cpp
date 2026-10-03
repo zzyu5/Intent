@@ -14,10 +14,12 @@ Value Construction::allocateLike(Location loc, Value input, Type element) {
   return allocate(loc, element ? element : type.getElementType(), type.getDimSize(0), type.getDimSize(1));
 }
 
-std::optional<LocalAxis> Construction::selectedAxis(Value value, unsigned axis) {
-  auto type = cast<RankedTensorType>(value.getType());
+std::optional<LocalAxis> Construction::selectedAxis(
+    Value value, unsigned axis, ArrayRef<unsigned> fieldPath) {
+  auto type = logicalTensorType(value, fieldPath);
   if (type.getDimSize(axis) == 1) return std::nullopt;
-  if (auto selected = valueSlices.find(value); selected != valueSlices.end())
+  if (auto selected = valueSlices.find(value);
+      fieldPath.empty() && selected != valueSlices.end())
     if (auto found = selected->second.find(axis); found != selected->second.end())
       return found->second;
   auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
@@ -26,20 +28,18 @@ std::optional<LocalAxis> Construction::selectedAxis(Value value, unsigned axis) 
   return std::nullopt;
 }
 
-FailureOr<LocalShape> Construction::localShape(RankedTensorType type, Location loc, Value source) {
+FailureOr<LocalShape> Construction::localShape(
+    Value source, Location loc, ArrayRef<unsigned> fieldPath) {
+  auto type = logicalTensorType(source, fieldPath);
+  if (!type) return failure();
   auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
   LocalShape shape;
   for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-    if (source)
-      if (auto selected = selectedAxis(source, axis)) {
-        shape.push_back(*selected);
-        continue;
-      }
-    if (type.getDimSize(axis) != 1) {
-      auto bound = axisBindings.find(ids[axis]);
-      if (bound != axisBindings.end()) { shape.push_back(bound->second); continue; }
+    if (auto selected = selectedAxis(source, axis, fieldPath)) {
+      shape.push_back(*selected);
+      continue;
     }
-    Value size = extent(type, axis, loc);
+    Value size = logicalExtent(source, axis, loc, fieldPath);
     APInt constant;
     if (!size || !matchPattern(size, m_ConstantInt(&constant)) || constant.isNegative())
       return emitError(loc, "DSA local axis needs a selected execution slice or a compile-call shape binding; dimension ") << ids[axis], failure();
@@ -57,16 +57,6 @@ FailureOr<LocalShape> Construction::localShape(RankedTensorType type, Location l
 
 Type Construction::storageElement(Type type) { return type.isIndex() ? b.getI64Type() : type; }
 
-FailureOr<LocalShape> Construction::localShape(Value value, Location loc) {
-  auto type = cast<RankedTensorType>(value.getType());
-  auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
-  for (unsigned axis = 0; axis < type.getRank(); ++axis) if (!extent(type, axis, loc)) {
-    DenseSet<Value> visited;
-    bindLogicalExtent(value, ids[axis], visited);
-  }
-  return localShape(type, loc, value);
-}
-
 Value Construction::allocateTensor(Location loc, Type element, const LocalShape &shape) {
   int64_t rows = 1;
   for (unsigned axis = 0; axis + 1 < shape.size(); ++axis) rows *= shape[axis].capacity;
@@ -79,14 +69,16 @@ Value Construction::allocateTensor(Location loc, Type element, const LocalShape 
   return value;
 }
 
-Value Construction::projectTensor(Location loc, RankedTensorType type, Value value, Value source) {
+Value Construction::projectTensor(Location loc, Value source, Value value,
+                                  ArrayRef<unsigned> fieldPath) {
   if (!localShapes.count(value)) return value;
+  auto type = logicalTensorType(source, fieldPath);
   LocalShape original = localShapes.lookup(value), selected = original;
   auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
   bool changed = false;
   for (int64_t axis = 0; axis < type.getRank(); ++axis) {
     auto binding = axisBindings.find(ids[axis]);
-    std::optional<LocalAxis> planned = source ? selectedAxis(source, axis) : std::nullopt;
+    std::optional<LocalAxis> planned = selectedAxis(source, axis, fieldPath);
     if (type.getDimSize(axis) == 1 || (!planned && binding == axisBindings.end())) continue;
     const auto &current = original[axis];
     const auto &required = planned ? *planned : binding->second;

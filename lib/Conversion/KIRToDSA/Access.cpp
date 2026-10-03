@@ -26,8 +26,8 @@ FailureOr<AffineIndices> Construction::affineIndex(Value original) {
       if (input.getRank() > type.getRank()) return failure();
       unsigned leading = type.getRank() - input.getRank();
       for (unsigned axis = 0; axis < input.getRank(); ++axis) {
-        if (singletonAxis(input, axis)) continue;
-        if (!equalAxisExtent(input, axis, type, leading + axis)) return failure();
+        if (singletonAxis(op->getOperand(0), axis)) continue;
+        if (!equalAxisExtent(op->getOperand(0), axis, original, leading + axis)) return failure();
         result.steps[leading + axis] = source->steps[axis];
       }
     }
@@ -66,7 +66,7 @@ FailureOr<AffineIndices> Construction::affineIndex(Value original) {
         int64_t literal = *term.staticValues.front();
         Value coordinate = index(loc, literal);
         if (literal < 0) {
-          Value size = extent(cast<RankedTensorType>(relation->source.getType()), *term.sourceAxis, loc);
+          Value size = logicalExtent(relation->source, *term.sourceAxis, loc);
           if (!size) return failure();
           coordinate = add(loc, size, coordinate);
         }
@@ -202,7 +202,7 @@ LogicalResult Construction::tensorAccess(Operation *op) {
           coordinate = found->second.base;
           auto type = cast<RankedTensorType>(term.operands.front().getType());
           for (unsigned axis = 0; axis < type.getRank(); ++axis) {
-            if (singletonAxis(type, axis)) continue;
+            if (singletonAxis(term.operands.front(), axis)) continue;
             unsigned mapped = term.indexAxes[axis];
             Value coefficient = found->second.steps[axis];
             coordinate = add(loc, coordinate, mul(loc, shape[mapped].begin, coefficient));

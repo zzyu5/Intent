@@ -19,6 +19,7 @@ add_mlir_library(MLIRIntentKIRToGPU
   MLIRIR
   MLIRSCFDialect
   MLIRIntentAnalysis
+  MLIRIntentConversionSupport
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
   MLIRIntentDialect

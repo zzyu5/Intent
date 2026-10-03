@@ -383,12 +383,39 @@ GEMM 的 lowering 子树。Intent 的局部矩阵也消费已形成的 operand �
 ### Canonical 关系与 physical construction
 
 [CanonicalKernelAnalysis](include/Intent/Analysis/CanonicalKernel.h) 查询 immutable
-KIR 的实际 def-use 与类型关系。`indexRelation` 同时返回每项索引贡献的
+KIR 的实际 def-use 与类型关系。[Kernel.cpp](lib/Analysis/Canonical/Kernel.cpp)
+中的 `indexRelation` 同时返回每项索引贡献的
 `resultAxes` 和 tensor index 的 `indexAxes`；GPU、CPU、DSA construction
 直接消费这份映射，不各自计算 advanced-index block 的位置。
-`operandProjections` 描述操作数轴到结果轴的投影，`axisProvenance` 跟踪坐标来源，
-`tensorExtent` 查询当前值上已有的 extent 表达。相同 extent 不证明相同坐标；
+`operandProjections` 描述操作数轴到结果轴的投影，`axisProvenance` 跟踪坐标来源。
+相同 extent 不证明相同坐标；
 row-major reshape 也不自动成为 transpose。
+
+[Shapes.cpp](lib/Analysis/Canonical/Shapes.cpp) 的
+`tensorExtent(value, axis, fieldPath)` 按实际 SSA、product 字段路径与轴查询常数、
+尺寸 SSA、domain、shaped-value dimension 或 inferred reshape 关系。
+`reshapeGroups` 查询明确的元素重组关系，`equalTensorExtents` 证明逻辑尺寸相等，
+`emissionAxis` 从 RegionScan 的实际 emit 字段定位恢复完整 source extent 的轴。
+维度 identity 可用于证明相等，不能据此任意替换尺寸来源或统一 product 各字段的 shape。
+
+[LogicalShape.h](include/Intent/Conversion/LogicalShape.h) 的 `reifyLogicalExtent`
+以 `OpFoldResult` 接收 family 已绑定的 SSA 或 typed expression；
+`materializeLogicalExtent` 是它的 `Value` 适配入口，两者共用
+[LogicalShape.cpp](lib/Conversion/LogicalShape.cpp) 中同一份 inferred reshape
+乘积／商解释。新增逻辑 shape 规则进入 canonical 查询，family 只实现实际绑定、
+整数运算拼写与物化，不各自重读 ShapeRelation 或维护全局 dimension 到值的替代表。
+
+物化沿关系查询时，在当前作用域已有的 actual value/formal 处停止，保留具体字段和轴。
+CPU 用当前 tensor/memref 的 dimension，且检查 dominance 与隔离 region 边界；
+DSA 的逻辑 extent 与局部 storage capacity、GPU 的完整逻辑 extent 与 fragment
+extent 各守自己的含义，不能因数值相同而互换。SourceSlice 的 member extent
+属于当前 slice；它既不能被外层完整 source 尺寸覆盖，也不能自动成为 host launch 参数。
+
+职责对照：本机 MLIR 20 `include/mlir/Interfaces/InferTypeOpInterface.td:344–370`
+按实际 operands 为每个 result/axis reify `OpFoldResult`；本地 Triton
+`lib/Dialect/Triton/IR/Ops.cpp:221–244,531–544` 分别按 source permutation 和每个
+reduce operand 推导结果形状。Intent 保持 canonical KIR 只读，将关系查询与各
+family 的实际物化分开，不复制目标 layout 或 local-memory 表示。
 
 GPU 的私有 [ConstructionSchema](lib/Conversion/KIRToGPU/ConstructionSchema.h)
 把这些 canonical 关系接到现有 physical value schema：构造实际 projection 后，
@@ -487,7 +514,8 @@ Triton/cuTile，CPU/DSA 的 physical program 仍由各自 transforms 形成。
 
 [ProductSchema.h](include/Intent/Analysis/ProductSchema.h) 从已验证的 canonical
 tuple/record 类型读取字段，并按声明顺序递归访问 leaves。`walkProductLeaves`
-同时给出结构字段路径；`getProductLeafRange` 和 `getProductLeafRanges` 返回展平
+同时给出结构字段路径；`getProductComponentType` 查询该路径的类型，
+`getProductLeafRange` 和 `getProductLeafRanges` 返回展平
 SSA components 的范围，不能把它们当内存字节偏移。字段名只用于诊断。
 
 [KIRToCPU](lib/Conversion/KIRToCPU/KIRToCPU.cpp) 的 tuple/record 构造、extract、
@@ -662,7 +690,7 @@ lowering，而不把 unsigned storage 当作 signed 数值运算。
 新增或修改访问时，用 ODS 的命名 operands；不要再添加 `value_operand_index` 一类旁路字段。
 逻辑 buffer 的动态 extents 与 optional initializer 同样独立，shape relation 只引用 extents。
 
-[CanonicalKernelAnalysis::indexRelation](lib/Analysis/CanonicalKernel.cpp) 将当前分组解析成
+[CanonicalKernelAnalysis::indexRelation](lib/Analysis/Canonical/Kernel.cpp) 将当前分组解析成
 SSA values 和源轴关系，GPU、CPU、DSA construction 共用这份结果。
 Slice 的 start/stop/step 保留三个位置：静态或缺省位置的 Value 为空，不能压缩后改变槽位。
 这个分析不选择物理 tile、内存布局或读取实现；这些仍由各 family 完成。
@@ -1072,7 +1100,7 @@ SSA、product、domain 与 dimension 映射只有一份，完成后由独立 phy
 
 | 模块 | 构造责任 |
 |---|---|
-| `Values.cpp` | 标量/张量值、product 展平、domain 与运行时维度绑定 |
+| `Values.cpp` | 实际 SSA 绑定、product 展平、domain 与共享 logical extent 的 CPU 物化 |
 | `Access.cpp` | indexed read/write、作者 mutable buffer、原子与 scatter effects |
 | `Arithmetic.cpp`、`Tensor.cpp` | 数值合同、pointwise 和显式 tensor 形状运算 |
 | `Collectives.cpp` | helper region、reduce/scan、分段 region 与 histogram |

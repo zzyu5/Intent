@@ -14,7 +14,7 @@ struct Domain {
   Value begin, end, step, extent;
 };
 
-// One conversion context owns values, product leaves and runtime dimensions.
+// One conversion context owns actual values, product leaves and domains.
 // Source operations remain immutable; all lowering writes the physical module.
 class Construction {
 public:
@@ -30,20 +30,22 @@ private:
   Value constant(Location loc, int64_t value);
   FailureOr<Value> indexValue(Value value, Type logicalType, Location loc);
   Value domainExtent(Value begin, Value end, Value step, Location loc);
-  FailureOr<SmallVector<Value>> extents(RankedTensorType tensor, Location loc);
-  LogicalResult bindShape(Operation *operation);
+  Value lookupLeaf(Value value, ArrayRef<unsigned> fieldPath = {}) const;
+  FailureOr<Value> extent(Value value, unsigned axis, Location loc,
+                          ArrayRef<unsigned> fieldPath = {});
+  FailureOr<SmallVector<Value>> extents(Value value, Location loc,
+                                       ArrayRef<unsigned> fieldPath = {});
   static RankedTensorType tensorType(Type type);
   static Type valueType(Type type);
   static Value dimension(OpBuilder &b, Location loc, Value value, int64_t axis);
   static Value extractElement(OpBuilder &b, Location loc, Value value,
                               ValueRange indices);
   Value emptyTensor(RankedTensorType tensor, ArrayRef<Value> sizes, Location loc);
-  FailureOr<SmallVector<Value>> emptyResults(TypeRange types, Location loc);
+  FailureOr<SmallVector<Value>> emptyResults(ValueRange values, Location loc);
   SmallVector<Value> flattened(Value value);
   SmallVector<Value> flattened(ValueRange inputs);
   void bindProduct(Value original, ValueRange components);
-  void bindDimensions(Type original, Value value, Location loc);
-  void bindValues(ValueRange originals, ValueRange components, Location loc);
+  void bindValues(ValueRange originals, ValueRange components);
   ArrayAttr fieldPaths(TypeRange types);
   SmallVector<AffineMap> pointwiseMaps(ValueRange inputs, int64_t rank);
   Value elementAt(Value input, ValueRange members, OpBuilder &nested, Location loc);
@@ -113,7 +115,6 @@ private:
   func::FuncOp function;
   IRMapping values;
   llvm::DenseMap<Value, SmallVector<Value>> products;
-  llvm::DenseMap<int64_t, Value> dimensions;
   llvm::DenseMap<Value, Domain> domains;
 };
 

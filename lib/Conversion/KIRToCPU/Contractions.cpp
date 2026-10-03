@@ -102,7 +102,7 @@ LogicalResult Construction::contract(ContractOp operation) {
       AffineMap::get(loopRank, 0, rhsMap, builder.getContext()),
       AffineMap::get(loopRank, 0, resultMap, builder.getContext())};
   Location loc = operation.getLoc();
-  auto sizes = extents(resultType, loc);
+  auto sizes = extents(operation.getResult(), loc);
   if (failed(sizes)) return failure();
   Value output = emptyTensor(resultType, *sizes, loc);
   Value result = emitContraction(values.lookup(operation.getLhs()), values.lookup(operation.getRhs()),
@@ -126,7 +126,7 @@ LogicalResult Construction::sparseContract(SparseContractOp operation) {
       element.getIntOrFloatBitWidth() > accumulator.getIntOrFloatBitWidth())
     return operation.emitError("CPU sparse contraction requires rank-two compressed matrices and lossless floating widening");
   Location loc = operation.getLoc();
-  auto sizes = extents(resultType, loc);
+  auto sizes = extents(operation.getResult(), loc);
   if (failed(sizes)) return failure();
   Value output = emptyTensor(resultType, *sizes, loc);
   Value compressed = values.lookup(operation.getCompressed()), rhs = values.lookup(operation.getRhs());
@@ -195,7 +195,7 @@ LogicalResult Construction::scaledContract(ScaledContractOp operation) {
   Value lhs = values.lookup(operation.getLhs()), rhs = values.lookup(operation.getRhs());
   Value groups = dimension(builder, loc, lhs, 1);
   Value depth = builder.create<arith::MulIOp>(loc, groups, constant(loc, groupSize));
-  auto sizes = extents(outputType, loc);
+  auto sizes = extents(operation.getResult(), loc);
   if (failed(sizes)) return failure();
   auto decode = [&](Value source, Value scales, ScaledFormat format, bool left) {
     SmallVector<Value> shape = left ? SmallVector<Value>{(*sizes)[0], depth}
@@ -261,7 +261,7 @@ LogicalResult Construction::scaledContract(ScaledContractOp operation) {
 LogicalResult Construction::lower(QuantizeOp op) {
   Location loc = op.getLoc();
   auto tensor = cast<RankedTensorType>(op.getResult().getType());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   Value output = emptyTensor(tensor, *sizes, loc);
   auto result = builder.create<cpu::QuantizeOp>(loc, tensorType(tensor),

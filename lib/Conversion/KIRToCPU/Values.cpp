@@ -1,8 +1,10 @@
 #include "Construction.h"
 #include "Intent/Analysis/ProductSchema.h"
+#include "Intent/Conversion/LogicalShape.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 
 using namespace mlir;
@@ -34,64 +36,101 @@ Value Construction::domainExtent(Value begin, Value end, Value step, Location lo
   return builder.createOrFold<arith::CeilDivSIOp>(loc, nonnegative, step);
 }
 
-FailureOr<SmallVector<Value>> Construction::extents(RankedTensorType tensor, Location loc) {
-  SmallVector<Value> result;
-  auto shape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
-  for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
-    if (!tensor.isDynamicDim(axis)) {
-      result.push_back(constant(loc, tensor.getDimSize(axis)));
-      continue;
-    }
-    if (!shape || !dimensions.count(shape.getDimensions()[axis])) {
-      emitError(loc, "CPU construction cannot resolve the canonical dynamic extent");
-      return failure();
-    }
-    result.push_back(dimensions.lookup(shape.getDimensions()[axis]));
+static bool availableAt(Value actual, const OpBuilder &builder) {
+  if (!actual) return false;
+  Block *scope = builder.getInsertionBlock();
+  while (scope && scope != actual.getParentBlock()) {
+    Operation *parent = scope->getParentOp();
+    if (!parent || parent->hasTrait<OpTrait::IsIsolatedFromAbove>()) return false;
+    scope = parent->getBlock();
   }
+  if (!scope) return false;
+  if (Operation *definition = actual.getDefiningOp()) {
+    DominanceInfo dominance;
+    if (!dominance.properlyDominates(
+            definition->getBlock(), definition->getIterator(),
+            builder.getInsertionBlock(), builder.getInsertionPoint(), false))
+      return false;
+  }
+  return true;
+}
+
+Value Construction::lookupLeaf(Value value, ArrayRef<unsigned> fieldPath) const {
+  Value actual;
+  if (!getProductComponents(value.getType())) {
+    if (!fieldPath.empty()) return {};
+    actual = values.lookupOrNull(value);
+  } else {
+    auto found = products.find(value);
+    if (found == products.end()) return {};
+    auto range = getProductLeafRange(value.getType(), fieldPath);
+    if (failed(range) || range->size != 1) return {};
+    actual = found->second[range->offset];
+  }
+  return availableAt(actual, builder) ? actual : Value();
+}
+
+FailureOr<Value> Construction::extent(Value value, unsigned axis, Location loc,
+                                      ArrayRef<unsigned> fieldPath) {
+  LogicalShapeMaterialization materialization;
+  materialization.lookup = [&](Value source, ArrayRef<unsigned> path,
+                               unsigned sourceAxis) -> Value {
+    Value actual = lookupLeaf(source, path);
+    if (!actual) return {};
+    auto type = dyn_cast<ShapedType>(actual.getType());
+    if (!type || !type.hasRank() || sourceAxis >= type.getRank()) return {};
+    return dimension(builder, loc, actual, sourceAxis);
+  };
+  materialization.leaf = [&](const TensorExtentFact &fact) -> FailureOr<Value> {
+    if (fact.constant) return constant(loc, *fact.constant);
+    if (fact.value) {
+      Value actual = lookupLeaf(fact.value);
+      if (actual) return indexValue(actual, fact.value.getType(), loc);
+    }
+    if (fact.domain) {
+      auto found = domains.find(fact.domain);
+      if (found != domains.end() && availableAt(found->second.extent, builder))
+        return found->second.extent;
+    }
+    if (fact.source)
+      if (Value actual = materialization.lookup(fact.source, fact.fieldPath,
+                                               fact.axis))
+        return actual;
+    return failure();
+  };
+  materialization.multiply = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(builder.createOrFold<arith::MulIOp>(loc, lhs, rhs));
+  };
+  materialization.exactDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    if (matchPattern(rhs, m_Zero()))
+      return emitError(loc, "CPU inferred reshape requires a uniquely determined extent"), failure();
+    return Value(builder.createOrFold<arith::DivSIOp>(loc, lhs, rhs));
+  };
+  auto result = materializeLogicalExtent(analysis, value, axis, materialization,
+                                         fieldPath);
+  if (failed(result))
+    return emitError(loc, "CPU construction cannot resolve the canonical value extent"), failure();
   return result;
 }
 
-LogicalResult Construction::bindShape(Operation *operation) {
-  auto shape = operation->getAttrOfType<ShapeRelationAttr>("shape");
-  if (!shape) return success();
-  Location loc = operation->getLoc();
-  SmallVector<Value> sizes;
-  std::optional<int64_t> inferred;
-  for (Attribute axis : shape.getAxes()) {
-    auto expression = cast<ShapeExprAttr>(axis);
-    if (expression.getKind() == 2) {
-      inferred = expression.getDimension();
-      continue;
-    }
-    Value size;
-    if (expression.getKind() == 0) {
-      size = constant(loc, expression.getPayload());
-    } else {
-      Value operand = isa<BufferOp>(operation)
-          ? cast<BufferOp>(operation).getExtents()[expression.getPayload()]
-          : operation->getOperand(expression.getPayload());
-      auto extent = indexValue(values.lookup(operand), operand.getType(), loc);
-      if (failed(extent)) return failure();
-      size = *extent;
-    }
-    dimensions[expression.getDimension()] = size;
-    sizes.push_back(size);
+FailureOr<SmallVector<Value>> Construction::extents(
+    Value value, Location loc, ArrayRef<unsigned> fieldPath) {
+  auto range = getProductLeafRange(value.getType(), fieldPath);
+  if (failed(range) || range->size != 1) return failure();
+  SmallVector<Type> leaves;
+  appendProductLeafTypes(value.getType(), leaves);
+  Type type = leaves[range->offset];
+  if (auto view = dyn_cast<ViewType>(type)) type = view.getTensor();
+  if (auto buffer = dyn_cast<BufferType>(type)) type = buffer.getTensor();
+  auto tensor = dyn_cast<RankedTensorType>(type);
+  if (!tensor) return failure();
+  SmallVector<Value> result;
+  for (unsigned axis = 0; axis < tensor.getRank(); ++axis) {
+    auto size = extent(value, axis, loc, fieldPath);
+    if (failed(size)) return failure();
+    result.push_back(*size);
   }
-  if (inferred) {
-    Value knownElements = constant(loc, 1);
-    for (Value size : sizes)
-      knownElements = builder.createOrFold<arith::MulIOp>(loc, knownElements, size);
-    if (matchPattern(knownElements, m_Zero()))
-      return operation->emitError("CPU inferred reshape requires a uniquely determined extent");
-    Value source = values.lookup(operation->getOperand(0));
-    Value sourceElements = constant(loc, 1);
-    for (int64_t axis = 0; axis < cast<ShapedType>(source.getType()).getRank(); ++axis)
-      sourceElements = builder.createOrFold<arith::MulIOp>(loc, sourceElements,
-          dimension(builder, loc, source, axis));
-    // A legal inferred reshape has a nonzero known product and exact quotient.
-    dimensions[*inferred] = builder.createOrFold<arith::DivSIOp>(loc, sourceElements, knownElements);
-  }
-  return success();
+  return result;
 }
 
 RankedTensorType Construction::tensorType(Type type) {
@@ -125,17 +164,22 @@ Value Construction::emptyTensor(RankedTensorType tensor, ArrayRef<Value> sizes, 
                                          tensor.getElementType(), dynamic);
 }
 
-FailureOr<SmallVector<Value>> Construction::emptyResults(TypeRange types, Location loc) {
-  SmallVector<Type> leaves;
-  appendProductLeafTypes(types, leaves);
+FailureOr<SmallVector<Value>> Construction::emptyResults(ValueRange values, Location loc) {
   SmallVector<Value> result;
-  for (Type leaf : leaves) {
-    auto tensor = dyn_cast<RankedTensorType>(leaf);
-    if (!tensor) tensor = RankedTensorType::get({}, leaf);
-    auto sizes = extents(tensor, loc);
-    if (failed(sizes)) return failure();
-    result.push_back(emptyTensor(tensor, *sizes, loc));
+  LogicalResult status = success();
+  for (Value value : values) {
+    walkProductLeaves(value.getType(), [&](Type leaf, ArrayRef<unsigned> path) {
+      if (failed(status)) return;
+      if (auto tensor = dyn_cast<RankedTensorType>(leaf)) {
+        auto sizes = extents(value, loc, path);
+        if (failed(sizes)) { status = failure(); return; }
+        result.push_back(emptyTensor(tensor, *sizes, loc));
+      } else {
+        result.push_back(emptyTensor(RankedTensorType::get({}, leaf), {}, loc));
+      }
+    });
   }
+  if (failed(status)) return failure();
   return result;
 }
 
@@ -155,27 +199,10 @@ void Construction::bindProduct(Value original, ValueRange components) {
   else values.map(original, components.front());
 }
 
-void Construction::bindDimensions(Type original, Value value, Location loc) {
-  auto tensor = dyn_cast<RankedTensorType>(original);
-  if (!tensor || !isa<ShapedType>(value.getType())) return;
-  auto identities = cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions();
-  for (auto [axis, identity] : llvm::enumerate(identities.asArrayRef()))
-    dimensions[identity] = dimension(builder, loc, value, axis);
-}
-
-void Construction::bindValues(ValueRange originals, ValueRange components, Location loc) {
+void Construction::bindValues(ValueRange originals, ValueRange components) {
   auto ranges = getProductLeafRanges(originals.getTypes());
-  for (auto [original, range] : llvm::zip(originals, ranges)) {
-    SmallVector<Type> leaves;
-    appendProductLeafTypes(original.getType(), leaves);
-    SmallVector<Value> parts;
-    for (auto [leaf, value] :
-         llvm::zip(leaves, components.slice(range.offset, range.size))) {
-      bindDimensions(leaf, value, loc);
-      parts.push_back(value);
-    }
-    bindProduct(original, parts);
-  }
+  for (auto [original, range] : llvm::zip(originals, ranges))
+    bindProduct(original, components.slice(range.offset, range.size));
 }
 
 ArrayAttr Construction::fieldPaths(TypeRange types) {
@@ -216,9 +243,9 @@ Value Construction::elementAt(Value input, ValueRange members, OpBuilder &nested
 }
 
 LogicalResult Construction::lower(DimOp op) {
-  if (!dimensions.count(op.getDimension()))
-    return op.emitError("CPU dimension has no runtime ABI binding");
-  values.map(op.getResult(), dimensions.lookup(op.getDimension()));
+  auto size = extent(op.getSource(), op.getAxis(), op.getLoc());
+  if (failed(size)) return failure();
+  values.map(op.getResult(), *size);
   return success();
 }
 
@@ -234,7 +261,6 @@ LogicalResult Construction::lower(DomainOp op) {
   Value extent = domainExtent(*physicalBegin, *physicalEnd, *physicalStep, loc);
   Domain domain{*physicalBegin, *physicalEnd, *physicalStep, extent};
   domains[op.getResult()] = domain;
-  dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.extent;
   return success();
 }
 
@@ -258,7 +284,6 @@ LogicalResult Construction::lower(SubregionOp op) {
   }
   domain.extent = domainExtent(domain.begin, domain.end, domain.step, loc);
   domains[op.getResult()] = domain;
-  dimensions[cast<IntegerAttr>(op.getExtentDimensions()[0]).getInt()] = domain.extent;
   return success();
 }
 

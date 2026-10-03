@@ -44,16 +44,17 @@ struct ParallelWorkset {
 
 static LogicalResult finalizeParallelWorkset(
     ParallelWorkset &workset,
-    func::FuncOp function) {
+    func::FuncOp function,
+    CanonicalKernelAnalysis &canonicalAnalysis) {
   MLIRContext *context = workset.operation.getContext();
   for (const IterationAxis &axis : workset.axes) {
     FailureOr<PhysicalExprAttr> start =
-        launchExpression(axis.start, function);
+        launchExpression(axis.start, canonicalAnalysis, function);
     FailureOr<PhysicalExprAttr> stop =
-        launchExpression(axis.stop, function);
+        launchExpression(axis.stop, canonicalAnalysis, function);
     FailureOr<PhysicalExprAttr> step =
         axis.step
-            ? launchExpression(axis.step, function)
+            ? launchExpression(axis.step, canonicalAnalysis, function)
             : FailureOr<PhysicalExprAttr>(
                   expression(context, PhysicalExprKind::Constant, 1));
     if (failed(start) || failed(stop) || failed(step))
@@ -176,9 +177,9 @@ LogicalResult constructGPUProgram(
         break;
     }
     if (llvm::any_of(axes, [&](const IterationAxis &axis) {
-          return failed(launchExpression(axis.start, function)) ||
-                 failed(launchExpression(axis.stop, function)) ||
-                 (axis.step && failed(launchExpression(axis.step, function)));
+          return failed(launchExpression(axis.start, canonicalAnalysis, function)) ||
+                 failed(launchExpression(axis.stop, canonicalAnalysis, function)) ||
+                 (axis.step && failed(launchExpression(axis.step, canonicalAnalysis, function)));
         })) {
       wholeBodyPrefix = true;
       break;
@@ -254,7 +255,7 @@ LogicalResult constructGPUProgram(
       workset.launchExtents.push_back(
           expression(function.getContext(), PhysicalExprKind::Constant, 1));
       workset.launchLength = workset.launchExtents.front();
-    } else if (failed(finalizeParallelWorkset(workset, function))) {
+    } else if (failed(finalizeParallelWorkset(workset, function, canonicalAnalysis))) {
         return failure();
     }
     worksets.push_back(std::move(workset));
@@ -323,17 +324,6 @@ LogicalResult constructGPUProgram(
       if (Operation *target = value->getDefiningOp())
         if (Attribute node = operation.getAttr("intent.node"))
           target->setAttr(gpu::originAttr, node);
-    } else if (auto dim = dyn_cast<intent::DimOp>(operation)) {
-      RankedTensorType tensor = viewTensor(dim.getSource());
-      if (tensor && dim.getAxis() < static_cast<uint64_t>(tensor.getRank()) &&
-          !tensor.isDynamicDim(dim.getAxis())) {
-        values[dim.getResult()] = builder.create<arith::ConstantIndexOp>(
-            dim.getLoc(), tensor.getDimSize(dim.getAxis()));
-        continue;
-      }
-      auto found = dimensionValues.find(dim.getDimension());
-      if (found != dimensionValues.end())
-        values[dim.getResult()] = found->second;
     }
   }
   Value pid = builder.create<gpu::ProgramIdOp>(function.getLoc(),

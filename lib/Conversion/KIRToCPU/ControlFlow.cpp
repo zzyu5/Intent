@@ -11,7 +11,6 @@ LogicalResult Construction::orderedControl(Operation *operation) {
   SmallVector<Type> resultTypes;
   appendProductLeafTypes(operation->getResultTypes(), resultTypes);
   for (Type &type : resultTypes) type = valueType(type);
-  auto savedDimensions = dimensions;
   Location loc = operation->getLoc();
   auto body = [&](Block &source, Block *target) {
     if (!target->empty() && target->back().hasTrait<OpTrait::IsTerminator>()) target->back().erase();
@@ -19,14 +18,13 @@ LogicalResult Construction::orderedControl(Operation *operation) {
     builder.setInsertionPointToEnd(target);
     if (failed(lowerBlock(source))) return failure();
     builder.create<scf::YieldOp>(loc, flattened(source.getTerminator()->getOperands()));
-    dimensions = savedDimensions;
     return success();
   };
   if (auto conditional = dyn_cast<IfOp>(operation)) {
     auto target = builder.create<scf::IfOp>(loc, resultTypes, values.lookup(conditional.getCondition()), true);
     if (failed(body(conditional.getThenRegion().front(), target.thenBlock())) ||
         failed(body(conditional.getElseRegion().front(), target.elseBlock()))) return failure();
-    bindValues(operation->getResults(), target.getResults(), loc);
+    bindValues(operation->getResults(), target.getResults());
     return success();
   }
   if (auto loop = dyn_cast<ForOp>(operation)) {
@@ -38,10 +36,10 @@ LogicalResult Construction::orderedControl(Operation *operation) {
     {
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(target.getBody());
-      bindValues(loop.getRegionIterArgs(), target.getRegionIterArgs(), loc);
+      bindValues(loop.getRegionIterArgs(), target.getRegionIterArgs());
     }
     if (failed(body(loop.getBody().front(), target.getBody()))) return failure();
-    bindValues(operation->getResults(), target.getResults(), loc);
+    bindValues(operation->getResults(), target.getResults());
     return success();
   }
   auto loop = cast<WhileOp>(operation);
@@ -54,20 +52,19 @@ LogicalResult Construction::orderedControl(Operation *operation) {
   {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&before);
-    bindValues(loop.getBeforeArguments(), before.getArguments(), loc);
+    bindValues(loop.getBeforeArguments(), before.getArguments());
     if (failed(lowerBlock(loop.getBefore().front()))) return failure();
     auto condition = cast<ConditionOp>(loop.getBefore().front().getTerminator());
     builder.create<scf::ConditionOp>(loc, values.lookup(condition.getCondition()),
                                      flattened(condition.getArgs()));
   }
-  dimensions = savedDimensions;
   {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(&after);
-    bindValues(loop.getAfterArguments(), after.getArguments(), loc);
+    bindValues(loop.getAfterArguments(), after.getArguments());
   }
   if (failed(body(loop.getAfter().front(), &after))) return failure();
-  bindValues(operation->getResults(), target.getResults(), loc);
+  bindValues(operation->getResults(), target.getResults());
   return success();
 }
 
@@ -83,10 +80,7 @@ LogicalResult Construction::lower(ParallelOp op) {
   Value coordinate = builder.createOrFold<arith::AddIOp>(loc, domain.begin,
       builder.createOrFold<arith::MulIOp>(loc, parallel.getInductionVars()[0], domain.step));
   values.map(op.getBody().front().getArgument(0), coordinate);
-  auto savedDimensions = dimensions;
-  LogicalResult result = lowerBlock(op.getBody().front());
-  dimensions = std::move(savedDimensions);
-  return result;
+  return lowerBlock(op.getBody().front());
 }
 
 } // namespace intent::kir_to_cpu

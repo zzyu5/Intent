@@ -2,24 +2,17 @@
 
 namespace intent::kir_to_dsa {
 
-bool Construction::singletonAxis(RankedTensorType type, unsigned axis) {
-  if (!type.isDynamicDim(axis)) return type.getDimSize(axis) == 1;
-  auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
-  Value size = dimensions.lookup(ids[axis]);
-  return size && matchPattern(size, m_One());
+bool Construction::singletonAxis(Value value, unsigned axis) {
+  return knownExtent(value, axis).constant == 1;
 }
 
-bool Construction::equalAxisExtent(RankedTensorType lhs, unsigned a, RankedTensorType rhs, unsigned c) {
-  if (!lhs.isDynamicDim(a) && !rhs.isDynamicDim(c)) return lhs.getDimSize(a) == rhs.getDimSize(c);
-  auto lhsIds = cast<TensorShapeAttr>(lhs.getEncoding()).getDimensions();
-  auto rhsIds = cast<TensorShapeAttr>(rhs.getEncoding()).getDimensions();
-  if (lhsIds[a] > 0 && lhsIds[a] == rhsIds[c]) return true;
-  Value l = dimensions.lookup(lhsIds[a]), r = dimensions.lookup(rhsIds[c]);
-  if (l && r && sameIndex(l, r)) return true;
-  APInt constant;
-  if (!lhs.isDynamicDim(a) && r && matchPattern(r, m_ConstantInt(&constant))) return constant.getSExtValue() == lhs.getDimSize(a);
-  if (!rhs.isDynamicDim(c) && l && matchPattern(l, m_ConstantInt(&constant))) return constant.getSExtValue() == rhs.getDimSize(c);
-  return false;
+bool Construction::equalAxisExtent(Value lhs, unsigned a, Value rhs, unsigned c,
+                                    ArrayRef<unsigned> lhsPath,
+                                    ArrayRef<unsigned> rhsPath) {
+  if (analysis.equalTensorExtents(lhs, a, rhs, c, lhsPath, rhsPath)) return true;
+  auto left = knownExtent(lhs, a, lhsPath), right = knownExtent(rhs, c, rhsPath);
+  if (left.constant && right.constant) return left.constant == right.constant;
+  return left.value && right.value && left.value == right.value;
 }
 
 std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, unsigned selectedAxis,
@@ -37,7 +30,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
       // Distinct writable views are disjoint in this target's launch ABI.
       // Reordering separate writes to one view needs an effect-footprint proof.
       if (failed(relation) || !type || selectedAxis >= type.getRank() || !written.insert(relation->source).second) return std::nullopt;
-      if (outputType && !equalAxisExtent(outputType, selectedAxis, type, selectedAxis)) return std::nullopt;
+      if (outputType && !equalAxisExtent(plan.extentSource, selectedAxis, data, selectedAxis)) return std::nullopt;
       if (!outputType) {
         outputType = type;
         plan.extentSource = data;
@@ -55,7 +48,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
   }
   std::function<bool(Value, AxisRequirements)> require;
   std::function<bool(Value)> scalar;
-  std::function<bool(Operation *, RankedTensorType, const AxisRequirements &)> access;
+  std::function<bool(Operation *, Value, const AxisRequirements &)> access;
   DenseSet<Value> scalarSeen;
   scalar = [&](Value value) -> bool {
     if (auto tensor = dyn_cast<RankedTensorType>(value.getType())) return require(value, AxisRequirements(tensor.getRank(), false));
@@ -69,7 +62,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
     } else if (!isMemoryEffectFree(op) && !isa<DomainOp, SubregionOp>(op)) return false;
     return llvm::all_of(op->getOperands(), scalar);
   };
-  access = [&](Operation *op, RankedTensorType result, const AxisRequirements &requested) -> bool {
+  access = [&](Operation *op, Value result, const AxisRequirements &requested) -> bool {
     auto relation = analysis.indexRelation(op);
     if (failed(relation)) return false;
     if (relation->resultDimensionIdentities.size() != requested.size()) return false;
@@ -83,8 +76,8 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
         AxisRequirements indexAxes(type.getRank(), false);
         for (unsigned axis = 0; axis < type.getRank(); ++axis) {
           unsigned mapped = term.indexAxes[axis];
-          if (!singletonAxis(type, axis) && requested[mapped]) {
-            if (!equalAxisExtent(type, axis, result, mapped)) return false;
+          if (!singletonAxis(indices, axis) && requested[mapped]) {
+            if (!equalAxisExtent(indices, axis, result, mapped)) return false;
             indexAxes[axis] = true;
           }
         }
@@ -107,7 +100,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
     auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type || requested.size() != type.getRank()) return false;
     for (unsigned axis = 0; axis < requested.size(); ++axis)
-      if (singletonAxis(type, axis)) requested[axis] = false;
+      if (singletonAxis(value, axis)) requested[axis] = false;
     auto [entry, inserted] = plan.requirements.try_emplace(value, requested);
     if (!inserted) return entry->second == requested;
     // A pre-existing immutable SSA snapshot can be projected locally.
@@ -117,7 +110,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
     if (isa<ViewLoadOp, GatherOp>(op)) {
       if (auto load = dyn_cast<ViewLoadOp>(op))
         if (cast<ViewType>(load.getSource().getType()).getAccess() != 0) return false;
-      return access(op, type, requested);
+      return access(op, value, requested);
     }
     if (!isMemoryEffectFree(op)) return false;
     if (isa<IndicesOp, FullOp>(op)) return llvm::all_of(op->getOperands(), scalar);
@@ -129,8 +122,8 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
       AxisRequirements inputAxes(source.getRank(), false);
       unsigned leading = type.getRank() - source.getRank();
       for (unsigned axis = 0; axis < source.getRank(); ++axis)
-        if (requested[leading + axis] && !singletonAxis(source, axis)) {
-          if (!equalAxisExtent(source, axis, type, leading + axis)) return false;
+        if (requested[leading + axis] && !singletonAxis(input, axis)) {
+          if (!equalAxisExtent(input, axis, value, leading + axis)) return false;
           inputAxes[axis] = true;
         }
       return require(input, inputAxes);
@@ -163,7 +156,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
     Value data = cast<IndexedAccessOpInterface>(write).getStoredValue();
     auto type = cast<RankedTensorType>(data.getType());
     AxisRequirements requested(type.getRank(), false); requested[selectedAxis] = true;
-    if (!require(data, requested) || !access(write, type, requested)) return std::nullopt;
+    if (!require(data, requested) || !access(write, data, requested)) return std::nullopt;
   }
   for (auto [source, axis] : sources) {
     auto type = dyn_cast<RankedTensorType>(source.getType());
@@ -189,7 +182,9 @@ std::optional<TileDomain> Construction::sliceDomain(const WorksetTiling &plan,
     for (auto [axis, requested] : llvm::enumerate(entry.second)) {
       if (!requested) continue;
       Value extent = logicalExtent(entry.first, axis, loc);
-      if (!extent || !sameIndex(size, extent)) return std::nullopt;
+      if (!extent || (!sameIndex(size, extent) &&
+          !analysis.equalTensorExtents(plan.extentSource, plan.extentAxis,
+                                       entry.first, axis))) return std::nullopt;
       if (auto current = selectedAxis(entry.first, axis)) {
         if (!matchPattern(current->begin, m_Zero()) ||
             !sameIndex(current->count, current->extent)) return std::nullopt;
@@ -388,10 +383,12 @@ Value Construction::independentRowControl(Block &block) {
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
-  if (rowType && rowType.isDynamicDim(0) &&
-      !dimensions.count(cast<TensorShapeAttr>(rowType.getEncoding()).getDimensions()[0]))
-    return {};
-  return !proof.wasInterrupted() && control ? row : Value();
+  if (proof.wasInterrupted() || !control || !row) return {};
+  if (rowType && rowType.isDynamicDim(0)) {
+    auto extent = knownExtent(row, 0);
+    if (!extent.constant && !extent.value) return {};
+  }
+  return row;
 }
 
 LogicalResult Construction::lowerStructuredBlock(Block &block) {
@@ -412,11 +409,11 @@ LogicalResult Construction::lowerStructuredBlock(Block &block) {
         Value size = logicalExtent(row, 0, loc);
         if (!size) return emitError(loc, "DSA independent row carry has no logical extent");
         auto savedValues = values; auto savedProducts = products;
-        auto savedDimensions = dimensions; auto savedDomains = domains;
+        auto savedDomains = domains;
         auto savedAxes = axisBindings; auto savedSlices = valueSlices;
         auto restore = llvm::make_scope_exit([&] {
           values = std::move(savedValues); products = std::move(savedProducts);
-          dimensions = std::move(savedDimensions); domains = std::move(savedDomains);
+          domains = std::move(savedDomains);
           axisBindings = std::move(savedAxes); valueSlices = std::move(savedSlices);
         });
         // An empty row still executes the author's scalar control once. Its
@@ -433,19 +430,22 @@ LogicalResult Construction::lowerStructuredBlock(Block &block) {
   }
   auto partition = partitionQueryAxis(block, fold);
   if (failed(partition)) return failure();
-  int64_t query = *partition;
-  if (!query || axisBindings.count(query)) return lowerOperations(block);
-  Value size = dimensions.lookup(query);
+  Value source = *partition;
+  if (!source) return lowerOperations(block);
+  int64_t query = cast<TensorShapeAttr>(
+      logicalTensorType(source).getEncoding()).getDimensions()[0];
+  if (axisBindings.count(query)) return lowerOperations(block);
+  Value size = logicalExtent(source, 0, fold.getLoc());
   if (!size) return fold.emitError("DSA query extent is unavailable");
   auto savedValues = values; auto savedProducts = products;
-  auto savedDimensions = dimensions; auto savedAxes = axisBindings;
+  auto savedAxes = axisBindings;
   auto status = loop(fold.getLoc(), index(fold.getLoc(), 0), size, index(fold.getLoc(), config.getTileM()), [&](Value begin) {
     Value count = b.create<arith::MinSIOp>(fold.getLoc(), sub(fold.getLoc(), size, begin), index(fold.getLoc(), config.getTileM()));
     axisBindings[query] = {size, begin, count, config.getTileM()};
     return lowerOperations(block);
   });
   values = std::move(savedValues); products = std::move(savedProducts);
-  dimensions = std::move(savedDimensions); axisBindings = std::move(savedAxes);
+  axisBindings = std::move(savedAxes);
   return status;
 }
 
@@ -512,7 +512,7 @@ LogicalResult Construction::distributeWorkset(Location loc) {
   for (Value source : workset.domains) {
     if (!bindDomain(source)) return emitError(loc, "DSA independent task domain is unavailable");
     Domain domain = domains.lookup(source);
-    Value count = b.createOrFold<arith::MaxSIOp>(loc, sub(loc, domain.end, domain.begin), index(loc, 0));
+    Value count = domain.extent;
     counts.push_back(count); intervals.push_back(domain); total = mul(loc, total, count);
   }
   // A free result axis supplies additional independent task owners. Its
@@ -523,15 +523,21 @@ LogicalResult Construction::distributeWorkset(Location loc) {
   if (folds.size() == 1) {
     auto axis = partitionQueryAxis(*workset.body, folds.front());
     if (failed(axis)) return failure();
-    if (*axis && !axisBindings.count(*axis) && dimensions.count(*axis)) {
-      query = *axis;
-      querySize = dimensions.lookup(query);
-      queryTiles = b.createOrFold<arith::CeilDivSIOp>(loc, querySize, index(loc, config.getTileM()));
-      total = mul(loc, total, queryTiles);
+    if (Value source = *axis) {
+      int64_t dimension = cast<TensorShapeAttr>(
+          logicalTensorType(source).getEncoding()).getDimensions()[0];
+      if (!axisBindings.count(dimension)) {
+        querySize = logicalExtent(source, 0, loc);
+        if (querySize) {
+          query = dimension;
+          queryTiles = b.createOrFold<arith::CeilDivSIOp>(loc, querySize, index(loc, config.getTileM()));
+          total = mul(loc, total, queryTiles);
+        }
+      }
     }
   }
   if (matchPattern(total, m_Zero())) return success();
-  auto savedValues = values; auto savedProducts = products; auto savedDimensions = dimensions;
+  auto savedValues = values; auto savedProducts = products;
   auto savedAxes = axisBindings;
   ++parallelDepth;
   LogicalResult status = loop(loc, taskId, total, taskCount, [&](Value task) {
@@ -551,7 +557,7 @@ LogicalResult Construction::distributeWorkset(Location loc) {
     return lowerBlock(*workset.body);
   });
   --parallelDepth;
-  values = std::move(savedValues); products = std::move(savedProducts); dimensions = std::move(savedDimensions);
+  values = std::move(savedValues); products = std::move(savedProducts);
   axisBindings = std::move(savedAxes);
   return status;
 }

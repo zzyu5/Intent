@@ -1,4 +1,7 @@
 #include "Construction.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/DenseSet.h"
+#include <functional>
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -6,16 +9,62 @@ using namespace mlir;
 
 namespace intent::kir_to_gpu {
 
+namespace {
+
+bool isShapeMetadataOnly(Operation *operation) {
+  auto scalarInteger = [](Type type) { return type.isIntOrIndex(); };
+  auto shapeOperand = [](OpOperand &use) {
+    Operation *owner = use.getOwner();
+    if (!isa<intent::FullOp, intent::BroadcastOp, intent::ReshapeOp>(owner))
+      return false;
+    auto relation = owner->getAttrOfType<ShapeRelationAttr>("shape");
+    return relation && llvm::any_of(relation.getAxes(), [&](Attribute attribute) {
+      auto axis = cast<ShapeExprAttr>(attribute);
+      return axis.getKind() == 1 &&
+             axis.getPayload() == use.getOperandNumber();
+    });
+  };
+  llvm::DenseMap<Value, bool> known;
+  llvm::DenseSet<Value> active;
+  std::function<bool(Value)> onlyShape = [&](Value value) {
+    if (auto found = known.find(value); found != known.end())
+      return found->second;
+    if (!active.insert(value).second)
+      return false;
+    bool result = llvm::all_of(value.getUses(), [&](OpOperand &use) {
+      if (shapeOperand(use))
+        return true;
+      Operation *owner = use.getOwner();
+      return owner->getNumRegions() == 0 && owner->getNumResults() != 0 &&
+             isMemoryEffectFree(owner) &&
+             llvm::all_of(owner->getOperandTypes(), scalarInteger) &&
+             llvm::all_of(owner->getResultTypes(), scalarInteger) &&
+             llvm::all_of(owner->getResults(), onlyShape);
+    });
+    active.erase(value);
+    known[value] = result;
+    return result;
+  };
+  return operation->getNumRegions() == 0 && operation->getNumResults() != 0 &&
+         isMemoryEffectFree(operation) &&
+         llvm::all_of(operation->getResultTypes(), scalarInteger) &&
+         (isa<intent::DimOp>(operation) ||
+          llvm::all_of(operation->getOperandTypes(), scalarInteger)) &&
+         llvm::all_of(operation->getResults(), onlyShape);
+}
+
+} // namespace
+
 ScalarRegionLowering::ScalarRegionLowering(
     OpBuilder &builder,
     llvm::DenseMap<Value, Value> values,
     ArrayRef<Value> views,
-    llvm::DenseMap<int64_t, Value> dimensions,
+    llvm::DenseMap<int64_t, Value> abiDimensions,
     llvm::DenseMap<StringAttr, Value> parameters,
     CanonicalKernelAnalysis &canonicalAnalysis,
     func::FuncOp physicalKernel)
     : builder(builder), values(std::move(values)), views(views),
-      dimensions(std::move(dimensions)), parameters(std::move(parameters)),
+      abiDimensions(std::move(abiDimensions)), parameters(std::move(parameters)),
       canonicalAnalysis(canonicalAnalysis), physicalKernel(physicalKernel) {}
 
 FailureOr<SmallVector<Value>> ScalarRegionLowering::lowerBlock(Block &source) {
@@ -32,6 +81,10 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::lowerBlock(Block &source) {
     }
     if (isa<intent::ReturnOp>(operation))
       return SmallVector<Value>{};
+    // Shape-only users consume the canonical relation directly. A numerical
+    // use requests the logical runtime value through get(), in its own scope.
+    if (isShapeMetadataOnly(&operation))
+      continue;
     if (failed(lower(&operation)))
       return failure();
   }

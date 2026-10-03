@@ -6,11 +6,14 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <cstdint>
 #include <optional>
 
 namespace intent {
+
+class ReshapeOp;
 
 struct CoordinateOrigin {
   mlir::Value source;
@@ -60,13 +63,27 @@ struct TensorOperandProjection {
   llvm::SmallVector<std::optional<unsigned>, 4> resultAxes;
 };
 
-/// An extent explicitly supplied by the defining shape relation or tensor type.
-/// Unknown extents have neither member; no other equal-sized value is searched.
+/// A read-only logical extent relation. Exactly one of constant, value, domain,
+/// or source describes a known extent; no same-sized unrelated value is searched.
 struct TensorExtentFact {
   std::optional<int64_t> constant;
   mlir::Value value;
   // A domain/subregion extent, without synthesizing a DimOp in immutable KIR.
   mlir::Value domain;
+  // The exact shaped SSA component whose dimension remains a runtime leaf.
+  mlir::Value source;
+  unsigned axis = 0;
+  llvm::SmallVector<unsigned, 2> fieldPath;
+  // The source is the owning reshape result. Its existing shape operands define
+  // the unique inferred quotient; this is not a new executable shape recipe.
+  bool inferred = false;
+
+  bool isKnown() const { return constant || value || domain || source; }
+};
+
+struct LogicalReshapeGroup {
+  llvm::SmallVector<int64_t, 2> sourceAxes;
+  llvm::SmallVector<int64_t, 2> resultAxes;
 };
 
 enum class CanonicalFactState { Exact, Unknown, Ambiguous };
@@ -119,7 +136,19 @@ public:
   CoordinateProvenance axisProvenance(mlir::Value value, unsigned axis);
   mlir::FailureOr<llvm::SmallVector<TensorOperandProjection, 3>>
   operandProjections(mlir::OpResult result) const;
-  TensorExtentFact tensorExtent(mlir::Value value, unsigned axis);
+  TensorExtentFact tensorExtent(mlir::Value value, unsigned axis,
+      llvm::ArrayRef<unsigned> fieldPath = {},
+      llvm::function_ref<bool(mlir::Value, llvm::ArrayRef<unsigned>, unsigned)>
+          stop = nullptr);
+  bool equalTensorExtents(mlir::Value lhs, unsigned lhsAxis, mlir::Value rhs,
+                          unsigned rhsAxis,
+                          llvm::ArrayRef<unsigned> lhsPath = {},
+                          llvm::ArrayRef<unsigned> rhsPath = {});
+  mlir::FailureOr<unsigned>
+  emissionAxis(mlir::OpResult result,
+               llvm::ArrayRef<unsigned> fieldPath = {}) const;
+  mlir::FailureOr<llvm::SmallVector<LogicalReshapeGroup, 4>>
+  reshapeGroups(ReshapeOp reshape);
   mlir::FailureOr<IndexRelationFact>
   indexRelation(mlir::Operation *operation);
   mlir::FailureOr<llvm::SmallVector<LogicalWorksetFact, 4>>

@@ -2,10 +2,11 @@
 
 namespace intent::kir_to_dsa {
 
-FailureOr<int64_t> Construction::partitionQueryAxis(Block &block, RegionFoldOp fold) {
+FailureOr<Value> Construction::partitionQueryAxis(Block &block, RegionFoldOp fold) {
   auto sourceType = cast<RankedTensorType>(fold.getOperands().front().getType());
   auto sourceIds = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions();
   int64_t query = 0;
+  Value querySource;
   for (Operation &op : block.without_terminator()) if (auto store = dyn_cast<ViewStoreOp>(op)) {
     auto type = dyn_cast<RankedTensorType>(store.getValue().getType());
     if (!type || !type.getRank()) continue;
@@ -14,9 +15,10 @@ FailureOr<int64_t> Construction::partitionQueryAxis(Block &block, RegionFoldOp f
       if (query && query != candidate)
         return store.emitError("DSA fold outputs require different work ownership projections"), failure();
       query = candidate;
+      querySource = store.getValue();
     }
   }
-  if (!query) return query;
+  if (!query) return Value();
   // Slicing is legal only when this axis stays free throughout the author's
   // helpers. Reducing it or indexing it nonlocally requires another plan.
   bool independent = true;
@@ -90,7 +92,7 @@ FailureOr<int64_t> Construction::partitionQueryAxis(Block &block, RegionFoldOp f
   });
   if (!independent)
     return fold.emitError("DSA query partition requires an axis preserved by the region value graph"), failure();
-  return query;
+  return querySource;
 }
 
 bool Construction::replayableSlice(Value value, int64_t dimension, DenseSet<Value> &visited) {
@@ -315,11 +317,11 @@ Value Construction::regionTraversalEnd(RegionFoldOp fold, Value size, int64_t so
 FailureOr<SmallVector<Value>> Construction::jointSummary(RegionFoldOp fold, OnlineSummary plan,
     ArrayRef<SmallVector<Value>> arguments, ArrayRef<Value> state) {
   auto savedValues = values; auto savedProducts = products;
-  auto savedDimensions = dimensions; auto savedAxes = axisBindings;
+  auto savedAxes = axisBindings;
   auto savedShapes = localShapes; auto savedStreamed = streamedOperations;
   auto restore = llvm::make_scope_exit([&] {
     values = std::move(savedValues); products = std::move(savedProducts);
-    dimensions = std::move(savedDimensions); axisBindings = std::move(savedAxes);
+    axisBindings = std::move(savedAxes);
     streamedOperations = std::move(savedStreamed);
     for (auto &entry : savedShapes) localShapes[entry.first] = entry.second;
   });
@@ -386,9 +388,7 @@ LogicalResult Construction::lowerRegion(Operation *op) {
     if (llvm::count(ids.asArrayRef(), dimension) != 1 || !replayableSlice(source, dimension, visited))
       return op->emitError("DSA source slicing requires an independent axis and immutable replayable inputs; this source needs explicit snapshot materialization");
   }
-  DenseSet<Value> extentDefinitions;
-  bindLogicalExtent(sources.front(), dimension, extentDefinitions);
-  Value size = extent(sourceType, axis, loc);
+  Value size = logicalExtent(sources.front(), axis, loc);
   if (!size) return op->emitError("DSA region source has no bound logical extent");
   if (auto bound = axisBindings.find(dimension); bound != axisBindings.end())
     if (!matchPattern(bound->second.begin, m_Zero()) || !sameIndex(bound->second.count, size) || !sameIndex(bound->second.extent, size))
@@ -422,7 +422,7 @@ LogicalResult Construction::lowerRegion(Operation *op) {
     return success();
   }
   auto initial = flatten(identities), initialState = flatten(states);
-  auto slots = makeSlots(identities.getTypes(), loc), next = makeSlots(identities.getTypes(), loc);
+  auto slots = makeSlots(identities, loc), next = makeSlots(identities, loc);
   if (failed(slots) || failed(next) || initial.size() != slots->size()) return failure();
   for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
   SmallVector<SmallVector<Value>> captureFields;
@@ -463,18 +463,19 @@ LogicalResult Construction::lowerRegion(Operation *op) {
       llvm::append_range(emittedArgs, splitFields(states.getTypes(), *incoming));
       llvm::append_range(emittedArgs, captureFields);
       auto emitted = helper(schema.getEmitRegion()->front(), emittedArgs, sourceCount, axis);
-      SmallVector<Type> outputTypes;
       ValueRange outputValues = schema.getEmittedResults();
-      for (Type type : outputValues.getTypes()) appendProductLeafTypes(type, outputTypes);
-      if (failed(emitted) || emitted->size() != outputTypes.size()) return op->emitError("DSA scan output schema is unavailable");
-      for (unsigned i = 0; i < outputTypes.size(); ++i) {
+      auto outputComponents = logicalComponents(outputValues);
+      if (failed(emitted) || emitted->size() != outputComponents.size()) return op->emitError("DSA scan output schema is unavailable");
+      for (unsigned i = 0; i < outputComponents.size(); ++i) {
         // Reattach the helper-local slice to the complete output's source
         // coordinates before its view consumers form destination addresses.
-        auto outputType = cast<RankedTensorType>(outputTypes[i]);
-        auto outputIds = cast<TensorShapeAttr>(outputType.getEncoding()).getDimensions();
+        const auto &component = outputComponents[i];
+        auto outputAxis = analysis.emissionAxis(cast<OpResult>(component.value),
+                                                component.path);
+        if (failed(outputAxis))
+          return op->emitError("DSA scan output has no unique source member axis");
         LocalShape outputShape = localShapes.lookup((*emitted)[i]);
-        for (int64_t outputAxis = 0; outputAxis < outputType.getRank(); ++outputAxis)
-          if (outputIds[outputAxis] == dimension) outputShape[outputAxis] = {size, begin, count, config.getRegionTile()};
+        outputShape[*outputAxis] = {size, begin, count, config.getRegionTile()};
         localShapes[(*emitted)[i]] = std::move(outputShape);
       }
       auto outputFields = splitFields(outputValues.getTypes(), *emitted);

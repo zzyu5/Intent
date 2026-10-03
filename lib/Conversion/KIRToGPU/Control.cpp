@@ -31,7 +31,7 @@ LogicalResult ScalarRegionLowering::lower(intent::IfOp ifOperation) {
     if (!targetBlock.empty() && isa<scf::YieldOp>(targetBlock.back()))
       targetBlock.back().erase();
     OpBuilder nested(&targetBlock, targetBlock.begin());
-    ScalarRegionLowering child(nested, values, views, dimensions, parameters,
+    ScalarRegionLowering child(nested, values, views, abiDimensions, parameters,
                                canonicalAnalysis, physicalKernel);
     FailureOr<SmallVector<Value>> yielded =
         child.lowerBlock(sourceRegion.front());
@@ -144,7 +144,7 @@ LogicalResult ScalarRegionLowering::lowerLoop(Operation *operation) {
       for (auto [argument, carry] : llvm::zip(iterArguments, carries))
         childValues[argument] = carry;
       ScalarRegionLowering child(nested, std::move(childValues), views,
-                                 dimensions, parameters, canonicalAnalysis,
+                                 abiDimensions, parameters, canonicalAnalysis,
                                  physicalKernel);
       FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source);
       if (failed(yielded)) {
@@ -245,7 +245,7 @@ LogicalResult ScalarRegionLowering::lower(intent::WhileOp whileOperation) {
       childValues[source] = targetArgument;
     builder.setInsertionPointToStart(before);
     ScalarRegionLowering child(builder, std::move(childValues), views,
-                               dimensions, parameters, canonicalAnalysis,
+                               abiDimensions, parameters, canonicalAnalysis,
                                physicalKernel);
     Block &source = whileOperation.getBefore().front();
     for (Operation &nested : source.without_terminator())
@@ -276,7 +276,7 @@ LogicalResult ScalarRegionLowering::lower(intent::WhileOp whileOperation) {
       childValues[source] = targetArgument;
     builder.setInsertionPointToStart(after);
     ScalarRegionLowering child(builder, std::move(childValues), views,
-                               dimensions, parameters, canonicalAnalysis,
+                               abiDimensions, parameters, canonicalAnalysis,
                                physicalKernel);
     FailureOr<SmallVector<Value>> yielded =
         child.lowerBlock(whileOperation.getAfter().front());

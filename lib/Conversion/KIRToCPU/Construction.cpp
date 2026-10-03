@@ -84,19 +84,8 @@ LogicalResult Construction::lower(func::FuncOp source) {
       builder.getContext(), entryLayout == CPUEntryLayout::Contiguous, true));
   function.addEntryBlock();
   builder.setInsertionPointToStart(&function.front());
-  for (auto [oldValue, newValue] : llvm::zip(runtimeArguments, function.getArguments())) {
+  for (auto [oldValue, newValue] : llvm::zip(runtimeArguments, function.getArguments()))
     values.map(oldValue, newValue);
-    if (auto view = dyn_cast<ViewType>(oldValue.getType())) {
-      auto type = cast<RankedTensorType>(view.getTensor());
-      auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions().asArrayRef();
-      for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-        Value extent = type.isDynamicDim(axis)
-            ? Value(builder.create<memref::DimOp>(source.getLoc(), newValue, axis))
-            : constant(source.getLoc(), type.getDimSize(axis));
-        dimensions.try_emplace(ids[axis], extent);
-      }
-    }
-  }
   if (failed(lowerBlock(source.front())))
     return failure();
   builder.create<func::ReturnOp>(source.getLoc());
@@ -114,7 +103,6 @@ LogicalResult Construction::lowerBlock(Block &block) {
 }
 
 LogicalResult Construction::lowerOperation(Operation *operation) {
-  if (failed(bindShape(operation))) return failure();
   return llvm::TypeSwitch<Operation *, LogicalResult>(operation)
       .Case<ConstantOp, DimOp, DomainOp, SubregionOp, RegionEndOp, ParallelOp,
             BufferOp, FullOp, IndicesOp, JoinOp, BroadcastOp, MakeRecordOp,

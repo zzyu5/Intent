@@ -1,4 +1,6 @@
 #include "Construction.h"
+#include "Intent/Analysis/ProductSchema.h"
+#include "Intent/Conversion/LogicalShape.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -118,18 +120,24 @@ Value ScalarRegionLowering::rangeExtent(
     Value start,
     Value stop,
     Value step) {
-  if (integerConstant(start) == 0 && integerConstant(step) == 1)
-    return stop;
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   Value distance = createBinary(builder, location, builder.getIndexType(), stop,
                                 start, BinaryOperator::Subtract);
-  Value adjusted = createBinary(
-      builder, location, builder.getIndexType(), distance,
-      createBinary(builder, location, builder.getIndexType(), step, one,
-                   BinaryOperator::Subtract),
-      BinaryOperator::Add);
-  return createBinary(builder, location, builder.getIndexType(), adjusted, step,
-                      BinaryOperator::FloorDivide);
+  Value nonnegative = createBinary(builder, location, builder.getIndexType(),
+                                   distance, zero, BinaryOperator::Maximum);
+  Value quotient = createBinary(builder, location, builder.getIndexType(),
+                                 nonnegative, step, BinaryOperator::FloorDivide);
+  Value remainder = createBinary(builder, location, builder.getIndexType(),
+                                  nonnegative, step, BinaryOperator::Remainder);
+  Value hasTail = createCompare(builder, location, builder.getI1Type(),
+                               remainder, zero, ComparePredicate::Ne);
+  Value tail = builder.create<gpu::SelectOp>(
+      location, builder.getIndexType(), hasTail, one, zero);
+  // For positive step, a nonzero remainder implies quotient < nonnegative;
+  // incrementing the quotient avoids an overflowing distance + step - 1.
+  return createBinary(builder, location, builder.getIndexType(), quotient, tail,
+                      BinaryOperator::Add);
 }
 
 Value ScalarRegionLowering::rangeBound(
@@ -159,8 +167,8 @@ FailureOr<Value> ScalarRegionLowering::physicalExtentValue(
     int64_t identity = expression.getValue();
     if (identity <= 0)
       return failure();
-    auto found = dimensions.find(identity);
-    return found == dimensions.end() ? FailureOr<Value>(failure())
+    auto found = abiDimensions.find(identity);
+    return found == abiDimensions.end() ? FailureOr<Value>(failure())
                                      : FailureOr<Value>(found->second);
   }
   if (kind == PhysicalExprKind::Parameter) {
@@ -178,71 +186,84 @@ FailureOr<Value> ScalarRegionLowering::physicalExtentValue(
       location, builder.getIndexType(), expression));
 }
 
-FailureOr<PhysicalExprAttr> ScalarRegionLowering::physicalShapeExpression(
-    Value value,
-    Operation *origin) {
-  func::FuncOp function = origin->getParentOfType<func::FuncOp>();
-  FailureOr<PhysicalExprAttr> launched = launchExpression(value, function);
-  if (succeeded(launched))
-    return *launched;
-  Operation *definition = value.getDefiningOp();
-  if (auto dim = dyn_cast_or_null<intent::DimOp>(definition)) {
-    FailureOr<Value> lowered = get(dim.getSource());
-    auto fragment = succeeded(lowered)
-                        ? dyn_cast<gpu::FragmentType>((*lowered).getType())
-                        : gpu::FragmentType();
-    if (!fragment || dim.getDimension() <= 0)
-      return failure();
-    PhysicalExprAttr extent;
-    for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps())) {
-      auto mapping = dyn_cast<gpu::AxisMapAttr>(attribute);
-      if (!mapping || mapping.getDimensionId() !=
-                          static_cast<int64_t>(dim.getDimension()))
-        continue;
-      auto candidate =
-          cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-      if (extent && extent != candidate)
+FailureOr<Value> ScalarRegionLowering::logicalExtent(
+    Location location, Value value, unsigned axis,
+    ArrayRef<unsigned> fieldPath) {
+  LogicalShapeMaterialization materialization;
+  materialization.leaf = [&](const TensorExtentFact &extent) -> FailureOr<Value> {
+    if (extent.constant)
+      return Value(builder.create<arith::ConstantIndexOp>(location,
+                                                         *extent.constant));
+    if (extent.value) {
+      auto lowered = get(extent.value);
+      return failed(lowered) ? FailureOr<Value>(failure())
+                             : asIndex(location, *lowered);
+    }
+    if (extent.domain) {
+      auto lowered = get(extent.domain);
+      if (failed(lowered) || !isa<gpu::RangeType>((*lowered).getType()))
         return failure();
-      extent = candidate;
+      return rangeExtent(location, rangeBound(location, *lowered, 0),
+                         rangeBound(location, *lowered, 1),
+                         rangeBound(location, *lowered, 2));
     }
-    return extent ? FailureOr<PhysicalExprAttr>(extent)
-                  : FailureOr<PhysicalExprAttr>(failure());
-  }
-  if (auto binary = dyn_cast_or_null<intent::BinaryOp>(definition)) {
-    FailureOr<PhysicalExprAttr> lhs =
-        physicalShapeExpression(binary.getLhs(), origin);
-    FailureOr<PhysicalExprAttr> rhs =
-        physicalShapeExpression(binary.getRhs(), origin);
-    if (failed(lhs) || failed(rhs))
+    if (!extent.source)
       return failure();
-    PhysicalExprKind kind;
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add:
-      kind = PhysicalExprKind::Add;
-      break;
-    case BinaryOperator::Subtract:
-      kind = PhysicalExprKind::Subtract;
-      break;
-    case BinaryOperator::Multiply:
-      kind = PhysicalExprKind::Multiply;
-      break;
-    case BinaryOperator::FloorDivide:
-      kind = PhysicalExprKind::FloorDiv;
-      break;
-    case BinaryOperator::Maximum:
-    case BinaryOperator::MaximumNum:
-      kind = PhysicalExprKind::Maximum;
-      break;
-    case BinaryOperator::Minimum:
-    case BinaryOperator::MinimumNum:
-      kind = PhysicalExprKind::Minimum;
-      break;
-    default:
+    if (auto argument = dyn_cast<BlockArgument>(extent.source))
+      if (auto structured = dyn_cast<StructuredOpInterface>(
+              argument.getOwner()->getParentOp()))
+        for (const auto &relation : structured.getRegionArgumentRelations(
+                 *argument.getOwner()->getParent()))
+          if (relation.to == argument &&
+              relation.kind == StructuredRelationKind::SourceSlice &&
+              llvm::is_contained(relation.axes, extent.axis))
+            return emitError(location,
+                "compiler-selected source-slice extent is only available to "
+                "shape relations"), failure();
+    auto lowered = get(extent.source);
+    if (failed(lowered))
       return failure();
+    Value component = *lowered;
+    Type logicalType = extent.source.getType();
+    for (unsigned field : extent.fieldPath) {
+      auto components = getProductComponents(logicalType);
+      auto record = dyn_cast<gpu::RecordType>(component.getType());
+      if (!components || field >= components.size() || !record ||
+          field >= record.getFieldTypes().size())
+        return failure();
+      logicalType = cast<TypeAttr>(components[field]).getValue();
+      Type physicalType = cast<TypeAttr>(record.getFieldTypes()[field]).getValue();
+      component = builder.create<gpu::ExtractOp>(
+          location, physicalType, component, field);
     }
-    return binaryExpression(origin->getContext(), kind, *lhs, *rhs);
-  }
-  return failure();
+    auto physicalAxis = physicalResourceAxis(logicalType, component.getType(),
+                                             extent.axis);
+    if (failed(physicalAxis))
+      return failure();
+    if (isa<gpu::ViewType, gpu::BufferType>(component.getType()))
+      return resourceExtent(location, component, *physicalAxis);
+    if (!isa<gpu::FragmentType>(component.getType()))
+      return failure();
+    // A fragment's capacity is not its logical shape. Its current coordinate
+    // relation must retain the source bounds, including a local subregion.
+    gpu::PhysicalProgramAnalysis analysis(physicalKernel);
+    auto range = gpu::queryExactLogicalRange(
+        analysis.axisRanges(component, *physicalAxis));
+    if (failed(range))
+      return failure();
+    return rangeExtent(location, range->getLogicalStart(),
+                       range->getLogicalStop(), range->getStep());
+  };
+  materialization.multiply = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return createBinary(builder, location, builder.getIndexType(), lhs, rhs,
+                        BinaryOperator::Multiply);
+  };
+  materialization.exactDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return createBinary(builder, location, builder.getIndexType(), lhs, rhs,
+                        BinaryOperator::FloorDivide);
+  };
+  return materializeLogicalExtent(canonicalAnalysis, value, axis,
+                                  materialization, fieldPath);
 }
 
 FailureOr<Value> ScalarRegionLowering::asIndex(Location location, Value value) {
@@ -270,74 +291,13 @@ FailureOr<Value> ScalarRegionLowering::asLogicalIndex(
   return Value(builder.create<gpu::CastOp>(location, target, value));
 }
 
-void ScalarRegionLowering::bindExtentDimensions(
-    ArrayAttr identities,
-    Value extent) {
-  if (!identities || identities.size() != 1)
-    return;
-  int64_t identity = cast<IntegerAttr>(identities[0]).getInt();
-  if (identity > 0)
-    dimensions[identity] = extent;
-}
-
 LogicalResult ScalarRegionLowering::lower(intent::DimOp dim) {
-  Operation *operation = dim.getOperation();
-  Location location = dim.getLoc();
   if (values.count(dim.getResult()))
     return success();
-  auto binding = dimensions.find(dim.getDimension());
-  if (binding != dimensions.end()) {
-    values[dim.getResult()] = binding->second;
-    return success();
-  }
-  FailureOr<Value> source = get(dim.getSource());
-  if (failed(source))
-    return dim.emitOpError(
-        "GPU construction lost a launch-visible dimension binding");
-  binding = dimensions.find(dim.getDimension());
-  if (binding != dimensions.end()) {
-    values[dim.getResult()] = binding->second;
-    return success();
-  }
-  if (isa<gpu::RangeType>((*source).getType())) {
-    Value start = rangeBound(location, *source, 0);
-    Value stop = rangeBound(location, *source, 1);
-    Value step = rangeBound(location, *source, 2);
-    Value extent = rangeExtent(location, start, stop, step);
-    values[dim.getResult()] = extent;
-    if (dim.getDimension() > 0)
-      dimensions[dim.getDimension()] = extent;
-    return success();
-  }
-  if (auto fragment = dyn_cast<gpu::FragmentType>((*source).getType())) {
-    if (dim.getAxis() >= fragment.getShape().size())
-      return dim.emitOpError("fragment dimension axis is outside its rank");
-    FailureOr<Value> extent = physicalExtentValue(
-        location,
-        cast<PhysicalExprAttr>(fragment.getShape()[dim.getAxis()]));
-    if (failed(extent))
-      return dim.emitOpError(
-          "fragment dimension has no materialized physical extent");
-    values[dim.getResult()] = *extent;
-    if (dim.getDimension() > 0)
-      dimensions[dim.getDimension()] = *extent;
-    return success();
-  }
-  if (!isa<gpu::ViewType>((*source).getType()))
-    return dim.emitOpError(
-        "GPU construction has no exact runtime extent for this dimension");
-  auto view = cast<gpu::ViewType>((*source).getType());
-  auto extent = cast<PhysicalExprAttr>(
-      view.getLayout().getExtents()[dim.getAxis()]);
-  if (extent.getKind() ==
-      PhysicalExprKind::Constant) {
-    values[dim.getResult()] = builder.create<arith::ConstantIndexOp>(
-        location, extent.getValue());
-    return success();
-  }
-  auto target = builder.create<gpu::DimOp>(location, builder.getIndexType(),
-                                           *source, dim.getAxis());
-  mapResults(operation, target);
+  auto extent = logicalExtent(dim.getLoc(), dim.getSource(), dim.getAxis());
+  if (failed(extent))
+    return dim.emitOpError("logical source axis has no runtime extent binding");
+  values[dim.getResult()] = *extent;
   return success();
 }
 
@@ -375,8 +335,6 @@ LogicalResult ScalarRegionLowering::lower(intent::DomainOp domain) {
   auto target =
       builder.create<gpu::RangeOp>(location, type, *start, *stop, *step);
   mapResults(operation, target);
-  bindExtentDimensions(domain.getExtentDimensions(),
-                       rangeExtent(location, *start, *stop, *step));
   return success();
 }
 
@@ -437,8 +395,6 @@ LogicalResult ScalarRegionLowering::lower(intent::SubregionOp subregion) {
     target->setAttr(gpu::sourceSubregionBoundAttr,
                     builder.getI64IntegerAttr(*bound));
   mapResults(operation, target);
-  bindExtentDimensions(subregion.getExtentDimensions(),
-                       rangeExtent(location, start, stop, step));
   return success();
 }
 
@@ -460,11 +416,15 @@ LogicalResult ScalarRegionLowering::lower(intent::IndicesOp indices) {
     return indices.emitOpError("indices physical source is unavailable");
   if (auto fragment = dyn_cast<gpu::FragmentType>((*source).getType())) {
     auto axisAttr = operation->getAttrOfType<IntegerAttr>("tensor_axis");
-    if (!axisAttr || axisAttr.getInt() < 0 ||
-        axisAttr.getInt() >= static_cast<int64_t>(fragment.getShape().size()))
+    if (!axisAttr || axisAttr.getInt() < 0)
       return indices.emitOpError(
-          "tensor indices require one explicit physical source axis");
-    unsigned axis = axisAttr.getInt();
+          "tensor indices require one explicit logical source axis");
+    unsigned logicalAxis = axisAttr.getInt();
+    auto physicalAxis = physicalResourceAxis(
+        indices.getSource().getType(), fragment, logicalAxis);
+    if (failed(physicalAxis))
+      return indices.emitOpError("tensor index axis has no physical projection");
+    unsigned axis = *physicalAxis;
     auto mapping =
         cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
     auto extent = cast<gpu::PhysicalExprAttr>(fragment.getShape()[axis]);
@@ -491,21 +451,8 @@ LogicalResult ScalarRegionLowering::lower(intent::IndicesOp indices) {
       logicalStop = range->getLogicalStop();
       step = range->getStep();
     } else {
-      auto logical = cast<RankedTensorType>(indices.getSource().getType());
-      PhysicalExprAttr logicalExtent;
-      if (logical.isDynamicDim(axis)) {
-        FailureOr<PhysicalExprAttr> resolved =
-            logicalExtentExpression(canonicalAnalysis, indices.getSource(), axis);
-        if (failed(resolved))
-          return indices.emitOpError(
-              "tensor index axis has conflicting logical extent relations");
-        logicalExtent = *resolved;
-      } else {
-        logicalExtent = expression(operation->getContext(),
-                                   PhysicalExprKind::Constant,
-                                   logical.getDimSize(axis));
-      }
-      FailureOr<Value> stop = physicalExtentValue(location, logicalExtent);
+      FailureOr<Value> stop =
+          logicalExtent(location, indices.getSource(), logicalAxis);
       if (failed(stop))
         return indices.emitOpError(
             "tensor index axis has no logical extent authority");

@@ -120,7 +120,7 @@ FailureOr<Value> Construction::indexedRead(Operation *operation, const IndexRela
     return conditional.getResult(0);
   };
   if (!tensor) return read(builder, operation->getLoc(), {});
-  auto shape = extents(tensor, operation->getLoc());
+  auto shape = extents(operation->getResult(0), operation->getLoc());
   if (failed(shape)) return failure();
   Value output = emptyTensor(tensor, *shape, operation->getLoc());
   auto result = builder.create<linalg::GenericOp>(operation->getLoc(), TypeRange{output.getType()}, ValueRange{}, ValueRange{output},
@@ -153,7 +153,16 @@ LogicalResult Construction::atomicAccess(Operation *operation) {
   SmallVector<Value> sizes, members, outputs;
   bool used = llvm::any_of(operation->getResults(), [](Value value) { return !value.use_empty(); });
   if (tensor) {
-    auto extentsOr = extents(tensor, loc);
+    Value shapeSource = operation->getNumResults()
+        ? operation->getResult(0) : access.getStoredValue();
+    SmallVector<unsigned, 2> path;
+    bool first = true;
+    walkProductLeaves(shapeSource.getType(), [&](Type, ArrayRef<unsigned> fieldPath) {
+      if (!first) return;
+      path.assign(fieldPath.begin(), fieldPath.end());
+      first = false;
+    });
+    auto extentsOr = extents(shapeSource, loc, path);
     if (failed(extentsOr)) return failure();
     sizes = *extentsOr;
     if (used)
@@ -196,7 +205,7 @@ LogicalResult Construction::atomicAccess(Operation *operation) {
     }
     if (!used) return {};
     if (!tensor) {
-      bindValues(operation->getResults(), results, loc);
+      bindValues(operation->getResults(), results);
       return {};
     }
     SmallVector<Value> updated;
@@ -205,7 +214,7 @@ LogicalResult Construction::atomicAccess(Operation *operation) {
     return updated;
   };
   auto results = traverse(0, outputs);
-  if (used && tensor) bindValues(operation->getResults(), results, loc);
+  if (used && tensor) bindValues(operation->getResults(), results);
   return success();
 }
 
@@ -337,7 +346,7 @@ FailureOr<Value> Construction::indexed(Operation *operation) {
   if (operation->getNumResults() != 1 || !isa<RankedTensorType>(operation->getResult(0).getType()))
     return operation->emitError("CPU inserted write axes are not implemented"), failure();
   auto tensor = cast<RankedTensorType>(operation->getResult(0).getType());
-  auto shape = extents(tensor, operation->getLoc());
+  auto shape = extents(operation->getResult(0), operation->getLoc());
   if (failed(shape)) return failure();
   Value output = emptyTensor(tensor, *shape, operation->getLoc());
   if (isa<MemRefType>(selected.getType()))
@@ -369,7 +378,7 @@ LogicalResult Construction::lower(BufferOp op) {
   if (!analysis.logicalBuffer(op).isExact())
     return op.emitError("CPU logical buffer requires an exact lexical allocation fact");
   auto tensor = cast<RankedTensorType>(cast<BufferType>(op.getResult().getType()).getTensor());
-  auto sizes = extents(tensor, loc);
+  auto sizes = extents(op.getResult(), loc);
   if (failed(sizes)) return failure();
   SmallVector<Value> dynamic;
   for (auto [axis, size] : llvm::enumerate(*sizes))
@@ -383,7 +392,6 @@ LogicalResult Construction::lower(BufferOp op) {
     else builder.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{storage});
   }
   values.map(op.getResult(), storage);
-  bindDimensions(tensor, storage, loc);
   return success();
 }
 

@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentAnalysis
-  CanonicalKernel.cpp
+  Canonical/Kernel.cpp
+  Canonical/Shapes.cpp
   BufferStorage.cpp
   ContractionAxes.cpp
   ControlFlow.cpp

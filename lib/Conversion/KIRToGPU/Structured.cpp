@@ -238,7 +238,7 @@ LogicalResult ScalarRegionLowering::lowerPureRegion(
     childValues[from] = to;
   builder.setInsertionPointToStart(block);
   ScalarRegionLowering child(builder, std::move(childValues), views,
-                             dimensions, parameters, canonicalAnalysis,
+                             abiDimensions, parameters, canonicalAnalysis,
                              physicalKernel);
   FailureOr<SmallVector<Value>> yielded = child.lowerBlock(source.front());
   if (failed(yielded))

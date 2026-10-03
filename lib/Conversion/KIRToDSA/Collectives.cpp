@@ -24,7 +24,6 @@ void Construction::bindHelperValue(Value formal, ArrayRef<Value> fields, bool re
         binding.begin = index(formal.getLoc(), 0);
         shape[axis] = binding;
       }
-      dimensions[ids[axis]] = binding.extent;
       axisBindings[ids[axis]] = binding;
     }
     if (rebase) localShapes[field] = shape;
@@ -35,7 +34,7 @@ FailureOr<SmallVector<Value>> Construction::helper(Block &block, ArrayRef<SmallV
                                     unsigned sourceCount, int64_t sourceAxis) {
   if (arguments.size() != block.getNumArguments()) return block.getParentOp()->emitError("DSA helper argument schema mismatch"), failure();
   auto savedValues = values; auto savedProducts = products;
-  auto savedDimensions = dimensions; auto savedAxes = axisBindings;
+  auto savedAxes = axisBindings;
   auto savedShapes = localShapes;
   auto savedStreamed = streamedOperations;
   for (auto [i, formal] : llvm::enumerate(block.getArguments()))
@@ -44,7 +43,7 @@ FailureOr<SmallVector<Value>> Construction::helper(Block &block, ArrayRef<SmallV
   SmallVector<Value> result;
   if (succeeded(status)) result = flatten(block.getTerminator()->getOperands());
   values = std::move(savedValues); products = std::move(savedProducts);
-  dimensions = std::move(savedDimensions); axisBindings = std::move(savedAxes);
+  axisBindings = std::move(savedAxes);
   streamedOperations = std::move(savedStreamed);
   for (auto &entry : savedShapes) localShapes[entry.first] = entry.second;
   if (failed(status) || result.empty() || llvm::is_contained(result, Value())) return failure();
@@ -63,13 +62,12 @@ LogicalResult Construction::streamReduction(ReduceOp reduce, unsigned axis,
   Location loc = reduce.getLoc();
   auto initial = flatten(reduce.getIdentities());
   auto captures = flatten(reduce.getCaptures());
-  SmallVector<Type> sourceTypes;
-  appendProductLeafTypes(reduce.getSources().getTypes(), sourceTypes);
+  auto sourceFields = logicalComponents(reduce.getSources());
   SmallVector<Value> outputs;
-  if (initial.size() != sourceTypes.size()) return failure();
-  for (auto [type, value] : llvm::zip(sourceTypes, initial)) {
-    auto tensor = cast<RankedTensorType>(type);
-    auto local = localShape(tensor, loc);
+  if (initial.size() != sourceFields.size()) return failure();
+  for (auto [field, value] : llvm::zip(sourceFields, initial)) {
+    auto tensor = cast<RankedTensorType>(field.type);
+    auto local = localShape(field.value, loc, field.path);
     if (failed(local)) return failure();
     local->erase(local->begin() + axis);
     Value output = allocateTensor(loc, tensor.getElementType(), *local);
@@ -161,8 +159,8 @@ std::optional<LogicalResult> Construction::stageProductReduction(ReduceOp reduce
     auto type = dyn_cast<RankedTensorType>(source.getType());
     if (!type || type.getRank() != 2 ||
         cast<TensorShapeAttr>(type.getEncoding()).getDimensions() != ids ||
-        !equalAxisExtent(first, 0, type, 0) ||
-        !equalAxisExtent(first, 1, type, 1)) return std::nullopt;
+        !equalAxisExtent(sources.front(), 0, source, 0) ||
+        !equalAxisExtent(sources.front(), 1, source, 1)) return std::nullopt;
     for (int64_t dimension : ids.asArrayRef()) {
       DenseSet<Value> visited;
       if (!replayableSlice(source, dimension, visited)) return std::nullopt;
@@ -257,12 +255,13 @@ LogicalResult Construction::reduceTensor(ReduceOp reduce) {
     int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
     bool stream = (*shape)[axis].capacity > config.getRegionTile() &&
         elements > config.getLocalBytes() / bytes / 2 && completeShape(*shape);
-    for (Type field : sourceTypes) {
-      auto type = dyn_cast<RankedTensorType>(field);
+    for (const auto &field : logicalComponents(reduce.getSources())) {
+      auto type = dyn_cast<RankedTensorType>(field.type);
       if (!type || axis >= type.getRank()) { stream = false; break; }
       auto ids = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
       stream &= ids[axis] == dimension && llvm::count(ids.asArrayRef(), dimension) == 1;
-      stream &= equalAxisExtent(first, axis, type, axis);
+      stream &= equalAxisExtent(reduce.getSources().front(), axis,
+                                 field.value, axis, {}, field.path);
     }
     DenseSet<Value> visited;
     for (Value source : reduce.getSources()) stream &= replayableSlice(source, dimension, visited);
@@ -409,10 +408,10 @@ LogicalResult Construction::streamScan(ScanOp scan, Block &block) {
     if (&op == scan) break;
     if (!canDefer(&op) && failed(lowerOperation(&op))) return failure();
   }
-  Value size = extent(first, axis, loc);
+  Value size = logicalExtent(scan.getSources().front(), axis, loc);
   if (!size) return scan.emitError("DSA scan traversal extent is unavailable");
   auto initial = flatten(scan.getIdentities());
-  auto states = makeSlots(scan.getIdentities().getTypes(), loc);
+  auto states = makeSlots(scan.getIdentities(), loc);
   if (failed(states) || initial.size() != states->size()) return failure();
   for (auto [value, state] : llvm::zip(initial, *states))
     if (failed(copyTo(value, state, loc))) return failure();
@@ -420,7 +419,6 @@ LogicalResult Construction::streamScan(ScanOp scan, Block &block) {
   auto savedValues = values;
   auto savedProducts = products;
   auto savedAxes = axisBindings;
-  auto savedDimensions = dimensions;
   LogicalResult status = loop(loc, index(loc, 0), size, index(loc, 1),
       [&](Value position) -> LogicalResult {
     Value i = scan.getReverse()
@@ -448,7 +446,6 @@ LogicalResult Construction::streamScan(ScanOp scan, Block &block) {
   values = std::move(savedValues);
   products = std::move(savedProducts);
   axisBindings = std::move(savedAxes);
-  dimensions = std::move(savedDimensions);
   return status;
 }
 

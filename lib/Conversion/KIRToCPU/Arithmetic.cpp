@@ -114,7 +114,7 @@ LogicalResult Construction::pointwise(Operation *operation) {
     values.map(operation->getResult(0), *result);
     return success();
   }
-  auto sizes = extents(tensor, operation->getLoc());
+  auto sizes = extents(operation->getResult(0), operation->getLoc());
   if (failed(sizes)) return failure();
   Value output = emptyTensor(tensor, *sizes, operation->getLoc());
   LogicalResult status = success();

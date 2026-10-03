@@ -3,6 +3,23 @@
 
 namespace intent::kir_to_dsa {
 
+SmallVector<LogicalComponent> logicalComponents(ValueRange values) {
+  SmallVector<LogicalComponent> result;
+  for (Value value : values)
+    walkProductLeaves(value.getType(), [&](Type type, ArrayRef<unsigned> path) {
+      result.push_back({value, llvm::to_vector<2>(path), type});
+    });
+  return result;
+}
+
+RankedTensorType logicalTensorType(Value value, ArrayRef<unsigned> fieldPath) {
+  Type type = getProductComponentType(value.getType(), fieldPath);
+  if (!type) return {};
+  if (auto view = dyn_cast<ViewType>(type)) type = view.getTensor();
+  if (auto buffer = dyn_cast<BufferType>(type)) type = buffer.getTensor();
+  return dyn_cast<RankedTensorType>(type);
+}
+
 Value Construction::index(Location loc, int64_t n) { return b.create<arith::ConstantIndexOp>(loc, n); }
 
 Value Construction::add(Location loc, Value a, Value c) { return b.createOrFold<arith::AddIOp>(loc, a, c); }
@@ -18,7 +35,7 @@ Value Construction::get(Value source) {
     value = values.lookupOrNull(source);
   }
   if (value) if (auto tensor = dyn_cast<RankedTensorType>(source.getType())) {
-    value = projectTensor(source.getLoc(), tensor, value, source);
+    value = projectTensor(source.getLoc(), source, value);
     if (value) values.map(source, value);
   }
   return value;
@@ -38,46 +55,80 @@ Value Construction::asIndex(Value value, Location loc) {
   return succeeded(result) ? *result : Value();
 }
 
-Value Construction::extent(RankedTensorType type, unsigned axis, Location loc) {
-  if (!type.isDynamicDim(axis)) return index(loc, type.getDimSize(axis));
-  auto shape = dyn_cast_or_null<TensorShapeAttr>(type.getEncoding());
-  return shape ? dimensions.lookup(shape.getDimensions()[axis]) : Value();
+Value Construction::boundExtent(Value value, ArrayRef<unsigned> fieldPath,
+                                unsigned axis) {
+  if (auto found = publicExtents.find(value);
+      fieldPath.empty() && found != publicExtents.end())
+    return axis < found->second.size() ? found->second[axis] : Value();
+  Value physical;
+  if (getProductComponents(value.getType())) {
+    auto field = getProductLeafRange(value.getType(), fieldPath);
+    auto found = products.find(value);
+    if (failed(field) || field->size != 1 || found == products.end() ||
+        field->offset >= found->second.size()) return {};
+    physical = found->second[field->offset];
+  } else if (fieldPath.empty()) {
+    physical = values.lookupOrNull(value);
+  }
+  if (!physical) return {};
+  if (auto found = localShapes.find(physical); found != localShapes.end())
+    return axis < found->second.size() ? found->second[axis].extent : Value();
+  // A local allocation's descriptor contains capacity, not logical extent.
+  return {};
 }
 
-bool Construction::bindLogicalExtent(Value source, int64_t dimension, DenseSet<Value> &visited) {
-  if (dimensions.count(dimension)) return true;
-  if (!visited.insert(source).second) return false;
-  Operation *op = source.getDefiningOp();
-  if (!op) return false;
-  if (isa<DomainOp, SubregionOp>(op)) {
-    auto ids = op->getAttrOfType<ArrayAttr>("extent_dimensions");
-    if (ids && llvm::any_of(ids, [&](Attribute id) { return cast<IntegerAttr>(id).getInt() == dimension; }))
-      return bindDomain(source) && dimensions.count(dimension);
-  }
-  if (auto relation = op->getAttrOfType<ShapeRelationAttr>("shape")) {
-    for (Attribute attribute : relation.getAxes()) {
-      auto expression = cast<ShapeExprAttr>(attribute);
-      if (expression.getDimension() != dimension) continue;
-      Value size;
-      if (expression.getKind() == 0) size = index(op->getLoc(), expression.getPayload());
-      if (expression.getKind() == 1) size = asIndex(get(op->getOperand(expression.getPayload())), op->getLoc());
-      if (size) { dimensions[dimension] = size; return true; }
+Value Construction::logicalExtent(Value value, unsigned axis, Location loc,
+                                  ArrayRef<unsigned> fieldPath) {
+  LogicalShapeMaterialization materialization;
+  materialization.lookup = [&](Value source, ArrayRef<unsigned> path,
+                                unsigned sourceAxis) {
+    return boundExtent(source, path, sourceAxis);
+  };
+  materialization.leaf = [&](const TensorExtentFact &fact) -> FailureOr<Value> {
+    if (fact.constant) return index(loc, *fact.constant);
+    if (fact.value) {
+      Value scalar = asIndex(get(fact.value), loc);
+      return scalar ? FailureOr<Value>(scalar) : FailureOr<Value>(failure());
     }
-  }
-  // Follow the actual value's definition without materializing its tensor.
-  // A logical extent may be established in an ancestor workset's domain.
-  for (Value operand : op->getOperands())
-    if (bindLogicalExtent(operand, dimension, visited)) return true;
-  return false;
+    if (fact.domain) {
+      if (!bindDomain(fact.domain)) return failure();
+      auto domain = domains.find(fact.domain);
+      if (domain == domains.end()) return failure();
+      return domain->second.extent;
+    }
+    if (fact.source) {
+      Value size = boundExtent(fact.source, fact.fieldPath, fact.axis);
+      if (size) return size;
+    }
+    return failure();
+  };
+  materialization.multiply = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return mul(loc, lhs, rhs);
+  };
+  materialization.exactDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    if (matchPattern(rhs, m_Zero())) return failure();
+    return Value(b.createOrFold<arith::DivSIOp>(loc, lhs, rhs));
+  };
+  auto result = materializeLogicalExtent(analysis, value, axis, materialization,
+                                         fieldPath);
+  return succeeded(result) ? *result : Value();
 }
 
-Value Construction::logicalExtent(Value value, unsigned axis, Location loc) {
-  auto type = cast<RankedTensorType>(value.getType());
-  if (Value size = extent(type, axis, loc)) return size;
-  auto identities = cast<TensorShapeAttr>(type.getEncoding()).getDimensions();
-  DenseSet<Value> visited;
-  bindLogicalExtent(value, identities[axis], visited);
-  return extent(type, axis, loc);
+TensorExtentFact Construction::knownExtent(Value value, unsigned axis,
+                                          ArrayRef<unsigned> fieldPath) {
+  auto fact = analysis.tensorExtent(value, axis, fieldPath);
+  Value size = boundExtent(value, fieldPath, axis);
+  if (!size && fact.source)
+    size = boundExtent(fact.source, fact.fieldPath, fact.axis);
+  if (!size && fact.value) size = values.lookupOrNull(fact.value);
+  if (!size && fact.domain)
+    if (auto found = domains.find(fact.domain); found != domains.end())
+      size = found->second.extent;
+  if (!size) return fact;
+  APInt constant;
+  if (matchPattern(size, m_ConstantInt(&constant)))
+    return {constant.getSExtValue(), {}};
+  return {std::nullopt, size};
 }
 
 bool Construction::sameIndex(Value a, Value c) {
@@ -169,10 +220,10 @@ SmallVector<Value> Construction::flatten(ValueRange inputs) {
       if (!products.count(input) && input.getDefiningOp() && failed(materialize(input.getDefiningOp()))) return {};
       auto fields = products.lookup(input);
       {
-        SmallVector<Type> schema; appendProductLeafTypes(input.getType(), schema);
+        auto schema = logicalComponents(ValueRange{input});
         if (fields.size() != schema.size()) return {};
-        for (unsigned i = 0; i < schema.size(); ++i) if (auto tensor = dyn_cast<RankedTensorType>(schema[i])) {
-          fields[i] = projectTensor(input.getLoc(), tensor, fields[i]);
+        for (unsigned i = 0; i < schema.size(); ++i) if (isa<RankedTensorType>(schema[i].type)) {
+          fields[i] = projectTensor(input.getLoc(), input, fields[i], schema[i].path);
           if (!fields[i]) return {};
         }
         products[input] = fields;
@@ -189,23 +240,21 @@ void Construction::bindProduct(Value original, ValueRange fields) {
   else values.map(original, fields.front());
 }
 
-FailureOr<SmallVector<Value>> Construction::makeSlots(TypeRange types, Location loc) {
+FailureOr<SmallVector<Value>> Construction::makeSlots(ValueRange sources,
+                                                      Location loc) {
   SmallVector<Value> slots;
-  for (Type type : types) {
-    SmallVector<Type> flat;
-    appendProductLeafTypes(type, flat);
-    for (Type field : flat) {
-      if (auto tensor = dyn_cast<RankedTensorType>(field)) {
-        auto shape = localShape(tensor, loc);
-        if (failed(shape)) return failure();
-        slots.push_back(allocateTensor(loc, tensor.getElementType(), *shape));
-      } else {
-        Value slot = allocate(loc,
-            field.isIndex() || isa<LogicalIndexType>(field) ? b.getI64Type() : field,
-            1, 1);
-        localShapes[slot] = {};
-        slots.push_back(slot);
-      }
+  for (const auto &component : logicalComponents(sources)) {
+    Type field = component.type;
+    if (auto tensor = dyn_cast<RankedTensorType>(field)) {
+      auto shape = localShape(component.value, loc, component.path);
+      if (failed(shape)) return failure();
+      slots.push_back(allocateTensor(loc, tensor.getElementType(), *shape));
+    } else {
+      Value slot = allocate(loc,
+          field.isIndex() || isa<LogicalIndexType>(field) ? b.getI64Type() : field,
+          1, 1);
+      localShapes[slot] = {};
+      slots.push_back(slot);
     }
   }
   return slots;

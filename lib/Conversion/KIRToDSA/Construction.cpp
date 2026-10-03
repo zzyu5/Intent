@@ -98,15 +98,11 @@ LogicalResult Construction::lower(func::FuncOp source) {
   b.setInsertionPointToStart(&function.front());
   for (auto [old, value] : llvm::zip(sourceArguments, function.getArguments())) {
     values.map(old, value);
-    if (auto view = dyn_cast<ViewType>(old.getType())) {
-      auto tensor = cast<RankedTensorType>(view.getTensor());
-      auto ids = cast<TensorShapeAttr>(tensor.getEncoding()).getDimensions();
-      for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
-        auto physical = cast<MemRefType>(value.getType());
-        Value size = physical.isDynamicDim(axis) ? Value(b.create<memref::DimOp>(source.getLoc(), value, axis))
-                                                : index(source.getLoc(), physical.getDimSize(axis));
-        if (ids[axis] > 0) dimensions.try_emplace(ids[axis], size);
-      }
+    if (isa<ViewType>(old.getType())) {
+      auto type = cast<MemRefType>(value.getType());
+      auto &sizes = publicExtents[old];
+      for (int64_t axis = 0; axis < type.getRank(); ++axis)
+        sizes.push_back(b.createOrFold<memref::DimOp>(source.getLoc(), value, axis));
     }
   }
   taskId = b.create<dsa::TaskIdOp>(source.getLoc(), b.getIndexType());
@@ -159,7 +155,6 @@ LogicalResult Construction::loop(Location loc, Value begin, Value end, Value ste
 
 LogicalResult Construction::orderedControl(Operation *operation) {
   Location loc = operation->getLoc();
-  auto savedDimensions = dimensions;
   auto savedDomains = domains;
   auto savedAxes = axisBindings;
   auto savedSlices = valueSlices;
@@ -167,12 +162,15 @@ LogicalResult Construction::orderedControl(Operation *operation) {
   auto savedProducts = products;
   auto savedStreamed = streamedOperations;
   auto restore = [&]() {
-    dimensions = savedDimensions; domains = savedDomains;
+    domains = savedDomains;
     axisBindings = savedAxes; valueSlices = savedSlices;
     values = savedValues; products = savedProducts;
     streamedOperations = savedStreamed;
   };
-  auto slots = makeSlots(operation->getResultTypes(), loc);
+  ValueRange stateSources = operation->getResults();
+  if (auto loop = dyn_cast<ForOp>(operation)) stateSources = loop.getInitArgs();
+  if (auto loop = dyn_cast<WhileOp>(operation)) stateSources = loop.getInitArgs();
+  auto slots = makeSlots(stateSources, loc);
   if (failed(slots)) return failure();
   if (auto conditional = dyn_cast<IfOp>(operation)) {
     auto target = b.create<scf::IfOp>(loc, get(conditional.getCondition()), true);
@@ -187,7 +185,7 @@ LogicalResult Construction::orderedControl(Operation *operation) {
     auto whileLoop = dyn_cast<WhileOp>(operation);
     auto initial = flatten(forLoop ? forLoop.getInitArgs() : whileLoop.getInitArgs());
     if (initial.size() != slots->size()) return operation->emitError("DSA initial and result state schemas differ");
-    auto next = makeSlots(operation->getResultTypes(), loc);
+    auto next = makeSlots(stateSources, loc);
     if (failed(next)) return failure();
     for (auto [value, slot] : llvm::zip(initial, *slots)) if (failed(copyTo(value, slot, loc))) return failure();
     savedValues = values; savedProducts = products;
@@ -384,13 +382,7 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
   if (isa<ConstantOp, CastOp, BinaryOp, CompareOp, SelectOp, MaskOp, UnaryOp>(operation))
     return lowerScalarOperation(operation);
   if (auto dim = dyn_cast<DimOp>(operation)) {
-    Value value = dimensions.lookup(dim.getDimension());
-    if (!value) {
-      DenseSet<Value> visited;
-      bindLogicalExtent(dim.getSource(), dim.getDimension(), visited);
-      value = dimensions.lookup(dim.getDimension());
-    }
-    if (!value && isa<ViewType>(dim.getSource().getType())) value = b.create<memref::DimOp>(loc, get(dim.getSource()), dim.getAxis());
+    Value value = logicalExtent(dim.getSource(), dim.getAxis(), loc);
     if (!value) return dim.emitError("DSA dimension has no runtime binding");
     values.map(dim.getResult(), value); return success();
   }
@@ -401,8 +393,8 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
     Value step = domain.getBounds().size() == 3 ? asIndex(get(domain.getBounds()[2]), loc) : index(loc, 1);
     if (!begin || !end || !step || !matchPattern(step, m_One())) return domain.emitError("DSA construction requires a unit-step interval");
     int64_t identity = cast<IntegerAttr>(domain.getExtentDimensions()[0]).getInt();
-    domains[domain.getResult()] = {begin, end, step, identity, upperDistance(end, begin)};
-    if (identity > 0) dimensions[identity] = b.createOrFold<arith::MaxSIOp>(loc, sub(loc, end, begin), index(loc, 0));
+    Value count = b.createOrFold<arith::MaxSIOp>(loc, sub(loc, end, begin), index(loc, 0));
+    domains[domain.getResult()] = {begin, end, step, count, identity, upperDistance(end, begin)};
     return success();
   }
   if (auto region = dyn_cast<SubregionOp>(operation)) {
@@ -416,9 +408,8 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
     int64_t dimension = cast<IntegerAttr>(region.getExtentDimensions()[0]).getInt();
     auto capacity = upperDistance(end, begin);
     if (source.capacity) capacity = capacity ? std::min(*capacity, *source.capacity) : source.capacity;
-    domains[region.getResult()] = {begin, end, source.step, dimension, capacity};
     Value count = sub(loc, end, begin);
-    dimensions[dimension] = count;
+    domains[region.getResult()] = {begin, end, source.step, count, dimension, capacity};
     if (capacity) axisBindings[dimension] = {count, index(loc, 0), count, std::max<int64_t>(1, *capacity)};
     return success();
   }
@@ -431,7 +422,6 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
     if (!domains.count(parallel.getSource()) || parallel.getBody().front().getNumArguments() != 1)
       return parallel.emitError("DSA parallel work requires a single interval");
     auto domain = domains.lookup(parallel.getSource());
-    auto savedDimensions = dimensions;
     bool distribute = parallelDepth++ == 0;
     Value begin = distribute ? add(loc, domain.begin, mul(loc, taskId, domain.step)) : domain.begin;
     Value step = distribute ? mul(loc, taskCount, domain.step) : domain.step;
@@ -439,7 +429,7 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
       values.map(parallel.getBody().front().getArgument(0), i);
       return lowerBlock(parallel.getBody().front());
     });
-    --parallelDepth; dimensions = std::move(savedDimensions); return result;
+    --parallelDepth; return result;
   }
   if (isa<AssumeInBoundsOp>(operation)) return success();
   return operation->emitError("operation has no DSA construction implementation");

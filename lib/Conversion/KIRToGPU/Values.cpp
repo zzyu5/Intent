@@ -176,25 +176,38 @@ LogicalResult ScalarRegionLowering::lower(intent::FullOp full) {
   if (failed(fill) || failed(result) || !isa<gpu::FragmentType>(*result))
     return full.emitOpError("full has no physical fragment realization");
   auto targetType = cast<gpu::FragmentType>(*result);
+  auto logical = cast<RankedTensorType>(full.getResult().getType());
   SmallVector<Attribute> shape(targetType.getShape().begin(),
                                targetType.getShape().end());
   SmallVector<Attribute> mappings(targetType.getAxisMaps().begin(),
                                   targetType.getAxisMaps().end());
   for (unsigned resultAxis = 0; resultAxis < shape.size(); ++resultAxis) {
-    auto extent = canonicalAnalysis.tensorExtent(full.getResult(), resultAxis);
-    auto dim = extent.value ? extent.value.getDefiningOp<intent::DimOp>()
-                            : intent::DimOp();
+    // A bound on a dynamic logical extent is not Full's actual member count.
+    // Seed it scalarly unless an explicit tensor shape below supplies the
+    // current physical capacity. Static KIR extents retain their exact size.
+    if (logical.isDynamicDim(resultAxis))
+      shape[resultAxis] = expression(operation->getContext(),
+                                     PhysicalExprKind::Constant, 1);
+    // A shape explicitly taken from a tensor may reuse that tensor's current
+    // physical capacity. This does not materialize its logical .shape value.
+    auto extent = cast<ShapeExprAttr>(full.getShape().getAxes()[resultAxis]);
+    auto dim = extent.getKind() == 1
+        ? full->getOperand(extent.getPayload()).getDefiningOp<intent::DimOp>()
+        : intent::DimOp();
     if (!dim)
       continue;
     FailureOr<Value> source = get(dim.getSource());
     auto fragment = succeeded(source)
                         ? dyn_cast<gpu::FragmentType>((*source).getType())
                         : gpu::FragmentType();
-    if (!fragment || dim.getAxis() >= fragment.getShape().size())
+    auto sourceAxis = fragment
+        ? physicalResourceAxis(dim.getSource().getType(), fragment, dim.getAxis())
+        : FailureOr<unsigned>(failure());
+    if (failed(sourceAxis))
       continue;
     auto sourceMapping =
-        cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[dim.getAxis()]);
-    shape[resultAxis] = fragment.getShape()[dim.getAxis()];
+        cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[*sourceAxis]);
+    shape[resultAxis] = fragment.getShape()[*sourceAxis];
     mappings[resultAxis] = gpu::AxisMapAttr::get(
         operation->getContext(), sourceMapping.getSourceId(),
         sourceMapping.getSourceAxis(), sourceMapping.getDimensionId(),
@@ -339,102 +352,19 @@ LogicalResult ScalarRegionLowering::lower(intent::ReshapeOp reshape) {
         mapping.getSourceAxis(), mapping.getDimensionId(), mappings.size(), mapping.getDerived()));
   }
   unsigned resultRank = logicalResult.getRank();
-  ArrayAttr relation = reshape.getShape().getAxes();
-  if (!relation || relation.size() != resultRank)
-    return reshape.emitOpError(
-        "reshape result has no complete canonical shape relation");
-  func::FuncOp function = operation->getParentOfType<func::FuncOp>();
-  DenseI64ArrayAttr logicalSourceDimensions = dimensionIds(logicalSource);
-  if (!function || !logicalSourceDimensions ||
-      logicalSourceDimensions.size() !=
-          static_cast<int64_t>(logicalSourceRank))
-    return reshape.emitOpError(
-        "reshape source has no complete logical extent relation");
-  SmallVector<PhysicalExprAttr> logicalSourceExtents;
-  for (unsigned axis = 0; axis < logicalSourceRank; ++axis) {
-    PhysicalExprAttr extent;
-    if (!logicalSource.isDynamicDim(axis)) {
-      extent = expression(operation->getContext(),
-                          PhysicalExprKind::Constant,
-                          logicalSource.getDimSize(axis));
-    } else if (logicalSourceDimensions[axis] > 0) {
-      FailureOr<PhysicalExprAttr> resolved = logicalExtentExpression(canonicalAnalysis, reshape.getInputs().front(), axis);
-      if (failed(resolved))
-        return reshape.emitOpError(
-            "reshape source dimension has conflicting logical extent relations");
-      extent = *resolved;
-    } else {
-      return reshape.emitOpError(
-          "reshape source axis has no logical extent identity");
-    }
-    logicalSourceExtents.push_back(extent);
-  }
-
-  SmallVector<PhysicalExprAttr> logicalResultExtents;
-  std::optional<unsigned> inferredAxis;
-  PhysicalExprAttr knownResultProduct = expression(
-      operation->getContext(), PhysicalExprKind::Constant, 1);
-  for (auto [axis, attribute] : llvm::enumerate(relation)) {
-    auto extent = dyn_cast<intent::ShapeExprAttr>(attribute);
-    if (!extent)
-      return reshape.emitOpError(
-          "reshape result shape relation has an invalid entry");
-    PhysicalExprAttr physical;
-    if (extent.getKind() == 0) {
-      physical = expression(operation->getContext(),
-                            PhysicalExprKind::Constant,
-                            extent.getPayload());
-    } else if (extent.getKind() == 1) {
-      int64_t operand = extent.getPayload();
-      if (operand < 0 ||
-          operand >= static_cast<int64_t>(operation->getNumOperands()))
-        return reshape.emitOpError(
-            "reshape shape relation references an invalid extent operand");
-      if (extent.getDimension() <= 0)
-        return reshape.emitOpError(
-            "reshape result extent has no typed logical expression");
-      FailureOr<PhysicalExprAttr> resolved = logicalExtentExpression(canonicalAnalysis, reshape.getResult(), axis);
-      if (failed(resolved))
-        return reshape.emitOpError(
-            "reshape result dimension has conflicting logical extent relations");
-      physical = *resolved;
-    } else if (extent.getKind() == 2) {
-      if (inferredAxis)
-        return reshape.emitOpError(
-            "reshape has more than one inferred logical extent");
-      inferredAxis = axis;
-      logicalResultExtents.push_back(PhysicalExprAttr());
-      continue;
-    } else {
-      return reshape.emitOpError(
-          "reshape shape relation uses an unknown extent kind");
-    }
-    logicalResultExtents.push_back(physical);
-    knownResultProduct = binaryExpression(
-        operation->getContext(), PhysicalExprKind::Multiply,
-        knownResultProduct, physical);
-  }
-  PhysicalExprAttr logicalSourceProduct = expression(
-      operation->getContext(), PhysicalExprKind::Constant, 1);
-  for (PhysicalExprAttr extent : logicalSourceExtents)
-    logicalSourceProduct = binaryExpression(
-        operation->getContext(), PhysicalExprKind::Multiply,
-        logicalSourceProduct, extent);
-  if (inferredAxis) {
-    logicalResultExtents[*inferredAxis] = binaryExpression(
-          operation->getContext(), PhysicalExprKind::FloorDiv,
-          logicalSourceProduct, knownResultProduct);
-  }
-
-  FailureOr<ArrayAttr> reassociation = gpu::inferReshapeReassociation(
-      operation->getContext(),
-      SmallVector<Attribute>(logicalSourceExtents.begin(),
-                             logicalSourceExtents.end()),
-      SmallVector<Attribute>(logicalResultExtents.begin(),
-                             logicalResultExtents.end()));
-  if (failed(reassociation))
+  auto groups = canonicalAnalysis.reshapeGroups(reshape);
+  if (failed(groups))
     return reshape.emitOpError(
         "canonical reshape has no exact row-major logical relation");
+  SmallVector<Attribute> reassociation;
+  for (const LogicalReshapeGroup &group : *groups)
+    reassociation.push_back(gpu::ReshapeGroupAttr::get(
+        operation->getContext(), builder.getDenseI64ArrayAttr(group.sourceAxes),
+        builder.getDenseI64ArrayAttr(group.resultAxes)));
+  SmallVector<TensorExtentFact> logicalResultExtents;
+  for (unsigned axis = 0; axis < resultRank; ++axis)
+    logicalResultExtents.push_back(
+        canonicalAnalysis.tensorExtent(reshape.getResult(), axis));
 
   SmallVector<PhysicalExprAttr> physicalResultExtents(resultRank);
   SmallVector<Attribute> physicalResultMappings;
@@ -447,12 +377,11 @@ LogicalResult ScalarRegionLowering::lower(intent::ReshapeOp reshape) {
           "reshape result axis has no coordinate identity");
     physicalResultMappings.push_back(*mapping);
   }
-  for (Attribute attribute : *reassociation) {
-    auto group = cast<gpu::ReshapeGroupAttr>(attribute);
+  for (const LogicalReshapeGroup &group : *groups) {
     PhysicalExprAttr sourceProduct = expression(
         operation->getContext(), PhysicalExprKind::Constant, 1);
     for (int64_t logicalSourceAxis :
-         group.getSourceAxes().asArrayRef())
+         group.sourceAxes)
       sourceProduct = binaryExpression(
           operation->getContext(), PhysicalExprKind::Multiply,
           sourceProduct,
@@ -462,19 +391,18 @@ LogicalResult ScalarRegionLowering::lower(intent::ReshapeOp reshape) {
         operation->getContext(), PhysicalExprKind::Constant, 1);
     SmallVector<unsigned> unresolved;
     for (int64_t logicalResultAxis :
-         group.getResultAxes().asArrayRef()) {
-      PhysicalExprAttr logicalExtent =
-          logicalResultExtents[logicalResultAxis];
-      if (logicalExtent.getKind() ==
-              PhysicalExprKind::Constant &&
-          logicalExtent.getValue() == 1) {
-        physicalResultExtents[logicalResultAxis] = logicalExtent;
+         group.resultAxes) {
+      if (logicalResultExtents[logicalResultAxis].constant == 1) {
+        physicalResultExtents[logicalResultAxis] = expression(
+            operation->getContext(), PhysicalExprKind::Constant, 1);
         continue;
       }
       std::optional<unsigned> matchedSource;
       for (int64_t logicalSourceAxis :
-           group.getSourceAxes().asArrayRef()) {
-        if (logicalSourceExtents[logicalSourceAxis] != logicalExtent)
+           group.sourceAxes) {
+        if (!canonicalAnalysis.equalTensorExtents(
+                reshape.getInputs().front(), logicalSourceAxis,
+                reshape.getResult(), logicalResultAxis))
           continue;
         if (matchedSource) {
           matchedSource.reset();
@@ -507,20 +435,21 @@ LogicalResult ScalarRegionLowering::lower(intent::ReshapeOp reshape) {
       int64_t logicalConstantProduct =
           allConstant ? knownProduct.getValue() : 0;
       for (unsigned axis : unresolved) {
-        PhysicalExprAttr logicalExtent = logicalResultExtents[axis];
-        if (logicalExtent.getKind() !=
-            PhysicalExprKind::Constant) {
+        auto logicalExtent = logicalResultExtents[axis].constant;
+        if (!logicalExtent) {
           allConstant = false;
           continue;
         }
         if (allConstant)
-          logicalConstantProduct *= logicalExtent.getValue();
+          logicalConstantProduct *= *logicalExtent;
       }
       auto sourceKind = sourceProduct.getKind();
       if (allConstant && sourceKind == PhysicalExprKind::Constant &&
           logicalConstantProduct == sourceProduct.getValue()) {
         for (unsigned axis : unresolved)
-          physicalResultExtents[axis] = logicalResultExtents[axis];
+          physicalResultExtents[axis] = expression(
+              operation->getContext(), PhysicalExprKind::Constant,
+              *logicalResultExtents[axis].constant);
         knownProduct = sourceProduct;
         unresolved.clear();
       } else if (sourceKind == PhysicalExprKind::Constant &&
@@ -559,7 +488,7 @@ LogicalResult ScalarRegionLowering::lower(intent::ReshapeOp reshape) {
       builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
       source.getValidity(), source.getOwner());
   auto target = builder.create<gpu::ReshapeOp>(
-      location, result, *input, *reassociation);
+      location, result, *input, builder.getArrayAttr(reassociation));
   mapResults(operation, target);
   return success();
 }

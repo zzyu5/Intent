@@ -92,26 +92,6 @@ bool samePhysicalShape(gpu::FragmentType lhs, gpu::FragmentType rhs) {
          lhs.getOwner() == rhs.getOwner();
 }
 
-FailureOr<PhysicalExprAttr> logicalExtentExpression(
-    CanonicalKernelAnalysis &canonicalAnalysis,
-    Value value,
-    unsigned axis) {
-  TensorExtentFact extent = canonicalAnalysis.tensorExtent(value, axis);
-  if (extent.constant)
-    return expression(value.getContext(), PhysicalExprKind::Constant,
-                      *extent.constant);
-  auto function = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (extent.value)
-    return launchExpression(extent.value, function);
-  auto tensor = dyn_cast<RankedTensorType>(value.getType());
-  auto dimensions = tensor ? dimensionIds(tensor) : DenseI64ArrayAttr();
-  if (!function || !dimensions || axis >= dimensions.size())
-    return failure();
-  PhysicalExprAttr identity = dimensionExpression(function, dimensions[axis]);
-  if (!identity) return failure();
-  return identity;
-}
-
 static FailureOr<PhysicalAxisIdentity> physicalAxisIdentity(
     CanonicalKernelAnalysis &canonicalAnalysis,
     Operation *origin,

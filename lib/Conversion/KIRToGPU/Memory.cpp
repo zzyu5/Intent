@@ -15,15 +15,10 @@ LogicalResult ScalarRegionLowering::lower(intent::BufferOp buffer) {
   auto logical = cast<intent::BufferType>(buffer.getResult().getType());
   auto tensor = cast<RankedTensorType>(logical.getTensor());
   SmallVector<Attribute> shape;
-  for (Attribute attribute : buffer.getShape().getAxes()) {
-    auto axis = cast<intent::ShapeExprAttr>(attribute);
-    FailureOr<PhysicalExprAttr> extent = failure();
-    if (axis.getKind() == 0)
-      extent = expression(operation->getContext(),
-                          PhysicalExprKind::Constant, axis.getPayload());
-    else if (axis.getKind() == 1)
-      extent = launchExpression(buffer.getExtents()[axis.getPayload()],
-                                operation->getParentOfType<func::FuncOp>());
+  for (unsigned axis = 0; axis < tensor.getRank(); ++axis) {
+    auto extent = launchExtentExpression(
+        canonicalAnalysis, buffer.getResult(), axis,
+        operation->getParentOfType<func::FuncOp>());
     if (failed(extent))
       return buffer.emitOpError(
           "logical buffer allocation requires a launch-visible extent");

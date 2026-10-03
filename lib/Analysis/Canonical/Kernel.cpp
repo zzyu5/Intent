@@ -548,66 +548,6 @@ CanonicalKernelAnalysis::computeAxisProvenance(Value value, unsigned axis) {
   return provenance.origins.empty() ? ownAxis() : provenance;
 }
 
-TensorExtentFact CanonicalKernelAnalysis::tensorExtent(Value value,
-                                                      unsigned axis) {
-  Type type = value.getType();
-  if (auto view = dyn_cast<ViewType>(type)) type = view.getTensor();
-  if (auto buffer = dyn_cast<BufferType>(type)) type = buffer.getTensor();
-  auto tensor = dyn_cast<RankedTensorType>(type);
-  if (!tensor || axis >= tensor.getRank())
-    return {};
-  if (!tensor.isDynamicDim(axis))
-    return {tensor.getDimSize(axis), {}};
-  Operation *operation = value.getDefiningOp();
-  if (!operation)
-    return {};
-  if (auto indices = dyn_cast<IndicesOp>(operation)) {
-    Value source = indices.getSource();
-    if (isa<DomainType, RegionType>(source.getType()))
-      return {std::nullopt, {}, source};
-    return tensorExtent(source, axis);
-  }
-  if (isa<IndexedAccessOpInterface>(operation)) {
-    auto access = indexRelation(operation);
-    if (failed(access)) return {};
-    for (const IndexTermFact &term : access->terms) {
-      if (!llvm::is_contained(term.resultAxes, axis)) continue;
-      if (term.kind == 4)
-        return {std::nullopt, {}, term.operands.front()};
-      if (term.kind == 0 && term.sourceAxis)
-        return tensorExtent(access->source, *term.sourceAxis);
-      if (term.kind == 3)
-        for (auto [indexAxis, mapped] : llvm::enumerate(term.indexAxes))
-          if (mapped == axis &&
-              cast<RankedTensorType>(term.operands.front().getType()).getDimSize(indexAxis) != 1)
-            return tensorExtent(term.operands.front(), indexAxis);
-    }
-    return {};
-  }
-  ShapeRelationAttr shape;
-  if (auto reshape = dyn_cast<ReshapeOp>(operation)) shape = reshape.getShape();
-  else if (auto broadcast = dyn_cast<BroadcastOp>(operation)) shape = broadcast.getShape();
-  else if (auto full = dyn_cast<FullOp>(operation)) shape = full.getShape();
-  if (shape) {
-    auto extent = cast<ShapeExprAttr>(shape.getAxes()[axis]);
-    if (extent.getKind() == 0)
-      return {extent.getPayload(), {}};
-    if (extent.getKind() == 1)
-      return {std::nullopt, operation->getOperand(extent.getPayload())};
-    return {};
-  }
-  auto projections = operandProjections(cast<OpResult>(value));
-  if (succeeded(projections))
-    for (const auto &projection : *projections)
-      for (auto [sourceAxis, resultAxis] : llvm::enumerate(projection.resultAxes))
-        if (resultAxis == axis) {
-          Value source = operation->getOperand(projection.operandNumber);
-          if (cast<RankedTensorType>(source.getType()).getDimSize(sourceAxis) != 1)
-            return tensorExtent(source, sourceAxis);
-        }
-  return {};
-}
-
 FailureOr<SmallVector<LogicalWorksetFact, 4>>
 CanonicalKernelAnalysis::logicalWorksets(func::FuncOp function) const {
   SmallVector<LogicalWorksetFact, 4> worksets;

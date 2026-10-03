@@ -2,6 +2,7 @@
 #define INTENT_CONVERSION_KIRTODSA_CONSTRUCTION_H
 
 #include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
+#include "Intent/Conversion/LogicalShape.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Analysis/ContractionAxes.h"
@@ -27,7 +28,11 @@
 namespace intent::kir_to_dsa {
 using namespace mlir;
 
-struct Domain { Value begin, end, step; int64_t dimension; std::optional<int64_t> capacity; };
+struct Domain {
+  Value begin, end, step, extent;
+  int64_t dimension;
+  std::optional<int64_t> capacity;
+};
 // An axis keeps its source extent even when only one execution slice is local.
 struct LocalAxis { Value extent, begin, count; int64_t capacity; };
 using LocalShape = SmallVector<LocalAxis, 2>;
@@ -44,6 +49,15 @@ struct AffineIndices {
   Value base;
   SmallVector<Value> steps;
 };
+
+struct LogicalComponent {
+  Value value;
+  SmallVector<unsigned, 2> path;
+  Type type;
+};
+SmallVector<LogicalComponent> logicalComponents(ValueRange values);
+RankedTensorType logicalTensorType(Value value,
+                                  ArrayRef<unsigned> fieldPath = {});
 
 class Construction {
 public:
@@ -69,9 +83,11 @@ private:
   Value get(Value source);
   LogicalResult materialize(Operation *op);
   Value asIndex(Value value, Location loc);
-  Value extent(RankedTensorType type, unsigned axis, Location loc);
-  bool bindLogicalExtent(Value source, int64_t dimension, DenseSet<Value> &visited);
-  Value logicalExtent(Value value, unsigned axis, Location loc);
+  Value boundExtent(Value value, ArrayRef<unsigned> fieldPath, unsigned axis);
+  TensorExtentFact knownExtent(Value value, unsigned axis,
+                               ArrayRef<unsigned> fieldPath = {});
+  Value logicalExtent(Value value, unsigned axis, Location loc,
+                      ArrayRef<unsigned> fieldPath = {});
   bool sameIndex(Value a, Value c);
   LogicalResult lowerScalarOperation(Operation *operation);
   FailureOr<Value> scalarOperation(Operation *source, ValueRange operands);
@@ -79,7 +95,7 @@ private:
   Value scalarCast(Location loc, Value value, Type type);
   SmallVector<Value> flatten(ValueRange inputs);
   void bindProduct(Value original, ValueRange fields);
-  FailureOr<SmallVector<Value>> makeSlots(TypeRange types, Location loc);
+  FailureOr<SmallVector<Value>> makeSlots(ValueRange sources, Location loc);
   LogicalResult copyTo(Value value, Value slot, Location loc);
   void bindSlots(ValueRange originals, ValueRange slots, Location loc);
   FailureOr<Value> lowerResults(Block &block, ValueRange slots);
@@ -87,12 +103,14 @@ private:
   // Tensors.cpp: local storage, projection, and elementwise construction.
   Value allocate(Location loc, Type element, int64_t rows, int64_t columns, int64_t space = dsa::nramSpace);
   Value allocateLike(Location loc, Value input, Type element = {});
-  std::optional<LocalAxis> selectedAxis(Value value, unsigned axis);
-  FailureOr<LocalShape> localShape(RankedTensorType type, Location loc, Value source = {});
+  std::optional<LocalAxis> selectedAxis(Value value, unsigned axis,
+                                      ArrayRef<unsigned> fieldPath = {});
   Type storageElement(Type type);
-  FailureOr<LocalShape> localShape(Value value, Location loc);
+  FailureOr<LocalShape> localShape(Value value, Location loc,
+                                 ArrayRef<unsigned> fieldPath = {});
   Value allocateTensor(Location loc, Type element, const LocalShape &shape);
-  Value projectTensor(Location loc, RankedTensorType type, Value value, Value source = {});
+  Value projectTensor(Location loc, Value source, Value value,
+                      ArrayRef<unsigned> fieldPath = {});
   SmallVector<Value> physicalCoordinates(Location loc, Value buffer, ValueRange coordinates);
   Value loadLocal(Location loc, Value value, ValueRange coordinates);
   void storeLocal(Location loc, Value value, Value buffer, ValueRange coordinates);
@@ -138,7 +156,7 @@ private:
   LogicalResult streamScan(ScanOp scan, Block &block);
 
   // Regions.cpp: structured summary traversal and consumer replay.
-  FailureOr<int64_t> partitionQueryAxis(Block &block, RegionFoldOp fold);
+  FailureOr<Value> partitionQueryAxis(Block &block, RegionFoldOp fold);
   bool replayableSlice(Value value, int64_t dimension, DenseSet<Value> &visited);
   void forgetReplayedTensors(Value value, DenseSet<Value> &visited);
   FailureOr<SmallVector<Operation *>> regionConsumers(Operation *region, unsigned outputCount, int64_t dimension);
@@ -148,8 +166,10 @@ private:
   LogicalResult lowerRegion(Operation *op);
 
   // Worksets.cpp: execution slices, interval binding, and task distribution.
-  bool singletonAxis(RankedTensorType type, unsigned axis);
-  bool equalAxisExtent(RankedTensorType lhs, unsigned a, RankedTensorType rhs, unsigned c);
+  bool singletonAxis(Value value, unsigned axis);
+  bool equalAxisExtent(Value lhs, unsigned a, Value rhs, unsigned c,
+                       ArrayRef<unsigned> lhsPath = {},
+                       ArrayRef<unsigned> rhsPath = {});
   std::optional<WorksetTiling> planExecutionSlices(Block &block, unsigned selectedAxis = 0,
         ArrayRef<std::pair<Value, unsigned>> sources = {});
   std::optional<TileDomain> sliceDomain(const WorksetTiling &plan,
@@ -174,7 +194,7 @@ private:
   func::FuncOp function;
   IRMapping values;
   DenseMap<Value, SmallVector<Value>> products;
-  DenseMap<int64_t, Value> dimensions;
+  DenseMap<Value, SmallVector<Value>> publicExtents;
   DenseMap<Value, Domain> domains;
   Value taskId, taskCount;
   unsigned parallelDepth = 0;

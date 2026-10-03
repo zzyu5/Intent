@@ -63,10 +63,6 @@ FailureOr<Value> ScalarRegionLowering::resourceExtent(
       return failure();
     gpu::PhysicalProgramAnalysis analysis(physicalKernel);
     if (analysis.axisRealization(resource, axis).constructionScalarSeed) {
-      auto mapping = cast<gpu::AxisMapAttr>(fragment.getAxisMaps()[axis]);
-      auto dimension = dimensions.find(mapping.getDimensionId());
-      if (dimension != dimensions.end())
-        return dimension->second;
       FailureOr<gpu::MakeRangeOp> range =
           gpu::queryExactLogicalRange(analysis.axisRanges(resource, axis));
       if (failed(range))
@@ -335,6 +331,7 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
       auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
       auto logical =
           dyn_cast<RankedTensorType>(relation->source.getType());
+      Value logicalValue = relation->source;
       const bool fragmentIndex = static_cast<bool>(fragment);
       unsigned logicalAxis = sourceAxis;
       unsigned fragmentAxis = *physicalSourceAxis;
@@ -344,6 +341,7 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
             valueType.getRank() == relation->resultDimensionIdentities.size()) {
           fragment = valuePrototype;
           logical = valueType;
+          logicalValue = stored;
           logicalAxis = resultAxis;
           fragmentAxis =
               fragment.getShape().size() - valueType.getRank() + resultAxis;
@@ -356,11 +354,8 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
             fragment.getAxisMaps()[fragmentAxis]);
         bool coversSource = false;
         if (logical.isDynamicDim(logicalAxis)) {
-          if (identities) {
-            auto binding = dimensions.find(identities[logicalAxis]);
-            coversSource =
-                binding != dimensions.end() && stop == binding->second;
-          }
+          coversSource = canonicalAnalysis.equalTensorExtents(
+              term.operands[0], 0, logicalValue, logicalAxis);
         } else {
           coversSource = integerConstant(stop) == logical.getDimSize(logicalAxis);
         }

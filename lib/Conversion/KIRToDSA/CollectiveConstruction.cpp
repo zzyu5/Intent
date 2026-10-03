@@ -50,7 +50,6 @@ LogicalResult Construction::buildCollectiveHelper(
 
   auto savedValues = values;
   auto savedProducts = products;
-  auto savedDimensions = dimensions;
   auto savedDomains = domains;
   auto savedAxes = axisBindings;
   auto savedShapes = localShapes;
@@ -59,7 +58,6 @@ LogicalResult Construction::buildCollectiveHelper(
   auto restore = llvm::make_scope_exit([&] {
     values = std::move(savedValues);
     products = std::move(savedProducts);
-    dimensions = std::move(savedDimensions);
     domains = std::move(savedDomains);
     axisBindings = std::move(savedAxes);
     localShapes = std::move(savedShapes);
