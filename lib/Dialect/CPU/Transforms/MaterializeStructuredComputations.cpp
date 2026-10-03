@@ -12,6 +12,24 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
+class LoopImplementationListener final : public OpBuilder::Listener {
+public:
+  explicit LoopImplementationListener(ImplementationAttr binding)
+      : binding(binding) {}
+
+  void notifyOperationInserted(Operation *operation,
+                               OpBuilder::InsertPoint) final {
+    if (!binding) return;
+    operation->walk([&](scf::ForOp loop) {
+      if (!loop->hasAttr("intent_cpu.implementation"))
+        loop->setAttr("intent_cpu.implementation", binding);
+    });
+  }
+
+private:
+  ImplementationAttr binding;
+};
+
 SmallVector<Value> coordinates(OpBuilder &b, Location loc, AffineMap map,
                                ValueRange domain) {
   SmallVector<Value> result;
@@ -28,11 +46,9 @@ bool supportedMap(AffineMap map) {
   });
 }
 
-bool materializeProductReduction(linalg::GenericOp operation) {
+bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
+                                 OpBuilder::Listener *listener) {
   auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
-  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-  auto widthAttr = binding ? dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("vector_width")) : IntegerAttr{};
-  int64_t width = widthAttr ? widthAttr.getInt() : 0;
   if (!order || !order.getAdjacentReassociation() || width <= 1)
     return false;
   if (width & (width - 1)) return false;
@@ -95,7 +111,7 @@ bool materializeProductReduction(linalg::GenericOp operation) {
       if (!storage.disjoint(previous, output)) return false;
   }
 
-  OpBuilder b(operation);
+  OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   SmallVector<Value> sizes, position(sourceType.getRank());
   for (int64_t axis = 0; axis < sourceType.getRank(); ++axis)
@@ -256,14 +272,15 @@ void collapseProductReductionAxes(linalg::GenericOp operation) {
   }
 }
 
-LogicalResult materialize(linalg::GenericOp operation) {
+LogicalResult materialize(linalg::GenericOp operation, int64_t width,
+                          OpBuilder::Listener *listener) {
   if (operation.getOutputs().empty() || operation.getNumResults())
     return operation.emitError("CPU structured materialization requires destination buffers");
   auto maps = operation.getIndexingMapsArray();
   if (!llvm::all_of(maps, supportedMap))
     return operation.emitError("CPU pointwise coordinate map has no implemented scalar projection");
-  if (materializeProductReduction(operation)) return success();
-  OpBuilder b(operation);
+  if (materializeProductReduction(operation, width, listener)) return success();
+  OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   SmallVector<Value> sizes(operation.getNumLoops()), position;
   for (auto [memory, map] : llvm::zip(operation->getOperands(), maps)) {
@@ -360,8 +377,8 @@ LogicalResult materialize(linalg::GenericOp operation) {
   return success();
 }
 
-LogicalResult materialize(ReduceOp operation) {
-  OpBuilder b(operation);
+LogicalResult materialize(ReduceOp operation, OpBuilder::Listener *listener) {
+  OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   auto reduction = b.create<scf::ForOp>(loc, index(b, loc, 0), operation.getExtent(),
       index(b, loc, 1), ValueRange{operation.getInitial()});
@@ -388,8 +405,9 @@ LogicalResult materialize(ReduceOp operation) {
   return success();
 }
 
-LogicalResult materialize(ScanOp operation, int64_t width) {
-  OpBuilder b(operation);
+LogicalResult materialize(ScanOp operation, int64_t width,
+                          OpBuilder::Listener *listener) {
+  OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   auto type = cast<MemRefType>(operation.getSources()[0].getType());
   int64_t scanAxis = operation.getAxis();
@@ -431,9 +449,9 @@ LogicalResult materialize(ScanOp operation, int64_t width) {
           viewType, metadata.getBaseBuffer(), begin, sizes, steps));
     }
     auto vectorScan = cast<ScanOp>(b.clone(*operation, mapping));
-    if (failed(materialize(vectorScan, width))) return failure();
+    if (failed(materialize(vectorScan, width, listener))) return failure();
     operation->moveBefore(dispatch.elseBlock(), dispatch.elseBlock()->begin());
-    return materialize(operation, 1);
+    return materialize(operation, 1, listener);
   }
   SmallVector<Value> sizes, position(type.getRank());
   for (int64_t axis = 0; axis < type.getRank(); ++axis)
@@ -546,15 +564,21 @@ LogicalResult materialize(ScanOp operation, int64_t width) {
   return success();
 }
 
-LogicalResult materialize(ScanOp operation) {
-  int64_t width = 1;
-  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
-  if (binding)
-    if (auto parameter = dyn_cast_or_null<IntegerAttr>(binding.getParameters().get("scan_width")))
-      width = parameter.getInt();
-  return materialize(operation, width);
-}
+} // namespace
 
+LogicalResult materializeStructuredComputation(Operation *operation,
+                                              int64_t width,
+                                              ImplementationAttr loopBinding) {
+  if (width <= 0)
+    return operation->emitError("structured materialization requires a positive vector width");
+  LoopImplementationListener listener(loopBinding);
+  if (auto generic = dyn_cast<linalg::GenericOp>(operation))
+    return materialize(generic, width, &listener);
+  if (auto reduce = dyn_cast<ReduceOp>(operation))
+    return materialize(reduce, &listener);
+  if (auto scan = dyn_cast<ScanOp>(operation))
+    return materialize(scan, width, &listener);
+  return operation->emitError("operation has no CPU structured materialization");
 }
 
 LogicalResult realizeHistograms(func::FuncOp function) {
@@ -629,7 +653,9 @@ LogicalResult realizeHistograms(func::FuncOp function) {
   return success();
 }
 
-LogicalResult materializeStructuredComputations(func::FuncOp function) {
+LogicalResult materializeStructuredComputations(
+    func::FuncOp function,
+    llvm::function_ref<LogicalResult(Operation *)> materializeOperation) {
   function.walk([&](linalg::GenericOp operation) { collapseProductReductionAxes(operation); });
   SmallVector<Operation *> views;
   function.walk([&](Operation *operation) {
@@ -710,13 +736,11 @@ LogicalResult materializeStructuredComputations(func::FuncOp function) {
           [](OpBuilder &nested, Location loc, ValueRange arguments) {
             nested.create<linalg::YieldOp>(loc, arguments[0]);
           });
+      if (Attribute binding = fill->getAttr("intent_cpu.implementation"))
+        generic->setAttr("intent_cpu.implementation", binding);
       fill.erase();
-      if (failed(materialize(generic))) return failure();
-    } else if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
-      if (failed(materialize(generic))) return failure();
-    } else if (auto scan = dyn_cast<ScanOp>(operation)) {
-      if (failed(materialize(scan))) return failure();
-    } else if (failed(materialize(cast<ReduceOp>(operation)))) return failure();
+      if (failed(materializeOperation(generic))) return failure();
+    } else if (failed(materializeOperation(operation))) return failure();
   }
   return success();
 }

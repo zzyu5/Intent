@@ -165,6 +165,17 @@ LogicalResult expandAtomicUpdates(ModuleOp module) {
   return success();
 }
 
+LogicalResult finishNativeProgram(ModuleOp module) {
+  if (failed(verifySourceProgram(module))) return failure();
+  // Source legality closes every implementation's expansion. The executable
+  // loops, vectors and resources now own the selected behavior; retained
+  // candidate summaries remain available for artifact inspection.
+  module.walk([](Operation *operation) {
+    operation->removeAttr("intent_cpu.implementation");
+  });
+  return success();
+}
+
 }
 
 LogicalResult prepareNativeProgram(ModuleOp module) {
@@ -172,11 +183,22 @@ LogicalResult prepareNativeProgram(ModuleOp module) {
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   if (!capabilities || (capabilities.getVectorBits() != 256 && capabilities.getVectorBits() != 512))
     return module.emitError("Mojo native currently requires an AVX2 or AVX512 CPU capability");
+  auto implementations = cpu::lookupImplementationProvider(module, "mojo");
+  if (failed(implementations)) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>())
     if (failed(cpu::materializeTaskDispatches(function))) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    auto programBinding = function->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
+    if (!programBinding)
+      return function.emitError("Mojo materialization requires an explicit program implementation");
     if (failed(materializeRegisterContractions(function)) ||
-        failed(cpu::materializeStructuredComputations(function))) return failure();
+        failed(cpu::materializeStructuredComputations(function, [&](Operation *operation) {
+          // Preparation and fills have no source computation to inherit from.
+          // The explicitly selected program implementation owns these loops.
+          if (!operation->hasAttr("intent_cpu.implementation"))
+            operation->setAttr("intent_cpu.implementation", programBinding);
+          return (**implementations).materialize(operation);
+        }))) return failure();
     // Implementation supplies may introduce additional independent worksets.
     if (failed(cpu::isolateTasks(function)) ||
         failed(cpu::materializeTaskDispatches(function))) return failure();
@@ -191,19 +213,29 @@ LogicalResult fusePrivateComputations(ModuleOp module) {
 }
 
 LogicalResult vectorizeNativeProgram(ModuleOp module) {
+  auto implementations = cpu::lookupImplementationProvider(module, "mojo");
+  if (failed(implementations)) return failure();
+  auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-    auto bindings = function->getAttrOfType<ArrayAttr>("intent_cpu.implementations");
-    if (!bindings || bindings.empty()) return function.emitError("Mojo lowering requires selected implementations");
-    auto binding = cast<cpu::ImplementationAttr>(bindings[0]);
-    for (Attribute value : bindings)
-      for (StringRef name : {"vector_width", "register_replicas", "reduction_replicas"})
-        if (cpu::implementationParameter(cast<cpu::ImplementationAttr>(value), name) != cpu::implementationParameter(binding, name))
-          return function.emitError("Mojo loop materialization requires coordinated vector bindings");
-    if (failed(cpu::fuseReductionTraversals(function)) ||
-        failed(cpu::vectorizeLoops(function,
-            cpu::implementationParameter(binding, "vector_width"),
-            cpu::implementationParameter(binding, "register_replicas"),
-            cpu::implementationParameter(binding, "reduction_replicas")))) return failure();
+    auto programBinding = function->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
+    if (!programBinding)
+      return function.emitError("Mojo vectorization requires an explicit program implementation");
+    function.walk([&](scf::ForOp loop) {
+      if (!loop->hasAttr("intent_cpu.implementation"))
+        loop->setAttr("intent_cpu.implementation", programBinding);
+    });
+    if (failed(cpu::fuseReductionTraversals(function))) return failure();
+    SmallVector<scf::ForOp> loops;
+    function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
+    auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
+    for (scf::ForOp loop : loops) {
+      auto binding = loop->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
+      auto implementation = (**implementations).verifyBinding(binding, capabilities, configuration, loop);
+      if (failed(implementation)) return failure();
+      if (!(*implementation)->vectorize)
+        return loop.emitError("selected Mojo implementation has no loop vectorization");
+      if (failed((*implementation)->vectorize(loop, binding))) return failure();
+    }
   }
   return success();
 }
@@ -241,7 +273,7 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
       if (needsFloatingPointEnvironment(dispatch)) scopes.push_back(&dispatch.getBody().front());
     });
   }
-  if (scopes.empty()) return verifySourceProgram(module);
+  if (scopes.empty()) return finishNativeProgram(module);
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToStart(module.getBody());
   auto enter = builder.create<func::FuncOp>(module.getLoc(), "intent_cpu_enter_ieee",
@@ -257,7 +289,7 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
     builder.setInsertionPoint(scope->getTerminator());
     builder.create<func::CallOp>(module.getLoc(), leave, ValueRange{previous});
   }
-  return verifySourceProgram(module);
+  return finishNativeProgram(module);
 }
 
 }

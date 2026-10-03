@@ -6,10 +6,12 @@
 #include "Intent/Dialect/CPU/Transforms/Configuration.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassOptions.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace intent::cpu {
 
@@ -52,7 +54,11 @@ mlir::LogicalResult groupWorksetComputations(mlir::func::FuncOp function,
 mlir::LogicalResult exposeStructuredWorksets(mlir::func::FuncOp function,
     const ImplementationRegistry &implementations, llvm::ArrayRef<mlir::Value> leadingExtents = {});
 void forwardCPUOutputs(mlir::func::FuncOp function);
-mlir::LogicalResult materializeStructuredComputations(mlir::func::FuncOp function);
+mlir::LogicalResult materializeStructuredComputations(
+    mlir::func::FuncOp function,
+    llvm::function_ref<mlir::LogicalResult(mlir::Operation *)> materialize);
+mlir::LogicalResult materializeStructuredComputation(
+    mlir::Operation *operation, int64_t width, ImplementationAttr loopBinding);
 mlir::LogicalResult realizeSliceCollectives(mlir::func::FuncOp function);
 mlir::LogicalResult realizeHistograms(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
@@ -62,8 +68,8 @@ mlir::LogicalResult blockContractions(mlir::func::FuncOp function,
                                     const ImplementationRegistry &implementations);
 mlir::LogicalResult blockStructuredComputations(mlir::func::FuncOp function,
                                     const ImplementationRegistry &implementations);
-mlir::LogicalResult vectorizeLoops(mlir::func::FuncOp function, int64_t width,
-                                   int64_t replicas, int64_t reductionReplicas);
+mlir::LogicalResult vectorizeLoop(mlir::scf::ForOp loop, int64_t width,
+                                  int64_t replicas);
 mlir::LogicalResult partitionTasks(mlir::func::FuncOp function, int64_t grain,
                                  const ImplementationRegistry &implementations);
 mlir::LogicalResult isolateTasks(mlir::func::FuncOp function);

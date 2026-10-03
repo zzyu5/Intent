@@ -367,12 +367,10 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
 
 }
 
-LogicalResult vectorizeLoops(func::FuncOp function, int64_t width, int64_t replicas,
-                            int64_t reductionReplicas) {
-  SmallVector<scf::ForOp> loops;
-  function.walk<WalkOrder::PostOrder>([&](scf::ForOp op) { loops.push_back(op); });
-  for (scf::ForOp loop : loops)
-    vectorize(loop, width, loop.getNumResults() ? reductionReplicas : replicas);
+LogicalResult vectorizeLoop(scf::ForOp loop, int64_t width, int64_t replicas) {
+  if (width <= 0 || replicas <= 0)
+    return loop.emitError("CPU loop vectorization requires positive width and replicas");
+  vectorize(loop, width, replicas);
   return success();
 }
 

@@ -6,6 +6,10 @@ add_mlir_library(MLIRIntentWeftTransforms
   Reductions.cpp
   TaskInterface.cpp
   TaskLowering.cpp
+  TaskViews.cpp
+  TaskStorage.cpp
+  TaskComputations.cpp
+  TaskControl.cpp
   ScalarValues.cpp
   Views.cpp
   DEPENDS IntentWeftTransformsIncGen

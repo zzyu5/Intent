@@ -213,8 +213,14 @@ void declareQuantEncodings(ModuleOp module) {
       b.getDenseI64ArrayAttr({32, 2048, 256}), b.getDenseI64ArrayAttr({}));
 }
 
-LogicalResult expandQuantize(OpBuilder &b, cpu::QuantizeOp operation,
-    Value input, Value output, int64_t &nextAxis) {
+LogicalResult expandQuantize(cpu::QuantizeOp operation,
+                            cpu::ImplementationExpansion &expansion) {
+  OpBuilder &b = expansion.builder();
+  int64_t &nextAxis = expansion.nextAxis();
+  auto inputView = expansion.view(operation.getInput());
+  auto outputView = expansion.view(operation.getOutput());
+  if (failed(inputView) || failed(outputView)) return failure();
+  Value input = *inputView, output = *outputView;
   auto binding = operation->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
   if (!binding)
     return operation.emitError("Q8_K expansion requires its selected Weft implementation");
@@ -265,8 +271,14 @@ LogicalResult expandQuantize(OpBuilder &b, cpu::QuantizeOp operation,
   return success();
 }
 
-FailureOr<Value> expandQuantizedDot(OpBuilder &b, cpu::QuantizedDotOp operation,
-    Value lhs, Value rhs, int64_t &nextAxis) {
+LogicalResult expandQuantizedDot(cpu::QuantizedDotOp operation,
+                                cpu::ImplementationExpansion &expansion) {
+  OpBuilder &b = expansion.builder();
+  int64_t &nextAxis = expansion.nextAxis();
+  auto lhsView = expansion.view(operation.getLhs());
+  auto rhsView = expansion.view(operation.getRhs());
+  if (failed(lhsView) || failed(rhsView)) return failure();
+  Value lhs = *lhsView, rhs = *rhsView;
   Microprogram p{b, operation.getLoc(), nextAxis};
   auto output = cast<MemRefType>(operation.getOutput().getType());
   bool grouped = output.getRank() != 0;
@@ -278,7 +290,7 @@ FailureOr<Value> expandQuantizedDot(OpBuilder &b, cpu::QuantizedDotOp operation,
     auto binding = operation->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
     if (columns != 4 || !binding || !binding.getParameters().get("columns") ||
         cpu::implementationParameter(binding, "columns") != columns)
-      return operation.emitError("grouped quantized dots require the selected four-column matrix implementation"), failure();
+      return operation.emitError("grouped quantized dots require the selected four-column matrix implementation");
   }
   auto state = [&](Type element, Value initial) -> Value {
     return grouped ? Value(b.create<wk::NewOp>(p.loc, p.valueType(element, {columns}, {rowAxis}), initial, true)) : initial;
@@ -337,7 +349,7 @@ FailureOr<Value> expandQuantizedDot(OpBuilder &b, cpu::QuantizedDotOp operation,
     Value term = p.binary(p.field(x, "ds", b.getF32Type(), 0), p.binary(positive, negative, "sub"), "mul");
     b.create<scf::YieldOp>(p.loc, p.binary(records.getRegionIterArgs()[0], term, "add"));
   }
-  return records.getResult(0);
+  return expansion.write(operation.getOutput(), records.getResult(0));
 }
 
 }

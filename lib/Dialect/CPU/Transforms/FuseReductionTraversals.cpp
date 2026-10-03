@@ -62,6 +62,9 @@ memref::StoreOp pointwiseStore(scf::ForOp loop) {
 }
 
 bool fuse(scf::ForOp first, scf::ForOp second, DominanceInfo &dominance) {
+  auto binding = first->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+  if (binding != second->getAttrOfType<ImplementationAttr>("intent_cpu.implementation"))
+    return false;
   if (!readOnlyReduction(second) ||
       !sameBound(first.getLowerBound(), second.getLowerBound()) ||
       !sameBound(first.getUpperBound(), second.getUpperBound()) ||
@@ -99,6 +102,7 @@ bool fuse(scf::ForOp first, scf::ForOp second, DominanceInfo &dominance) {
         order.getAdjacentReassociation() && firstOrder.getAdjacentReassociation(),
         order.getElementPermutation() && firstOrder.getElementPermutation());
   joined->setAttr("intent_cpu.reduction_order", order);
+  if (binding) joined->setAttr("intent_cpu.implementation", binding);
   b.setInsertionPointToStart(joined.getBody());
   SmallVector<Value> yields;
   auto append = [&](scf::ForOp source, unsigned begin) {

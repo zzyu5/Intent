@@ -176,7 +176,8 @@ std::optional<std::string> matchImplementation(
     const Implementation &implementation, Operation *operation,
     CapabilitiesAttr capabilities, const Configuration &configuration,
     ImplementationMatch &match) {
-  if (!implementation.applicable(operation)) return "implementation does not match this computation";
+  if (!implementation.matches(operation))
+    return "implementation does not match this computation";
   if (auto reason = checkInputLayouts(operation, implementation.contraction)) return reason;
   Builder builder(operation->getContext());
   DictionaryAttr parameters;
@@ -218,15 +219,12 @@ ImplementationRegistry::profileParameters(StringRef name) const {
                   : std::nullopt;
 }
 
-bool needsImplementation(Operation *operation) {
-  if (auto function = dyn_cast<func::FuncOp>(operation)) {
-    bool computation = false;
-    function.walk([&](Operation *nested) {
-      computation |= isa<linalg::GenericOp, ReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(nested);
-    });
-    return !function.isExternal() && !computation;
-  }
-  return isa<linalg::GenericOp, ReduceOp, ScanOp, HistogramOp, QuantizeOp, QuantizedDotOp>(operation);
+bool ImplementationRegistry::needsImplementation(Operation *operation) const {
+  if (auto function = dyn_cast<func::FuncOp>(operation); function && function.isExternal())
+    return false;
+  return llvm::any_of(implementations, [&](const Implementation &implementation) {
+    return implementation.operationKind(operation);
+  });
 }
 
 FailureOr<const Implementation *> ImplementationRegistry::lookup(Operation *operation) const {
@@ -238,10 +236,21 @@ FailureOr<const Implementation *> ImplementationRegistry::lookup(Operation *oper
       module ? module->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities") : CapabilitiesAttr(),
       function ? function->getAttrOfType<ConfigurationAttr>("intent_cpu.configuration") : ConfigurationAttr(), operation);
   if (failed(implementation)) return failure();
-  if ((*implementation)->applicable(operation) && !checkInputLayouts(operation, (*implementation)->contraction))
+  if ((*implementation)->matches(operation) &&
+      !checkInputLayouts(operation, (*implementation)->contraction))
     return *implementation;
   operation->emitError("CPU computation has lost its selected implementation binding");
   return failure();
+}
+
+LogicalResult ImplementationRegistry::materialize(Operation *operation) const {
+  auto implementation = lookup(operation);
+  if (failed(implementation)) return failure();
+  if (!(*implementation)->materialize)
+    return operation->emitError(
+        "selected CPU implementation has no structured materialization");
+  auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation");
+  return (*implementation)->materialize(operation, binding);
 }
 
 FailureOr<const Implementation *> ImplementationRegistry::verifyBinding(
@@ -307,7 +316,7 @@ SmallVector<SmallVector<ImplementationAttr>> ImplementationRegistry::candidates(
     auto &computation = computations.emplace_back();
     SmallVector<std::pair<StringRef, std::string>> rejections;
     for (const auto &implementation : implementations) {
-      if (!implementation.applicable(operation)) continue;
+      if (!implementation.matches(operation)) continue;
       ImplementationMatch match;
       if (auto reason = matchImplementation(implementation, operation, capabilities, configuration, match)) {
         rejections.emplace_back(implementation.name, std::move(*reason));
@@ -405,9 +414,8 @@ LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAt
   for (auto [operation, binding] : selected)
     operation->setAttr("intent_cpu.implementation", binding);
   function->setAttr("intent_cpu.configuration", sharedConfiguration(function.getContext(), configuration));
-  // This preserves the selected implementation/parameter identity after local
-  // expansion. Mojo's coordinated vector materialization and provider artifact
-  // metadata consume it; it is not a reclassification of the expanded graph.
+  // This summary records selected implementations for artifact inspection.
+  // Execution consumers use bindings on the current operation or lexical owner.
   function->setAttr("intent_cpu.implementations", builder.getArrayAttr(distinctBindings));
   function->setAttr("intent_cpu.requires_matrix_i8_i32", builder.getBoolAttr(matrix));
   return success();

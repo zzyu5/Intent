@@ -5,6 +5,7 @@
 #include "Intent/Dialect/CPU/Transforms/Configuration.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -82,16 +83,32 @@ struct ImplementationParameter {
   static ImplementationParameter minimum(llvm::StringRef name, int64_t limit, llvm::ArrayRef<Axis> axes);
 };
 
+// Services supplied by the provider's current native conversion. A borrowed
+// view preserves the CPU storage's declared axes; read/write/bind distinguish
+// value materialization, destination updates and source SSA replacement.
+class ImplementationExpansion {
+public:
+  virtual ~ImplementationExpansion() = default;
+  virtual mlir::OpBuilder &builder() = 0;
+  virtual int64_t &nextAxis() = 0;
+  virtual mlir::FailureOr<mlir::Value> view(mlir::Value source) = 0;
+  virtual mlir::FailureOr<mlir::Value> read(mlir::Value source) = 0;
+  virtual mlir::LogicalResult write(mlir::Value destination,
+                                    mlir::Value value) = 0;
+  virtual mlir::LogicalResult bind(mlir::Value sourceResult,
+                                   mlir::Value nativeValue) = 0;
+};
+
 struct Implementation {
   llvm::StringRef name;
+  // Optional per-instance refinement of the registered operation family.
   std::function<bool(mlir::Operation *)> applicable;
   std::function<std::optional<std::string>(mlir::Operation *, CapabilitiesAttr,
                                          const Configuration &)> check;
   llvm::SmallVector<ImplementationParameter, 5> parameters;
   std::function<mlir::LogicalResult(mlir::OpBuilder &, mlir::linalg::GenericOp,
       const ContractionTile &, ConfigurationAttr, ImplementationAttr)> formTile;
-  std::function<mlir::FailureOr<llvm::SmallVector<mlir::Value>>(
-      mlir::OpBuilder &, mlir::Operation *, mlir::ValueRange, int64_t &)> expand;
+  std::function<mlir::LogicalResult(mlir::Operation *, ImplementationExpansion &)> expand;
   ContractionRequirements contraction;
   std::function<int64_t(ImplementationAttr)> parallelWindow;
   bool requiresMatrixI8I32 = false;
@@ -100,6 +117,15 @@ struct Implementation {
   // Leading parallel rows retained together inside one independent work item.
   std::function<int64_t(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
   std::function<std::optional<std::string>(mlir::DictionaryAttr, CapabilitiesAttr)> parameterRelations;
+  std::function<mlir::LogicalResult(mlir::Operation *, ImplementationAttr)> materialize;
+  std::function<mlir::LogicalResult(mlir::scf::ForOp, ImplementationAttr)> vectorize;
+  // The registered operation family is independent of per-instance legality.
+  // A recognized computation with no legal candidate must still be diagnosed.
+  std::function<bool(mlir::Operation *)> operationKind;
+
+  bool matches(mlir::Operation *operation) const {
+    return operationKind(operation) && (!applicable || applicable(operation));
+  }
 
   // A read-only query of the selected implementation's surrounding supply.
   // An empty result requires no preparation; it is not a performance estimate.
@@ -115,8 +141,17 @@ public:
                   llvm::ArrayRef<llvm::StringRef> localParameters);
   std::optional<llvm::ArrayRef<llvm::StringRef>>
   profileParameters(llvm::StringRef name) const;
-  void add(Implementation implementation) { implementations.push_back(std::move(implementation)); }
+  template <typename... Operations>
+  void add(Implementation implementation) {
+    static_assert(sizeof...(Operations) > 0, "declare the implementation's operation family");
+    implementation.operationKind = [](mlir::Operation *operation) {
+      return mlir::isa<Operations...>(operation);
+    };
+    implementations.push_back(std::move(implementation));
+  }
+  bool needsImplementation(mlir::Operation *operation) const;
   mlir::FailureOr<const Implementation *> lookup(mlir::Operation *operation) const;
+  mlir::LogicalResult materialize(mlir::Operation *operation) const;
   // Validate retained bindings without rerunning pre-expansion applicability.
   mlir::FailureOr<const Implementation *> verifyBinding(
       ImplementationAttr binding, CapabilitiesAttr capabilities,
@@ -145,7 +180,6 @@ mlir::FailureOr<const ImplementationRegistry *>
 lookupImplementationProvider(mlir::Operation *operation, llvm::StringRef provider);
 mlir::LogicalResult verifyImplementationBindings(mlir::ModuleOp module, llvm::StringRef provider);
 
-bool needsImplementation(mlir::Operation *operation);
 int64_t implementationParameter(ImplementationAttr binding, llvm::StringRef name);
 
 }

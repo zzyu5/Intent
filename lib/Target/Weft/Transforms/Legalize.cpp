@@ -155,7 +155,11 @@ LogicalResult legalizeProgram(ModuleOp program) {
           llvm::is_contained(argumentPositions, 0u) ? 0 : -1));
       task.erase();
     }
-    if (failed(cpu::materializeStructuredComputations(function))) return failure();
+    if (failed(cpu::materializeStructuredComputations(
+            function, [](Operation *operation) {
+              return cpu::materializeStructuredComputation(operation, 1, {});
+            })))
+      return failure();
   }
   program->setAttr(taskBindingsAttr, ArrayAttr::get(program.getContext(), taskBindings));
   return verifyProgram(program);

@@ -183,36 +183,30 @@ cpu::ImplementationRegistry implementations() {
   auto check = [](Operation *, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
     return std::nullopt;
   };
-  result.add({"weft.scalar_program", [](Operation *op) { return isa<func::FuncOp>(op); },
-      check, {}, {}, {}});
-  result.add({"weft.q8_k", [](Operation *op) { return isa<cpu::QuantizeOp>(op); },
+  result.add<func::FuncOp>({"weft.scalar_program", {}, check, {}, {}, {}});
+  result.add<cpu::QuantizeOp>({"weft.q8_k", {},
       check, {ImplementationParameter::local("chunk", {false, {}, 0, {32, 64}})},
-      {}, [](OpBuilder &b, Operation *operation, ValueRange args, int64_t &nextAxis)
-          -> FailureOr<SmallVector<Value>> {
-        if (failed(expandQuantize(b, cast<cpu::QuantizeOp>(operation), args[0], args[1], nextAxis)))
-          return failure();
-        return SmallVector<Value>{};
+      {}, [](Operation *operation, ImplementationExpansion &expansion) {
+        return expandQuantize(cast<cpu::QuantizeOp>(operation), expansion);
       }});
-  auto quantizedDot = [](OpBuilder &b, Operation *operation, ValueRange args, int64_t &nextAxis)
-          -> FailureOr<SmallVector<Value>> {
-        auto value = expandQuantizedDot(b, cast<cpu::QuantizedDotOp>(operation), args[0], args[1], nextAxis);
-        if (failed(value)) return failure();
-        return SmallVector<Value>{*value};
-      };
+  auto quantizedDot = [](Operation *operation,
+                         ImplementationExpansion &expansion) {
+    return expandQuantizedDot(cast<cpu::QuantizedDotOp>(operation), expansion);
+  };
   auto checkMatrix = [](DictionaryAttr, CapabilitiesAttr capabilities) -> std::optional<std::string> {
     if (!capabilities.getMatrixI8I32()) return "target does not provide signed i8-to-i32 matrix operations";
     if (capabilities.getVectorBits() != 256)
       return "matrix implementation requires vector_bits=256, got " + std::to_string(capabilities.getVectorBits());
     return std::nullopt;
   };
-  Implementation matrixDot{"weft.q4_k_q8_k_matrix", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
+  Implementation matrixDot{"weft.q4_k_q8_k_matrix", {},
       check, {ImplementationParameter::constant("columns", 4)},
       {}, quantizedDot, {}, [](ImplementationAttr binding) {
         return implementationParameter(binding, "columns");
       }, true};
   matrixDot.parameterRelations = checkMatrix;
-  result.add(std::move(matrixDot));
-  result.add({"weft.q4_k_q8_k", [](Operation *op) { return isa<cpu::QuantizedDotOp>(op); },
+  result.add<cpu::QuantizedDotOp>(std::move(matrixDot));
+  result.add<cpu::QuantizedDotOp>({"weft.q4_k_q8_k", {},
       check, {}, {}, quantizedDot});
   Implementation integer{"weft.matrix_i8_i32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
@@ -232,8 +226,8 @@ cpu::ImplementationRegistry implementations() {
         ImplementationParameter::local("micro_k", {false, {}, 0, {8}})},
     formIntegerTile, {}, {true, true, true}, {}, true};
   integer.parameterRelations = checkMatrix;
-  result.add(std::move(integer));
-  result.add({"weft.contract_f32", [](Operation *op) {
+  result.add<linalg::GenericOp>(std::move(integer));
+  result.add<linalg::GenericOp>({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32() &&
@@ -242,13 +236,15 @@ cpu::ImplementationRegistry implementations() {
     }, check, {ImplementationParameter::minimum("panel", 4,
         {ImplementationParameter::Axis::TileM, ImplementationParameter::Axis::TileN})},
     formTile, {}, {true, true, true}});
-  result.add({"weft.structured", [](Operation *op) {
+  Implementation structured{"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
-      return isa<cpu::ReduceOp, cpu::ScanOp, cpu::HistogramOp>(op);
+      return true;
     }, check, {ImplementationParameter::minimum("panel", 4, {ImplementationParameter::Axis::TileN})},
     {}, {}, {}, [](ImplementationAttr binding) {
       return implementationParameter(binding, "panel");
-    }});
+    }};
+  result.add<linalg::GenericOp, cpu::ReduceOp, cpu::ScanOp, cpu::HistogramOp>(
+      std::move(structured));
   return result;
 }
 

@@ -1,4 +1,5 @@
 #include "Intent/Target/Mojo/Transforms/Passes.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "../../../Dialect/CPU/Transforms/Utilities.h"
@@ -16,6 +17,29 @@ SmallVector<ImplementationParameter, 5> vectorParameters() {
   return {ImplementationParameter::local("vector_width", {true, {}, 32, {}}),
       ImplementationParameter::local("register_replicas", {true, 16, 0, {}}),
       ImplementationParameter::local("reduction_replicas", {true, 16, 0, {}})};
+}
+
+ImplementationAttr vectorLoopBinding(ImplementationAttr binding) {
+  Builder builder(binding.getContext());
+  NamedAttrList parameters;
+  for (StringRef name : {"vector_width", "register_replicas", "reduction_replicas"})
+    parameters.append(name, builder.getI64IntegerAttr(implementationParameter(binding, name)));
+  return ImplementationAttr::get(binding.getContext(), builder.getStringAttr("mojo.vector"),
+                                 parameters.getDictionary(binding.getContext()));
+}
+
+LogicalResult materializeVectorComputation(Operation *operation,
+                                          ImplementationAttr binding) {
+  int64_t width = implementationParameter(binding,
+      isa<cpu::ScanOp>(operation) ? "scan_width" : "vector_width");
+  return cpu::materializeStructuredComputation(operation, width,
+                                               vectorLoopBinding(binding));
+}
+
+LogicalResult vectorizeSelectedLoop(scf::ForOp loop, ImplementationAttr binding) {
+  return cpu::vectorizeLoop(loop, implementationParameter(binding, "vector_width"),
+      implementationParameter(binding,
+          loop.getNumResults() ? "reduction_replicas" : "register_replicas"));
 }
 
 Value subview(OpBuilder &b, Location loc, Value source,
@@ -164,8 +188,8 @@ cpu::ImplementationRegistry implementations() {
   contractionParameters.push_back(ImplementationParameter::local("micro_m", {false, 8, 0, {}}));
   contractionParameters.push_back(ImplementationParameter::local("micro_n", {false, 4, 0, {}}));
   Implementation contraction{"mojo.register_float", [](Operation *op) {
-      auto generic = dyn_cast<linalg::GenericOp>(op);
-      return generic && isMatrixContraction(generic) &&
+      auto generic = cast<linalg::GenericOp>(op);
+      return isMatrixContraction(generic) &&
           isa<FloatType>(cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType());
     }, [](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config) -> std::optional<std::string> {
       int64_t width = config.parameter("vector_width"), m = config.parameter("micro_m"), n = config.parameter("micro_n");
@@ -187,6 +211,7 @@ cpu::ImplementationRegistry implementations() {
     if (count > 24) return "micro_m * micro_n requires more than 24 accumulator groups";
     return std::nullopt;
   };
+  contraction.materialize = materializeVectorComputation;
   auto inputRequirements = [](InputReuse reuse) {
     return [reuse](linalg::GenericOp operation, ConfigurationAttr, ImplementationAttr binding) {
       int64_t width = implementationParameter(binding, "vector_width");
@@ -200,11 +225,11 @@ cpu::ImplementationRegistry implementations() {
     Implementation integer = contraction;
     integer.name = name;
     integer.applicable = [](Operation *op) {
-      auto generic = dyn_cast<linalg::GenericOp>(op);
-      return generic && isMatrixContraction(generic) &&
+      auto generic = cast<linalg::GenericOp>(op);
+      return isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isSignlessInteger(32);
     };
-    result.add(integer);
+    result.add<linalg::GenericOp>(integer);
     integer.name = exactFloatName;
     auto integerCheck = integer.check;
     integer.check = [integerCheck](Operation *operation, CapabilitiesAttr capabilities, const Configuration &config)
@@ -219,7 +244,7 @@ cpu::ImplementationRegistry implementations() {
       return std::nullopt;
     };
     integer.parameters.push_back(ImplementationParameter::constant("exact_f32_chunk", 1024));
-    result.add(std::move(integer));
+    result.add<linalg::GenericOp>(std::move(integer));
   };
   contraction.inputs = inputRequirements(InputReuse::Group);
   contraction.check = [directCheck](Operation *op, CapabilitiesAttr capabilities, const Configuration &config)
@@ -236,7 +261,7 @@ cpu::ImplementationRegistry implementations() {
           std::to_string(limit) + " reduction elements";
     return std::nullopt;
   };
-  result.add(contraction);
+  result.add<linalg::GenericOp>(contraction);
   addInteger("mojo.register_integer", "mojo.register_integer_f32");
   contraction.name = "mojo.register_float_shared";
   contraction.inputs = inputRequirements(InputReuse::Consumers);
@@ -250,13 +275,13 @@ cpu::ImplementationRegistry implementations() {
     return std::nullopt;
   };
   contraction.check = sharedCheck;
-  result.add(contraction);
+  result.add<linalg::GenericOp>(contraction);
   addInteger("mojo.register_integer_shared", "mojo.register_integer_f32_shared");
   contraction.name = "mojo.register_float_direct";
   contraction.check = directCheck;
   contraction.contraction.unitInnerStride[1] = true;
   contraction.inputs = {};
-  result.add(contraction);
+  result.add<linalg::GenericOp>(contraction);
   addInteger("mojo.register_integer_direct", "mojo.register_integer_f32_direct");
   contraction.name = "mojo.register_float_widened";
   contraction.contraction.unitInnerStride[1] = false;
@@ -278,32 +303,38 @@ cpu::ImplementationRegistry implementations() {
         {0, element, 1, config.getTileK(), alignment, InputReuse::Consumers, config.getTileK()},
         {1, element, 1, width * implementationParameter(binding, "micro_n"), alignment, InputReuse::Consumers, 1}};
   };
-  result.add(std::move(contraction));
+  result.add<linalg::GenericOp>(std::move(contraction));
   auto check = [](Operation *, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
     return std::nullopt;
   };
   Implementation vector{"mojo.vector", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
-      return isa<cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(op);
+      return true;
     }, check, vectorParameters(), {}, {}};
   vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr) {
     return registerContractionRows(operation);
   };
-  result.add(std::move(vector));
+  vector.materialize = materializeVectorComputation;
+  vector.vectorize = vectorizeSelectedLoop;
+  result.add<linalg::GenericOp, cpu::ReduceOp, cpu::HistogramOp, func::FuncOp>(std::move(vector));
   auto scanParameters = [](bool vectorized) {
     auto fields = vectorParameters();
     fields.push_back(vectorized ? ImplementationParameter::alias("scan_width", "vector_width")
                                : ImplementationParameter::constant("scan_width", 1));
     return fields;
   };
-  result.add({"mojo.scan_scalar", [](Operation *op) { return isa<cpu::ScanOp>(op); },
-      check, scanParameters(false), {}, {}});
-  result.add({"mojo.scan_vector", [](Operation *op) { return isa<cpu::ScanOp>(op); },
+  Implementation scalarScan{"mojo.scan_scalar", {},
+      check, scanParameters(false), {}, {}};
+  scalarScan.materialize = materializeVectorComputation;
+  result.add<cpu::ScanOp>(std::move(scalarScan));
+  Implementation vectorScan{"mojo.scan_vector", {},
       [](Operation *op, CapabilitiesAttr, const Configuration &) -> std::optional<std::string> {
         if (!supportsVectorScan(cast<cpu::ScanOp>(op)))
           return "vector scan requires a source-form innermost scan with supported storage and an elementwise combine";
         return std::nullopt;
-      }, scanParameters(true), {}, {}});
+      }, scanParameters(true), {}, {}};
+  vectorScan.materialize = materializeVectorComputation;
+  result.add<cpu::ScanOp>(std::move(vectorScan));
   return result;
 }
 
