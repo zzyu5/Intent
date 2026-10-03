@@ -121,21 +121,27 @@ Value ScalarRegionLowering::rangeExtent(
     Value stop,
     Value step) {
   Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
-  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   Value distance = createBinary(builder, location, builder.getIndexType(), stop,
                                 start, BinaryOperator::Subtract);
-  Value nonnegative = createBinary(builder, location, builder.getIndexType(),
-                                   distance, zero, BinaryOperator::Maximum);
+  return createBinary(builder, location, builder.getIndexType(),
+                      ceilDivide(location, distance, step), zero,
+                      BinaryOperator::Maximum);
+}
+
+Value ScalarRegionLowering::ceilDivide(Location location, Value numerator,
+                                       Value denominator) {
+  Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
+  Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   Value quotient = createBinary(builder, location, builder.getIndexType(),
-                                 nonnegative, step, BinaryOperator::FloorDivide);
+                                 numerator, denominator, BinaryOperator::FloorDivide);
   Value remainder = createBinary(builder, location, builder.getIndexType(),
-                                  nonnegative, step, BinaryOperator::Remainder);
+                                  numerator, denominator, BinaryOperator::Remainder);
   Value hasTail = createCompare(builder, location, builder.getI1Type(),
                                remainder, zero, ComparePredicate::Ne);
   Value tail = builder.create<gpu::SelectOp>(
       location, builder.getIndexType(), hasTail, one, zero);
-  // For positive step, a nonzero remainder implies quotient < nonnegative;
-  // incrementing the quotient avoids an overflowing distance + step - 1.
+  // Floor division plus a nonzero-remainder increment is signed ceil division;
+  // it does not form an overflowing numerator + denominator - 1.
   return createBinary(builder, location, builder.getIndexType(), quotient, tail,
                       BinaryOperator::Add);
 }
@@ -261,6 +267,17 @@ FailureOr<Value> ScalarRegionLowering::logicalExtent(
   materialization.exactDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
     return createBinary(builder, location, builder.getIndexType(), lhs, rhs,
                         BinaryOperator::FloorDivide);
+  };
+  materialization.subtract = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return createBinary(builder, location, builder.getIndexType(), lhs, rhs,
+                        BinaryOperator::Subtract);
+  };
+  materialization.ceilDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return ceilDivide(location, lhs, rhs);
+  };
+  materialization.maximum = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return createBinary(builder, location, builder.getIndexType(), lhs, rhs,
+                        BinaryOperator::Maximum);
   };
   return materializeLogicalExtent(canonicalAnalysis, value, axis,
                                   materialization, fieldPath);

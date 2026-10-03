@@ -109,6 +109,15 @@ Value Construction::logicalExtent(Value value, unsigned axis, Location loc,
     if (matchPattern(rhs, m_Zero())) return failure();
     return Value(b.createOrFold<arith::DivSIOp>(loc, lhs, rhs));
   };
+  materialization.subtract = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return sub(loc, lhs, rhs);
+  };
+  materialization.ceilDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(b.createOrFold<arith::CeilDivSIOp>(loc, lhs, rhs));
+  };
+  materialization.maximum = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(b.createOrFold<arith::MaxSIOp>(loc, lhs, rhs));
+  };
   auto result = materializeLogicalExtent(analysis, value, axis, materialization,
                                          fieldPath);
   return succeeded(result) ? *result : Value();

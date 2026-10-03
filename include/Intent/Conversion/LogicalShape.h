@@ -16,6 +16,12 @@ struct LogicalShapeReification {
                                                  mlir::OpFoldResult)> multiply;
   std::function<mlir::FailureOr<mlir::OpFoldResult>(mlir::OpFoldResult,
                                                  mlir::OpFoldResult)> exactDivide;
+  std::function<mlir::FailureOr<mlir::OpFoldResult>(mlir::OpFoldResult,
+                                                 mlir::OpFoldResult)> subtract;
+  std::function<mlir::FailureOr<mlir::OpFoldResult>(mlir::OpFoldResult,
+                                                 mlir::OpFoldResult)> ceilDivide;
+  std::function<mlir::FailureOr<mlir::OpFoldResult>(mlir::OpFoldResult,
+                                                 mlir::OpFoldResult)> maximum;
 };
 
 mlir::FailureOr<mlir::OpFoldResult> reifyLogicalExtent(
@@ -31,6 +37,9 @@ struct LogicalShapeMaterialization {
   std::function<mlir::FailureOr<mlir::Value>(const TensorExtentFact &)> leaf;
   std::function<mlir::FailureOr<mlir::Value>(mlir::Value, mlir::Value)> multiply;
   std::function<mlir::FailureOr<mlir::Value>(mlir::Value, mlir::Value)> exactDivide;
+  std::function<mlir::FailureOr<mlir::Value>(mlir::Value, mlir::Value)> subtract;
+  std::function<mlir::FailureOr<mlir::Value>(mlir::Value, mlir::Value)> ceilDivide;
+  std::function<mlir::FailureOr<mlir::Value>(mlir::Value, mlir::Value)> maximum;
 };
 
 // The SSA convenience adapter for the same reifier. Inferred reshape

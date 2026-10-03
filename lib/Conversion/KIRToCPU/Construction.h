@@ -3,6 +3,7 @@
 
 #include "Intent/Analysis/CanonicalKernel.h"
 #include "Intent/Conversion/KIRToCPU/KIRToCPU.h"
+#include "Intent/Conversion/IndexedAccess.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -28,7 +29,8 @@ private:
 
   // Values.cpp
   Value constant(Location loc, int64_t value);
-  FailureOr<Value> indexValue(Value value, Type logicalType, Location loc);
+  static FailureOr<Value> indexValue(OpBuilder &builder, Value value,
+                                     Type logicalType, Location loc);
   Value domainExtent(Value begin, Value end, Value step, Location loc);
   Value lookupLeaf(Value value, ArrayRef<unsigned> fieldPath = {}) const;
   FailureOr<Value> extent(Value value, unsigned axis, Location loc,
@@ -58,19 +60,29 @@ private:
   LogicalResult lower(ExtractOp op);
 
   // Access.cpp
-  LogicalResult verifyIndexTerms(Operation *operation, const IndexRelationFact &fact);
-  SmallVector<Value> indexedCoordinates(const IndexRelationFact &fact,
-                                       Value source, ValueRange members,
-                                       OpBuilder &nested, Location loc);
-  LogicalResult indexedWrite(Operation *operation);
-  FailureOr<Value> indexedRead(Operation *operation, const IndexRelationFact &fact, Value source);
-  LogicalResult atomicAccess(Operation *operation);
-  LogicalResult scatterReduce(ScatterReduceOp operation);
-  FailureOr<Value> indexed(Operation *operation);
   bool alwaysValid(Operation *operation);
   LogicalResult lower(BufferOp op);
   LogicalResult load(Operation *operation);
   LogicalResult store(Operation *operation);
+
+  // Access/Coordinates.cpp: family spelling for the canonical index reifier.
+  IndexTermMaterialization indexMaterialization(OpBuilder &nested, Location loc);
+  FailureOr<SmallVector<Value>> indexedCoordinates(
+      const IndexRelationFact &fact, ValueRange members,
+      OpBuilder &nested, Location loc);
+  static bool hasTensorIndices(const IndexRelationFact &fact);
+
+  // Access/Views.cpp: rectangular value slices and memory descriptors.
+  FailureOr<Value> indexed(Operation *operation);
+
+  // Access/Elements.cpp: value snapshots and unique writes over result members.
+  LogicalResult indexedWrite(Operation *operation);
+  FailureOr<Value> indexedRead(Operation *operation,
+                               const IndexRelationFact &fact, Value source);
+
+  // Access/Atomics.cpp: ordered atomic observations and collision reduction.
+  LogicalResult atomicAccess(Operation *operation);
+  LogicalResult scatterReduce(ScatterReduceOp operation);
 
   // Arithmetic.cpp
   FailureOr<Value> arithmetic(Operation *operation, ValueRange arguments, OpBuilder &builder);

@@ -310,7 +310,7 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 | [Construction.cpp](lib/Conversion/KIRToDSA/Construction.cpp) | 公共参数到原生入口、操作分派、作者控制流与 carry 的生命周期 |
 | [Values.cpp](lib/Conversion/KIRToDSA/Values.cpp) | SSA 物化、标量数值运算、product 字段绑定与控制状态槽 |
 | [Tensors.cpp](lib/Conversion/KIRToDSA/Tensors.cpp) | 局部 shape、storage、已选窗口的投影及逐元素操作 |
-| [Access.cpp](lib/Conversion/KIRToDSA/Access.cpp) | 消费公共 IndexRelation，形成当前窗口的地址、validity 和 load/store |
+| [Access.cpp](lib/Conversion/KIRToDSA/Access.cpp)、[AccessCoordinates.cpp](lib/Conversion/KIRToDSA/AccessCoordinates.cpp) | 消费共同索引物化入口，形成当前窗口的地址、validity 和 load/store；后者绑定逻辑坐标与局部存储坐标 |
 | [Contractions.cpp](lib/Conversion/KIRToDSA/Contractions.cpp) | 消费公共 ContractionAxes，形成局部矩阵、K 遍历和独立 accumulator |
 | [Collectives.cpp](lib/Conversion/KIRToDSA/Collectives.cpp)、[CollectiveConstruction.cpp](lib/Conversion/KIRToDSA/CollectiveConstruction.cpp) | 前者形成 reduce/scan 的 source staging 与局部窗口；后者把 sources、initials、captures、active extents 和完整 helper 写入当前 DSA collective |
 | [Regions.cpp](lib/Conversion/KIRToDSA/Regions.cpp) | region fold/scan 的 source 遍历、summary 和消费者投影 |
@@ -405,7 +405,9 @@ row-major reshape 也不自动成为 transpose。
 以 `OpFoldResult` 接收 family 已绑定的 SSA 或 typed expression；
 `materializeLogicalExtent` 是它的 `Value` 适配入口，两者共用
 [LogicalShape.cpp](lib/Conversion/LogicalShape.cpp) 中同一份 inferred reshape
-乘积／商解释。新增逻辑 shape 规则进入 canonical 查询，family 只实现实际绑定、
+乘积／商解释。索引结果的 slice extent 根据实际 access result/axis 查询原 relation，
+复用共同索引物化的 start/stop/step 与成员数量计算，不把未绑定结果维度交回 family 猜测。
+新增逻辑 shape 规则进入 canonical 查询，family 只实现实际绑定、
 整数运算拼写与物化，不各自解释逻辑尺寸公式或维护全局 dimension 到值的替代表。
 GPU construction 仍可读取显式 `Dim(source)` 的来源关系来选择该 source 当前的
 fragment capacity；这属于物理映射，不将 capacity 返回成作者可观察的逻辑尺寸。
@@ -700,6 +702,31 @@ SSA values 和源轴关系，GPU、CPU、DSA construction 共用这份结果。
 Slice 的 start/stop/step 保留三个位置：静态或缺省位置的 Value 为空，不能压缩后改变槽位。
 这个分析不选择物理 tile、内存布局或读取实现；这些仍由各 family 完成。
 
+[IndexedAccess.h](include/Intent/Conversion/IndexedAccess.h) 的
+`materializeIndexTerm` 在转换点解释完整切片、插入轴、静态或动态坐标、domain、
+slice 与 tensor index。返回的 `IndexRange` 保存逻辑 begin/end/step/count，
+仅供当前转换使用，不是存入 IR 的执行计划。静态负索引使用逻辑 source extent；
+slice 解析既有缺省边界，不附加 Python 的边界 clamp。
+GPU construction 的整数常量运算交给 [BinaryOp 的 fold](lib/Dialect/GPU/IR/Canonicalization.cpp)，
+共用位宽回绕及数学 floor/remainder 规则，不另写宿主 `int64_t` 折叠。
+`materializeIndexCoordinates` 进一步按原 `resultAxes`/`indexAxes` 投影当前逻辑成员，
+处理 tensor index 的单位轴广播，回调只负责实际取值和 index 类型转换。
+共同实现位于 [IndexedAccess.cpp](lib/Conversion/IndexedAccess.cpp)。
+
+CPU 保留 tensor/memref slice 与逐点访问选择；DSA 保留矩形 DMA、GatherRows、
+当前窗口的 begin/count/capacity 和 NRAM 地址；GPU 保留 fragment ownership 前缀、
+MakeRange 的物理容量与 provenance。三者不再分别解释 slice 默认值、负静态索引
+或 advanced-index 坐标公式。Validity/fill 仍从 KIR 接口读取；需要逐点条件访问时，
+坐标物化和实际读取位于有效分支内。`sourceAxes` 描述坐标访问哪个资源轴，不能改变
+原索引操作数的 occurrence 或把相同 SSA 的两次使用合并。
+
+职责对照：本地 MLIR 20 的
+`mlir/lib/Dialect/MemRef/Transforms/FoldMemRefAliasOps.cpp:451–454,618–621`
+让 load/store 共用 offset/stride/dropped-axis 坐标组合，具体访问操作仍各自保留 effects。
+本地 Triton `python/triton/language/semantic.py:1009–1014,1038–1044`
+先将 mask/other 与实际 pointer tensor 对齐，再形成 masked load；Intent 的共同逻辑
+索引解释同样不取代各 family 的物理访问或 predication 合同。
+
 GPU 的 [AccessOpInterface](include/Intent/Dialect/GPU/IR/AccessOpInterface.h) 独立描述
 物理 resource、coordinates/source axes、payload、结果及 validity/fill。
 Footprint、关系闭合、predication、workspace 与 provider 的访问分析读取这份合同。
@@ -789,7 +816,9 @@ KIR 的验证入口直接属于 operation，按合同分布在
 online/additive 合流。它们是组内机制，不是新增独立 pass。
 
 Region 的私有 [RegionCloning.cpp](lib/Dialect/GPU/Transforms/Region/RegionCloning.cpp) 负责
-helper 参数与 source slice 的 extent 绑定及内联；
+helper 参数与 source slice 的 extent 绑定及内联。预先替换的值、clone 结果与 yield
+共用实际绑定的 schema 投影，并更新真实 SSA；只有已经绑定的轴约束物理 extent，
+其余轴保留 producer 的推导。维度变化通过精确轴映射处理，不放宽冲突检查；
 [RegionScanOutputs.cpp](lib/Dialect/GPU/Transforms/Region/RegionScanOutputs.cpp) 负责 scan
 输出消费者的坐标、分段和 tail 克隆。同 rank 的切片变换使用
 `rewriteClonedPhysicalTypes` 保存源操作关系、更新 clone results/formals；不再只改
@@ -853,6 +882,7 @@ GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`
 | GPU 类型与形状属性自身的不变量 | [IR/TypeVerification.h](include/Intent/Dialect/GPU/IR/TypeVerification.h) | `verifyGPUTypeInvariants` 用 MLIR `AttrTypeWalker` 复用各类型/属性的 `verify`；完整 GPU verifier 在操作验证前调用，避免 release 构造绕过 checked constructor 后漏检 |
 | 执行组构造、重建与 provider 展开 | [Transforms/Mapping/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
+| 逐轴均匀性与 extent 来源 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `uniformFragmentAxes` 沿实际 SSA、广播及纯计算的轴关系证明哪些轴不携带独立遍历；归约证明与已有 typed combine 投影资格一致，保留非均匀轴 |
 | 已选执行域的类型提升、轴重映射和克隆 | [Transforms/Value/ExecutionSchema.h](include/Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h) | 实际 `oldToNew`/`executionToNew` 映射与 `cloneWithSchema`；不选择执行轴，不接管 effects 或控制策略 |
 | 普通值运算的 operand/result 轴关系与形状传递 | [IR/FragmentOpInterface.h](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) | 按操作数位置查询；改写前取得关系，传递 extents，数值与重放资格由调用方证明 |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
@@ -1139,7 +1169,10 @@ SSA、product、domain 与 dimension 映射只有一份，完成后由独立 phy
 | 模块 | 构造责任 |
 |---|---|
 | `Values.cpp` | 实际 SSA 绑定、product 展平、domain 与共享 logical extent 的 CPU 物化 |
-| `Access.cpp` | indexed read/write、作者 mutable buffer、原子与 scatter effects |
+| `Access.cpp` | 作者 mutable buffer 与 indexed read/write 分派 |
+| `Access/Coordinates.cpp` | 共同索引物化器的 CPU 绑定、实际 index 值与类型转换 |
+| `Access/Views.cpp` | 矩形 tensor/memref slice、读取 snapshot 与 canonical 返回类型 |
+| `Access/Elements.cpp`、`Access/Atomics.cpp` | 逐成员读取/写入、有效分支、原子及 scatter effects |
 | `Arithmetic.cpp`、`Tensor.cpp` | 数值合同、pointwise 和显式 tensor 形状运算 |
 | `Collectives.cpp` | helper region、reduce/scan、分段 region 与 histogram |
 | `Contractions.cpp` | 普通、稀疏、scaled 与量化 contraction |

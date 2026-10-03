@@ -3,6 +3,10 @@ add_mlir_library(MLIRIntentKIRToCPU
   Construction.cpp
   Values.cpp
   Access.cpp
+  Access/Coordinates.cpp
+  Access/Views.cpp
+  Access/Elements.cpp
+  Access/Atomics.cpp
   Arithmetic.cpp
   Tensor.cpp
   Collectives.cpp

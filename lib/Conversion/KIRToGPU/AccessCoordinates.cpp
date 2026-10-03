@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Conversion/IndexedAccess.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -78,7 +79,7 @@ FailureOr<Value> ScalarRegionLowering::resourceExtent(
 }
 
 FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
-    Operation *operation) {
+    Operation *operation, SmallVectorImpl<int64_t> &sourceAxes) {
   auto relation = canonicalAnalysis.indexRelation(operation);
   if (failed(relation))
     return failure();
@@ -146,6 +147,37 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
         operation->getLoc(), type, start, *extent, step, start, stop, sourceId,
         sourceAxis, derived));
   };
+  Location location = operation->getLoc();
+  IndexTermMaterialization materialization;
+  materialization.constant = [&](int64_t value) -> Value {
+    return builder.create<arith::ConstantIndexOp>(location, value);
+  };
+  materialization.scalar = [&](Value logical) -> FailureOr<Value> {
+    auto value = get(logical);
+    return failed(value) ? FailureOr<Value>(failure())
+                         : asLogicalIndex(location, *value);
+  };
+  materialization.extent = [&](Value logical, unsigned axis) -> FailureOr<Value> {
+    return logicalExtent(location, logical, axis);
+  };
+  materialization.domain = [&](Value logical) -> FailureOr<IndexRange> {
+    auto range = get(logical);
+    if (failed(range) || !isa<gpu::RangeType>(range->getType())) return failure();
+    Value begin = rangeBound(location, *range, 0);
+    Value end = rangeBound(location, *range, 1);
+    Value step = rangeBound(location, *range, 2);
+    return IndexRange{begin, end, step, rangeExtent(location, begin, end, step)};
+  };
+  auto binary = [&](BinaryOperator kind, Value lhs, Value rhs) -> FailureOr<Value> {
+    return createBinary(builder, location, builder.getIndexType(), lhs, rhs, kind);
+  };
+  materialization.add = [&](Value lhs, Value rhs) { return binary(BinaryOperator::Add, lhs, rhs); };
+  materialization.subtract = [&](Value lhs, Value rhs) { return binary(BinaryOperator::Subtract, lhs, rhs); };
+  materialization.multiply = [&](Value lhs, Value rhs) { return binary(BinaryOperator::Multiply, lhs, rhs); };
+  materialization.maximum = [&](Value lhs, Value rhs) { return binary(BinaryOperator::Maximum, lhs, rhs); };
+  materialization.ceilDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return ceilDivide(location, lhs, rhs);
+  };
   for (const IndexTermFact &term : relation->terms) {
     if (!term.sourceAxis)
       continue;
@@ -155,6 +187,19 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
         relation->source.getType(), (*resource).getType(), sourceAxis);
     if (failed(physicalSourceAxis))
       return failure();
+    sourceAxes.push_back(*physicalSourceAxis);
+    auto bindings = materialization;
+    if (term.kind == 0)
+      if (auto fragment = dyn_cast<gpu::FragmentType>(resource->getType()))
+        // The full window of an existing fragment consumes its current physical
+        // value. AT and SLICE still bind the logical source extent above.
+        bindings.extent = [&, fragment](Value, unsigned) {
+          return physicalExtentValue(location,
+              cast<PhysicalExprAttr>(fragment.getShape()[*physicalSourceAxis]));
+        };
+    auto reified = materializeIndexTerm(relation->source, term, bindings);
+    if (failed(reified))
+      return operation->emitOpError("index term has no coordinate materialization"), failure();
     if (term.kind == 0) {
       auto view = dyn_cast<gpu::ViewType>((*resource).getType());
       auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
@@ -168,7 +213,7 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
             "full-slice term has no matching physical source axis");
         return failure();
       }
-      Value start = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 0);
+      Value start = reified->range->begin;
       Value stop;
       uint64_t sourceId;
       PhysicalExprAttr extent;
@@ -238,7 +283,7 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
           return failure();
         extent = *resultPhysicalExtent;
       }
-      Value step = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 1);
+      Value step = reified->range->step;
       FailureOr<Value> coordinate = makeRange(
           logicalSourceAxis, start, stop, step, sourceId, dimension, derived,
           extent);
@@ -247,32 +292,16 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
       coordinates.push_back(*coordinate);
       continue;
     }
-    if (term.kind == 2) {
-      int64_t literal = *term.staticValues[0];
-      Value coordinate = builder.create<arith::ConstantIndexOp>(
-          operation->getLoc(), literal);
-      if (literal < 0) {
-        FailureOr<Value> extent =
-            resourceExtent(operation->getLoc(), *resource,
-                           *physicalSourceAxis);
-        if (failed(extent))
-          return failure();
-        coordinate = createBinary(builder, operation->getLoc(),
-                                  builder.getIndexType(), *extent, coordinate,
-                                  BinaryOperator::Add);
+    if (reified->coordinate || reified->tensor) {
+      Value physicalCoordinate = reified->coordinate;
+      if (reified->tensor) {
+        auto value = get(reified->tensor);
+        if (failed(value)) return failure();
+        physicalCoordinate = *value;
       }
-      coordinates.push_back(coordinate);
-      continue;
-    }
-    if (term.kind == 3) {
-      Value index = term.operands[0];
-      FailureOr<Value> coordinate = get(index);
-      if (failed(coordinate))
-        return failure();
-      Value physicalCoordinate = *coordinate;
       if (auto fragment = dyn_cast<gpu::FragmentType>(physicalCoordinate.getType())) {
-        auto logicalCoordinate =
-            dyn_cast<RankedTensorType>(index.getType());
+        auto logicalCoordinate = reified->tensor
+            ? dyn_cast<RankedTensorType>(reified->tensor.getType()) : RankedTensorType();
         if (logicalCoordinate) {
           if (fragment.getShape().size() < term.indexAxes.size())
             return failure();
@@ -314,9 +343,9 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
       FailureOr<Value> range = get(term.operands[0]);
       if (failed(range) || !isa<gpu::RangeType>((*range).getType()))
         return failure();
-      Value start = rangeBound(operation->getLoc(), *range, 0);
-      Value stop = rangeBound(operation->getLoc(), *range, 1);
-      Value step = rangeBound(operation->getLoc(), *range, 2);
+      Value start = reified->range->begin;
+      Value stop = reified->range->end;
+      Value step = reified->range->step;
       auto rangeType = cast<gpu::RangeType>((*range).getType());
       PhysicalExprAttr fallback = expression(
           operation->getContext(), PhysicalExprKind::Constant, 1);
@@ -390,56 +419,7 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
       coordinates.push_back(*coordinate);
       continue;
     }
-    if (term.kind == 5) {
-      SmallVector<Value> bounds;
-      for (unsigned component = 0; component < 3; ++component) {
-        Value dynamic = term.operands[component];
-        std::optional<int64_t> literal = term.staticValues[component];
-        if (dynamic) {
-          FailureOr<Value> value = get(dynamic);
-          if (failed(value))
-            return failure();
-          bounds.push_back(*value);
-        } else if (literal) {
-          bounds.push_back(builder.create<arith::ConstantIndexOp>(
-              operation->getLoc(), *literal));
-        } else {
-          auto view = dyn_cast<gpu::ViewType>((*resource).getType());
-          auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
-          auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
-          if ((!view && !buffer && !fragment) ||
-              (view && *physicalSourceAxis >= view.getRank()) ||
-              (buffer && *physicalSourceAxis >= buffer.getShape().size()) ||
-              (fragment &&
-               *physicalSourceAxis >= fragment.getShape().size()))
-            return failure();
-          if (component == 0) {
-            bounds.push_back(builder.create<arith::ConstantIndexOp>(
-                operation->getLoc(), 0));
-          } else if (component == 1) {
-            if (view || buffer) {
-              FailureOr<Value> physicalExtent = physicalExtentValue(
-                  operation->getLoc(),
-                  cast<PhysicalExprAttr>(
-                      view ? view.getLayout().getExtents()[*physicalSourceAxis]
-                           : buffer.getShape()[*physicalSourceAxis]));
-              if (failed(physicalExtent))
-                return failure();
-              bounds.push_back(*physicalExtent);
-            } else {
-              FailureOr<Value> physicalExtent = physicalExtentValue(
-                  operation->getLoc(), cast<PhysicalExprAttr>(
-                                           fragment.getShape()[*physicalSourceAxis]));
-              if (failed(physicalExtent))
-                return failure();
-              bounds.push_back(*physicalExtent);
-            }
-          } else {
-            bounds.push_back(builder.create<arith::ConstantIndexOp>(
-                operation->getLoc(), 1));
-          }
-        }
-      }
+    if (reified->range) {
       auto view = dyn_cast<gpu::ViewType>((*resource).getType());
       auto buffer = dyn_cast<gpu::BufferType>((*resource).getType());
       auto fragment = dyn_cast<gpu::FragmentType>((*resource).getType());
@@ -484,7 +464,8 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
       if (dimension <= 0)
         return failure();
       FailureOr<Value> coordinate = makeRange(
-          logicalSourceAxis, bounds[0], bounds[1], bounds[2], sourceId,
+          logicalSourceAxis, reified->range->begin, reified->range->end,
+          reified->range->step, sourceId,
           dimension, derived, extent);
       if (failed(coordinate))
         return failure();
@@ -494,27 +475,6 @@ FailureOr<SmallVector<Value>> ScalarRegionLowering::accessCoordinates(
     return failure();
   }
   return coordinates;
-}
-
-FailureOr<SmallVector<int64_t>> ScalarRegionLowering::sourceAxes(
-    Operation *operation) {
-  auto relation = canonicalAnalysis.indexRelation(operation);
-  if (failed(relation))
-    return failure();
-  FailureOr<Value> resource = get(relation->source);
-  if (failed(resource))
-    return failure();
-  SmallVector<int64_t> axes;
-  for (const IndexTermFact &term : relation->terms) {
-    if (!term.sourceAxis)
-      continue;
-    FailureOr<unsigned> physicalSourceAxis = physicalResourceAxis(
-        relation->source.getType(), (*resource).getType(), *term.sourceAxis);
-    if (failed(physicalSourceAxis))
-      return failure();
-    axes.push_back(*physicalSourceAxis);
-  }
-  return axes;
 }
 
 } // namespace intent::kir_to_gpu

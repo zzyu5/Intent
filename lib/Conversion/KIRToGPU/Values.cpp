@@ -17,29 +17,7 @@ Value createBinary(
     Value lhs,
     Value rhs,
     BinaryOperator kind) {
-  auto left = lhs.getDefiningOp<arith::ConstantOp>();
-  auto right = rhs.getDefiningOp<arith::ConstantOp>();
-  auto leftInteger = left ? dyn_cast<IntegerAttr>(left.getValue()) : IntegerAttr();
-  auto rightInteger = right ? dyn_cast<IntegerAttr>(right.getValue()) : IntegerAttr();
-  if (leftInteger && rightInteger) {
-    int64_t l = leftInteger.getInt();
-    int64_t r = rightInteger.getInt();
-    std::optional<int64_t> folded;
-    if (kind == BinaryOperator::Add)
-      folded = l + r;
-    else if (kind == BinaryOperator::Subtract)
-      folded = l - r;
-    else if (kind == BinaryOperator::Multiply)
-      folded = l * r;
-    else if (kind == BinaryOperator::FloorDivide && r != 0)
-      folded = l / r;
-    else if (kind == BinaryOperator::LogicalAnd)
-      folded = l && r;
-    if (folded)
-      return builder.create<arith::ConstantOp>(
-          location, result, builder.getIntegerAttr(result, *folded));
-  }
-  return builder.create<gpu::BinaryOp>(location, result, lhs, rhs, kind);
+  return builder.createOrFold<gpu::BinaryOp>(location, result, lhs, rhs, kind);
 }
 
 FailureOr<Value> retargetBroadcast(

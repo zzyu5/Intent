@@ -15,7 +15,8 @@ Value Construction::constant(Location loc, int64_t value) {
   return builder.create<arith::ConstantIndexOp>(loc, value);
 }
 
-FailureOr<Value> Construction::indexValue(Value value, Type logicalType, Location loc) {
+FailureOr<Value> Construction::indexValue(OpBuilder &builder, Value value,
+                                         Type logicalType, Location loc) {
   if (value.getType().isIndex()) return value;
   if (isa<IntegerType>(value.getType()) && !value.getType().isInteger(1)) {
     auto integer = dyn_cast<IntegerType>(logicalType);
@@ -85,7 +86,7 @@ FailureOr<Value> Construction::extent(Value value, unsigned axis, Location loc,
     if (fact.constant) return constant(loc, *fact.constant);
     if (fact.value) {
       Value actual = lookupLeaf(fact.value);
-      if (actual) return indexValue(actual, fact.value.getType(), loc);
+      if (actual) return indexValue(builder, actual, fact.value.getType(), loc);
     }
     if (fact.domain) {
       auto found = domains.find(fact.domain);
@@ -100,6 +101,15 @@ FailureOr<Value> Construction::extent(Value value, unsigned axis, Location loc,
   };
   materialization.multiply = [&](Value lhs, Value rhs) -> FailureOr<Value> {
     return Value(builder.createOrFold<arith::MulIOp>(loc, lhs, rhs));
+  };
+  materialization.subtract = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(builder.createOrFold<arith::SubIOp>(loc, lhs, rhs));
+  };
+  materialization.ceilDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(builder.createOrFold<arith::CeilDivSIOp>(loc, lhs, rhs));
+  };
+  materialization.maximum = [&](Value lhs, Value rhs) -> FailureOr<Value> {
+    return Value(builder.createOrFold<arith::MaxSIOp>(loc, lhs, rhs));
   };
   materialization.exactDivide = [&](Value lhs, Value rhs) -> FailureOr<Value> {
     if (matchPattern(rhs, m_Zero()))
@@ -254,9 +264,9 @@ LogicalResult Construction::lower(DomainOp op) {
   Value begin = values.lookup(op.getBounds()[0]);
   Value end = values.lookup(op.getBounds()[1]);
   Value step = op.getBounds().size() == 3 ? values.lookup(op.getBounds()[2]) : constant(loc, 1);
-  auto physicalBegin = indexValue(begin, op.getBounds()[0].getType(), loc);
-  auto physicalEnd = indexValue(end, op.getBounds()[1].getType(), loc);
-  auto physicalStep = indexValue(step, op.getBounds().size() == 3 ? op.getBounds()[2].getType() : builder.getIndexType(), loc);
+  auto physicalBegin = indexValue(builder, begin, op.getBounds()[0].getType(), loc);
+  auto physicalEnd = indexValue(builder, end, op.getBounds()[1].getType(), loc);
+  auto physicalStep = indexValue(builder, step, op.getBounds().size() == 3 ? op.getBounds()[2].getType() : builder.getIndexType(), loc);
   if (failed(physicalBegin) || failed(physicalEnd) || failed(physicalStep)) return failure();
   Value extent = domainExtent(*physicalBegin, *physicalEnd, *physicalStep, loc);
   Domain domain{*physicalBegin, *physicalEnd, *physicalStep, extent};
@@ -272,13 +282,13 @@ LogicalResult Construction::lower(SubregionOp op) {
   unsigned position = 1;
   if (op.getHasStart()) {
     Value input = op.getInputs()[position++];
-    auto start = indexValue(values.lookup(input), input.getType(), loc);
+    auto start = indexValue(builder, values.lookup(input), input.getType(), loc);
     if (failed(start)) return failure();
     domain.begin = *start;
   }
   if (op.getHasStop()) {
     Value input = op.getInputs()[position];
-    auto stop = indexValue(values.lookup(input), input.getType(), loc);
+    auto stop = indexValue(builder, values.lookup(input), input.getType(), loc);
     if (failed(stop)) return failure();
     domain.end = *stop;
   }

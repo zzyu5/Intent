@@ -44,6 +44,50 @@ OpFoldResult SelectOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 OpFoldResult BinaryOp::fold(FoldAdaptor adaptor) {
+  Type result = getResult().getType();
+  if (result.isIntOrIndex()) {
+    auto lhs = dyn_cast_or_null<IntegerAttr>(adaptor.getLhs());
+    auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs());
+    if (!lhs || !rhs || lhs.getType() != result || rhs.getType() != result)
+      return {};
+    APInt left = lhs.getValue(), right = rhs.getValue(), value = left;
+    auto integer = dyn_cast<IntegerType>(result);
+    bool unsignedType = integer &&
+        (integer.isUnsigned() || integer.getWidth() == 1);
+    switch (getOperatorKind()) {
+    case BinaryOperator::Add: value += right; break;
+    case BinaryOperator::Subtract: value -= right; break;
+    case BinaryOperator::Multiply: value *= right; break;
+    case BinaryOperator::FloorDivide:
+    case BinaryOperator::Remainder: {
+      if (right.isZero() || (!unsignedType && left.isMinSignedValue() &&
+                             right.isAllOnes())) return {};
+      APInt quotient = unsignedType ? left.udiv(right) : left.sdiv(right);
+      APInt remainder = unsignedType ? left.urem(right) : left.srem(right);
+      if (!unsignedType && !remainder.isZero() &&
+          left.isNegative() != right.isNegative()) {
+        --quotient;
+        remainder += right;
+      }
+      value = getOperatorKind() == BinaryOperator::FloorDivide
+                  ? quotient : remainder;
+      break;
+    }
+    case BinaryOperator::LogicalAnd:
+      value = APInt(left.getBitWidth(), !left.isZero() && !right.isZero());
+      break;
+    case BinaryOperator::Maximum:
+    case BinaryOperator::MaximumNum:
+      value = (unsignedType ? left.ult(right) : left.slt(right)) ? right : left;
+      break;
+    case BinaryOperator::Minimum:
+    case BinaryOperator::MinimumNum:
+      value = (unsignedType ? left.ult(right) : left.slt(right)) ? left : right;
+      break;
+    default: return {};
+    }
+    return IntegerAttr::get(result, value);
+  }
   if (getOperatorKind() != BinaryOperator::TrueDivide || getApproximate() ||
       getFlushToZero()) return {};
   auto type = dyn_cast<FloatType>(getResult().getType());

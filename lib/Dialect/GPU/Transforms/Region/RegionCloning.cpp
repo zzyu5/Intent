@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 
@@ -34,6 +35,25 @@ const ExtentBinding *findBinding(ArrayRef<ExtentBinding> bindings,
   return found == bindings.end() ? nullptr : &*found;
 }
 
+FailureOr<SmallVector<std::optional<unsigned>>>
+helperAxisProjection(FragmentType expected, FragmentType actual) {
+  SmallVector<std::optional<unsigned>> actualAxes(expected.getShape().size());
+  if (expected.getShape().size() == actual.getShape().size()) {
+    // Formal/actual and original/clone pairs explicitly preserve positions.
+    for (unsigned axis = 0; axis < actualAxes.size(); ++axis)
+      actualAxes[axis] = axis;
+    return actualAxes;
+  }
+  auto projection = queryAxisProjection(expected, actual);
+  if (!projection.isExact()) return failure();
+  for (auto [axis, input] : llvm::enumerate(projection.targetToSource)) {
+    if (!input) continue;
+    if (*input >= actualAxes.size() || actualAxes[*input]) return failure();
+    actualAxes[*input] = axis;
+  }
+  return actualAxes;
+}
+
 LogicalResult collectExtentBindings(Type expected, Type actual,
                                     SmallVectorImpl<ExtentBinding> &bindings,
                                     std::string &reason,
@@ -42,29 +62,10 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
     auto actualFragment = dyn_cast<FragmentType>(actual);
     if (!actualFragment)
       return success();
-    SmallVector<std::optional<unsigned>> actualAxes(
-        expectedFragment.getShape().size());
-    if (expectedFragment.getShape().size() == actualFragment.getShape().size()) {
-      // A helper formal and its actual component, or an operation result and
-      // its clone, have explicit positional axes. Repeated provenance is not
-      // permission to select the first matching occurrence instead.
-      for (unsigned axis = 0; axis < actualAxes.size(); ++axis)
-        actualAxes[axis] = axis;
-    } else {
-      auto projection = queryAxisProjection(expectedFragment, actualFragment);
-      if (!projection.isExact()) {
-        reason = "helper schema refinement has no unique axis projection";
-        return failure();
-      }
-      for (auto [axis, input] : llvm::enumerate(projection.targetToSource)) {
-        if (!input)
-          continue;
-        if (actualAxes[*input]) {
-          reason = "helper schema refinement repeats one source axis";
-          return failure();
-        }
-        actualAxes[*input] = axis;
-      }
+    auto actualAxes = helperAxisProjection(expectedFragment, actualFragment);
+    if (failed(actualAxes)) {
+      reason = "helper schema refinement has no unique axis projection";
+      return failure();
     }
     for (auto [expectedAxis, attribute] :
          llvm::enumerate(expectedFragment.getAxisMaps())) {
@@ -72,7 +73,7 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
           !llvm::is_contained(selectedAxes, expectedAxis))
         continue;
       auto expectedMap = cast<AxisMapAttr>(attribute);
-      std::optional<unsigned> actualAxis = actualAxes[expectedAxis];
+      std::optional<unsigned> actualAxis = (*actualAxes)[expectedAxis];
       if (!actualAxis) {
         reason = "helper schema refinement dropped a selected source axis";
         return failure();
@@ -90,7 +91,20 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
             existing->actualSourceAxis != actualMap.getSourceAxis() ||
             existing->actualDimensionId != actualMap.getDimensionId() ||
             existing->actualDerived != actualMap.getDerived()) {
-          reason = "helper arguments bind one logical axis to incompatible physical extents";
+          reason.clear();
+          llvm::raw_string_ostream message(reason);
+          message << "helper axis has incompatible physical bindings; expected_axis="
+                  << expectedAxis << "; expected_mapping=" << expectedMap
+                  << "; expected_extent="
+                  << expectedFragment.getShape()[expectedAxis]
+                  << "; actual_axis=" << *actualAxis
+                  << "; actual_mapping=" << actualMap
+                  << "; actual_extent=" << extent
+                  << "; previous_mapping=(" << existing->actualSourceId
+                  << ", " << existing->actualSourceAxis << ", "
+                  << existing->actualDimensionId << ", "
+                  << existing->actualDerived << ")"
+                  << "; previous_extent=" << existing->extent;
           return failure();
         }
         continue;
@@ -209,6 +223,59 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
                  : type;
 }
 
+// Preserve extents learned from actual producers except where this helper
+// invocation already supplied an explicit axis binding. Such a binding is a
+// projection request, not permission to change the producer or its other uses.
+Type boundProjectionType(Type original, Type actual,
+                         ArrayRef<ExtentBinding> bindings,
+                         Operation *producer) {
+  if (auto source = dyn_cast<FragmentType>(original)) {
+    auto target = dyn_cast<FragmentType>(actual);
+    if (!target)
+      return actual == source.getElementType()
+          ? bindPhysicalExtents(source, bindings, producer) : Type();
+    auto actualAxes = helperAxisProjection(source, target);
+    if (failed(actualAxes)) return {};
+    auto selected = cast<FragmentType>(
+        bindPhysicalExtents(source, bindings, producer));
+    SmallVector<Attribute> shape(target.getShape().getValue());
+    SmallVector<Attribute> mappings(target.getAxisMaps().getValue());
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+      if (boundAxis(source, axis, bindings, producer)) {
+        if (!(*actualAxes)[axis]) return {};
+        unsigned targetAxis = *(*actualAxes)[axis];
+        shape[targetAxis] = selected.getShape()[axis];
+        auto mapping = cast<AxisMapAttr>(selected.getAxisMaps()[axis]);
+        mappings[targetAxis] = AxisMapAttr::get(
+            actual.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
+            mapping.getDimensionId(), targetAxis, mapping.getDerived());
+      }
+    return FragmentType::get(
+        actual.getContext(), target.getElementType(),
+        ArrayAttr::get(actual.getContext(), shape),
+        ArrayAttr::get(actual.getContext(), mappings),
+        target.getValidity(), target.getOwner());
+  }
+  auto source = dyn_cast<RecordType>(original);
+  if (!source) return actual;
+  auto target = dyn_cast<RecordType>(actual);
+  if (!target || source.getFieldNames() != target.getFieldNames() ||
+      source.getFieldTypes().size() != target.getFieldTypes().size())
+    return {};
+  SmallVector<Attribute> fields;
+  for (auto [before, after] :
+       llvm::zip(source.getFieldTypes(), target.getFieldTypes())) {
+    Type field = boundProjectionType(cast<TypeAttr>(before).getValue(),
+                                    cast<TypeAttr>(after).getValue(),
+                                    bindings, producer);
+    if (!field) return {};
+    fields.push_back(TypeAttr::get(field));
+  }
+  return RecordType::get(actual.getContext(), target.getFieldNames(),
+                         ArrayAttr::get(actual.getContext(), fields),
+                         target.getOwner());
+}
+
 void bindClonedRanges(Operation *root) {
   root->walk([&](MakeRangeOp range) {
     auto originalExtent =
@@ -261,8 +328,11 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   for (auto [argument, value] :
        llvm::zip(region.front().getArguments(), arguments)) {
     if (failed(collectExtentBindings(argument.getType(), value.getType(),
-                                     extentBindings, reason)))
+                                     extentBindings, reason))) {
+      reason = "helper argument " + std::to_string(argument.getArgNumber()) +
+               ": " + reason;
       return failure();
+    }
     mapping.map(argument, value);
   }
   auto conjoin = [&](Value value) -> FailureOr<Value> {
@@ -322,10 +392,45 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   }
   if (additionalSource && additionalTarget)
     mapping.map(additionalSource, additionalTarget);
+  auto projectBound = [&](Value original, Value actual) -> FailureOr<Value> {
+    Type target = boundProjectionType(original.getType(), actual.getType(),
+                                     extentBindings, original.getDefiningOp());
+    auto fail = [&](StringRef message) -> FailureOr<Value> {
+      reason.clear();
+      llvm::raw_string_ostream diagnostic(reason);
+      diagnostic << message << "; source=";
+      if (auto result = dyn_cast<OpResult>(original))
+        diagnostic << result.getOwner()->getName() << " result "
+                   << result.getResultNumber();
+      else
+        diagnostic << "argument " << cast<BlockArgument>(original).getArgNumber();
+      diagnostic << "; original_type=" << original.getType()
+                 << "; actual_type=" << actual.getType();
+      if (target) diagnostic << "; target_type=" << target;
+      return failure();
+    };
+    if (!target)
+      return fail("helper replacement has no exact bound fragment or product projection");
+    auto projected = projectPhysicalValueToSchema(
+        builder, original.getLoc(), actual, target);
+    if (failed(projected))
+      return fail("helper replacement cannot adopt its invocation's bound schema");
+    return projected;
+  };
+  for (BlockArgument argument : region.front().getArguments()) {
+    auto projected = projectBound(argument, mapping.lookup(argument));
+    if (failed(projected)) return failure();
+    mapping.map(argument, *projected);
+  }
   for (Operation &operation : region.front().without_terminator()) {
     if (operation.getNumResults() == 1 &&
-        mapping.lookupOrNull(operation.getResult(0)))
+        mapping.lookupOrNull(operation.getResult(0))) {
+      Value result = operation.getResult(0);
+      auto replacement = projectBound(result, mapping.lookup(result));
+      if (failed(replacement)) return failure();
+      mapping.map(result, *replacement);
       continue;
+    }
     SmallVector<Type> selectedTypes;
     for (Value result : operation.getResults())
       selectedTypes.push_back(bindPhysicalExtents(result.getType(), extentBindings,
@@ -357,9 +462,13 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
     }
     bindClonedRanges(clone);
     for (unsigned index = 0; index < operation.getNumResults(); ++index) {
+      Value originalValue = operation.getResult(index);
+      auto projected = projectBound(originalValue, clone->getResult(index));
+      if (failed(projected)) return failure();
+      mapping.map(originalValue, *projected);
       auto original = dyn_cast<FragmentType>(operation.getResult(index).getType());
       auto selected = dyn_cast<FragmentType>(selectedTypes[index]);
-      auto type = dyn_cast<FragmentType>(clone->getResult(index).getType());
+      auto type = dyn_cast<FragmentType>(projected->getType());
       if (!original || !selected || !type || type == selected)
         continue;
       SmallVector<unsigned> changedAxes;
@@ -371,8 +480,11 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
             changedAxes.push_back(axis);
       if (changedRank || !changedAxes.empty()) {
         if (failed(collectExtentBindings(original, type, extentBindings, reason,
-                                        changedAxes)))
+                                        changedAxes))) {
+          reason = "cloned " + operation.getName().getStringRef().str() +
+                   " result " + std::to_string(index) + ": " + reason;
           return failure();
+        }
       }
     }
     for (auto [source, result] :
@@ -395,7 +507,9 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
       reason = "helper yield is outside the cloned value graph";
       return failure();
     }
-    results.push_back(mapped);
+    auto projected = projectBound(value, mapped);
+    if (failed(projected)) return failure();
+    results.push_back(*projected);
   }
   return results;
 }

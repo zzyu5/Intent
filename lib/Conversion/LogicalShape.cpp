@@ -1,4 +1,5 @@
 #include "Intent/Conversion/LogicalShape.h"
+#include "Intent/Conversion/IndexedAccess.h"
 #include "Intent/Dialect/Intent/IR/IntentOps.h"
 #include "llvm/ADT/ScopeExit.h"
 
@@ -47,6 +48,17 @@ FailureOr<OpFoldResult> reifyLogicalExtent(
     if (fact.source)
       if (OpFoldResult bound = lookup(fact.source, fact.fieldPath, fact.axis))
         return bound;
+    if (fact.source) {
+      Operation *operation = fact.source.getDefiningOp();
+      if (isa_and_nonnull<IndexedAccessOpInterface>(operation)) {
+        auto relation = analysis.indexRelation(operation);
+        if (failed(relation)) return failure();
+        for (const IndexTermFact &term : relation->terms)
+          if (term.kind == 5 && llvm::is_contained(term.resultAxes, fact.axis))
+            return reifyIndexSliceExtent(analysis, relation->source, term,
+                                        reification);
+      }
+    }
     if (!fact.inferred) return reification.leaf(fact);
     auto reshape = fact.source.getDefiningOp<ReshapeOp>();
     if (!reshape || !fact.fieldPath.empty()) return failure();
@@ -106,6 +118,19 @@ FailureOr<Value> materializeLogicalExtent(
     if (failed(result)) return failure();
     return OpFoldResult(*result);
   };
+  using Binary = std::function<FailureOr<Value>(Value, Value)>;
+  auto adapt = [](const Binary &binary) {
+    return [binary](OpFoldResult lhs, OpFoldResult rhs)
+               -> FailureOr<OpFoldResult> {
+      if (!binary) return failure();
+      auto result = binary(cast<Value>(lhs), cast<Value>(rhs));
+      if (failed(result)) return failure();
+      return OpFoldResult(*result);
+    };
+  };
+  callbacks.subtract = adapt(materialization.subtract);
+  callbacks.ceilDivide = adapt(materialization.ceilDivide);
+  callbacks.maximum = adapt(materialization.maximum);
   auto result = reifyLogicalExtent(analysis, value, axis, callbacks, fieldPath);
   if (failed(result)) return failure();
   return cast<Value>(*result);

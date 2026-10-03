@@ -2,6 +2,7 @@
 #define INTENT_CONVERSION_KIRTODSA_CONSTRUCTION_H
 
 #include "Intent/Conversion/KIRToDSA/KIRToDSA.h"
+#include "Intent/Conversion/IndexedAccess.h"
 #include "Intent/Conversion/LogicalShape.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Analysis/CanonicalKernel.h"
@@ -124,8 +125,15 @@ private:
   bool canDefer(Operation *op);
   LogicalResult tensorOperation(Operation *op);
 
-  // Access.cpp: source index relations and external memory accesses.
+  // AccessCoordinates.cpp: logical coordinate reification and local geometry.
+  IndexTermMaterialization indexMaterialization(Location loc);
+  FailureOr<SmallVector<Value>> accessCoordinates(
+      const IndexRelationFact &relation, const LocalShape &shape,
+      ValueRange coordinates, Location loc);
+  FailureOr<AffineIndices> affineAccessTerm(Value source,
+      const IndexTermFact &term, unsigned resultRank, Location loc);
   FailureOr<AffineIndices> affineIndex(Value original);
+  // Access.cpp: physical tile, gathered-row, and element access selection.
   LogicalResult tensorAccess(Operation *op);
   Value stride(Location loc, Value view, int64_t axis);
 

@@ -4,6 +4,7 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   Values.cpp
   Tensors.cpp
   Access.cpp
+  AccessCoordinates.cpp
   Contractions.cpp
   Collectives.cpp
   CollectiveConstruction.cpp

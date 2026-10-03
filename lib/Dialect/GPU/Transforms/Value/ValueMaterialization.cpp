@@ -409,6 +409,31 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
       if (succeeded(projected))
         return *projected;
     }
+  } else if (auto transpose = value.getDefiningOp<TransposeOp>()) {
+    auto input = transpose.getValue().getType();
+    auto relation = queryAxisProjection(source, target);
+    bool projects = source.getShape().size() == target.getShape().size() &&
+        relation.isExact() && llvm::all_of(
+            llvm::enumerate(relation.targetToSource), [](auto item) {
+              return item.value() && *item.value() == item.index();
+            });
+    auto relations = queryFragmentOperandRelations(transpose.getOperation());
+    auto declaredInput = FragmentType::get(
+        target.getContext(), input.getElementType(), input.getShape(),
+        input.getAxisMaps(), target.getValidity(), target.getOwner());
+    // Transport the selected extents through the original permutation. The
+    // producer keeps its own axis occurrences while the result is retiled.
+    auto transported = projects && succeeded(relations) && relations->size() == 1
+        ? transportFragmentOperandType(relations->front(), target, declaredInput)
+        : FailureOr<Type>(failure());
+    if (succeeded(transported)) {
+      auto projected = projectFragmentValue(
+          builder, location, transpose.getValue(), cast<FragmentType>(*transported),
+          changed);
+      if (succeeded(projected))
+        projection = builder.create<TransposeOp>(
+            location, target, *projected, transpose.getPermutation());
+    }
   } else if (auto reshape = value.getDefiningOp<ReshapeOp>()) {
     auto input = cast<FragmentType>(reshape.getValue().getType());
     bool projects = source.getShape().size() == target.getShape().size();

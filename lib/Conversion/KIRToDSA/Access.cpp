@@ -2,108 +2,6 @@
 
 namespace intent::kir_to_dsa {
 
-FailureOr<AffineIndices> Construction::affineIndex(Value original) {
-  Location loc = original.getLoc();
-  auto type = dyn_cast<RankedTensorType>(original.getType());
-  if (!type) {
-    Value scalar = asIndex(get(original), loc);
-    if (!scalar) return failure();
-    return AffineIndices{scalar, {}};
-  }
-  if (!type.getElementType().isIndex() && !type.getElementType().isInteger(64)) return failure();
-  if (auto indices = original.getDefiningOp<IndicesOp>()) {
-    if (!bindDomain(indices.getSource())) return failure();
-    Domain domain = domains.lookup(indices.getSource());
-    return AffineIndices{domain.begin, {domain.step}};
-  }
-  Operation *op = original.getDefiningOp();
-  if (!op) return failure();
-  if (isa<BroadcastOp, FullOp>(op)) {
-    auto source = affineIndex(op->getOperand(0));
-    if (failed(source)) return failure();
-    AffineIndices result{source->base, SmallVector<Value>(type.getRank(), index(loc, 0))};
-    if (auto input = dyn_cast<RankedTensorType>(op->getOperand(0).getType())) {
-      if (input.getRank() > type.getRank()) return failure();
-      unsigned leading = type.getRank() - input.getRank();
-      for (unsigned axis = 0; axis < input.getRank(); ++axis) {
-        if (singletonAxis(op->getOperand(0), axis)) continue;
-        if (!equalAxisExtent(op->getOperand(0), axis, original, leading + axis)) return failure();
-        result.steps[leading + axis] = source->steps[axis];
-      }
-    }
-    return result;
-  }
-  if (auto cast = dyn_cast<CastOp>(op)) {
-    auto input = dyn_cast<RankedTensorType>(cast.getInput().getType());
-    if (!input || (!input.getElementType().isIndex() && !input.getElementType().isInteger(64))) return failure();
-    return affineIndex(cast.getInput());
-  }
-  if (auto transpose = dyn_cast<TransposeOp>(op)) {
-    auto source = affineIndex(transpose.getInput());
-    if (failed(source)) return failure();
-    AffineIndices result{source->base, {}};
-    for (Attribute axis : transpose.getPermutation()) result.steps.push_back(source->steps[cast<IntegerAttr>(axis).getInt()]);
-    return result;
-  }
-  if (auto gather = dyn_cast<GatherOp>(op)) {
-    if (gather.getValid() && !constantTrue(gather.getValid())) return failure();
-    auto relation = analysis.indexRelation(gather);
-    if (failed(relation)) return failure();
-    auto source = affineIndex(relation->source);
-    if (failed(source)) return failure();
-    AffineIndices result{source->base, SmallVector<Value>(type.getRank(), index(loc, 0))};
-    for (const auto &term : relation->terms) {
-      if (term.kind == 1) continue;
-      if (!term.sourceAxis) return failure();
-      Value coefficient = source->steps[*term.sourceAxis];
-      if (term.kind == 0) result.steps[term.resultAxes.front()] = coefficient;
-      else if (term.kind == 4) {
-        if (!bindDomain(term.operands.front())) return failure();
-        Domain domain = domains.lookup(term.operands.front());
-        result.base = add(loc, result.base, mul(loc, coefficient, domain.begin));
-        result.steps[term.resultAxes.front()] = mul(loc, coefficient, domain.step);
-      } else if (term.kind == 2) {
-        int64_t literal = *term.staticValues.front();
-        Value coordinate = index(loc, literal);
-        if (literal < 0) {
-          Value size = logicalExtent(relation->source, *term.sourceAxis, loc);
-          if (!size) return failure();
-          coordinate = add(loc, size, coordinate);
-        }
-        result.base = add(loc, result.base, mul(loc, coefficient, coordinate));
-      } else return failure();
-    }
-    return result;
-  }
-  auto binary = dyn_cast<BinaryOp>(op);
-  if (!binary) return failure();
-  auto lhs = affineIndex(binary.getLhs()), rhs = affineIndex(binary.getRhs());
-  if (failed(lhs) || failed(rhs)) return failure();
-  if (lhs->steps.empty()) lhs->steps.assign(type.getRank(), index(loc, 0));
-  if (rhs->steps.empty()) rhs->steps.assign(type.getRank(), index(loc, 0));
-  if (lhs->steps.size() != type.getRank() || rhs->steps.size() != type.getRank()) return failure();
-  AffineIndices result{Value(), SmallVector<Value>(type.getRank())};
-  if (binary.getOperatorKind() == BinaryOperator::Add || binary.getOperatorKind() == BinaryOperator::Subtract) {
-    bool plus = binary.getOperatorKind() == BinaryOperator::Add;
-    result.base = plus ? add(loc, lhs->base, rhs->base) : sub(loc, lhs->base, rhs->base);
-    for (unsigned axis = 0; axis < type.getRank(); ++axis)
-      result.steps[axis] = plus ? add(loc, lhs->steps[axis], rhs->steps[axis]) : sub(loc, lhs->steps[axis], rhs->steps[axis]);
-    return result;
-  }
-  if (binary.getOperatorKind() == BinaryOperator::Multiply) {
-    auto uniform = [](const AffineIndices &map) { return llvm::all_of(map.steps, [](Value step) { return matchPattern(step, m_Zero()); }); };
-    const AffineIndices *variable = nullptr; Value factor;
-    if (uniform(*lhs)) { variable = &*rhs; factor = lhs->base; }
-    else if (uniform(*rhs)) { variable = &*lhs; factor = rhs->base; }
-    if (variable) {
-      result.base = mul(loc, lhs->base, rhs->base);
-      for (unsigned axis = 0; axis < type.getRank(); ++axis) result.steps[axis] = mul(loc, factor, variable->steps[axis]);
-      return result;
-    }
-  }
-  return failure();
-}
-
 LogicalResult Construction::tensorAccess(Operation *op) {
   auto relation = analysis.indexRelation(op);
   if (failed(relation)) return failure();
@@ -112,6 +10,13 @@ LogicalResult Construction::tensorAccess(Operation *op) {
   bool external = isa<ViewType>(relation->source.getType());
   Value source = get(relation->source);
   if (!source) return op->emitError("DSA indexed source is unavailable");
+  SmallVector<ReifiedIndexTerm> terms;
+  auto materialization = indexMaterialization(loc);
+  for (const auto &term : relation->terms) {
+    auto reified = materializeIndexTerm(relation->source, term, materialization);
+    if (failed(reified)) return op->emitError("DSA logical access coordinate is unavailable");
+    terms.push_back(*reified);
+  }
   auto access = cast<IndexedAccessOpInterface>(op);
   Value original = store ? access.getStoredValue() : op->getResult(0);
   auto tensor = dyn_cast<RankedTensorType>(original.getType());
@@ -137,10 +42,10 @@ LogicalResult Construction::tensorAccess(Operation *op) {
         inputType.getNumElements() == outputType.getNumElements();
     bool complete = true;
     unsigned sourceAxis = 0;
-    for (const auto &term : relation->terms) {
-      if (term.kind != 0 && term.kind != 1) { contiguous = false; break; }
+    for (auto [term, reified] : llvm::zip_equal(relation->terms, terms)) {
+      if (term.sourceAxis && !reified.range) { contiguous = false; break; }
       const auto &target = shape[term.resultAxes.front()];
-      if (term.kind == 1) {
+      if (!term.sourceAxis) {
         contiguous &= target.capacity == 1 && matchPattern(target.extent, m_One()) &&
             matchPattern(target.count, m_One()) && matchPattern(target.begin, m_Zero());
       } else {
@@ -148,6 +53,9 @@ LogicalResult Construction::tensorAccess(Operation *op) {
           contiguous = false; break;
         }
         const auto &input = inputShape[sourceAxis++];
+        contiguous &= matchPattern(reified.range->begin, m_Zero()) &&
+            matchPattern(reified.range->step, m_One()) &&
+            sameIndex(reified.range->count, input.extent);
         complete &= sameIndex(input.count, index(loc, input.capacity));
         contiguous &= input.capacity == target.capacity &&
             sameIndex(input.begin, target.begin) && sameIndex(input.count, target.count) &&
@@ -167,62 +75,29 @@ LogicalResult Construction::tensorAccess(Operation *op) {
   Value fill = !allValid && fallback ? get(fallback) : Value();
   if (!allValid && ((validity && !valid) || (fallback && !fill)))
     return op->emitError("DSA access predicate or fill is unavailable");
-  auto sourceExtent = [&](unsigned axis) -> Value {
-    if (!external) return localShapes.lookup(source)[axis].extent;
-    auto buffer = cast<MemRefType>(source.getType());
-    return buffer.isDynamicDim(axis) ? Value(b.create<memref::DimOp>(loc, source, axis)) : index(loc, buffer.getDimSize(axis));
-  };
-  auto staticCoordinate = [&](const IndexTermFact &term) {
-    int64_t literal = *term.staticValues.front();
-    return literal < 0 ? add(loc, sourceExtent(*term.sourceAxis), index(loc, literal)) : index(loc, literal);
-  };
-
   // Rectangular external accesses preserve arbitrary view strides. Their
   // selected origins and tails are explicit before BANG C serialization.
   bool rectangle = external && allValid && (tensor || !store) && shape.size() <= 2;
-  DenseMap<Value, AffineIndices> affine;
-  for (const auto &term : relation->terms) {
-    rectangle &= term.kind >= 0 && term.kind <= 4;
-    if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
-      auto coordinate = affineIndex(term.operands.front());
-      if (failed(coordinate)) rectangle = false;
-      else affine[term.operands.front()] = *coordinate;
+  SmallVector<AffineIndices> affine;
+  if (rectangle) {
+    for (const auto &term : relation->terms) {
+      if (!term.sourceAxis) continue;
+      auto coordinate = affineAccessTerm(relation->source, term, shape.size(), loc);
+      if (failed(coordinate)) { rectangle = false; break; }
+      affine.push_back(*coordinate);
     }
   }
   if (rectangle) {
     Value offset = index(loc, 0);
     SmallVector<Value> strides(shape.size(), index(loc, 0));
-    for (const auto &term : relation->terms) {
-      if (term.kind == 1) continue;
-      if (!term.sourceAxis) return op->emitError("DSA access has no source axis");
-      Value step = stride(loc, source, *term.sourceAxis), coordinate;
-      if (term.kind == 2) coordinate = staticCoordinate(term);
-      else if (term.kind == 3) {
-        if (auto found = affine.find(term.operands.front()); found != affine.end()) {
-          coordinate = found->second.base;
-          auto type = cast<RankedTensorType>(term.operands.front().getType());
-          for (unsigned axis = 0; axis < type.getRank(); ++axis) {
-            if (singletonAxis(term.operands.front(), axis)) continue;
-            unsigned mapped = term.indexAxes[axis];
-            Value coefficient = found->second.steps[axis];
-            coordinate = add(loc, coordinate, mul(loc, shape[mapped].begin, coefficient));
-            strides[mapped] = add(loc, strides[mapped], mul(loc, step, coefficient));
-          }
-        } else coordinate = asIndex(get(term.operands.front()), loc);
+    for (auto [axis, geometry] : llvm::enumerate(affine)) {
+      Value step = stride(loc, source, axis), coordinate = geometry.base;
+      for (unsigned outputAxis = 0; outputAxis < shape.size(); ++outputAxis) {
+        Value coefficient = geometry.steps[outputAxis];
+        coordinate = add(loc, coordinate, mul(loc, shape[outputAxis].begin, coefficient));
+        strides[outputAxis] = add(loc, strides[outputAxis], mul(loc, step, coefficient));
       }
-      else {
-        unsigned outputAxis = term.resultAxes.front();
-        coordinate = shape[outputAxis].begin;
-        if (term.kind == 4) {
-          if (term.operands.size() != 1 || !bindDomain(term.operands[0])) return op->emitError("DSA access interval is unavailable");
-          Domain domain = domains.lookup(term.operands[0]);
-          coordinate = add(loc, domain.begin, mul(loc, coordinate, domain.step));
-          step = mul(loc, step, domain.step);
-        }
-        strides[outputAxis] = add(loc, strides[outputAxis], step);
-      }
-      if (!coordinate) return op->emitError("DSA scalar address is unavailable");
-      offset = add(loc, offset, mul(loc, coordinate, stride(loc, source, *term.sourceAxis)));
+      offset = add(loc, offset, mul(loc, coordinate, step));
     }
     if (!tensor) {
       Value value = b.create<dsa::LoadScalarOp>(loc, cast<MemRefType>(source.getType()).getElementType(), source, offset);
@@ -241,49 +116,25 @@ LogicalResult Construction::tensorAccess(Operation *op) {
   auto readAt = [&](Value value, ValueRange coordinates) {
     return isa<MemRefType>(value.getType()) ? loadLocal(loc, value, coordinates) : value;
   };
-  DenseMap<Value, Value> indexValues;
-  for (const auto &term : relation->terms) if (term.kind == 3) {
-    Value value = get(term.operands.front());
-    if (!value) return op->emitError("DSA index operand is unavailable");
-    indexValues[term.operands.front()] = value;
-  }
+  // Index tensors are immutable operands. Bind their storage outside a masked
+  // element's branch; only the selected coordinate is loaded inside that branch.
+  for (const auto &term : terms)
+    if (term.tensor && !get(term.tensor))
+      return op->emitError("DSA index operand is unavailable");
   auto locate = [&](ValueRange coordinates, Value &offset, SmallVectorImpl<Value> &sourceCoordinates) -> LogicalResult {
-      offset = index(loc, 0);
-      for (const auto &term : relation->terms) {
-        if (term.kind == 1) continue;
-        if (!term.sourceAxis) return op->emitError("DSA indexing requires explicit source axes");
-        Value coordinate;
-        if (term.kind == 0 || term.kind == 4) {
-          unsigned outputAxis = term.resultAxes.front();
-          coordinate = add(loc, shape[outputAxis].begin, coordinates[outputAxis]);
-          if (term.kind == 4) {
-            if (!bindDomain(term.operands.front())) return op->emitError("DSA index interval is unavailable");
-            Domain domain = domains.lookup(term.operands.front());
-            coordinate = add(loc, domain.begin, mul(loc, coordinate, domain.step));
-          }
-        } else if (term.kind == 2) coordinate = staticCoordinate(term);
-        else if (term.kind == 3 && term.operands.size() == 1) {
-          Value value = indexValues.lookup(term.operands.front());
-          if (!value) return op->emitError("DSA index operand is unavailable");
-          if (auto indexType = dyn_cast<RankedTensorType>(term.operands.front().getType())) {
-            SmallVector<Value> indexCoordinates;
-            const auto &indexShape = localShapes.lookup(value);
-            for (int64_t axis = 0; axis < indexType.getRank(); ++axis) {
-              unsigned mapped = term.indexAxes[axis];
-              bool singleton = indexType.getDimSize(axis) == 1 || matchPattern(indexShape[axis].extent, m_One());
-              indexCoordinates.push_back(singleton ? index(loc, 0) : sub(loc, add(loc, shape[mapped].begin, coordinates[mapped]), indexShape[axis].begin));
-            }
-            coordinate = asIndex(loadLocal(loc, value, indexCoordinates), loc);
-          } else coordinate = asIndex(value, loc);
-        }
-        if (!coordinate) return op->emitError("DSA access index form is not implemented");
-        if (external) offset = add(loc, offset, mul(loc, coordinate, stride(loc, source, *term.sourceAxis)));
-        else {
-          if (!localShapes.count(source)) return op->emitError("DSA gather source has no local axis binding");
-          sourceCoordinates.push_back(sub(loc, coordinate, localShapes.lookup(source)[*term.sourceAxis].begin));
-        }
+    auto logical = accessCoordinates(*relation, shape, coordinates, loc);
+    if (failed(logical)) return op->emitError("DSA access coordinates could not be materialized");
+    offset = index(loc, 0);
+    for (auto [axis, coordinate] : llvm::enumerate(*logical)) {
+      if (external) offset = add(loc, offset, mul(loc, coordinate, stride(loc, source, axis)));
+      else {
+        auto local = localShapes.find(source);
+        if (local == localShapes.end() || axis >= local->second.size())
+          return op->emitError("DSA gather source has no local axis binding");
+        sourceCoordinates.push_back(sub(loc, coordinate, local->second[axis].begin));
       }
-      return success();
+    }
+    return success();
   };
   // Preserve irregular row addresses together with their regular trailing
   // intervals, allowing the target to coalesce rows during local supply.
@@ -311,17 +162,14 @@ LogicalResult Construction::tensorAccess(Operation *op) {
       cast<MemRefType>(source.getType()).getElementType() == cast<MemRefType>(data.getType()).getElementType();
   int columnTerm = -1;
   for (auto [i, term] : llvm::enumerate(relation->terms)) {
-    rowTiles &= term.kind >= 0 && term.kind <= 4;
-    rowTiles &= term.kind == 1 || bool(term.sourceAxis);
-    if (term.kind == 4) rowTiles &= term.operands.size() == 1;
-    if ((term.kind == 0 || term.kind == 4) && term.resultAxes.front() == 1) {
+    const auto &reified = terms[i];
+    if (reified.range && term.resultAxes.front() == 1) {
       rowTiles &= columnTerm < 0;
       columnTerm = i;
     }
-    if (term.kind != 3) continue;
-    auto indexType = dyn_cast<RankedTensorType>(term.operands.front().getType());
-    if (!indexType) continue;
-    auto local = localShapes.find(indexValues.lookup(term.operands.front()));
+    if (!reified.tensor) continue;
+    auto indexType = cast<RankedTensorType>(reified.tensor.getType());
+    auto local = localShapes.find(values.lookupOrNull(reified.tensor));
     if (local == localShapes.end()) { rowTiles = false; continue; }
     for (int64_t axis = 0; axis < indexType.getRank(); ++axis) {
       unsigned mapped = term.indexAxes[axis];
@@ -331,11 +179,8 @@ LogicalResult Construction::tensorAccess(Operation *op) {
   }
   if (rowTiles && columnTerm >= 0) {
     const auto &term = relation->terms[columnTerm];
-    Value columnStride = stride(loc, source, *term.sourceAxis);
-    if (term.kind == 4) {
-      if (!bindDomain(term.operands.front())) return op->emitError("DSA row interval is unavailable");
-      columnStride = mul(loc, columnStride, domains.lookup(term.operands.front()).step);
-    }
+    Value columnStride = mul(loc, stride(loc, source, *term.sourceAxis),
+                             terms[columnTerm].range->step);
     Value offsets = allocate(loc, b.getI64Type(), 1, shape[0].capacity);
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, shape[1].count, index(loc, 0));
     auto branch = b.create<scf::IfOp>(loc, nonempty, false);

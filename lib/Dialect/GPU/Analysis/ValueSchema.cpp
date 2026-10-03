@@ -350,14 +350,17 @@ FailureOr<FragmentType> queryValueSchema(func::FuncOp kernel,
     auto source = dyn_cast<FragmentType>(contributor.getType());
     if (!source)
       continue;
-    // A scalar splat follows the consumer's coordinates. Its old width is not
-    // an independent extent authority when that consumer is retiled.
-    if (uniformScalarSource(contributor))
-      continue;
+    // An axis replicated through a pure value expression follows the
+    // consumer's coordinates; other axes may still own an independent
+    // traversal. Projection materializes the selected schema without
+    // retargeting the original producer or its other users.
+    auto uniformAxes = uniformFragmentAxes(contributor);
     SmallVector<bool> sourceAuthority(source.getShape().size(), false);
     bool hasAuthority = false;
     for (unsigned sourceAxis = 0; sourceAxis < source.getShape().size();
          ++sourceAxis) {
+      if (uniformAxes[sourceAxis])
+        continue;
       PhysicalAxisRealizationFact realization =
           analysis.axisRealization(contributor, sourceAxis);
       auto sourceExtent =

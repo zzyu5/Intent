@@ -115,39 +115,41 @@ LogicalResult ScalarRegionLowering::lower(intent::BufferOp buffer) {
 }
 
 LogicalResult ScalarRegionLowering::lower(intent::GatherOp gather) {
-  Operation *operation = gather.getOperation();
-  Location location = gather.getLoc();
-  FailureOr<Value> source = get(gather.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  return lowerIndexedRead(gather);
+}
+
+LogicalResult ScalarRegionLowering::lowerIndexedRead(Operation *operation) {
+  auto access = cast<IndexedAccessOpInterface>(operation);
+  bool gather = isa<intent::GatherOp>(operation);
+  Location location = operation->getLoc();
+  FailureOr<Value> source = get(access.getAccessSource());
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Type> result = failed(coordinates)
                                ? FailureOr<Type>(failure())
                                : accessResultType(
-                                     operation, gather.getResult().getType(),
+                                     operation, operation->getResult(0).getType(),
                                      *coordinates);
   if (failed(source))
-    return gather.emitOpError("gather physical source is unavailable");
+    return operation->emitOpError("indexed read physical source is unavailable");
   if (failed(coordinates))
-    return gather.emitOpError(
-        "gather index relation has no physical coordinate realization");
-  if (failed(axes))
-    return gather.emitOpError(
-        "gather index relation has no physical source-axis mapping");
+    return operation->emitOpError(
+        "indexed read has no physical coordinate realization");
   if (failed(result))
-    return gather.emitOpError(
-        "gather result cannot preserve the physical coordinate relation");
+    return operation->emitOpError(
+        "indexed read result cannot preserve the physical coordinate relation");
   Value valid;
   Value fill;
-  if (gather.getValid()) {
+  if (access.getAccessValidity()) {
     FailureOr<Value> lowered =
-        get(gather.getValid());
+        get(access.getAccessValidity());
     if (failed(lowered))
       return failure();
     valid = *lowered;
   }
-  if (gather.getFill()) {
+  if (access.getAccessFill()) {
     FailureOr<Value> lowered =
-        get(gather.getFill());
+        get(access.getAccessFill());
     if (failed(lowered))
       return failure();
     fill = *lowered;
@@ -159,40 +161,40 @@ LogicalResult ScalarRegionLowering::lower(intent::GatherOp gather) {
       FailureOr<Value> aligned =
           projectAccessOperand(location, *operand, target);
       if (failed(aligned))
-        return gather.emitOpError(
-            "gather validity/fill cannot adopt its result relation");
+        return operation->emitOpError(
+            "indexed read validity/fill cannot adopt its result relation");
       *operand = *aligned;
     }
   }
   FailureOr<Value> bounded = materializeAccessValidity(
-      operation, *source, *coordinates, *axes, *result, valid);
+      operation, *source, *coordinates, axes, *result, valid);
   if (failed(bounded))
-    return gather.emitOpError(
-        "gather resource bounds cannot be materialized in its result relation");
+    return operation->emitOpError(
+        "indexed read bounds cannot be materialized in its result relation");
   valid = *bounded;
   if (valid && !fill) {
     FailureOr<Value> zero = zeroAccessFill(location, *result);
     if (failed(zero))
-      return gather.emitOpError(
-          "gather resource-bounds validity has no typed fill");
+      return operation->emitOpError(
+          "indexed read bounds validity has no typed fill");
     fill = *zero;
   }
-  if (coordinates->empty() && axes->empty() && source->getType() == *result) {
+  if (gather && coordinates->empty() && axes.empty() && source->getType() == *result) {
     Value target = *source;
     if (valid) {
       target = builder.create<gpu::SelectOp>(location, *result, valid,
                                               target, fill);
       attachOrigin(operation, target.getDefiningOp());
     }
-    values[gather.getResult()] = target;
+    values[operation->getResult(0)] = target;
     return success();
   }
   if (auto scalarTensor = dyn_cast<gpu::FragmentType>(source->getType());
-      scalarTensor && scalarTensor.getShape().empty() &&
-      coordinates->empty() && axes->empty()) {
+      gather && scalarTensor && scalarTensor.getShape().empty() &&
+      coordinates->empty() && axes.empty()) {
     FailureOr<PhysicalAxisIdentity> identity = resultAxisIdentity(operation, 0, 0);
     if (failed(identity))
-      return gather.emitOpError("scalar extraction has no physical value identity");
+      return operation->emitOpError("scalar extraction has no physical value identity");
     auto singleton = fragmentType(
         operation->getContext(), scalarTensor.getElementType(),
         {expression(operation->getContext(), PhysicalExprKind::Constant, 1)},
@@ -203,223 +205,86 @@ LogicalResult ScalarRegionLowering::lower(intent::GatherOp gather) {
     source = Value(builder.create<gpu::ReshapeOp>(
         location, singleton, *source, reassociation));
     coordinates->push_back(builder.create<arith::ConstantIndexOp>(location, 0));
-    axes->push_back(0);
+    axes.push_back(0);
   }
-  auto target = builder.create<gpu::GatherOp>(
-      location, *result, *source, *coordinates, valid, fill, *axes);
-  mapResults(operation, target);
+  if (gather)
+    mapResults(operation, builder.create<gpu::GatherOp>(
+        location, *result, *source, *coordinates, valid, fill, axes));
+  else
+    mapResults(operation, builder.create<gpu::LoadOp>(
+        location, *result, *source, *coordinates, valid, fill, axes));
   return success();
 }
 
 LogicalResult ScalarRegionLowering::lower(intent::ViewLoadOp load) {
-  Operation *operation = load.getOperation();
-  Location location = load.getLoc();
-  FailureOr<Value> resource = get(load.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
-  FailureOr<Type> result = failed(coordinates)
-                               ? FailureOr<Type>(failure())
-                               : accessResultType(
-                                     operation, load.getResult().getType(),
-                                     *coordinates);
-  if (failed(resource))
-    return load.emitOpError("view-load physical resource is unavailable");
-  if (failed(coordinates))
-    return load.emitOpError(
-        "view-load index relation has no physical coordinate realization");
-  if (failed(axes))
-    return load.emitOpError(
-        "view-load index relation has no physical source-axis mapping");
-  if (failed(result))
-    return load.emitOpError(
-        "view-load result cannot preserve the physical coordinate relation");
-  Value valid;
-  Value fill;
-  if (load.getValid()) {
-    FailureOr<Value> lowered =
-        get(load.getValid());
-    if (failed(lowered))
-      return failure();
-    valid = *lowered;
-  }
-  if (load.getFill()) {
-    FailureOr<Value> lowered =
-        get(load.getFill());
-    if (failed(lowered))
-      return failure();
-    fill = *lowered;
-  }
-  if (auto target = dyn_cast<gpu::FragmentType>(*result)) {
-    for (Value *operand : {&valid, &fill}) {
-      if (!*operand)
-        continue;
-      FailureOr<Value> aligned =
-          projectAccessOperand(location, *operand, target);
-      if (failed(aligned))
-        return load.emitOpError(
-            "view-load validity/fill cannot adopt its result relation");
-      *operand = *aligned;
-    }
-  }
-  FailureOr<Value> bounded = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, *result, valid);
-  if (failed(bounded))
-    return load.emitOpError(
-        "view-load resource bounds cannot be materialized in its result relation");
-  valid = *bounded;
-  if (valid && !fill) {
-    FailureOr<Value> zero = zeroAccessFill(location, *result);
-    if (failed(zero))
-      return load.emitOpError(
-          "view-load resource-bounds validity has no typed fill");
-    fill = *zero;
-  }
-  auto target = builder.create<gpu::LoadOp>(
-      location, *result, *resource, *coordinates, valid,
-      fill, *axes);
-  mapResults(operation, target);
-  return success();
+  return lowerIndexedRead(load);
 }
 
 LogicalResult ScalarRegionLowering::lower(intent::BufferLoadOp load) {
-  Operation *operation = load.getOperation();
-  Location location = load.getLoc();
-  FailureOr<Value> resource = get(load.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
-  FailureOr<Type> result = failed(coordinates)
-                               ? FailureOr<Type>(failure())
-                               : accessResultType(
-                                     operation, load.getResult().getType(),
-                                     *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
-      failed(result))
-    return load.emitOpError("buffer load physical relation is unavailable");
-  FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, *result, Value());
-  if (failed(valid))
-    return load.emitOpError(
-        "buffer-load resource bounds cannot be materialized in its result relation");
-  Value fill;
-  if (*valid) {
-    FailureOr<Value> zero = zeroAccessFill(location, *result);
-    if (failed(zero))
-      return load.emitOpError(
-          "buffer-load resource-bounds validity has no typed fill");
-    fill = *zero;
-  }
-  auto target = builder.create<gpu::LoadOp>(
-      location, *result, *resource, *coordinates, *valid, fill, *axes);
-  mapResults(operation, target);
-  return success();
+  return lowerIndexedRead(load);
 }
 
 LogicalResult ScalarRegionLowering::lower(intent::ViewStoreOp store) {
-  Operation *operation = store.getOperation();
-  Location location = store.getLoc();
-  FailureOr<Value> resource = get(store.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
-  FailureOr<Value> value =
-      failed(coordinates)
-          ? FailureOr<Value>(failure())
-          : accessValue(operation,
-                        store.getValue(),
-                        *coordinates);
-  if (failed(resource))
-    return store.emitOpError("view-store physical resource is unavailable");
-  if (failed(coordinates))
-    return store.emitOpError(
-        "view-store index relation has no physical coordinate realization");
-  if (failed(axes))
-    return store.emitOpError(
-        "view-store index relation has no physical source-axis mapping");
-  if (failed(value))
-    return store.emitOpError(
-        "view-store value cannot preserve its physical result relation");
-  FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
-  if (failed(valid))
-    return store.emitOpError(
-        "view-store resource bounds cannot be materialized in its value relation");
-  auto target = builder.create<gpu::StoreOp>(
-      location, *resource, *coordinates, *value, *valid, *axes);
-  if (Attribute node = operation->getAttr("intent.node"))
-    target->setAttr(gpu::originAttr, node);
-  return success();
+  return lowerIndexedWrite(store);
 }
 
-LogicalResult ScalarRegionLowering::lower(intent::BufferStoreOp store) {
-  Operation *operation = store.getOperation();
-  Location location = store.getLoc();
-  FailureOr<Value> resource = get(store.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+LogicalResult ScalarRegionLowering::lowerIndexedWrite(Operation *operation) {
+  auto access = cast<IndexedAccessOpInterface>(operation);
+  Location location = operation->getLoc();
+  FailureOr<Value> resource = get(access.getAccessSource());
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Value> value =
       failed(coordinates)
           ? FailureOr<Value>(failure())
           : accessValue(operation,
-                        store.getValue(),
+                        access.getStoredValue(),
                         *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
-      failed(value))
-    return store.emitOpError("buffer store physical relation is unavailable");
+  if (failed(resource))
+    return operation->emitOpError("indexed write physical resource is unavailable");
+  if (failed(coordinates))
+    return operation->emitOpError(
+        "indexed write has no physical coordinate realization");
+  if (failed(value))
+    return operation->emitOpError(
+        "indexed write value cannot preserve its physical result relation");
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      operation, *resource, *coordinates, axes, (*value).getType(), Value());
   if (failed(valid))
-    return store.emitOpError(
-        "buffer-store resource bounds cannot be materialized in its value relation");
+    return operation->emitOpError(
+        "indexed write bounds cannot be materialized in its value relation");
   auto target = builder.create<gpu::StoreOp>(
-      location, *resource, *coordinates, *value, *valid, *axes);
+      location, *resource, *coordinates, *value, *valid, axes);
   attachOrigin(operation, target);
   return success();
 }
 
+LogicalResult ScalarRegionLowering::lower(intent::BufferStoreOp store) {
+  return lowerIndexedWrite(store);
+}
+
 LogicalResult ScalarRegionLowering::lower(intent::ScatterUniqueOp store) {
-  Operation *operation = store.getOperation();
-  Location location = store.getLoc();
-  FailureOr<Value> resource = get(store.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
-  FailureOr<Value> value =
-      failed(coordinates)
-          ? FailureOr<Value>(failure())
-          : accessValue(operation,
-                        store.getValue(),
-                        *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
-      failed(value))
-    return store.emitOpError("unique scatter is not a scalar physical access");
-  FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
-  if (failed(valid))
-    return store.emitOpError(
-        "unique-scatter resource bounds cannot be materialized in its value relation");
-  auto target = builder.create<gpu::StoreOp>(
-      location, *resource, *coordinates, *value, *valid, *axes);
-  if (Attribute node = operation->getAttr("intent.node"))
-    target->setAttr(gpu::originAttr, node);
-  return success();
+  return lowerIndexedWrite(store);
 }
 
 LogicalResult ScalarRegionLowering::lower(intent::ScatterReduceOp scatter) {
   Operation *operation = scatter.getOperation();
   Location location = scatter.getLoc();
   FailureOr<Value> resource = get(scatter.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Value> value =
       failed(coordinates)
           ? FailureOr<Value>(failure())
           : accessValue(operation,
                         scatter.getValue(),
                         *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
+  if (failed(resource) || failed(coordinates) ||
       failed(value))
     return scatter.emitOpError(
         "scatter-reduce physical relation is unavailable");
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      operation, *resource, *coordinates, axes, (*value).getType(), Value());
   if (failed(valid))
     return scatter.emitOpError(
         "scatter-reduce resource bounds cannot be materialized in its value relation");
@@ -429,7 +294,7 @@ LogicalResult ScalarRegionLowering::lower(intent::ScatterReduceOp scatter) {
   state.addOperands(*value);
   if (*valid)
     state.addOperands(*valid);
-  state.addAttribute("source_axes", builder.getDenseI64ArrayAttr(*axes));
+  state.addAttribute("source_axes", builder.getDenseI64ArrayAttr(axes));
   state.addAttribute(
       "sharing", gpu::AtomicSharingDomainAttr::get(
                      operation->getContext(),
@@ -455,14 +320,14 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicLoadOp atomic) {
   Operation *operation = atomic.getOperation();
   Location location = atomic.getLoc();
   FailureOr<Value> resource = get(atomic.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Type> result =
       failed(coordinates)
           ? FailureOr<Type>(failure())
           : accessResultType(operation, atomic.getResult().getType(),
                              *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
+  if (failed(resource) || failed(coordinates) ||
       failed(result))
     return atomic.emitOpError("atomic load address/result is unavailable");
   gpu::AtomicSharingDomain sharing =
@@ -470,13 +335,13 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicLoadOp atomic) {
           ? gpu::AtomicSharingDomain::KernelInvocation
           : gpu::AtomicSharingDomain::ProgramInstance;
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, *result, Value());
+      operation, *resource, *coordinates, axes, *result, Value());
   if (failed(valid))
     return atomic.emitOpError(
         "atomic-load resource bounds cannot be materialized in its result relation");
   auto target = builder.create<gpu::AtomicLoadOp>(
       location, *result, *resource, *coordinates, *valid,
-      atomic.getOrdering(), sharing, *axes);
+      atomic.getOrdering(), sharing, axes);
   mapResults(operation, target);
   return success();
 }
@@ -485,15 +350,15 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicStoreOp atomic) {
   Operation *operation = atomic.getOperation();
   Location location = atomic.getLoc();
   FailureOr<Value> resource = get(atomic.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Value> value =
       failed(coordinates)
           ? FailureOr<Value>(failure())
           : accessValue(operation,
                         atomic.getValue(),
                         *coordinates);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
+  if (failed(resource) || failed(coordinates) ||
       failed(value))
     return atomic.emitOpError("atomic store address/value is unavailable");
   gpu::AtomicSharingDomain sharing =
@@ -501,13 +366,13 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicStoreOp atomic) {
           ? gpu::AtomicSharingDomain::KernelInvocation
           : gpu::AtomicSharingDomain::ProgramInstance;
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      operation, *resource, *coordinates, axes, (*value).getType(), Value());
   if (failed(valid))
     return atomic.emitOpError(
         "atomic-store resource bounds cannot be materialized in its value relation");
   auto target = builder.create<gpu::AtomicStoreOp>(
       location, *resource, *coordinates, *value, *valid,
-      atomic.getOrdering(), sharing, *axes);
+      atomic.getOrdering(), sharing, axes);
   if (Attribute node = operation->getAttr("intent.node"))
     target->setAttr(gpu::originAttr, node);
   return success();
@@ -517,8 +382,8 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicRMWOp atomic) {
   Operation *operation = atomic.getOperation();
   Location location = atomic.getLoc();
   FailureOr<Value> resource = get(atomic.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Value> value =
       failed(coordinates)
           ? FailureOr<Value>(failure())
@@ -528,7 +393,7 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicRMWOp atomic) {
   FailureOr<Type> result = failed(value)
                                ? FailureOr<Type>(failure())
                                : FailureOr<Type>((*value).getType());
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
+  if (failed(resource) || failed(coordinates) ||
       failed(value) || failed(result))
     return atomic.emitOpError("atomic RMW address/value is unavailable");
   gpu::AtomicSharingDomain sharing =
@@ -536,13 +401,13 @@ LogicalResult ScalarRegionLowering::lower(intent::AtomicRMWOp atomic) {
           ? gpu::AtomicSharingDomain::KernelInvocation
           : gpu::AtomicSharingDomain::ProgramInstance;
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*value).getType(), Value());
+      operation, *resource, *coordinates, axes, (*value).getType(), Value());
   if (failed(valid))
     return atomic.emitOpError(
         "atomic-RMW resource bounds cannot be materialized in its value relation");
   auto target = builder.create<gpu::AtomicRMWOp>(
       location, *result, *resource, *coordinates, *value, *valid,
-      atomic.getKind(), atomic.getOrdering(), sharing, *axes);
+      atomic.getKind(), atomic.getOrdering(), sharing, axes);
   mapResults(operation, target);
   return success();
 }
@@ -552,8 +417,8 @@ LogicalResult ScalarRegionLowering::lower(
   Operation *operation = atomic.getOperation();
   Location location = atomic.getLoc();
   FailureOr<Value> resource = get(atomic.getSource());
-  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation);
-  FailureOr<SmallVector<int64_t>> axes = sourceAxes(operation);
+  SmallVector<int64_t> axes;
+  FailureOr<SmallVector<Value>> coordinates = accessCoordinates(operation, axes);
   FailureOr<Value> expected =
       failed(coordinates)
           ? FailureOr<Value>(failure())
@@ -568,7 +433,7 @@ LogicalResult ScalarRegionLowering::lower(
                         *coordinates);
   FailureOr<Type> result =
       convertDataType(canonicalAnalysis, atomic.getResult().getType(), operation);
-  if (failed(resource) || failed(coordinates) || failed(axes) ||
+  if (failed(resource) || failed(coordinates) ||
       failed(expected) || failed(desired) || failed(result))
     return atomic.emitOpError("compare-exchange address/value is unavailable");
   gpu::AtomicSharingDomain sharing =
@@ -576,14 +441,14 @@ LogicalResult ScalarRegionLowering::lower(
           ? gpu::AtomicSharingDomain::KernelInvocation
           : gpu::AtomicSharingDomain::ProgramInstance;
   FailureOr<Value> valid = materializeAccessValidity(
-      operation, *resource, *coordinates, *axes, (*expected).getType(),
+      operation, *resource, *coordinates, axes, (*expected).getType(),
       Value());
   if (failed(valid))
     return atomic.emitOpError(
         "compare-exchange resource bounds cannot be materialized in its value relation");
   auto target = builder.create<gpu::AtomicCompareExchangeOp>(
       location, *result, *resource, *coordinates, *expected, *desired,
-      *valid, atomic.getOrdering(), sharing, *axes);
+      *valid, atomic.getOrdering(), sharing, axes);
   mapResults(operation, target);
   return success();
 }

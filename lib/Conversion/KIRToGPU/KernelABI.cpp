@@ -202,6 +202,15 @@ FailureOr<PhysicalExprAttr> launchExtentExpression(
   reification.exactDivide = [&](OpFoldResult lhs, OpFoldResult rhs) {
     return binary(PhysicalExprKind::FloorDiv, lhs, rhs);
   };
+  reification.subtract = [&](OpFoldResult lhs, OpFoldResult rhs) {
+    return binary(PhysicalExprKind::Subtract, lhs, rhs);
+  };
+  reification.ceilDivide = [&](OpFoldResult lhs, OpFoldResult rhs) {
+    return binary(PhysicalExprKind::CeilDiv, lhs, rhs);
+  };
+  reification.maximum = [&](OpFoldResult lhs, OpFoldResult rhs) {
+    return binary(PhysicalExprKind::Maximum, lhs, rhs);
+  };
   auto result = reifyLogicalExtent(canonicalAnalysis, value, axis,
                                   reification, fieldPath);
   if (failed(result)) return failure();

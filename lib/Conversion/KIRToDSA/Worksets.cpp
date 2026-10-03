@@ -70,7 +70,7 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
     AxisRequirements sourceAxes(local ? local.getRank() : 0, false);
     for (const auto &term : relation->terms) {
       if (term.kind == 0 && local) sourceAxes[*term.sourceAxis] = requested[term.resultAxes.front()];
-      if (term.kind == 3 && isa<RankedTensorType>(term.operands.front().getType())) {
+      if (!term.indexAxes.empty()) {
         Value indices = term.operands.front();
         auto type = cast<RankedTensorType>(indices.getType());
         AxisRequirements indexAxes(type.getRank(), false);
@@ -348,23 +348,17 @@ Value Construction::independentRowControl(Block &block) {
       if (write && !type) return WalkResult::interrupt();
       unsigned projected = 0;
       int64_t dimension = type ? cast<TensorShapeAttr>(type.getEncoding()).getDimensions()[0] : 0;
-      auto sourceType = cast<RankedTensorType>(view.getTensor());
-      auto sourceIds = cast<TensorShapeAttr>(sourceType.getEncoding()).getDimensions();
       for (const auto &term : relation->terms) {
-        if (term.kind == 0) {
-          if (!type || !term.sourceAxis || sourceIds[*term.sourceAxis] != dimension)
+        // The canonical access owns the result-axis occurrence. Row slicing
+        // needs one coordinate-producing result axis and scalar dependencies;
+        // it does not reinterpret the source domain's defining operation.
+        if (!term.resultAxes.empty()) {
+          if (!type || !term.sourceAxis || !term.indexAxes.empty() ||
+              term.resultAxes.size() != 1 || term.resultAxes.front() != 0 ||
+              relation->resultDimensionIdentities.front() != dimension)
             return WalkResult::interrupt();
           ++projected;
-        } else if (term.kind == 4) {
-          if (!type || term.operands.size() != 1) return WalkResult::interrupt();
-          Operation *domain = term.operands.front().getDefiningOp();
-          ArrayAttr identities;
-          if (auto range = dyn_cast_or_null<DomainOp>(domain)) identities = range.getExtentDimensions();
-          else if (auto range = dyn_cast_or_null<SubregionOp>(domain)) identities = range.getExtentDimensions();
-          if (!identities || identities.size() != 1 || cast<IntegerAttr>(identities[0]).getInt() != dimension)
-            return WalkResult::interrupt();
-          ++projected;
-        } else if (term.kind != 2 && term.kind != 3) return WalkResult::interrupt();
+        }
         for (Value operand : term.operands)
           if (operand && !scalar(operand)) return WalkResult::interrupt();
       }

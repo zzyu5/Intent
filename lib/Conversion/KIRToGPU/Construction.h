@@ -218,6 +218,8 @@ private:
 
   Value rangeExtent(Location location, Value start, Value stop, Value step);
 
+  Value ceilDivide(Location location, Value numerator, Value denominator);
+
   Value rangeBound(Location location, Value range, unsigned bound);
 
   FailureOr<Value> physicalExtentValue(
@@ -241,9 +243,8 @@ private:
       Value resource,
       unsigned axis);
 
-  FailureOr<SmallVector<Value>> accessCoordinates(Operation *operation);
-
-  FailureOr<SmallVector<int64_t>> sourceAxes(Operation *operation);
+  FailureOr<SmallVector<Value>> accessCoordinates(
+      Operation *operation, SmallVectorImpl<int64_t> &sourceAxes);
 
   FailureOr<Type> accessResultType(
       Operation *operation,
@@ -274,6 +275,10 @@ private:
       Value existing);
 
   FailureOr<Value> zeroAccessFill(Location location, Type type);
+
+  LogicalResult lowerIndexedRead(Operation *operation);
+
+  LogicalResult lowerIndexedWrite(Operation *operation);
 
   LogicalResult lower(intent::ConstantOp constant);
 
