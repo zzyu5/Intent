@@ -4,6 +4,7 @@
 #include "TaskInterface.h"
 #include "Quantization.h"
 #include "Reductions.h"
+#include "ScalarValues.h"
 #include "Intent/Dialect/CPU/Analysis/AxisRelations.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -253,14 +254,7 @@ private:
     return wk::ViewType::get(b.getContext(), dense(type), array({1}), array({nextAxis++}));
   }
   Type valueType(Type element, ArrayRef<int64_t> dimensions, ArrayRef<int64_t> ids) {
-    element = scalarType(element);
-    if (dimensions.empty()) return element;
-    return wk::ValueType::get(b.getContext(), element, array(dimensions), array(ids));
-  }
-  Type scalarType(Type type) {
-    if (auto integer = dyn_cast<IntegerType>(type); integer && integer.isSignless() && integer.getWidth() != 1)
-      return IntegerType::get(b.getContext(), integer.getWidth(), IntegerType::Signed);
-    return type;
+    return nativeValueType(element, dimensions, ids);
   }
   Value index(Location loc, int64_t value) { return b.create<arith::ConstantIndexOp>(loc, value); }
   FailureOr<Type> resultType(Value memory, Type scalar = {}) {
@@ -1114,112 +1108,20 @@ private:
     return success();
   }
 
-  FailureOr<Type> pointwiseType(Value lhs, Value rhs) {
-    if (element(lhs.getType()) != element(rhs.getType())) return failure();
-    auto dimensions = shape(lhs.getType()), ids = axes(lhs.getType());
-    auto rightAxes = axes(rhs.getType()), rightShape = shape(rhs.getType());
-    for (auto [axis, extent] : llvm::zip(rightAxes, rightShape)) {
-      auto it = llvm::find(ids, axis);
-      if (it == ids.end()) { ids.push_back(axis); dimensions.push_back(extent); }
-      else {
-        auto &left = dimensions[it - ids.begin()];
-        if (left == 1) left = extent;
-        else if (extent != 1 && extent != left) return failure();
-      }
-    }
-    return valueType(element(lhs.getType()), dimensions, ids);
-  }
-
   FailureOr<Value> binary(Location loc, Value lhs, Value rhs, StringRef kind) {
-    auto type = pointwiseType(lhs, rhs);
-    if (failed(type)) { emitError(loc, "Weft pointwise operands have incompatible axis/extent relations"); return failure(); }
-    return Value(b.create<wk::BinaryOp>(loc, *type, lhs, rhs, kind));
+    return createBinaryValue(b, loc, lhs, rhs, kind);
   }
 
   FailureOr<Value> expression(Operation *operation, IRMapping &mapping) {
-    Location loc = operation->getLoc();
-    if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
-      Type type = scalarType(constant.getType());
-      if (type == constant.getType()) return b.clone(*constant, mapping)->getResult(0);
-      Attribute value = constant.getValue();
-      if (auto integer = dyn_cast<IntegerAttr>(value)) value = b.getIntegerAttr(type, integer.getValue());
-      return Value(b.create<wk::ConstantOp>(loc, type, value));
-    }
     SmallVector<Value> operands;
-    for (Value operand : operation->getOperands()) operands.push_back(mapping.lookup(operand));
-    StringRef kind;
-    if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
-      switch (compare.getPredicate()) {
-      case arith::CmpIPredicate::eq: kind = "eq"; break;
-      case arith::CmpIPredicate::ne: kind = "ne"; break;
-      case arith::CmpIPredicate::slt: kind = "lt"; break;
-      case arith::CmpIPredicate::sle: kind = "le"; break;
-      case arith::CmpIPredicate::sgt: kind = "gt"; break;
-      case arith::CmpIPredicate::sge: kind = "ge"; break;
-      default: return compare.emitError("unsigned comparison requires unsigned Weft operands"), failure();
-      }
-    } else if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
-      switch (compare.getPredicate()) {
-      case arith::CmpFPredicate::OEQ: kind = "eq"; break;
-      case arith::CmpFPredicate::UNE: kind = "ne"; break;
-      case arith::CmpFPredicate::OLT: kind = "lt"; break;
-      case arith::CmpFPredicate::OLE: kind = "le"; break;
-      case arith::CmpFPredicate::OGT: kind = "gt"; break;
-      case arith::CmpFPredicate::OGE: kind = "ge"; break;
-      default: return compare.emitError("floating comparison has no exact Weft predicate mapping"), failure();
-      }
+    for (Value operand : operation->getOperands()) {
+      Value mapped = mapping.lookupOrNull(operand);
+      if (!mapped)
+        return operation->emitError("Weft scalar operand has no current value binding"),
+               failure();
+      operands.push_back(mapped);
     }
-    if (!kind.empty()) {
-      auto domain = pointwiseType(operands[0], operands[1]);
-      if (failed(domain)) return operation->emitError("comparison domains disagree"), failure();
-      return Value(b.create<wk::CompareOp>(loc,
-          valueType(b.getI1Type(), shape(*domain), axes(*domain)), operands[0], operands[1], kind));
-    }
-    if (isa<arith::SelectOp>(operation)) {
-      auto domain = pointwiseType(operands[1], operands[2]);
-      if (failed(domain)) return operation->emitError("select branch domains disagree"), failure();
-      auto dimensions = shape(*domain), ids = axes(*domain);
-      for (auto [axis, extent] : llvm::zip(axes(operands[0].getType()), shape(operands[0].getType()))) {
-        auto found = llvm::find(ids, axis);
-        if (found == ids.end()) { ids.push_back(axis); dimensions.push_back(extent); }
-        else if (dimensions[found - ids.begin()] == 1) dimensions[found - ids.begin()] = extent;
-        else if (extent != 1 && extent != dimensions[found - ids.begin()])
-          return operation->emitError("select predicate domain disagrees with branches"), failure();
-      }
-      return Value(b.create<wk::SelectOp>(loc, valueType(element(*domain), dimensions, ids),
-          operands[0], operands[1], operands[2]));
-    }
-    if (isa<arith::AddFOp, arith::AddIOp>(operation)) kind = "add";
-    else if (isa<arith::SubFOp, arith::SubIOp>(operation)) kind = "sub";
-    else if (isa<arith::MulFOp, arith::MulIOp>(operation)) kind = "mul";
-    else if (isa<arith::DivFOp, arith::DivSIOp>(operation)) kind = "div";
-    else if (isa<arith::RemSIOp>(operation)) kind = "mod";
-    else if (isa<arith::MaxNumFOp>(operation)) kind = "max";
-    else if (isa<arith::MinNumFOp>(operation)) kind = "min";
-    else if (isa<arith::MaximumFOp>(operation)) kind = "maximum";
-    else if (isa<arith::MinimumFOp>(operation)) kind = "minimum";
-    else if (isa<arith::AndIOp>(operation)) kind = "and";
-    else if (isa<arith::OrIOp>(operation)) kind = "or";
-    else if (isa<arith::XOrIOp>(operation)) kind = "xor";
-    if (!kind.empty()) return binary(loc, operands[0], operands[1], kind);
-    if (isa<arith::MinSIOp, arith::MaxSIOp>(operation))
-      return binary(loc, operands[0], operands[1], isa<arith::MinSIOp>(operation) ? "min" : "max");
-    if (auto divide = dyn_cast<arith::CeilDivSIOp>(operation)) {
-      auto minusOne = binary(loc, operands[1], index(loc, 1), "sub");
-      if (failed(minusOne)) return failure();
-      auto sum = binary(loc, operands[0], *minusOne, "add");
-      if (failed(sum)) return failure();
-      return binary(loc, *sum, operands[1], "div");
-    }
-    if (isa<arith::IndexCastOp, arith::SIToFPOp, arith::FPToSIOp, arith::ExtFOp, arith::TruncFOp, arith::ExtSIOp>(operation))
-      return Value(b.create<wk::CastOp>(loc, valueType(operation->getResult(0).getType(),
-          shape(operands[0].getType()), axes(operands[0].getType())), operands[0]));
-    if (isa<math::RsqrtOp>(operation)) kind = "rsqrt";
-    else if (isa<math::ExpOp>(operation)) kind = "exp";
-    else if (isa<arith::NegFOp>(operation)) kind = "neg";
-    if (!kind.empty()) return Value(b.create<wk::UnaryOp>(loc, operands[0].getType(), operands[0], kind));
-    operation->emitError("CPU operation has no Weft numerical representation");
-    return failure();
+    return lowerScalarValue(b, operation, operands);
   }
 
   FailureOr<Value> mappedInput(Value input, AffineMap map, ArrayRef<int64_t> loopAxes, bool namedAxes = false) {
@@ -1631,7 +1533,7 @@ private:
   FailureOr<SmallVector<Type>> controlTypes(ValueRange boundaries) {
     SmallVector<Type> result;
     for (Value value : boundaries) {
-      if (!isa<MemRefType>(value.getType())) result.push_back(scalarType(value.getType()));
+      if (!isa<MemRefType>(value.getType())) result.push_back(nativeScalarType(value.getType()));
       else if (controlOwners.contains(value)) {
         auto type = resultType(value);
         if (failed(type)) return failure();

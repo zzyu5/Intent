@@ -6,6 +6,7 @@ add_mlir_library(MLIRIntentWeftTransforms
   Reductions.cpp
   TaskInterface.cpp
   TaskLowering.cpp
+  ScalarValues.cpp
   Views.cpp
   DEPENDS IntentWeftTransformsIncGen
   LINK_LIBS PUBLIC
@@ -13,6 +14,7 @@ add_mlir_library(MLIRIntentWeftTransforms
   MLIRIntentWeftDialect
   MLIRIntentCPUAnalysis
   MLIRIntentCPUTransforms
+  MLIRIntentScalarSerialization
   MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect
