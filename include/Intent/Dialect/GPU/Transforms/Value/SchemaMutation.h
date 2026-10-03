@@ -7,6 +7,9 @@
 namespace intent::gpu {
 
 using ValueTypeChangeCallback = llvm::function_ref<void(mlir::Value, mlir::Type)>;
+using ClonedAxisRefinement =
+    llvm::function_ref<bool(mlir::OpOperand &source, unsigned sourceAxis,
+                           mlir::OpResult result, unsigned resultAxis)>;
 
 void setPhysicalValueType(mlir::Value value, mlir::Type type,
                           ValueTypeChangeCallback changed = {});
@@ -15,10 +18,13 @@ void setPhysicalValueType(mlir::Value value, mlir::Type type,
 // before changing clone results/formals; transport those relations using the
 // actual remapped clone operands. transform receives the unchanged source Value
 // and returns its clone's selected type. A null type is unsupported.
+// refineBroadcast proves a common selected coordinate domain for original
+// operand/result slots; equal selected shapes alone are not sufficient proof.
 mlir::LogicalResult rewriteClonedPhysicalTypes(
     mlir::Operation *source, mlir::Operation *clone,
     llvm::function_ref<mlir::Type(mlir::Value)> transform,
-    ValueTypeChangeCallback changed = {});
+    ValueTypeChangeCallback changed = {},
+    ClonedAxisRefinement refineBroadcast = {});
 
 bool hasSchemaBoundary(mlir::Operation *operation);
 

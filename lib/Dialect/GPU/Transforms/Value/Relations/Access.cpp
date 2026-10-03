@@ -25,15 +25,13 @@ WalkResult alignAccessResult(Operation *operation, RelationWorklist &changes) {
       diagnostic << "; coordinate=" << coordinate.getType();
     return WalkResult::interrupt();
   }
-  for (auto [axis, mapping] : llvm::enumerate((*refined).getAxisMaps())) {
+  for (unsigned axis = 0; axis < (*refined).getShape().size(); ++axis) {
     if (axis >= current.getShape().size() ||
         current.getShape()[axis] == (*refined).getShape()[axis])
       continue;
-    if (failed(retargetSourceExtent(
-            result, sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-            cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-            cast<AxisMapAttr>(mapping).getDimensionId(), changes.typeChanged(),
-            &changes)))
+    if (failed(retargetFragmentAxisExtent(
+            result, axis, cast<PhysicalExprAttr>((*refined).getShape()[axis]),
+            changes.typeChanged(), &changes)))
       return WalkResult::interrupt();
   }
   changes.setType(result, *refined);
@@ -61,27 +59,35 @@ LogicalResult alignAccessValue(Operation *operation,
     auto payload = dyn_cast<FragmentType>(valueType);
     if (!payload)
       return success();
-    PhysicalProgramAnalysis analysis(kernel);
     for (auto [slot, coordinate] :
          llvm::enumerate(access.getAccessCoordinates())) {
       auto type = dyn_cast<FragmentType>(coordinate.getType());
       if (!type)
         continue;
+      PhysicalProgramAnalysis analysis(kernel);
       SmallVector<Attribute> shape(type.getShape().begin(),
                                    type.getShape().end());
       bool changed = false;
-      for (auto [axis, attribute] : llvm::enumerate(type.getAxisMaps())) {
-        auto mapping = cast<AxisMapAttr>(attribute);
-        auto projection =
-            queryFragmentAxis(payload, sourceAxisIdentity(mapping));
-        if (!projection.isExact() ||
-            projection.dimensionId != mapping.getDimensionId() ||
-            shape[axis] == payload.getShape()[projection.fragmentAxis])
+      auto relation = queryAccessCoordinateAxes(access, slot);
+      if (relation.state == BroadcastProjectionState::Ambiguous)
+        return access.emitOpError("coordinate has ambiguous payload axes");
+      for (auto [payloadAxis, coordinateAxis] :
+           llvm::enumerate(relation.targetToSource)) {
+        if (!coordinateAxis)
+          continue;
+        unsigned axis = *coordinateAxis;
+        auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+        auto payloadMapping =
+            cast<AxisMapAttr>(payload.getAxisMaps()[payloadAxis]);
+        // The access owns the axis occurrence. Extent equality or a repeated
+        // source identity alone cannot select a coordinate's payload slot.
+        if (mapping.getDimensionId() != payloadMapping.getDimensionId() ||
+            shape[axis] == payload.getShape()[payloadAxis])
           continue;
         PhysicalRangeFact ranges = analysis.axisRanges(coordinate, axis);
         if (!ranges.isExact() || !ranges.roots.empty())
           continue;
-        shape[axis] = payload.getShape()[projection.fragmentAxis];
+        shape[axis] = payload.getShape()[payloadAxis];
         changed = true;
       }
       auto permutation = queryAxisPermutation(type, payload);
@@ -186,8 +192,8 @@ LogicalResult alignAccessValue(Operation *operation,
   // extents and coordinate provenance separate: the value does not acquire
   // the view's source identity, and the address does not overwrite a verified
   // row-major reshape decision.
-  PhysicalProgramAnalysis analysis(kernel);
   for (unsigned axis = 0; axis < currentType.getShape().size(); ++axis) {
+    PhysicalProgramAnalysis analysis(kernel);
     PhysicalAxisRealizationFact realization =
         analysis.axisRealization(store.getValue(), axis);
     if (!realization.hasExtentAuthority())
@@ -204,16 +210,14 @@ LogicalResult alignAccessValue(Operation *operation,
       if (axis >= relation.targetToSource.size() ||
           !relation.targetToSource[axis])
         continue;
-      PhysicalAxisProjection projection =
-          queryFragmentAxis(coordinateType, sourceAxisIdentity(mapping));
-      if (!projection.isExact() ||
-          projection.fragmentAxis != *relation.targetToSource[axis] ||
-          projection.dimensionId != mapping.getDimensionId() ||
-          coordinateType.getShape()[projection.fragmentAxis] == extent)
+      unsigned coordinateAxis = *relation.targetToSource[axis];
+      auto coordinateMapping =
+          cast<AxisMapAttr>(coordinateType.getAxisMaps()[coordinateAxis]);
+      if (coordinateMapping.getDimensionId() != mapping.getDimensionId() ||
+          coordinateType.getShape()[coordinateAxis] == extent)
         continue;
-      if (failed(retargetSourceExtent(coordinate, projection.source, extent,
-                                      projection.dimensionId,
-                                      changes.typeChanged(), &changes)))
+      if (failed(retargetFragmentAxisExtent(coordinate, coordinateAxis, extent,
+                                            changes.typeChanged(), &changes)))
         return failure();
     }
   }
@@ -233,9 +237,9 @@ LogicalResult alignAccessValue(Operation *operation,
     if (dimension <= 0)
       return store.emitOpError(
           "store coordinate refinement has no logical dimension authority");
-    if (failed(retargetSourceExtent(
-            store.getValue(), sourceAxisIdentity(cast<AxisMapAttr>(mapping)),
-            cast<PhysicalExprAttr>((*valueType).getShape()[axis]), dimension,
+    if (failed(retargetFragmentAxisExtent(
+            store.getValue(), axis,
+            cast<PhysicalExprAttr>((*valueType).getShape()[axis]),
             changes.typeChanged(), &changes)))
       return failure();
   }

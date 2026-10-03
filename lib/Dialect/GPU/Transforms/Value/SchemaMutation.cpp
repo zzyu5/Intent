@@ -27,13 +27,14 @@ void setPhysicalValueType(Value value, Type type, ValueTypeChangeCallback change
 
 LogicalResult rewriteClonedPhysicalTypes(
     Operation *source, Operation *clone,
-    llvm::function_ref<Type(Value)> transform, ValueTypeChangeCallback changed) {
+    llvm::function_ref<Type(Value)> transform, ValueTypeChangeCallback changed,
+    ClonedAxisRefinement refineBroadcast) {
   struct Snapshot {
     Operation *source;
     Operation *clone;
-    SmallVector<SmallVector<FragmentOperandRelation>> relations;
+    SmallVector<SmallVector<FragmentOperandRelation>, 1> relations;
   };
-  SmallVector<Snapshot> snapshots;
+  SmallVector<Snapshot, 0> snapshots;
   std::function<LogicalResult(Operation *, Operation *)> capture =
       [&](Operation *original, Operation *copy) -> LogicalResult {
         if (original->getName() != copy->getName() ||
@@ -98,7 +99,14 @@ LogicalResult rewriteClonedPhysicalTypes(
       if (!original || !actual)
         continue;
       auto transported = transportFragmentResultType(
-          relations, snapshot.clone->getOperandTypes(), actual);
+          relations, snapshot.clone->getOperandTypes(), actual,
+          [&](unsigned operand, unsigned sourceAxis, unsigned resultAxis) {
+            return refineBroadcast &&
+                   refineBroadcast(snapshot.source->getOpOperand(operand),
+                                   sourceAxis,
+                                   snapshot.source->getResult(index),
+                                   resultAxis);
+          });
       if (failed(transported))
         return snapshot.clone->emitOpError(
             "cloned operands cannot transport the source fragment relation");
@@ -399,49 +407,14 @@ LogicalResult closeSchemaBoundary(Operation *operation,
     for (const StructuredSchemaGroup &group :
          queryStructuredSchemaGroups(operation)) {
       Type target = group.producer->get().getType();
-      SmallVector<std::pair<int64_t, PhysicalExprAttr>> dimensions;
-      std::function<LogicalResult(Type)> collectDimensions =
-          [&](Type type) -> LogicalResult {
-        if (auto fragment = dyn_cast<FragmentType>(type)) {
-          for (auto [axis, mapping] : llvm::enumerate(fragment.getAxisMaps())) {
-            int64_t dimension = cast<AxisMapAttr>(mapping).getDimensionId();
-            if (dimension <= 0)
-              continue;
-            auto extent = cast<PhysicalExprAttr>(fragment.getShape()[axis]);
-            auto found = llvm::find_if(dimensions, [&](const auto &entry) {
-              return entry.first == dimension;
-            });
-            if (found != dimensions.end()) {
-              if (found->second != extent)
-                return failure();
-              continue;
-            }
-            dimensions.emplace_back(dimension, extent);
-          }
-          return success();
-        }
-        if (auto record = dyn_cast<RecordType>(type))
-          for (Attribute field : record.getFieldTypes())
-            if (failed(collectDimensions(cast<TypeAttr>(field).getValue())))
-              return failure();
-        return success();
-      };
-      if (failed(collectDimensions(target))) {
-        operation->emitOpError(
-            "structured component has conflicting physical dimension extents")
-            << "; seed_operand=" << group.seedOperand << "; schema=" << target;
-        return failure();
-      }
-      for (auto [dimension, extent] : dimensions) {
-        for (Value result : group.results)
-          if (failed(retargetDimensionExtent(
-                  result, dimension, extent, changes.typeChanged(), listener)))
-            return failure();
-        for (BlockArgument argument : group.arguments)
-          if (failed(retargetDimensionExtent(
-                  argument, dimension, extent, changes.typeChanged(), listener)))
-            return failure();
-      }
+      for (Value result : group.results)
+        if (failed(retargetValueExtents(result, target, changes.typeChanged(),
+                                       listener)))
+          return failure();
+      for (BlockArgument argument : group.arguments)
+        if (failed(retargetValueExtents(argument, target, changes.typeChanged(),
+                                       listener)))
+          return failure();
       FailureOr<Value> projected = projectPhysicalValueToSchema(
           builder, operation->getLoc(), operation->getOperand(group.seedOperand),
           target, changes.typeChanged());

@@ -475,11 +475,9 @@ static FailureOr<Value> projectFragmentValue(OpBuilder &builder,
         for (BlockArgument argument : clone.getCombine().front().getArguments())
           for (unsigned axis = 0; axis < target.getShape().size(); ++axis)
             if (source.getShape()[axis] != target.getShape()[axis])
-              if (failed(retargetSourceExtent(
-                  argument,
-                  sourceAxisIdentity(
-                      cast<AxisMapAttr>(source.getAxisMaps()[axis])),
-                  cast<PhysicalExprAttr>(target.getShape()[axis]), std::nullopt,
+              if (failed(retargetFragmentAxisExtent(
+                  argument, axis,
+                  cast<PhysicalExprAttr>(target.getShape()[axis]),
                   changed, builder.getListener())))
                 return failure();
         setPhysicalValueType(clone.getResult(0), resultTarget, changed);

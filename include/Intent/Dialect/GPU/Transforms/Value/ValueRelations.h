@@ -15,6 +15,18 @@ enum class ValueRelationScope {
 };
 
 // Relation maintenance belongs inside a complete transformation, before verify.
+// The selected occurrence is positional. Repeated logical/source identities in
+// another axis do not join their independent physical extents.
+mlir::LogicalResult retargetFragmentAxisExtent(
+    mlir::Value root, unsigned fragmentAxis, PhysicalExprAttr extent,
+    ValueTypeChangeCallback changed = {},
+    mlir::OpBuilder::Listener *listener = nullptr);
+// Preserve the value's scalar/record structure and coordinate occurrences,
+// while applying each selected leaf extent independently.
+mlir::LogicalResult retargetValueExtents(
+    mlir::Value root, mlir::Type selected,
+    ValueTypeChangeCallback changed = {},
+    mlir::OpBuilder::Listener *listener = nullptr);
 mlir::LogicalResult retargetSourceExtent(mlir::Value root, PhysicalSourceAxis source,
                           PhysicalExprAttr extent,
                           std::optional<int64_t> dimension = std::nullopt,

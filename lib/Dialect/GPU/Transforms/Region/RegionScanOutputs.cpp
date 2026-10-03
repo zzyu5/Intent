@@ -5,6 +5,9 @@
 #include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 
 using namespace mlir;
@@ -12,42 +15,53 @@ using namespace mlir;
 namespace intent::gpu::region {
 namespace {
 
-FailureOr<Type> slicedType(Type type,
-                           ArrayRef<SliceRelation> relations,
-                           PhysicalExprAttr extent,
-                           Operation *producer = nullptr) {
+struct SliceProjection {
+  std::optional<unsigned> axis;
+  AxisMapAttr segmentMapping;
+};
+
+FailureOr<SliceProjection>
+querySliceProjection(FragmentType fragment, ArrayRef<SliceRelation> relations,
+                     Operation *producer) {
+  SliceProjection selected;
+  for (const SliceRelation &relation : relations) {
+    PhysicalAxisProjection axis = queryFragmentAxis(fragment, relation.source);
+    if (axis.state == PhysicalFactState::Ambiguous)
+      return failure();
+    if (!axis.isExact())
+      continue;
+    if (selected.axis &&
+        (*selected.axis != axis.fragmentAxis ||
+         selected.segmentMapping != relation.segmentMapping))
+      return failure();
+    selected = {axis.fragmentAxis, relation.segmentMapping};
+  }
+  if (!selected.axis)
+    return selected;
+  if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
+    bool introducedUnitAxis =
+        isUnitExtent(fragment.getShape()[*selected.axis]) &&
+        llvm::none_of(relations, [&](const SliceRelation &relation) {
+          return !queryFragmentAxes(reshape.getValue().getType(), relation.source)
+                      .empty();
+        });
+    if (introducedUnitAxis)
+      return SliceProjection{};
+  }
+  return selected;
+}
+
+FailureOr<Type> slicedType(Type type, ArrayRef<SliceRelation> relations,
+                          PhysicalExprAttr extent,
+                          Operation *producer = nullptr) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
-    std::optional<PhysicalAxisProjection> selected;
-    AxisMapAttr segmentMapping;
-    for (const SliceRelation &relation : relations) {
-      PhysicalAxisProjection axis =
-          queryFragmentAxis(fragment, relation.source);
-      if (axis.state == PhysicalFactState::Ambiguous)
-        return failure();
-      if (!axis.isExact())
-        continue;
-      if (selected &&
-          (selected->fragmentAxis != axis.fragmentAxis ||
-           segmentMapping != relation.segmentMapping))
-        return failure();
-      selected = axis;
-      segmentMapping = relation.segmentMapping;
-    }
-    if (!selected)
+    auto selected = querySliceProjection(fragment, relations, producer);
+    if (failed(selected))
+      return failure();
+    if (!selected->axis)
       return type;
-    if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
-      bool introducedUnitAxis =
-          isUnitExtent(fragment.getShape()[selected->fragmentAxis]) &&
-          llvm::none_of(relations, [&](const SliceRelation &relation) {
-            return !queryFragmentAxes(reshape.getValue().getType(),
-                                      relation.source)
-                        .empty();
-          });
-      if (introducedUnitAxis)
-        return type;
-    }
-    return Type(replaceSliceAxis(fragment, selected->fragmentAxis, extent,
-                                 segmentMapping));
+    return Type(replaceSliceAxis(fragment, *selected->axis, extent,
+                                selected->segmentMapping));
   }
   if (auto record = dyn_cast<RecordType>(type)) {
     SmallVector<Attribute> fields;
@@ -63,6 +77,35 @@ FailureOr<Type> slicedType(Type type,
                                 record.getOwner()));
   }
   return type;
+}
+
+LogicalResult rewriteSlicedClone(Operation *source, Operation *clone,
+                                ArrayRef<SliceRelation> relations,
+                                PhysicalExprAttr extent) {
+  return rewriteClonedPhysicalTypes(
+      source, clone,
+      [&](Value original) -> Type {
+        auto selected = slicedType(original.getType(), relations, extent,
+                                   original.getDefiningOp());
+        return succeeded(selected) ? *selected : Type{};
+      },
+      {},
+      [&](OpOperand &operand, unsigned sourceAxis, OpResult result,
+          unsigned resultAxis) {
+        auto sourceType = dyn_cast<FragmentType>(operand.get().getType());
+        auto resultType = dyn_cast<FragmentType>(result.getType());
+        if (!sourceType || !resultType)
+          return false;
+        auto input = querySliceProjection(sourceType, relations,
+                                           operand.get().getDefiningOp());
+        auto output =
+            querySliceProjection(resultType, relations, result.getOwner());
+        // The selected member domain, not equal capacities, makes this a
+        // refinement of the same slice on both sides of the projection.
+        return succeeded(input) && succeeded(output) &&
+               input->axis == sourceAxis && output->axis == resultAxis &&
+               input->segmentMapping == output->segmentMapping;
+      });
 }
 
 bool isScanOutputPureConsumer(Operation *operation) {
@@ -122,41 +165,95 @@ Value mappedValue(IRMapping &mapping, Value value) {
   return value;
 }
 
+bool availableAtInsertionPoint(Value value, OpBuilder &builder,
+                               DominanceInfo &dominance) {
+  if (auto argument = dyn_cast<BlockArgument>(value))
+    return dominance.dominates(argument.getOwner(), builder.getInsertionBlock());
+  Operation *definition = value.getDefiningOp();
+  return definition && dominance.properlyDominates(
+      definition->getBlock(), definition->getIterator(),
+      builder.getInsertionBlock(), builder.getInsertionPoint(),
+      /*enclosingOk=*/false);
+}
+
+bool isPureScalarComputation(Operation *operation) {
+  return operation->getNumRegions() == 0 && isPure(operation) &&
+         llvm::all_of(operation->getResultTypes(), [](Type type) {
+           return isa<IntegerType, IndexType, FloatType>(type);
+         });
+}
+
+Value dominatingEquivalent(Value value, OpBuilder &builder, IRMapping &mapping,
+                          DominanceInfo &dominance) {
+  auto result = cast<OpResult>(value);
+  Operation *definition = result.getOwner();
+  SmallVector<Value> operands;
+  for (Value operand : definition->getOperands())
+    operands.push_back(mappedValue(mapping, operand));
+  for (Block *block = builder.getInsertionBlock(); block;) {
+    for (Operation &candidate : *block) {
+      if (candidate.getName() != definition->getName() ||
+          candidate.getNumResults() != definition->getNumResults() ||
+          !llvm::equal(candidate.getOperands(), operands) ||
+          !availableAtInsertionPoint(candidate.getResult(result.getResultNumber()),
+                                     builder, dominance))
+        continue;
+      if (OperationEquivalence::isEquivalentTo(
+              &candidate, definition,
+              OperationEquivalence::ignoreValueEquivalence,
+              nullptr, OperationEquivalence::IgnoreLocations))
+        return candidate.getResult(result.getResultNumber());
+    }
+    Operation *parent = block->getParentOp();
+    if (!parent || parent->hasTrait<OpTrait::IsIsolatedFromAbove>())
+      break;
+    block = parent->getBlock();
+  }
+  return {};
+}
+
 FailureOr<Value> materializeScanConsumerValue(
     OpBuilder &builder, Location location, RegionScanOp scan, Value value,
     IRMapping &mapping, ArrayRef<SliceRelation> relations,
     PhysicalExprAttr sliceExtent,
-    Value offset, Value segment, std::string &reason) {
+    Value offset, Value segment, DominanceInfo &dominance, std::string &reason) {
   if (!value)
     return Value();
-  if (Value mapped = mapping.lookupOrNull(value))
-    return mapped;
+  if (Value mapped = mapping.lookupOrNull(value)) {
+    if (availableAtInsertionPoint(mapped, builder, dominance))
+      return mapped;
+    reason = "region-scan mapped output address does not dominate its use";
+    return failure();
+  }
   Operation *definition = value.getDefiningOp();
-  if (!definition || definition->getBlock() != scan->getBlock())
-    return value;
-  bool precedesScan = definition->isBeforeInBlock(scan);
-  if (auto range = dyn_cast<MakeRangeOp>(definition)) {
-    FailureOr<Value> start = materializeScanConsumerValue(
-        builder, location, scan, range.getStart(), mapping, relations,
-        sliceExtent, offset, segment, reason);
-    FailureOr<Value> extent = materializeScanConsumerValue(
-        builder, location, scan, range.getExtent(), mapping, relations,
-        sliceExtent, offset, segment, reason);
-    FailureOr<Value> step = materializeScanConsumerValue(
-        builder, location, scan, range.getStep(), mapping, relations,
-        sliceExtent, offset, segment, reason);
-    if (failed(start) || failed(extent) || failed(step))
+  bool available = availableAtInsertionPoint(value, builder, dominance);
+  if (!definition || definition->getBlock() != scan->getBlock()) {
+    if (available)
+      return value;
+    reason = "region-scan output address is outside the segment insertion scope";
+    return failure();
+  }
+  bool changed = false;
+  for (Value operand : definition->getOperands()) {
+    FailureOr<Value> materialized = materializeScanConsumerValue(
+        builder, location, scan, operand, mapping, relations, sliceExtent,
+        offset, segment, dominance, reason);
+    if (failed(materialized))
       return failure();
+    changed |= *materialized != operand;
+    if (!mapping.lookupOrNull(operand) && *materialized != operand)
+      mapping.map(operand, *materialized);
+  }
+  if (auto range = dyn_cast<MakeRangeOp>(definition)) {
     auto type = cast<FragmentType>(range.getResult().getType());
     auto relation = llvm::find_if(relations, [&](const SliceRelation &candidate) {
       return sourceAxisIdentity(range) == candidate.source;
     });
     bool isSourceAxis = relation != relations.end();
-    if (precedesScan && !isSourceAxis && *start == range.getStart() &&
-        *extent == range.getExtent() && *step == range.getStep())
+    if (available && !isSourceAxis && !changed)
       return value;
-    Value physicalStart = *start;
-    Value physicalExtent = *extent;
+    Value physicalStart = mappedValue(mapping, range.getStart());
+    Value physicalExtent = mappedValue(mapping, range.getExtent());
     FragmentType physicalType = type;
     if (isSourceAxis) {
       physicalStart = builder.create<BinaryOp>(location, builder.getIndexType(),
@@ -167,22 +264,13 @@ FailureOr<Value> materializeScanConsumerValue(
                                       relation->segmentMapping);
     }
     Value result = builder.create<MakeRangeOp>(
-        location, physicalType, physicalStart, physicalExtent, *step,
-        range.getLogicalStart(), range.getLogicalStop(),
+        location, physicalType, physicalStart, physicalExtent,
+        mappedValue(mapping, range.getStep()),
+        mappedValue(mapping, range.getLogicalStart()),
+        mappedValue(mapping, range.getLogicalStop()),
         range.getSourceId(), range.getSourceAxis(), range.getDerived());
     mapping.map(value, result);
     return result;
-  }
-  bool changed = false;
-  for (Value operand : definition->getOperands()) {
-    FailureOr<Value> materialized = materializeScanConsumerValue(
-        builder, location, scan, operand, mapping, relations, sliceExtent,
-        offset, segment, reason);
-    if (failed(materialized))
-      return failure();
-    changed |= *materialized != operand;
-    if (!mapping.lookupOrNull(operand) && *materialized != operand)
-      mapping.map(operand, *materialized);
   }
   FailureOr<Type> sliced =
       slicedType(value.getType(), relations, sliceExtent, definition);
@@ -190,9 +278,15 @@ FailureOr<Value> materializeScanConsumerValue(
     reason = "region-scan output address has no unique segment relation";
     return failure();
   }
-  if (precedesScan && !changed && *sliced == value.getType())
+  if (available && !changed && *sliced == value.getType())
     return value;
-  if (!isa<arith::ConstantOp>(definition) &&
+  bool scalarComputation = isPureScalarComputation(definition);
+  if (scalarComputation)
+    if (Value existing = dominatingEquivalent(value, builder, mapping, dominance)) {
+      mapping.map(value, existing);
+      return existing;
+    }
+  if (!scalarComputation && !isa<arith::ConstantOp>(definition) &&
       !isScanOutputPureConsumer(definition)) {
     reason =
         "region-scan output address depends on an operation that cannot be moved into the segment loop: " +
@@ -200,12 +294,7 @@ FailureOr<Value> materializeScanConsumerValue(
     return failure();
   }
   Operation *clone = builder.clone(*definition, mapping);
-  if (failed(rewriteClonedPhysicalTypes(
-          definition, clone, [&](Value original) -> Type {
-            auto selected = slicedType(original.getType(), relations,
-                                       sliceExtent, original.getDefiningOp());
-            return succeeded(selected) ? *selected : Type{};
-          }))) {
+  if (failed(rewriteSlicedClone(definition, clone, relations, sliceExtent))) {
     reason = "region-scan output address cannot transport its sliced schema";
     return failure();
   }
@@ -226,13 +315,14 @@ LogicalResult cloneScanOutputConsumers(
     PhysicalExprAttr sliceExtent,
     Value segmentTail, RegionScanOp scan, Value offset, Value segment,
     std::string &reason) {
+  DominanceInfo dominance(scan->getParentOfType<func::FuncOp>());
   for (Operation *operation : consumers) {
     for (Value operand : operation->getOperands()) {
       if (mapping.lookupOrNull(operand))
         continue;
       FailureOr<Value> materialized = materializeScanConsumerValue(
           builder, location, scan, operand, mapping, relations, sliceExtent,
-          offset, segment, reason);
+          offset, segment, dominance, reason);
       if (failed(materialized))
         return failure();
       if (*materialized != operand && !mapping.lookupOrNull(operand))
@@ -269,12 +359,7 @@ LogicalResult cloneScanOutputConsumers(
       continue;
     }
     Operation *clone = builder.clone(*operation, mapping);
-    if (failed(rewriteClonedPhysicalTypes(
-            operation, clone, [&](Value original) -> Type {
-              auto selected = slicedType(original.getType(), relations,
-                                         sliceExtent, original.getDefiningOp());
-              return succeeded(selected) ? *selected : Type{};
-            }))) {
+    if (failed(rewriteSlicedClone(operation, clone, relations, sliceExtent))) {
       reason = "region-scan output consumer cannot transport its sliced schema";
       return failure();
     }

@@ -599,8 +599,16 @@ helper 的 schema；`projectSchemaBoundary` 将已选 schema 投影到对应 inc
 不反向改写被多个组件共享的 seed SSA。克隆消费者使用 `rewriteClonedPhysicalTypes`，先保存未改写源
 operation 的轴关系，统一改写 clone 的结果与 region formal 类型，再用实际 operands
 传递结果的轴关系。
-`retargetSourceExtent` / `retargetDimensionExtent` 返回 `LogicalResult`，调用方须将
-边界投影失败传回完整 transformation，不能继续报告成功。
+已知某个 fragment 轴的改写使用 `retargetFragmentAxisExtent(value, axis, extent)`；
+`retargetSourceExtent` / `retargetDimensionExtent` 只负责从调用方给定的语义定位起点。
+传递过程中保留值、record 字段路径及实际轴位置，沿 operation interface 的 operand
+槽位关系传播，不在每个相邻值中按 source ID 或同 dimension 重新猜轴。所有入口返回
+`LogicalResult`，调用方须将边界投影失败传回完整 transformation，不能继续报告成功。
+结构化状态边界使用 `retargetValueExtents` 按 producer 的对应字段与轴传递 extent；record
+只是分组，不能因两个字段带有同一 logical dimension 就强制它们采用相同物理宽度。
+字段之间真正的对齐要求由 combine 内的逐元素、归约等操作关系表达。
+逐元素闭合只把已有、可证明已物理化的结果执行域要求传给尚未独立物理化的结构字段，
+并要求来源范围已知；不会仅因某个 extent 是 parameter 就让它覆盖常量或独立遍历。
 [ValueMaterialization](lib/Dialect/GPU/Transforms/Value/ValueMaterialization.cpp)
 与 region helper 展开复用这些入口传递分段形状。Pointwise coverage、访问组合和
 online-summary 查询也消费相同的物理轴组，不能把逻辑 reshape 轴直接用作物理下标。
@@ -609,6 +617,17 @@ Triton/cuTile 的局部资格判断也读同一关系。
 `Structured` 各自处理操作关系，`ExtentPropagation` 负责 extent 穿过聚合值与控制流
 边界的传播。规则共用私有 `Worklist.h` 的类型更新与通知机制，不各建队列；对外仍使用
 [ValueRelations.h](include/Intent/Dialect/GPU/Transforms/Value/ValueRelations.h)。
+`FragmentOpInterface` 的关系还区分唯一 schema 输入、完整逐元素映射和 operation 自有的
+固定轴。消费者按这些事实传递类型：RandomBits 的 counter 提供 shape，seed 保持 scalar；
+Join 的输入 rank 保持不变，新增尾轴仍为 2。关系快照仅服务一次分析或改写，不是另一份 IR。
+访问改写从 `queryAccessCoordinateAxes(access, slot)` 取得 coordinate 与 payload 的对应，
+contraction 的成对轴及 reshape/transpose 的投影也保留具体 occurrence。
+Region scan 的输出组装保持 slice/result 轴序；成员轴通过
+`queryRegionScanEmissionAxis` 从当前 helper source-slice 关系取得，分段 extent 不沿组装边
+传播成完整输出的 extent。
+克隆默认保留原广播限制；需要将旧物理 singleton 与对应结果共同细化时，调用方通过
+`ClonedAxisRefinement` 证明两端属于同一个已选坐标域。Region 切片与 helper 实参绑定
+复用各自已有的切片/位置关系提供证明，单凭两个新 extent 相等不能获得这项许可。
 坐标对应不证明数值相等：cast 舍入、逻辑 singleton、effects 和可重放资格仍由
 各自分析或变换检查，不能仅因物理 extent 为 1 就消除整条逻辑轴。
 
@@ -827,6 +846,15 @@ GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`
 `replayAt` 必须给出真实原语义位置以及本次改写的 `IRMapping`，已绑定值是保存的
 SSA 快照，不沿其旧定义再次要求读取。没有 source selector 时检查整个未绑定 shaped
 graph；指定 source 时，独立且支配原位置的值可复用。能够复用原值不代表允许克隆它的读取。
+
+[MemoryEffects.h](include/Intent/Dialect/GPU/Analysis/MemoryEffects.h) 将读取稳定性和整个
+区域的只读资格分开查询，消费 MLIR recursive effects、实际资源值与共同 alias 分析。
+同一 effect resource 上可能别名的 write/free 会阻断移动，未知 effect 与 atomic 顺序也
+保留为屏障。`assume_in_bounds` 写入独立的不可寻址 assumption-state resource：它保留
+控制域中的约束，但不声称修改 tensor 数据。读取可以跨越这项独立 effect，含 assumption
+的整个 region 却不能因此被当成纯值复制。本地 Triton `python/src/ir.cc:1859–1861`
+同样创建 LLVM Assume；LLVM 将 assumption 的控制相关性建模为 inaccessible-memory
+effect，而不是可由 DCE 丢弃的普通零结果纯操作。
 
 [ReplayMaterialization.cpp](lib/Dialect/GPU/Transforms/Value/ReplayMaterialization.cpp) 集中执行按
 source occurrence 或按 ranges 的重放，复用上述证明并检查替代值在实际 builder 插入点

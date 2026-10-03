@@ -1,4 +1,5 @@
 #include "PhysicalProgramDetail.h"
+#include "Intent/Dialect/GPU/Analysis/MemoryEffects.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -62,13 +63,6 @@ bool reductionTypeConsumesSource(Type type, ArrayRef<int64_t> axes,
   return false;
 }
 
-Value accessResource(Operation *operation) {
-  if (auto access = dyn_cast<AccessOpInterface>(operation);
-      access && access.isMemoryAccess())
-    return access.getAccessResource();
-  return {};
-}
-
 bool typeCarriesTraversal(Type type, PhysicalSourceAxis source,
                           int64_t dimension) {
   if (auto fragment = dyn_cast<FragmentType>(type))
@@ -125,16 +119,7 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
     return false;
   ResourceAliasAnalysis aliases;
   auto preservesRead = [&](Operation *operation) {
-    return !operation->walk([&](Operation *nested) {
-      if (isa<LoadOp, GatherOp, scf::ForOp, scf::IfOp, scf::WhileOp>(nested) ||
-          isMemoryEffectFree(nested))
-        return WalkResult::advance();
-      Value written = accessResource(nested);
-      if (written && isa<StoreOp>(nested) &&
-          aliases.alias(load.getResource(), written).isNo())
-        return WalkResult::advance();
-      return WalkResult::interrupt();
-    }).wasInterrupted();
+    return preservesMemoryReads(load, operation, aliases);
   };
   // This motion stays in the same invocation of the enclosing block, including
   // the same iteration when the block belongs to an ordered loop.
@@ -314,13 +299,6 @@ void PhysicalProgramAnalysis::analyzeReplay(
         return;
       }
     }
-    auto readOnly = [](Operation *root) {
-      return !root->walk([](Operation *nested) {
-        return isa<LoadOp, GatherOp, scf::IfOp, scf::ForOp>(nested) ||
-                       isMemoryEffectFree(nested)
-                   ? WalkResult::advance() : WalkResult::interrupt();
-      }).wasInterrupted();
-    };
     SmallVector<Value> controls;
     if (auto branch = dyn_cast<scf::IfOp>(operation))
       controls.push_back(branch.getCondition());
@@ -338,7 +316,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       if (Operation *producer = control.getDefiningOp())
         controls.append(producer->getOperands().begin(), producer->getOperands().end());
     }
-    bool preservesReads = readOnly(operation);
+    bool preservesReads = hasOnlyReadEffects(operation);
     if (insertionAnchor && preservesReads) {
       // Nested control is cloned as part of an already visited replay region.
       // Check motion from that enclosing region, rather than trying to walk
@@ -353,9 +331,10 @@ void PhysicalProgramAnalysis::analyzeReplay(
           break;
         replayRoot = parent;
       }
+      ResourceAliasAnalysis aliases;
       Operation *anchor = insertionAnchor;
       while (anchor && anchor->getBlock() != replayRoot->getBlock()) {
-        preservesReads &= readOnly(anchor);
+        preservesReads &= preservesMemoryReads(replayRoot, anchor, aliases);
         anchor = anchor->getParentOp();
       }
       preservesReads &= anchor &&
@@ -363,7 +342,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       if (preservesReads && anchor != replayRoot)
         for (Operation *next = replayRoot->getNextNode(); next != anchor;
              next = next->getNextNode())
-          preservesReads &= readOnly(next);
+          preservesReads &= preservesMemoryReads(replayRoot, next, aliases);
     }
     if (!preservesReads || dependentControl) {
       appendUnique(result.blockers, operation);

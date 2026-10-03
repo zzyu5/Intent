@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/MemoryEffects.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -132,7 +133,12 @@ LogicalResult AssumeInBoundsOp::verify() {
 }
 
 void LoadOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Read::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
+}
+
+void AssumeInBoundsOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), AssumptionResource::get());
 }
 
 LogicalResult StoreOp::verify() {
@@ -140,7 +146,7 @@ LogicalResult StoreOp::verify() {
 }
 
 void StoreOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult ScatterReduceOp::verify() {
@@ -155,7 +161,8 @@ LogicalResult ScatterReduceOp::verify() {
 
 void ScatterReduceOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Write::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getResourceMutable());
+  effects.emplace_back(MemoryEffects::Write::get(), &getResourceMutable());
 }
 
 LogicalResult AtomicLoadOp::verify() {
@@ -217,9 +224,10 @@ LogicalResult BufferOp::verify() {
 }
 
 void BufferOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  effects.emplace_back(MemoryEffects::Allocate::get());
+  effects.emplace_back(MemoryEffects::Allocate::get(),
+                       cast<OpResult>(getResult()));
   if (getInitialValue())
-    effects.emplace_back(MemoryEffects::Write::get());
+    effects.emplace_back(MemoryEffects::Write::get(), cast<OpResult>(getResult()));
 }
 
 } // namespace intent::gpu

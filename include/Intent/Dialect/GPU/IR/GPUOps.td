@@ -224,7 +224,8 @@ def IntentGPU_TransposeOp : IntentGPU_Op<"transpose", [Pure, DeclareOpInterfaceM
   let hasCanonicalizer = 1;
 }
 
-def IntentGPU_JoinOp : IntentGPU_Op<"join", [Pure]> {
+def IntentGPU_JoinOp : IntentGPU_Op<"join", [
+    Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins IntentGPU_FragmentValue:$lhs,
                        IntentGPU_FragmentValue:$rhs,
                        I64Attr:$axis);
@@ -267,7 +268,9 @@ def IntentGPU_GatherOp : IntentGPU_ReadOp<"gather", "Gather", "getSourceMutable(
   let results = (outs IntentGPU_DataValue:$result);
 }
 
-def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds"> {
+def IntentGPU_AssumeInBoundsOp : IntentGPU_Op<"assume_in_bounds", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+  ]> {
   let arguments = (ins IntentGPU_DataValue:$index,
                        IntentGPU_ResourceValue:$resource,
                        I64Attr:$axis);
@@ -545,7 +548,8 @@ def IntentGPU_AtomicCompareExchangeOp : IntentGPU_AccessOp<"atomic_compare_excha
   let hasVerifier = 1;
 }
 
-def IntentGPU_RandomBitsOp : IntentGPU_Op<"random_bits", [Pure]> {
+def IntentGPU_RandomBitsOp : IntentGPU_Op<"random_bits", [
+    Pure, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
   let arguments = (ins I64:$seed, IntentGPU_DataValue:$counter);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;

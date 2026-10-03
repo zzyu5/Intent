@@ -314,6 +314,39 @@ POSITIONAL_RELATIONS(CompareOp, false)
 POSITIONAL_RELATIONS(SelectOp, false)
 #undef POSITIONAL_RELATIONS
 
+FailureOr<Relations> RandomBitsOp::getFragmentOperandRelations(
+    unsigned resultNumber, TypeRange operands, Type result) {
+  if (operands.size() != 2)
+    return failure();
+  // The scalar seed does not define the counter's lane schema.
+  auto relations = positional(operands.drop_front(), result, resultNumber, true);
+  if (failed(relations))
+    return failure();
+  relations->front().operandNumber = 1;
+  return relations;
+}
+
+FailureOr<Relations> JoinOp::getFragmentOperandRelations(
+    unsigned resultNumber, TypeRange operands, Type result) {
+  auto target = dyn_cast<FragmentType>(result);
+  if (resultNumber != 0 || operands.size() != 2 || !target)
+    return failure();
+  Relations relations;
+  for (auto [index, type] : llvm::enumerate(operands)) {
+    auto source = dyn_cast<FragmentType>(type);
+    if (!source || target.getShape().size() != source.getShape().size() + 1 ||
+        getAxis() != source.getShape().size())
+      return failure();
+    FragmentOperandRelation relation{static_cast<unsigned>(index), source,
+                                     target, {}};
+    for (unsigned axis = 0; axis < source.getShape().size(); ++axis)
+      relation.groups.push_back({Kind::Corresponding, {axis}, {axis}});
+    relation.invariantResultAxes.push_back(source.getShape().size());
+    relations.push_back(std::move(relation));
+  }
+  return relations;
+}
+
 FailureOr<Relations> SplatOp::getFragmentOperandRelations(
     unsigned resultNumber, TypeRange operands, Type result) {
   return broadcast(operands, result, resultNumber);
@@ -390,7 +423,8 @@ FailureOr<Relations> ReshapeOp::getFragmentOperandRelations(
 
 FailureOr<Type>
 transportFragmentResultType(ArrayRef<FragmentOperandRelation> relations,
-                            TypeRange operandTypes, Type declaredResult) {
+                            TypeRange operandTypes, Type declaredResult,
+                            FragmentBroadcastRefinement refineBroadcast) {
   auto target = dyn_cast<FragmentType>(declaredResult);
   if (relations.size() == 1 && relations.front().preservesSourceSchema) {
     const auto &relation = relations.front();
@@ -424,6 +458,9 @@ transportFragmentResultType(ArrayRef<FragmentOperandRelation> relations,
     auto oldResult = dyn_cast<FragmentType>(relation.resultType);
     if (!oldResult || oldResult.getShape().size() != shape.size())
       return failure();
+    for (unsigned axis : relation.invariantResultAxes)
+      if (shape[axis] != oldResult.getShape()[axis])
+        return failure();
     if (!previous) {
       if (source)
         return failure();
@@ -433,9 +470,18 @@ transportFragmentResultType(ArrayRef<FragmentOperandRelation> relations,
       return failure();
     for (const auto &group : relation.groups) {
       if (group.kind == Kind::Broadcast) {
-        if (llvm::any_of(group.sourceAxes, [&](unsigned axis) {
-              return !unit(source.getShape()[axis]);
+        if (llvm::all_of(group.sourceAxes, [&](unsigned axis) {
+              return unit(source.getShape()[axis]);
             }))
+          continue;
+        if (group.sourceAxes.size() != 1 || group.resultAxes.size() != 1 ||
+            !refineBroadcast)
+          return failure();
+        unsigned sourceAxis = group.sourceAxes.front();
+        unsigned resultAxis = group.resultAxes.front();
+        if (!refineBroadcast(relation.operandNumber, sourceAxis, resultAxis) ||
+            source.getShape()[sourceAxis] != target.getShape()[resultAxis] ||
+            failed(assign(resultAxis, source.getShape()[sourceAxis])))
           return failure();
         continue;
       }
@@ -485,6 +531,9 @@ transportFragmentOperandType(const FragmentOperandRelation &relation,
       target.getShape().size() != previous.getShape().size())
     return failure();
   SmallVector<Attribute> shape(source.getShape().getValue());
+  for (unsigned axis : relation.invariantResultAxes)
+    if (target.getShape()[axis] != previous.getShape()[axis])
+      return failure();
   for (const auto &group : relation.groups) {
     if (group.kind == Kind::Broadcast)
       continue;

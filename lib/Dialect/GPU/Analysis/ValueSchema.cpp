@@ -54,6 +54,56 @@ queryStructuredSchemaGroups(Operation *operation) {
   return groups;
 }
 
+FailureOr<unsigned> queryRegionScanEmissionAxis(
+    RegionScanOp scan, unsigned output, ArrayRef<unsigned> fieldPath) {
+  auto structured = cast<StructuredOpInterface>(scan.getOperation());
+  if (!llvm::hasSingleElement(scan.getEmit()) ||
+      scan.getEmit().front().empty() ||
+      output >= scan.getEmittedResults().size())
+    return failure();
+  auto yields = structured.getEmitYields();
+  if (output >= yields.size())
+    return failure();
+  auto fieldType = [&](Type type) -> Type {
+    for (unsigned field : fieldPath) {
+      auto record = dyn_cast<RecordType>(type);
+      if (!record || field >= record.getFieldTypes().size())
+        return {};
+      type = cast<TypeAttr>(record.getFieldTypes()[field]).getValue();
+    }
+    return type;
+  };
+  auto slice = dyn_cast_or_null<FragmentType>(
+      fieldType(yields[output].getType()));
+  auto result = dyn_cast_or_null<FragmentType>(
+      fieldType(scan.getEmittedResults()[output].getType()));
+  if (!slice || !result || slice.getElementType() != result.getElementType() ||
+      slice.getShape().size() != result.getShape().size() ||
+      slice.getAxisMaps() != result.getAxisMaps())
+    return failure();
+
+  std::optional<unsigned> memberAxis;
+  if (scan.getEmit().front().getNumArguments() < scan.getSources().size())
+    return failure();
+  for (BlockArgument source : structured.getEmitSources()) {
+    auto type = dyn_cast<FragmentType>(source.getType());
+    if (!type || scan.getAxis() >= type.getShape().size())
+      return failure();
+    auto member = cast<AxisMapAttr>(type.getAxisMaps()[scan.getAxis()]);
+    for (auto [axis, attribute] : llvm::enumerate(slice.getAxisMaps())) {
+      auto mapping = cast<AxisMapAttr>(attribute);
+      if (!(sourceAxisIdentity(mapping) == sourceAxisIdentity(member)) ||
+          mapping.getDimensionId() != member.getDimensionId())
+        continue;
+      if (memberAxis && *memberAxis != axis)
+        return failure();
+      memberAxis = axis;
+    }
+  }
+  return memberAxis ? FailureOr<unsigned>(*memberAxis)
+                    : FailureOr<unsigned>(failure());
+}
+
 FailureOr<func::FuncOp> getPhysicalKernel(ModuleOp module) {
   SmallVector<func::FuncOp> kernels;
   for (func::FuncOp function : module.getOps<func::FuncOp>())

@@ -19,6 +19,13 @@ struct StructuredSchemaGroup {
 llvm::SmallVector<StructuredSchemaGroup>
 queryStructuredSchemaGroups(mlir::Operation *operation);
 
+// A scan assembles each emitted fragment in the same axis order as its slice.
+// The member axis is owned by the current source-slice relation; it is not a
+// free-axis extent equality. Record fields retain their positional paths.
+mlir::FailureOr<unsigned> queryRegionScanEmissionAxis(
+    RegionScanOp scan, unsigned output,
+    llvm::ArrayRef<unsigned> fieldPath = {});
+
 // These queries inspect current IR and return facts/types without changing it.
 bool isShapeBound(PhysicalExprAttr bound);
 mlir::Type scalarCallbackType(mlir::Type type);

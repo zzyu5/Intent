@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/TypeRange.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include <optional>
 
@@ -30,6 +31,9 @@ struct FragmentOperandRelation {
   // Unary/cast operations forward the sole operand's complete lane schema.
   // Projection operations instead retain their declared result occurrences.
   bool preservesSourceSchema = false;
+  // Extents owned by the operation, independent of any operand (e.g. Join's
+  // trailing pair). Omitted groups in a partial query do not imply invariance.
+  llvm::SmallVector<unsigned, 1> invariantResultAxes = {};
 
   const FragmentAxisGroup *groupForResultAxis(unsigned axis) const;
   std::optional<unsigned> correspondingSourceAxis(unsigned resultAxis) const;
@@ -59,9 +63,16 @@ queryFragmentOperandRelations(mlir::Operation *operation,
 // recorded explicitly above. General split groups are not inverted by guessing
 // an axis or dividing symbolic sizes.
 // Scalar-to-fragment ownership creation remains the transformation's decision.
+// A caller may prove that an old physical singleton and its projected result
+// are both being refined within the same selected coordinate domain. This is
+// not implied by equal new extents. Slots without a source axis remain broadcast.
+using FragmentBroadcastRefinement =
+    llvm::function_ref<bool(unsigned operandNumber, unsigned sourceAxis,
+                           unsigned resultAxis)>;
 mlir::FailureOr<mlir::Type> transportFragmentResultType(
     llvm::ArrayRef<FragmentOperandRelation> relations,
-    mlir::TypeRange operandTypes, mlir::Type declaredResult);
+    mlir::TypeRange operandTypes, mlir::Type declaredResult,
+    FragmentBroadcastRefinement refineBroadcast = {});
 mlir::FailureOr<mlir::Type> transportFragmentOperandType(
     const FragmentOperandRelation &relation, mlir::Type newResultType,
     mlir::Type declaredOperand);

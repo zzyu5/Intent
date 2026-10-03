@@ -42,32 +42,41 @@ LogicalResult collectExtentBindings(Type expected, Type actual,
     auto actualFragment = dyn_cast<FragmentType>(actual);
     if (!actualFragment)
       return success();
+    SmallVector<std::optional<unsigned>> actualAxes(
+        expectedFragment.getShape().size());
+    if (expectedFragment.getShape().size() == actualFragment.getShape().size()) {
+      // A helper formal and its actual component, or an operation result and
+      // its clone, have explicit positional axes. Repeated provenance is not
+      // permission to select the first matching occurrence instead.
+      for (unsigned axis = 0; axis < actualAxes.size(); ++axis)
+        actualAxes[axis] = axis;
+    } else {
+      auto projection = queryAxisProjection(expectedFragment, actualFragment);
+      if (!projection.isExact()) {
+        reason = "helper schema refinement has no unique axis projection";
+        return failure();
+      }
+      for (auto [axis, input] : llvm::enumerate(projection.targetToSource)) {
+        if (!input)
+          continue;
+        if (actualAxes[*input]) {
+          reason = "helper schema refinement repeats one source axis";
+          return failure();
+        }
+        actualAxes[*input] = axis;
+      }
+    }
     for (auto [expectedAxis, attribute] :
          llvm::enumerate(expectedFragment.getAxisMaps())) {
       if (!selectedAxes.empty() &&
           !llvm::is_contained(selectedAxes, expectedAxis))
         continue;
       auto expectedMap = cast<AxisMapAttr>(attribute);
-      std::optional<unsigned> actualAxis;
-      for (auto [axis, candidate] :
-           llvm::enumerate(actualFragment.getAxisMaps())) {
-        auto actualMap = cast<AxisMapAttr>(candidate);
-        if (actualMap.getSourceId() == expectedMap.getSourceId() &&
-            actualMap.getSourceAxis() == expectedMap.getSourceAxis() &&
-            actualMap.getDerived() == expectedMap.getDerived()) {
-          actualAxis = axis;
-          break;
-        }
+      std::optional<unsigned> actualAxis = actualAxes[expectedAxis];
+      if (!actualAxis) {
+        reason = "helper schema refinement dropped a selected source axis";
+        return failure();
       }
-      // A structured helper argument is positionally paired with its source
-      // component.  Canonical KIR gives the helper-local tensor dimensions
-      // fresh provenance IDs, so the sliced source axis is not required to
-      // retain the caller's ID across this explicit region boundary.
-      if (!actualAxis && expectedFragment.getShape().size() ==
-                             actualFragment.getShape().size())
-        actualAxis = expectedAxis;
-      if (!actualAxis)
-        continue;
       Attribute extent = actualFragment.getShape()[*actualAxis];
       auto actualMap = cast<AxisMapAttr>(
           actualFragment.getAxisMaps()[*actualAxis]);
@@ -123,6 +132,30 @@ bool carriesAxis(Type type, AxisMapAttr expected) {
          });
 }
 
+const ExtentBinding *boundAxis(FragmentType fragment, unsigned axis,
+                              ArrayRef<ExtentBinding> bindings,
+                              Operation *producer) {
+  auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
+  const ExtentBinding *binding =
+      findBinding(bindings, mapping.getSourceId(), mapping.getSourceAxis(),
+                  mapping.getDimensionId(), mapping.getDerived());
+  if (!binding)
+    return nullptr;
+  if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer))
+    if (isUnitExtent(fragment.getShape()[axis]) &&
+        !carriesAxis(reshape.getValue().getType(), mapping))
+      return nullptr;
+  return binding;
+}
+
+bool sameBoundDomain(const ExtentBinding &source, const ExtentBinding &result) {
+  return source.actualSourceId == result.actualSourceId &&
+         source.actualSourceAxis == result.actualSourceAxis &&
+         source.actualDimensionId == result.actualDimensionId &&
+         source.actualDerived == result.actualDerived &&
+         source.extent == result.extent;
+}
+
 Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
                          Operation *producer = nullptr) {
   if (auto fragment = dyn_cast<FragmentType>(type)) {
@@ -134,18 +167,8 @@ Type bindPhysicalExtents(Type type, ArrayRef<ExtentBinding> bindings,
     for (auto [axis, attribute] : llvm::enumerate(fragment.getAxisMaps())) {
       auto mapping = cast<AxisMapAttr>(attribute);
       const ExtentBinding *binding =
-          findBinding(bindings, mapping.getSourceId(),
-                      mapping.getSourceAxis(), mapping.getDimensionId(),
-                      mapping.getDerived());
+          boundAxis(fragment, axis, bindings, producer);
       if (!binding)
-        continue;
-      bool introducedUnitAxis = false;
-      if (auto reshape = dyn_cast_or_null<ReshapeOp>(producer)) {
-        introducedUnitAxis =
-            isUnitExtent(shape[axis]) &&
-            !carriesAxis(reshape.getValue().getType(), mapping);
-      }
-      if (introducedUnitAxis)
         continue;
       if (shape[axis] != binding->extent) {
         shape[axis] = binding->extent;
@@ -308,10 +331,27 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
       selectedTypes.push_back(bindPhysicalExtents(result.getType(), extentBindings,
                                                  &operation));
     Operation *clone = builder.clone(operation, mapping);
-    if (failed(rewriteClonedPhysicalTypes(&operation, clone, [&](Value original) {
-          return bindPhysicalExtents(original.getType(), extentBindings,
-                                     original.getDefiningOp());
-        }))) {
+    if (failed(rewriteClonedPhysicalTypes(
+            &operation, clone,
+            [&](Value original) {
+              return bindPhysicalExtents(original.getType(), extentBindings,
+                                         original.getDefiningOp());
+            },
+            {},
+            [&](OpOperand &operand, unsigned sourceAxis, OpResult result,
+                unsigned resultAxis) {
+              auto sourceType = dyn_cast<FragmentType>(operand.get().getType());
+              auto resultType = dyn_cast<FragmentType>(result.getType());
+              if (!sourceType || !resultType)
+                return false;
+              const ExtentBinding *input =
+                  boundAxis(sourceType, sourceAxis, extentBindings,
+                            operand.get().getDefiningOp());
+              const ExtentBinding *output =
+                  boundAxis(resultType, resultAxis, extentBindings,
+                            result.getOwner());
+              return input && output && sameBoundDomain(*input, *output);
+            }))) {
       reason = "helper operands cannot transport the declared fragment schema";
       return failure();
     }

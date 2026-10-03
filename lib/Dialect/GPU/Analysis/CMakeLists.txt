@@ -13,6 +13,7 @@ add_mlir_library(MLIRIntentGPUAnalysis
   IndexRelations.cpp
   PhysicalParameters.cpp
   ResourceAlias.cpp
+  MemoryEffects.cpp
   Resources.cpp
   ValueSchema.cpp
   UniformValues.cpp
@@ -23,6 +24,7 @@ add_mlir_library(MLIRIntentGPUAnalysis
   MLIRIR
   MLIRSCFDialect
   MLIRControlFlowInterfaces
+  MLIRSideEffectInterfaces
   MLIRViewLikeInterface
   MLIRIntentGPUDialect
   MLIRIntentAnalysis

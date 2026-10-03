@@ -295,6 +295,11 @@ void PhysicalProgramAnalysis::collectAxisRanges(
       appendUnique(result.blockers, operation);
       return;
     }
+    if (!relations->empty() &&
+        llvm::all_of(*relations, [&](const FragmentOperandRelation &relation) {
+          return llvm::is_contained(relation.invariantResultAxes, fragmentAxis);
+        }))
+      return;
     auto expected = cast<AxisMapAttr>(fragment.getAxisMaps()[fragmentAxis]);
     for (const FragmentOperandRelation &relation : *relations) {
       auto input = dyn_cast<FragmentType>(relation.sourceType);
@@ -379,14 +384,6 @@ void PhysicalProgramAnalysis::collectAxisRanges(
     if (!followed) {
       result.state = PhysicalFactState::Unknown;
       appendUnique(result.blockers, operation);
-    }
-    return;
-  }
-  if (auto join = dyn_cast<JoinOp>(operation)) {
-    auto input = cast<FragmentType>(join.getLhs().getType());
-    if (fragmentAxis < input.getShape().size()) {
-      collectAxisRanges(join.getLhs(), fragmentAxis, result, visited);
-      collectAxisRanges(join.getRhs(), fragmentAxis, result, visited);
     }
     return;
   }

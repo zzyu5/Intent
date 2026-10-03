@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Worklist.h"
@@ -65,13 +66,13 @@ LogicalResult alignContractAccumulator(Operation *operation,
       if (dimension <= 0)
         return owner->emitOpError(
             "contract accumulator alignment has no dimension authority");
-      if (failed(retargetDimensionExtent(
-              result, dimension,
+      if (failed(retargetFragmentAxisExtent(
+              result, axis,
               cast<PhysicalExprAttr>(aligned.getShape()[axis]),
               changes.typeChanged(), &changes)))
         return failure();
-      if (failed(retargetDimensionExtent(
-              accumulator, dimension,
+      if (failed(retargetFragmentAxisExtent(
+              accumulator, axis,
               cast<PhysicalExprAttr>(aligned.getShape()[axis]),
               changes.typeChanged(), &changes)))
         return failure();
@@ -113,53 +114,58 @@ WalkResult alignContractOperands(Operation *operation,
     auto source = broadcast
                       ? dyn_cast<FragmentType>(broadcast.getValue().getType())
                       : FragmentType();
-    auto target = cast<FragmentType>(value.getType());
     if (!source)
       return false;
     auto relations = queryFragmentOperandRelations(broadcast);
-    auto mapping = cast<AxisMapAttr>(target.getAxisMaps()[axis]);
     if (failed(relations) || !relations->front().hasCompatibleExtents())
       return false;
     const auto *group = relations->front().groupForResultAxis(axis);
-    if (!group || !group->sourceAxes.empty() ||
-        queryFragmentAxes(target, sourceAxisIdentity(mapping)).size() != 1)
+    if (!group || !group->sourceAxes.empty())
       return false;
     auto ranges = PhysicalProgramAnalysis(kernel).axisRanges(value, axis);
     return ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty();
   };
-  auto batchExtentAuthority = [&](Value value, AxisMapAttr mapping) {
-    Value authority = value;
-    while (Operation *operation = authority.getDefiningOp()) {
+  auto batchExtentAuthority = [&](Value value, unsigned axis) {
+    std::pair<Value, unsigned> original{value, axis}, authority = original;
+    while (Operation *operation = authority.first.getDefiningOp()) {
       if (!isa<ReshapeOp, TransposeOp>(operation))
         break;
-      Value source = operation->getOperand(0);
-      if (!queryFragmentAxis(source.getType(), sourceAxisIdentity(mapping),
-                             mapping.getDimensionId())
-               .isExact())
-        return value;
-      authority = source;
+      auto relations = queryFragmentOperandRelations(operation);
+      if (failed(relations) || relations->size() != 1)
+        return original;
+      auto sourceAxis =
+          relations->front().correspondingSourceAxis(authority.second);
+      if (!sourceAxis)
+        return original;
+      authority = {operation->getOperand(relations->front().operandNumber),
+                   *sourceAxis};
     }
-    auto load = authority.getDefiningOp<LoadOp>();
+    auto load = authority.first.getDefiningOp<LoadOp>();
     if (!load)
-      return value;
+      return original;
     PhysicalProgramAnalysis analysis(kernel);
-    for (Value dependency : load->getOperands()) {
-      if (dependency == load.getResource() ||
-          !isa<FragmentType>(dependency.getType()))
-        continue;
-      if (queryFragmentAxes(dependency.getType(), sourceAxisIdentity(mapping))
-              .empty())
-        continue;
-      auto axis =
-          queryFragmentAxis(dependency.getType(), sourceAxisIdentity(mapping),
-                            mapping.getDimensionId());
-      if (!axis.isExact())
-        return value;
-      auto ranges = analysis.axisRanges(dependency, axis.fragmentAxis);
-      if (!ranges.isExact() || !ranges.roots.empty() ||
-          !ranges.blockers.empty())
-        return value;
-    }
+    auto isUniform = [&](Value dependency, const BroadcastProjection &relation) {
+      if (!dependency || !isa<FragmentType>(dependency.getType()))
+        return true;
+      if (!relation.isExact() || authority.second >= relation.targetToSource.size())
+        return false;
+      auto sourceAxis = relation.targetToSource[authority.second];
+      if (!sourceAxis)
+        return true;
+      auto ranges = analysis.axisRanges(dependency, *sourceAxis);
+      return ranges.isExact() && ranges.roots.empty() && ranges.blockers.empty();
+    };
+    auto access = cast<AccessOpInterface>(load.getOperation());
+    for (auto [slot, coordinate] : llvm::enumerate(load.getCoordinates()))
+      if (!isUniform(coordinate, queryAccessCoordinateAxes(access, slot)))
+        return original;
+    for (Value dependency : {load.getValid(), load.getFill()})
+      if (dependency)
+        if (auto type = dyn_cast<FragmentType>(dependency.getType()))
+          if (!isUniform(dependency, queryAxisProjection(
+                                         type, cast<FragmentType>(
+                                                   load.getResult().getType()))))
+            return original;
     return authority;
   };
 
@@ -192,20 +198,22 @@ WalkResult alignContractOperands(Operation *operation,
       if (lhsUnit == rhsUnit)
         rebindLhs = lhsUniform;
       if (rebindLhs) {
-        auto mapping = cast<AxisMapAttr>(lhsType.getAxisMaps()[lhsAxis]);
-        Value authority = batch ? batchExtentAuthority(lhs, mapping) : lhs;
-        if (failed(retargetSourceExtent(authority, sourceAxisIdentity(mapping),
-                                        cast<PhysicalExprAttr>(rhsExtent),
-                                        mapping.getDimensionId(),
-                                        changes.typeChanged(), &changes)))
+        auto authority = batch ? batchExtentAuthority(lhs, lhsAxis)
+                               : std::pair<Value, unsigned>{
+                                     lhs, static_cast<unsigned>(lhsAxis)};
+        if (failed(retargetFragmentAxisExtent(
+                authority.first, authority.second,
+                cast<PhysicalExprAttr>(rhsExtent), changes.typeChanged(),
+                &changes)))
           return failure();
       } else {
-        auto mapping = cast<AxisMapAttr>(rhsType.getAxisMaps()[rhsAxis]);
-        Value authority = batch ? batchExtentAuthority(rhs, mapping) : rhs;
-        if (failed(retargetSourceExtent(authority, sourceAxisIdentity(mapping),
-                                        cast<PhysicalExprAttr>(lhsExtent),
-                                        mapping.getDimensionId(),
-                                        changes.typeChanged(), &changes)))
+        auto authority = batch ? batchExtentAuthority(rhs, rhsAxis)
+                               : std::pair<Value, unsigned>{
+                                     rhs, static_cast<unsigned>(rhsAxis)};
+        if (failed(retargetFragmentAxisExtent(
+                authority.first, authority.second,
+                cast<PhysicalExprAttr>(lhsExtent), changes.typeChanged(),
+                &changes)))
           return failure();
       }
     }

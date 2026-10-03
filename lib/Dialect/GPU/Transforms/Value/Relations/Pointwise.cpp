@@ -132,9 +132,9 @@ WalkResult alignPointwiseValue(Operation *operation,
             });
         if (realization.constructionScalarSeed || derivedOccurrence ||
             selectedProgramExtent) {
-          if (failed(retargetSourceExtent(
-                  broadcast.getResult(), sourceAxisIdentity(targetMap),
-                  sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+          if (failed(retargetFragmentAxisExtent(
+                  broadcast.getResult(), targetAxis, sourceExtent,
+                  changes.typeChanged(), &changes)))
             return WalkResult::interrupt();
           target = cast<FragmentType>(broadcast.getResult().getType());
           continue;
@@ -153,10 +153,9 @@ WalkResult alignPointwiseValue(Operation *operation,
             analysis.axisRealization(broadcast.getResult(), targetAxis);
         if (input.hasExtentAuthority() && !input.constructionScalarSeed &&
             !output.hasExtentAuthority()) {
-          auto targetMap = cast<AxisMapAttr>(target.getAxisMaps()[targetAxis]);
-          if (failed(retargetSourceExtent(
-                  broadcast.getResult(), sourceAxisIdentity(targetMap),
-                  sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+          if (failed(retargetFragmentAxisExtent(
+                  broadcast.getResult(), targetAxis, sourceExtent,
+                  changes.typeChanged(), &changes)))
             return WalkResult::interrupt();
           target = cast<FragmentType>(broadcast.getResult().getType());
           continue;
@@ -176,15 +175,15 @@ WalkResult alignPointwiseValue(Operation *operation,
         return WalkResult::interrupt();
       }
       if (targetParameter) {
-        if (failed(retargetSourceExtent(
-                broadcast.getValue(), sourceAxisIdentity(sourceMap),
+        if (failed(retargetFragmentAxisExtent(
+                broadcast.getValue(), sourceAxis,
                 cast<PhysicalExprAttr>(target.getShape()[targetAxis]),
-                std::nullopt, changes.typeChanged(), &changes)))
+                changes.typeChanged(), &changes)))
           return WalkResult::interrupt();
       } else {
-        if (failed(retargetSourceExtent(
-                broadcast.getResult(), sourceAxisIdentity(targetMap),
-                sourceExtent, std::nullopt, changes.typeChanged(), &changes)))
+        if (failed(retargetFragmentAxisExtent(
+                broadcast.getResult(), targetAxis, sourceExtent,
+                changes.typeChanged(), &changes)))
           return WalkResult::interrupt();
       }
       source = cast<FragmentType>(broadcast.getValue().getType());
@@ -231,17 +230,44 @@ WalkResult alignPointwiseValue(Operation *operation,
   }
   if (!target)
     return WalkResult::advance();
-  // Sole-source operations acquire their operand's complete lane schema.
-  // Multi-operand operations first resolve extent authorities below: their
-  // still-unprojected uniform inputs need not yet have the result's rank.
-  if (isa<UnaryOp, CastOp, BitcastOp>(operation) &&
-      isa<FragmentType>(operation->getOperand(0).getType())) {
-    auto relations = queryFragmentOperandRelations(operation);
-    if (failed(relations)) {
-      operation->emitOpError(
-          "pointwise operation has no physical operand relation");
-      return WalkResult::interrupt();
-    }
+  auto relations = queryFragmentOperandRelations(operation);
+  if (failed(relations)) {
+    operation->emitOpError(
+        "pointwise operation has no physical operand relation");
+    return WalkResult::interrupt();
+  }
+  // A forwarding relation names its schema operand explicitly. Other operands
+  // (such as a random generator's scalar seed) do not acquire that schema.
+  bool forwardsSource =
+      relations->size() == 1 && relations->front().preservesSourceSchema;
+  if (forwardsSource &&
+      !isa<FragmentType>(
+          operation->getOperand(relations->front().operandNumber).getType()) &&
+      failed(align(operation, relations->front().operandNumber, target))) {
+    operation->emitOpError(
+        "schema source cannot adopt the selected physical result");
+    return WalkResult::interrupt();
+  }
+  bool fullPointwise =
+      relations->size() == operation->getNumOperands() &&
+      llvm::all_of(*relations, [&](const FragmentOperandRelation &relation) {
+        if (!relation.invariantResultAxes.empty())
+          return false;
+        SmallVector<bool> covered(target.getShape().size(), false);
+        for (const FragmentAxisGroup &group : relation.groups) {
+          if (group.kind == FragmentAxisRelationKind::Reassociation ||
+              group.sourceAxes.size() > 1 || group.resultAxes.size() != 1)
+            return false;
+          unsigned axis = group.resultAxes.front();
+          if (axis >= covered.size() || covered[axis])
+            return false;
+          covered[axis] = true;
+        }
+        return llvm::all_of(covered, [](bool axis) { return axis; });
+      });
+  // General relations preserve operand ranks. Only complete pointwise maps
+  // below may project every operand onto the full result domain.
+  if (forwardsSource || !fullPointwise) {
     auto result = transportFragmentResultType(
         *relations, operation->getOperandTypes(), target);
     if (failed(result)) {
@@ -252,6 +278,41 @@ WalkResult alignPointwiseValue(Operation *operation,
     changes.setType(operation->getResult(0), *result);
     return WalkResult::advance();
   }
+  // A realized result already has an execution-domain decision. A record field
+  // can still carry only its old boundary schema; that declaration is not an
+  // independent traversal. Transport the requirement through the operation's
+  // exact same-lane slots before comparing the remaining extent authorities.
+  for (const FragmentOperandRelation &relation : *relations) {
+    for (const FragmentAxisGroup &group : relation.groups) {
+      if (group.kind != FragmentAxisRelationKind::Corresponding ||
+          group.sourceAxes.size() != 1 || group.resultAxes.size() != 1)
+        continue;
+      Value operand = operation->getOperand(relation.operandNumber);
+      auto source = dyn_cast<FragmentType>(operand.getType());
+      auto result = cast<FragmentType>(operation->getResult(0).getType());
+      unsigned sourceAxis = group.sourceAxes.front();
+      unsigned resultAxis = group.resultAxes.front();
+      if (!source || source.getShape()[sourceAxis] == result.getShape()[resultAxis])
+        continue;
+      PhysicalProgramAnalysis analysis(kernel);
+      auto required = analysis.axisRealization(operation->getResult(0), resultAxis);
+      auto supplied = analysis.axisRealization(operand, sourceAxis);
+      auto sourceRanges = analysis.axisRanges(operand, sourceAxis);
+      if (!required.isExact() || !required.hasExtentAuthority() ||
+          !required.physicalized || required.constructionScalarSeed ||
+          !supplied.isExact() || supplied.physicalized ||
+          !sourceRanges.isExact() || !sourceRanges.blockers.empty() ||
+          supplied.extentAuthority !=
+              PhysicalAxisRealizationFact::ExtentAuthority::Structural)
+        continue;
+      if (failed(retargetFragmentAxisExtent(
+              operand, sourceAxis,
+              cast<PhysicalExprAttr>(result.getShape()[resultAxis]),
+              changes.typeChanged(), &changes)))
+        return WalkResult::interrupt();
+    }
+  }
+  target = cast<FragmentType>(operation->getResult(0).getType());
   FailureOr<FragmentType> refined =
       queryValueSchema(kernel, target, operation->getOperands());
   if (failed(refined)) {
@@ -272,11 +333,9 @@ WalkResult alignPointwiseValue(Operation *operation,
           "pointwise result refinement has no logical dimension authority");
       return WalkResult::interrupt();
     }
-    if (failed(retargetSourceExtent(
-            operation->getResult(0),
-            sourceAxisIdentity(cast<AxisMapAttr>(target.getAxisMaps()[axis])),
+    if (failed(retargetFragmentAxisExtent(
+            operation->getResult(0), axis,
             cast<PhysicalExprAttr>((*refined).getShape()[axis]),
-            cast<AxisMapAttr>(target.getAxisMaps()[axis]).getDimensionId(),
             changes.typeChanged(), &changes)))
       return WalkResult::interrupt();
   }
