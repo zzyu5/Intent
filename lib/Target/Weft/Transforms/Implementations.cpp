@@ -1,7 +1,7 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Quantization.h"
-#include "../../../Dialect/CPU/Transforms/Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"

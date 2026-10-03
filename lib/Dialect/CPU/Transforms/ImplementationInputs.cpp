@@ -1,8 +1,9 @@
-#include "ImplementationInputs.h"
+#include "Intent/Dialect/CPU/Transforms/ImplementationInputs.h"
+#include "InputWindows.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
-#include "Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
@@ -12,6 +13,45 @@
 
 using namespace mlir;
 namespace intent::cpu {
+
+struct ImplementationInputs::Impl {
+  explicit Impl(func::FuncOp function) : function(function) {}
+
+  FailureOr<SmallVector<InputSupply>> prepare(linalg::GenericOp operation,
+      ArrayRef<InputRequirement> requirements, const Implementation &implementation);
+  FailureOr<InputSupply> prepareCaptured(linalg::GenericOp operation,
+      memref::LoadOp input, const InputRequirement &requirement, Operation *scope);
+  FailureOr<SmallVector<InputSupply>> prepareGroup(OpBuilder &builder,
+      linalg::GenericOp operation, const ContractionTile &tile,
+      ConfigurationAttr configuration, ArrayRef<InputRequirement> requirements);
+
+  std::optional<InputSupply> prepareWindow(Value source, const InputRequirement &requirement,
+      linalg::GenericOp operation);
+  void guardLoop(scf::ForOp loop);
+  Operation *consumerScope(Value source, linalg::GenericOp operation,
+      const InputRequirement &requirement, const Implementation &implementation);
+  InputSupply materialize(Value source, const InputRequirement &requirement, Operation *scope);
+
+  struct Prepared {
+    Value source;
+    InputRequirement requirement;
+    memref::AllocOp allocation;
+  };
+  struct PreparedWindow {
+    Value source;
+    InputRequirement requirement;
+    unsigned axis;
+    bool transposed;
+    scf::ForOp scope;
+    memref::AllocOp storage;
+    memref::AllocOp initialized;
+  };
+  func::FuncOp function;
+  SmallVector<Prepared> prepared;
+  SmallVector<PreparedWindow> windows;
+  SmallVector<Operation *> guardedLoops;
+};
+
 namespace {
 
 bool sameRepresentation(const InputRequirement &first, const InputRequirement &second) {
@@ -80,6 +120,29 @@ bool panelAligned(OpFoldResult offset, int64_t panel) {
   return aligned(offset);
 }
 
+} // namespace
+
+ImplementationInputs::ImplementationInputs(func::FuncOp function)
+    : impl(std::make_unique<Impl>(function)) {}
+
+ImplementationInputs::~ImplementationInputs() = default;
+
+FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(
+    linalg::GenericOp operation, ArrayRef<InputRequirement> requirements,
+    const Implementation &implementation) {
+  return impl->prepare(operation, requirements, implementation);
+}
+
+FailureOr<InputSupply> ImplementationInputs::prepareCaptured(
+    linalg::GenericOp operation, memref::LoadOp input,
+    const InputRequirement &requirement, Operation *scope) {
+  return impl->prepareCaptured(operation, input, requirement, scope);
+}
+
+FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(
+    OpBuilder &builder, linalg::GenericOp operation, const ContractionTile &tile,
+    ConfigurationAttr configuration, ArrayRef<InputRequirement> requirements) {
+  return impl->prepareGroup(builder, operation, tile, configuration, requirements);
 }
 
 std::optional<ConsumerWindow> consumerWindow(Value source, const InputRequirement &requirement,
@@ -146,7 +209,7 @@ bool hasIndependentWindowCoordinates(memref::SubViewOp window, Operation *scope,
   return llvm::all_of(window.getMixedOffsets(), invariant) && llvm::all_of(window.getMixedSizes(), invariant);
 }
 
-FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::GenericOp operation,
+FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepare(linalg::GenericOp operation,
     ArrayRef<InputRequirement> requirements, const Implementation &implementation) {
   if (auto reason = checkInputRequirements(operation, requirements))
     return operation.emitError(*reason), failure();
@@ -164,7 +227,7 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(linalg::Generi
   return supplies;
 }
 
-void ImplementationInputs::guardLoop(scf::ForOp loop) {
+void ImplementationInputs::Impl::guardLoop(scf::ForOp loop) {
   if (llvm::is_contained(guardedLoops, loop.getOperation())) return;
   OpBuilder b(loop);
   Value nonempty = b.create<arith::CmpIOp>(loop.getLoc(), arith::CmpIPredicate::slt,
@@ -174,7 +237,7 @@ void ImplementationInputs::guardLoop(scf::ForOp loop) {
   guardedLoops.push_back(loop);
 }
 
-std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
+std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value source,
     const InputRequirement &requirement, linalg::GenericOp operation) {
   auto window = consumerWindow(source, requirement, operation);
   if (!window) return std::nullopt;
@@ -269,7 +332,7 @@ std::optional<InputSupply> ImplementationInputs::prepareWindow(Value source,
   return InputSupply{requirement.operand, requirement.panelAxis, requirement.panelSize, prepared->storage, std::move(begins)};
 }
 
-Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp operation,
+Operation *ImplementationInputs::Impl::consumerScope(Value source, linalg::GenericOp operation,
     const InputRequirement &requirement, const Implementation &implementation) {
   if (auto branch = dyn_cast<scf::IfOp>(operation->getParentOp()); branch && !branch.getElseRegion().empty()) {
     StorageAnalysis storage(function);
@@ -297,7 +360,7 @@ Operation *ImplementationInputs::consumerScope(Value source, linalg::GenericOp o
   return storage.preserves(loop, source) ? loop.getOperation() : operation;
 }
 
-FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp operation,
+FailureOr<InputSupply> ImplementationInputs::Impl::prepareCaptured(linalg::GenericOp operation,
     memref::LoadOp input, const InputRequirement &requirement, Operation *scope) {
   if (input->getBlock() != &operation.getRegion().front() ||
       (scope != operation && !scope->isAncestor(operation)) || requirement.reuse != InputReuse::Consumers)
@@ -314,7 +377,7 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(linalg::GenericOp o
   return materialize(source, requirement, scope);
 }
 
-InputSupply ImplementationInputs::materialize(Value source, const InputRequirement &requirement, Operation *scope) {
+InputSupply ImplementationInputs::Impl::materialize(Value source, const InputRequirement &requirement, Operation *scope) {
   StorageAnalysis analysis(function);
   DominanceInfo dominance(function);
   auto type = cast<MemRefType>(source.getType());
@@ -397,7 +460,7 @@ InputSupply ImplementationInputs::materialize(Value source, const InputRequireme
   return {requirement.operand, requirement.panelAxis, requirement.panelSize, storage, std::move(begins)};
 }
 
-FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(OpBuilder &b,
+FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepareGroup(OpBuilder &b,
     linalg::GenericOp operation, const ContractionTile &tile, ConfigurationAttr configuration,
     ArrayRef<InputRequirement> requirements) {
   SmallVector<InputSupply> supplies;

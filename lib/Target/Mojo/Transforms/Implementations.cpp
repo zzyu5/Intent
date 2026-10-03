@@ -2,7 +2,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
-#include "../../../Dialect/CPU/Transforms/Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include <optional>

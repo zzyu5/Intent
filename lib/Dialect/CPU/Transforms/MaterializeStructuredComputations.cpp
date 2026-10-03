@@ -1,5 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
-#include "Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "VectorReductions.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"

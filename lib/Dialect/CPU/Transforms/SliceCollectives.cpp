@@ -3,7 +3,7 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
-#include "Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"

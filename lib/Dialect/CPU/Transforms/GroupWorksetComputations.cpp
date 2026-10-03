@@ -1,7 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
-#include "Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"

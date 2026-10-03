@@ -2,7 +2,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation.h"
 #include "Intent/Dialect/CPU/Analysis/Contractions.h"
 #include "Contractions.h"
-#include "Utilities.h"
+#include "Intent/Dialect/CPU/Transforms/LoopBuilders.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/Support/MathExtras.h"
