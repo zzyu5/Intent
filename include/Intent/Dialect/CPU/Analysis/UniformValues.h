@@ -2,13 +2,13 @@
 #define INTENT_DIALECT_CPU_ANALYSIS_UNIFORMVALUES_H
 
 #include "Intent/Analysis/UniformValues.h"
+#include "Intent/Analysis/BufferStorage.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include <utility>
 
 namespace intent::cpu {
 
 class StorageAnalysis;
-struct StorageEffects;
 
 // Whole-view aliases have the same uniform contents. Partial slices retain
 // their own key; uniform facts about their complete allocation may still apply.
@@ -42,7 +42,7 @@ public:
   void visit(mlir::Operation *operation);
 
 private:
-  void invalidate(const StorageEffects &effects);
+  void invalidate(const intent::BufferStorageEffects &effects);
   UniformComputationFacts evaluate(mlir::linalg::GenericOp operation) const;
 
   StorageAnalysis *storage;

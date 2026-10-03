@@ -1,4 +1,5 @@
 #include "PassSupport.h"
+#include "StoragePatterns.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -43,6 +44,8 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   work.walk([&](MatMulOp matrix) { matrices.push_back(matrix); });
   if (matrices.size() != 1) return std::nullopt;
   MatMulOp matrix = matrices.front();
+  auto function = work->getParentOfType<func::FuncOp>();
+  StorageAnalysis storage(function);
   auto reduction = dyn_cast<scf::ForOp>(matrix->getParentOp());
   APInt step;
   if (!reduction || reduction->getBlock() != work.getBody() || !reduction.getInitArgs().empty() ||
@@ -88,14 +91,21 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     if (&operation == matrix.getOperation()) continue;
     if (auto load = dyn_cast<LoadTileOp>(operation)) {
       if (load.getAsynchronous() || !isa<BlockArgument>(load.getSource())) return std::nullopt;
-      if (load.getOutput() == matrix.getLhs() && !lhs) lhs = load;
-      else if (load.getOutput() == matrix.getRhs() && !rhs) rhs = load;
+      if (detail::sameCompleteView(storage, load.getOutput(),
+                                   matrix.getLhs()) &&
+          !lhs)
+        lhs = load;
+      else if (detail::sameCompleteView(storage, load.getOutput(),
+                                        matrix.getRhs()) &&
+               !rhs)
+        rhs = load;
       else return std::nullopt;
     } else if (auto fill = dyn_cast<FillOp>(operation)) {
       inputInitializers.push_back(fill);
     } else if (auto allocation = dyn_cast<memref::AllocaOp>(operation)) {
-      if (allocation.getResult() != matrix.getLhs() &&
-          allocation.getResult() != matrix.getRhs()) return std::nullopt;
+      if (allocation.getResult() != storage.uniqueOrigin(matrix.getLhs()) &&
+          allocation.getResult() != storage.uniqueOrigin(matrix.getRhs()))
+        return std::nullopt;
     } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
   }
   if (!lhs || !rhs || lhs.getRows() != matrix.getRows() || lhs.getColumns() != matrix.getDepth() ||
@@ -109,7 +119,6 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     return type && type.getRank() == 2 && type.getMemorySpaceAsInt() == 0;
   };
   if (!external(lhs.getSource()) || !external(rhs.getSource())) return std::nullopt;
-  auto function = work->getParentOfType<func::FuncOp>();
   auto interface = intent::getPublicInterface(function);
   auto viewStride = [&](Value stride, Value source, unsigned axis) {
     auto argument = dyn_cast<BlockArgument>(source);
@@ -149,19 +158,26 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     int64_t reduction = intent::publicViewDimensions(leftView)[1];
     if (reduction <= 0 || reduction != intent::publicViewDimensions(rightView)[0]) return std::nullopt;
   }
-  if (matrix.getLhs() == matrix.getRhs() || matrix.getAccumulator() == matrix.getLhs() ||
-      matrix.getAccumulator() == matrix.getRhs()) return std::nullopt;
+  if (!storage.disjoint(matrix.getLhs(), matrix.getRhs()) ||
+      !storage.disjoint(matrix.getAccumulator(), matrix.getLhs()) ||
+      !storage.disjoint(matrix.getAccumulator(), matrix.getRhs()))
+    return std::nullopt;
   SmallVector<Value> buffers{matrix.getLhs(), matrix.getRhs(), matrix.getAccumulator()};
   SmallVector<SmallVector<int64_t>> shapes{{config.getTileM(), config.getTileK()},
       {config.getTileK(), config.getTileN()}, {config.getTileM(), config.getTileN()}};
   for (auto [buffer, shape] : llvm::zip(buffers, shapes)) {
-    auto allocation = buffer.getDefiningOp<memref::AllocaOp>();
+    Value origin = storage.uniqueOrigin(buffer);
+    auto allocation =
+        origin ? origin.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp();
     if (!allocation || (allocation->getBlock() != work.getBody() &&
         (buffer == matrix.getAccumulator() ||
          allocation->getBlock() != reduction.getBody()))) return std::nullopt;
-    auto type = allocation.getType();
-    if (type.getShape() != ArrayRef<int64_t>(shape) || !type.getLayout().isIdentity() ||
-        type.getMemorySpaceAsInt() != nramSpace) return std::nullopt;
+    auto type = cast<MemRefType>(buffer.getType());
+    if (type.getShape() != ArrayRef<int64_t>(shape) ||
+        !type.getLayout().isIdentity() ||
+        type.getMemorySpaceAsInt() != nramSpace ||
+        !isCompleteStorageViewOf(buffer, origin))
+      return std::nullopt;
   }
   // Only the accumulator persists through the K traversal. All other work in
   // the outer body must be its pointwise epilogue or pure coordinate setup.
@@ -169,13 +185,20 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   for (Operation &operation : work.getBody()->without_terminator()) {
     if (&operation == reduction.getOperation()) break;
     if (auto fill = dyn_cast<FillOp>(operation)) {
-      if (fill.getOutput() == matrix.getLhs() || fill.getOutput() == matrix.getRhs()) {
+      if (detail::sameCompleteView(storage, fill.getOutput(),
+                                   matrix.getLhs()) ||
+          detail::sameCompleteView(storage, fill.getOutput(),
+                                   matrix.getRhs())) {
         inputInitializers.push_back(fill);
         continue;
       }
       FloatAttr zero;
-      if (initial || fill.getOutput() != matrix.getAccumulator() ||
-          !matchPattern(fill.getValue(), m_Constant(&zero)) || !zero.getValue().isZero()) return std::nullopt;
+      if (initial ||
+          !detail::sameCompleteView(storage, fill.getOutput(),
+                                    matrix.getAccumulator()) ||
+          !matchPattern(fill.getValue(), m_Constant(&zero)) ||
+          !zero.getValue().isZero())
+        return std::nullopt;
       initial = fill;
     } else if (!isa<memref::AllocaOp>(operation) && !isMemoryEffectFree(&operation)) return std::nullopt;
   }
@@ -184,18 +207,29 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   // padding. Its input initialization may be in either the task or K scope,
   // provided no other consumer observes that earlier value or aliases storage.
   for (FillOp fill : inputInitializers) {
-    LoadTileOp load = fill.getOutput() == matrix.getLhs() ? lhs
-        : fill.getOutput() == matrix.getRhs() ? rhs : LoadTileOp{};
+    LoadTileOp load =
+        detail::sameCompleteView(storage, fill.getOutput(), matrix.getLhs())
+            ? lhs
+        : detail::sameCompleteView(storage, fill.getOutput(), matrix.getRhs())
+            ? rhs
+            : LoadTileOp{};
     if (!load || (fill->getBlock() == reduction.getBody()
         ? !fill->isBeforeInBlock(load) : !fill->isBeforeInBlock(reduction)))
       return std::nullopt;
   }
-  for (LoadTileOp load : {lhs, rhs})
-    for (Operation *user : load.getOutput().getUsers()) {
-      if (user == load.getOperation() || user == matrix.getOperation()) continue;
+  for (LoadTileOp load : {lhs, rhs}) {
+    auto aliases = storage.aliases(storage.uniqueOrigin(load.getOutput()));
+    if (!aliases.complete)
+      return std::nullopt;
+    for (Operation *user : aliases.users) {
+      if (user == load.getOperation() || user == matrix.getOperation())
+        continue;
+      if (isBufferStorageAliasOperation(user))
+        continue;
       auto fill = dyn_cast<FillOp>(user);
       if (!fill || !llvm::is_contained(inputInitializers, fill)) return std::nullopt;
     }
+  }
   DenseSet<Value> available{matrix.getAccumulator(), row->begin, column->begin,
                             matrix.getRows(), matrix.getColumns()};
   DenseSet<Value> visiting;

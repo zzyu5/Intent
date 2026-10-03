@@ -1,5 +1,7 @@
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
+#include "Intent/Analysis/BufferStorage.h"
+#include "Intent/Dialect/DSA/IR/MemoryEffects.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/STLExtras.h"
@@ -49,12 +51,26 @@ LogicalResult verifyHelper(Operation *owner, Region &region,
                    captures.getTypes()))
     return owner->emitOpError("combine capture types must match explicit operands");
 
+  BufferStorageAnalysis storage(owner->getParentOfType<func::FuncOp>(),
+                                storagePolicy());
+  SmallVector<Value> borrowed;
+  for (BlockArgument argument : body.getArguments())
+    if (isa<BaseMemRefType>(argument.getType())) {
+      auto origins = storage.origins(argument);
+      if (!origins.complete)
+        return owner->emitOpError("collective argument has unknown storage flow");
+      llvm::append_range(borrowed, origins.values);
+    }
   auto knownLocal = [&](Value memory) {
-    Value root = storageRoot(memory);
-    if (auto formal = dyn_cast<BlockArgument>(root))
-      return formal.getOwner() == &body;
-    auto allocation = root.getDefiningOp<memref::AllocaOp>();
-    return allocation && region.isAncestor(allocation->getParentRegion());
+    auto origins = storage.origins(memory);
+    return origins.complete && !origins.values.empty() &&
+           llvm::all_of(origins.values, [&](Value origin) {
+             if (llvm::is_contained(borrowed, origin))
+               return true;
+             auto allocation = origin.getDefiningOp<memref::AllocaOp>();
+             return allocation &&
+                    region.isAncestor(allocation->getParentRegion());
+           });
   };
   WalkResult status = region.walk<WalkOrder::PreOrder>([&](Operation *operation) {
     for (Value operand : operation->getOperands())
@@ -85,10 +101,12 @@ LogicalResult verifyHelper(Operation *owner, Region &region,
         return WalkResult::interrupt();
       }
       if (isa<MemoryEffects::Read>(effect.getEffect())) continue;
-      Value root = storageRoot(memory);
-      auto allocation = root.getDefiningOp<memref::AllocaOp>();
-      if (!allocation || !region.isAncestor(allocation->getParentRegion()) ||
-          !isa<MemoryEffects::Allocate, MemoryEffects::Write>(effect.getEffect())) {
+      auto origins = storage.origins(memory);
+      if (!isa<MemoryEffects::Allocate, MemoryEffects::Write>(effect.getEffect()) ||
+          !llvm::all_of(origins.values, [&](Value origin) {
+            auto allocation = origin.getDefiningOp<memref::AllocaOp>();
+            return allocation && region.isAncestor(allocation->getParentRegion());
+          })) {
         operation->emitOpError(
             "collective inputs are borrowed read-only; writes require local scratch");
         return WalkResult::interrupt();
@@ -200,25 +218,30 @@ LogicalResult verifyCollective(Operation *operation, ValueRange sources,
     if (!scalar(capture.getType()) && !isCompleteLocalStorageView(capture))
       return operation->emitOpError("captures must be scalar values or complete local snapshots");
 
-  SmallVector<Value> readRoots, writtenRoots;
+  BufferStorageAnalysis storage(operation->getParentOfType<func::FuncOp>(),
+                                storagePolicy());
+  SmallVector<Value> readValues, writtenValues;
   for (ValueRange inputs : {sources, captures})
     for (Value input : inputs)
-      if (isa<MemRefType>(input.getType())) readRoots.push_back(storageRoot(input));
+      if (isa<MemRefType>(input.getType())) readValues.push_back(input);
   auto verifyDestinations = [&](ValueRange destinations,
                                 bool updatesInitial) -> LogicalResult {
     for (auto [field, destination] : llvm::enumerate(destinations)) {
-      Value root = storageRoot(destination);
-      if (!root.getDefiningOp<memref::AllocaOp>() ||
-          llvm::is_contained(readRoots, root) || llvm::is_contained(writtenRoots, root))
+      Value root = storage.uniqueOrigin(destination);
+      auto overlaps = [&](Value input) { return !storage.disjoint(destination, input); };
+      if (!root || !root.getDefiningOp<memref::AllocaOp>() ||
+          llvm::any_of(readValues, overlaps) || llvm::any_of(writtenValues, overlaps))
         return operation->emitOpError(
             "collective outputs require independent local storage");
       for (auto [initialField, initial] : llvm::enumerate(initials))
-        if (isa<MemRefType>(initial.getType()) && storageRoot(initial) == root &&
+        if (isa<MemRefType>(initial.getType()) && !storage.disjoint(initial, destination) &&
             !(updatesInitial && initialField == field &&
-              initial.getType() == destination.getType()))
+              initial.getType() == destination.getType() &&
+              isCompleteStorageViewOf(initial, root) &&
+              isCompleteStorageViewOf(destination, root)))
           return operation->emitOpError(
               "only a component's complete final state may replace its own initial storage");
-      writtenRoots.push_back(root);
+      writtenValues.push_back(destination);
     }
     return success();
   };
@@ -249,6 +272,49 @@ void collectiveEffects(Operation *operation, unsigned outputBegin,
 bool isCollectiveBorrowedArgument(BlockArgument argument) {
   return isa<SliceReduceOp, ScanOp>(argument.getOwner()->getParentOp()) &&
          isa<MemRefType>(argument.getType());
+}
+
+namespace {
+template <typename Collective>
+Value capturedBuffer(Collective operation, Value value) {
+  auto argument = dyn_cast<BlockArgument>(value);
+  if (!argument || argument.getOwner() != &operation.getCombine().front() ||
+      !isa<BaseMemRefType>(argument.getType()))
+    return {};
+  unsigned first = 2 * operation.getSources().size();
+  unsigned index = argument.getArgNumber();
+  if (index < first || index - first >= operation.getCaptures().size())
+    return {};
+  return operation.getCaptures()[index - first];
+}
+
+template <typename Collective>
+void collectiveFlow(Collective operation,
+                    bufferization::RegisterDependenciesFn registerDependencies) {
+  if (operation.getCombine().empty())
+    return;
+  for (BlockArgument argument : operation.getCombine().front().getArguments())
+    if (Value capture = capturedBuffer(operation, argument))
+      registerDependencies(capture, argument);
+}
+} // namespace
+
+void SliceReduceOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  collectiveFlow(*this, registerDependencies);
+}
+
+bool SliceReduceOp::mayBeTerminalBuffer(Value value) {
+  return !capturedBuffer(*this, value);
+}
+
+void ScanOp::populateDependencies(
+    bufferization::RegisterDependenciesFn registerDependencies) {
+  collectiveFlow(*this, registerDependencies);
+}
+
+bool ScanOp::mayBeTerminalBuffer(Value value) {
+  return !capturedBuffer(*this, value);
 }
 
 LogicalResult SliceReduceOp::verify() {

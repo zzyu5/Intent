@@ -1,6 +1,7 @@
 #ifndef INTENT_DIALECT_DSA_IR_DSAOPS_H
 #define INTENT_DIALECT_DSA_IR_DSAOPS_H
 #include "Intent/Dialect/Intent/IR/Interface.h"
+#include "mlir/Dialect/Bufferization/IR/BufferViewFlowOpInterface.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -17,7 +18,6 @@ inline constexpr llvm::StringLiteral entryRequirementsAttr = "intent_dsa.entry_r
 constexpr int64_t nramSpace = 1;
 constexpr int64_t matrixSpace = 2;
 constexpr int64_t sharedSpace = 3;
-mlir::Value storageRoot(mlir::Value value);
 // Collective formals denote borrowed values, not aliases of identity prototypes.
 bool isCollectiveBorrowedArgument(mlir::BlockArgument argument);
 mlir::LogicalResult verifyProgram(mlir::ModuleOp module);

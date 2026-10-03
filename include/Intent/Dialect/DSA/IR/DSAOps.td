@@ -3,9 +3,11 @@
 include "Intent/Dialect/DSA/IR/DSAAttrs.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Dialect/Bufferization/IR/BufferViewFlowOpInterface.td"
 class IntentDSA_Op<string name, list<Trait> traits = []>
     : Op<IntentDSA_Dialect, name, traits> { let hasVerifier = 1; }
-def IntentDSA_SynchronizeOp : IntentDSA_Op<"synchronize"> {
+def IntentDSA_SynchronizeOp : IntentDSA_Op<"synchronize", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Wait for the current work unit's selected streams";
   let arguments = (ins DefaultValuedAttr<BoolAttr, "false">:$local_only);
 }
@@ -27,13 +29,15 @@ def IntentDSA_LocalIdOp : IntentDSA_Op<"local_id", [Pure]> {
 def IntentDSA_IsMemoryCoreOp : IntentDSA_Op<"is_memory_core", [Pure]> {
   let results = (outs I1:$result);
 }
-def IntentDSA_GroupSynchronizeOp : IntentDSA_Op<"group_synchronize"> {
+def IntentDSA_GroupSynchronizeOp : IntentDSA_Op<"group_synchronize", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Complete local and shared transfers before all execution-group participants continue";
 }
-def IntentDSA_StageTileOp : IntentDSA_Op<"stage_tile"> {
+def IntentDSA_StageTileOp : IntentDSA_Op<"stage_tile", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Memory participant stages the active external rectangle into group-local storage";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$source,
-    Arg<AnyMemRef, "Inactive shared elements remain uninitialized", [MemWrite]>:$output,
+  let arguments = (ins AnyMemRef:$source,
+    Arg<AnyMemRef, "Inactive shared elements remain uninitialized">:$output,
     Index:$offset, Index:$row_stride, Index:$column_stride, Index:$rows, Index:$columns);
 }
 def IntentDSA_StrideOp : IntentDSA_Op<"stride", [Pure]> {
@@ -47,10 +51,11 @@ def IntentDSA_LoadScalarOp : IntentDSA_Op<"load_scalar"> {
 def IntentDSA_StoreScalarOp : IntentDSA_Op<"store_scalar"> {
   let arguments = (ins AnyType:$value, Arg<AnyMemRef, "", [MemWrite]>:$destination, Index:$offset);
 }
-def IntentDSA_LoadTileOp : IntentDSA_Op<"load_tile"> {
+def IntentDSA_LoadTileOp : IntentDSA_Op<"load_tile", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Load a zero-padded local tile; asynchronous external loads complete at the next work-unit synchronization";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$source,
-    Arg<AnyMemRef, "", [MemWrite]>:$output, Index:$offset,
+  let arguments = (ins AnyMemRef:$source,
+    AnyMemRef:$output, Index:$offset,
     Index:$row_stride, Index:$column_stride, Index:$rows, Index:$columns,
     DefaultValuedAttr<BoolAttr, "false">:$asynchronous);
 }
@@ -60,16 +65,18 @@ def IntentDSA_GatherPlanOp : IntentDSA_Op<"gather_plan"> {
     Arg<AnyMemRef, "Exact f32 row indices", [MemRead]>:$lane_indices,
     Arg<AnyMemRef, "Run descriptor and construction workspace", [MemWrite]>:$output);
 }
-def IntentDSA_GatherRowsOp : IntentDSA_Op<"gather_rows"> {
+def IntentDSA_GatherRowsOp : IntentDSA_Op<"gather_rows", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Gather external row intervals into a dense local tile using explicit element offsets";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$source,
-    Arg<AnyMemRef, "", [MemRead]>:$row_offsets,
-    Arg<AnyMemRef, "", [MemWrite]>:$output,
+  let arguments = (ins AnyMemRef:$source,
+    AnyMemRef:$row_offsets,
+    AnyMemRef:$output,
     Index:$column_stride, Index:$rows, Index:$columns,
-    Arg<Optional<AnyMemRef>, "Read-only run descriptor for the same offset snapshot", [MemRead]>:$plan,
+    Arg<Optional<AnyMemRef>, "Read-only run descriptor for the same offset snapshot">:$plan,
     DefaultValuedAttr<BoolAttr, "false">:$asynchronous);
 }
-def IntentDSA_GroupGatherRowsOp : IntentDSA_Op<"group_gather_rows"> {
+def IntentDSA_GroupGatherRowsOp : IntentDSA_Op<"group_gather_rows", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Four adjacent work owners collectively supply row intervals through shared storage";
   let description = [{
     All group participants execute this operation in uniform control. Prior
@@ -80,12 +87,12 @@ def IntentDSA_GroupGatherRowsOp : IntentDSA_Op<"group_gather_rows"> {
     i times the local column extent. Transfers complete before return, including
     every lane's consumption of shared storage. Inactive local rows are zero.
   }];
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$source,
-    Arg<AnyMemRef, "Lane-zero offset snapshot", [MemRead]>:$row_offsets,
-    Arg<AnyMemRef, "Lane-zero run descriptor", [MemRead]>:$plan,
-    Arg<AnyMemRef, "", [MemWrite]>:$output,
-    Arg<AnyMemRef, "Four adjacent column intervals", [MemRead, MemWrite]>:$shared_data,
-    Arg<AnyMemRef, "Published offsets and descriptor", [MemRead, MemWrite]>:$shared_metadata,
+  let arguments = (ins AnyMemRef:$source,
+    Arg<AnyMemRef, "Lane-zero offset snapshot">:$row_offsets,
+    Arg<AnyMemRef, "Lane-zero run descriptor">:$plan,
+    AnyMemRef:$output,
+    Arg<AnyMemRef, "Four adjacent column intervals">:$shared_data,
+    Arg<AnyMemRef, "Published offsets and descriptor">:$shared_metadata,
     Index:$rows, Index:$lane);
 }
 def IntentDSA_StoreTileOp : IntentDSA_Op<"store_tile"> {
@@ -100,10 +107,10 @@ def IntentDSA_IotaOp : IntentDSA_Op<"iota"> {
   let summary = "Materialize exact consecutive local lane indices starting at zero";
   let arguments = (ins Arg<AnyMemRef, "", [MemWrite]>:$output);
 }
-def IntentDSA_IndexLayoutOp : IntentDSA_Op<"index_layout"> {
+def IntentDSA_IndexLayoutOp : IntentDSA_Op<"index_layout", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Convert exact i64 indices between interleaved words and two dense i32 planes, or splat one index";
-  let arguments = (ins Arg<AnyType, "", [MemRead]>:$input,
-    Arg<AnyMemRef, "", [MemWrite]>:$output);
+  let arguments = (ins AnyType:$input, AnyMemRef:$output);
 }
 def IntentDSA_BroadcastRowsOp : IntentDSA_Op<"broadcast_rows"> {
   let summary = "Broadcast contiguous row scalars through an explicit transposed staging tile";
@@ -112,11 +119,10 @@ def IntentDSA_BroadcastRowsOp : IntentDSA_Op<"broadcast_rows"> {
     Arg<AnyMemRef, "", [MemWrite]>:$scratch,
     Index:$offset, Index:$rows, Index:$columns);
 }
-def IntentDSA_IndexBinaryOp : IntentDSA_Op<"index_binary"> {
+def IntentDSA_IndexBinaryOp : IntentDSA_Op<"index_binary", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Exact modular i64 arithmetic on separate low and high word planes";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-    Arg<AnyType, "", [MemRead]>:$rhs,
-    Arg<AnyMemRef, "", [MemWrite]>:$output,
+  let arguments = (ins AnyMemRef:$lhs, AnyType:$rhs, AnyMemRef:$output,
     Intent_BinaryOperatorAttr:$kind);
 }
 def IntentDSA_TransposeOp : IntentDSA_Op<"transpose"> {
@@ -124,10 +130,10 @@ def IntentDSA_TransposeOp : IntentDSA_Op<"transpose"> {
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,
     Arg<AnyMemRef, "", [MemWrite]>:$output, Index:$rows, Index:$columns);
 }
-def IntentDSA_SelectOp : IntentDSA_Op<"select"> {
-  let arguments = (ins AnyType:$condition, Arg<AnyMemRef, "", [MemRead]>:$true_value,
-    Arg<AnyType, "", [MemRead]>:$false_value, Arg<AnyMemRef, "", [MemWrite]>:$output,
-    Arg<Optional<AnyMemRef>, "", [MemWrite]>:$scratch);
+def IntentDSA_SelectOp : IntentDSA_Op<"select", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let arguments = (ins AnyType:$condition, AnyMemRef:$true_value,
+    AnyType:$false_value, AnyMemRef:$output, Optional<AnyMemRef>:$scratch);
 }
 def IntentDSA_MaskedFillOp : IntentDSA_Op<"masked_fill"> {
   let summary = "Retain f32 input bits under a full-width i32 predicate mask, otherwise use the scalar fill";
@@ -141,11 +147,12 @@ def IntentDSA_UnaryOp : IntentDSA_Op<"unary"> {
     Intent_UnaryOperatorAttr:$kind, BoolAttr:$approximate, BoolAttr:$flush_to_zero,
     Arg<Optional<AnyMemRef>, "", [MemWrite]>:$scratch);
 }
-def IntentDSA_BinaryOp : IntentDSA_Op<"binary"> {
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-    Arg<AnyType, "", [MemRead]>:$rhs, Arg<AnyMemRef, "", [MemWrite]>:$output,
+def IntentDSA_BinaryOp : IntentDSA_Op<"binary", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let arguments = (ins AnyMemRef:$lhs,
+    AnyType:$rhs, AnyMemRef:$output,
     Intent_BinaryOperatorAttr:$kind, BoolAttr:$approximate, BoolAttr:$flush_to_zero,
-    Arg<Optional<AnyMemRef>, "Workspace for destructive target primitives", [MemWrite]>:$scratch);
+    Arg<Optional<AnyMemRef>, "Workspace for destructive target primitives">:$scratch);
 }
 def IntentDSA_CompareOp : IntentDSA_Op<"compare"> {
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
@@ -167,24 +174,19 @@ def IntentDSA_CastOp : IntentDSA_Op<"cast"> {
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,
     Arg<AnyMemRef, "", [MemWrite]>:$output);
 }
-def IntentDSA_DivideRNOp : IntentDSA_Op<"divide_rn"> {
+def IntentDSA_DivideRNOp : IntentDSA_Op<"divide_rn", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Correctly rounded local f32 division with explicit integer correction workspace";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-    Arg<AnyType, "", [MemRead]>:$rhs,
-    Arg<AnyMemRef, "", [MemWrite]>:$output,
-    Arg<AnyMemRef, "", [MemWrite]>:$scratch,
-    Arg<AnyMemRef, "", [MemRead]>:$lane_indices);
+  let arguments = (ins AnyMemRef:$lhs, AnyType:$rhs,
+    AnyMemRef:$output, AnyMemRef:$scratch, AnyMemRef:$lane_indices);
 }
-def IntentDSA_DivideCastOp : IntentDSA_Op<"divide_cast"> {
+def IntentDSA_DivideCastOp : IntentDSA_Op<"divide_cast", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Strict f32 division followed by an RN-even f16 cast with explicit local workspace";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-    Arg<AnyType, "", [MemRead]>:$rhs,
-    Arg<AnyMemRef, "", [MemWrite]>:$output,
-    Arg<AnyMemRef, "", [MemWrite]>:$quotient,
-    Arg<AnyMemRef, "", [MemWrite]>:$bounds,
-    Arg<AnyMemRef, "", [MemWrite]>:$accepted,
-    Arg<AnyMemRef, "", [MemWrite]>:$narrow_bounds,
-    Arg<AnyMemRef, "Precomputed exact f32 physical lane indices", [MemRead]>:$lane_indices);
+  let arguments = (ins AnyMemRef:$lhs, AnyType:$rhs,
+    AnyMemRef:$output, AnyMemRef:$quotient, AnyMemRef:$bounds,
+    AnyMemRef:$accepted, AnyMemRef:$narrow_bounds,
+    Arg<AnyMemRef, "Precomputed exact f32 physical lane indices">:$lane_indices);
 }
 def IntentDSA_ReduceOp : IntentDSA_Op<"reduce"> {
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,
@@ -195,6 +197,7 @@ def IntentDSA_ReduceOp : IntentDSA_Op<"reduce"> {
 }
 def IntentDSA_SliceReduceOp : IntentDSA_Op<"slice_reduce", [
     AttrSizedOperandSegments, SingleBlock, IsolatedFromAbove,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Reduce local source members with a closed typed combine region";
   let description = [{
@@ -212,9 +215,13 @@ def IntentDSA_SliceReduceOp : IntentDSA_Op<"slice_reduce", [
     Variadic<AnyMemRef>:$outputs, Variadic<Index>:$counts,
     DenseI64ArrayAttr:$axes);
   let regions = (region AnyRegion:$combine);
+  let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
+  }];
 }
 def IntentDSA_ScanOp : IntentDSA_Op<"scan", [
     AttrSizedOperandSegments, SingleBlock, IsolatedFromAbove,
+    DeclareOpInterfaceMethods<BufferViewFlowOpInterface>,
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Scan local source members and publish their final component state";
   let description = [{
@@ -230,6 +237,9 @@ def IntentDSA_ScanOp : IntentDSA_Op<"scan", [
     Variadic<AnyMemRef>:$finals, I64Attr:$axis, BoolAttr:$inclusive,
     BoolAttr:$reverse);
   let regions = (region AnyRegion:$combine);
+  let extraClassDeclaration = [{
+    bool mayBeTerminalBuffer(::mlir::Value value);
+  }];
 }
 def IntentDSA_CollectiveYieldOp : IntentDSA_Op<"collective_yield", [
     Pure, Terminator, ReturnLike]> {

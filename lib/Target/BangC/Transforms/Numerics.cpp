@@ -132,13 +132,22 @@ void realizeCompareWorkspace(func::FuncOp function, dsa::ConfigurationAttr confi
   }
 }
 
-int floatGrid(Value value, Operation *read, unsigned depth = 0) {
+static Value ownedCompleteStorage(Value memory, dsa::StorageAnalysis &storage) {
+  Value origin = storage.uniqueOrigin(memory);
+  return origin && origin.getDefiningOp<memref::AllocaOp>() &&
+                 dsa::isCompleteStorageViewOf(memory, origin) &&
+                 storage.aliases(origin).complete
+             ? origin : Value{};
+}
+
+int floatGrid(Value value, Operation *read, dsa::StorageAnalysis &storage,
+              unsigned depth = 0) {
   Type type = value.getType();
   if (auto buffer = dyn_cast<MemRefType>(type)) type = buffer.getElementType();
   if (type.isF16()) return -24;
   if (type.isBF16()) return -133;
   if (!type.isF32() || depth > 32) return -149;
-  auto grid = [&](Value input, Operation *before) { return floatGrid(input, before, depth + 1); };
+  auto grid = [&](Value input, Operation *before) { return floatGrid(input, before, storage, depth + 1); };
   auto binary = [&](Value lhs, Value rhs, Operation *before, bool multiply) {
     int a = grid(lhs, before), b = grid(rhs, before);
     return multiply ? std::clamp(a + b, -149, 1024) : std::min(a, b);
@@ -156,43 +165,34 @@ int floatGrid(Value value, Operation *read, unsigned depth = 0) {
   if (auto add = value.getDefiningOp<arith::AddFOp>()) return binary(add.getLhs(), add.getRhs(), add, false);
   if (auto sub = value.getDefiningOp<arith::SubFOp>()) return binary(sub.getLhs(), sub.getRhs(), sub, false);
   if (auto mul = value.getDefiningOp<arith::MulFOp>()) return binary(mul.getLhs(), mul.getRhs(), mul, true);
-  if (!value.getDefiningOp<memref::AllocaOp>()) return -149;
-  // Owned, unaliased storage permits an exact last-writer query. Other views
-  // and opaque uses retain the general f32 grid.
-  for (Operation *user : value.getUsers())
-    if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); }) ||
-        (!isa<MemoryEffectOpInterface>(user) && !isMemoryEffectFree(user))) return -149;
-  for (Operation *previous = read->getPrevNode(); previous; previous = previous->getPrevNode()) {
-    if (auto fill = dyn_cast<dsa::FillOp>(previous); fill && fill.getOutput() == value) return grid(fill.getValue(), fill);
-    if (auto cast = dyn_cast<dsa::CastOp>(previous); cast && cast.getOutput() == value) return grid(cast.getInput(), cast);
-    if (auto copy = dyn_cast<memref::CopyOp>(previous); copy && copy.getTarget() == value) return grid(copy.getSource(), copy);
-    if (auto load = dyn_cast<dsa::LoadTileOp>(previous); load && load.getOutput() == value) return grid(load.getSource(), load);
-    if (auto operation = dyn_cast<dsa::BinaryOp>(previous); operation && operation.getOutput() == value) {
-      auto kind = operation.getKind();
-      if (kind == BinaryOperator::Add || kind == BinaryOperator::Subtract || kind == BinaryOperator::Multiply ||
-          kind == BinaryOperator::Maximum || kind == BinaryOperator::MaximumNum ||
-          kind == BinaryOperator::Minimum || kind == BinaryOperator::MinimumNum)
-        return binary(operation.getLhs(), operation.getRhs(), operation, kind == BinaryOperator::Multiply);
-      return -149;
-    }
-    if (auto reduce = dyn_cast<dsa::ReduceOp>(previous); reduce && reduce.getOutput() == value) {
-      auto kind = reduce.getKind();
-      if (kind == BinaryOperator::Add || kind == BinaryOperator::Maximum || kind == BinaryOperator::MaximumNum ||
-          kind == BinaryOperator::Minimum || kind == BinaryOperator::MinimumNum)
-        return std::min(grid(reduce.getInput(), reduce), grid(reduce.getIdentity(), reduce));
-      return -149;
-    }
-    bool overwritten = false;
-    previous->walk([&](Operation *operation) {
-      if (!llvm::is_contained(operation->getOperands(), value)) return;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == value)) overwritten = true;
-      } else if (!isMemoryEffectFree(operation)) overwritten = true;
-    });
-    if (overwritten) return -149;
+  Value origin = ownedCompleteStorage(value, storage);
+  if (!origin) return -149;
+  Operation *writer = storage.lastWriterBefore(value, read);
+  auto complete = [&](Value output) {
+    return dsa::isCompleteStorageViewOf(output, origin);
+  };
+  if (auto fill = dyn_cast_or_null<dsa::FillOp>(writer);
+      fill && complete(fill.getOutput())) return grid(fill.getValue(), fill);
+  if (auto cast = dyn_cast_or_null<dsa::CastOp>(writer);
+      cast && complete(cast.getOutput())) return grid(cast.getInput(), cast);
+  if (auto copy = dyn_cast_or_null<memref::CopyOp>(writer);
+      copy && complete(copy.getTarget())) return grid(copy.getSource(), copy);
+  if (auto load = dyn_cast_or_null<dsa::LoadTileOp>(writer);
+      load && complete(load.getOutput())) return grid(load.getSource(), load);
+  if (auto operation = dyn_cast_or_null<dsa::BinaryOp>(writer);
+      operation && complete(operation.getOutput())) {
+    auto kind = operation.getKind();
+    if (kind == BinaryOperator::Add || kind == BinaryOperator::Subtract || kind == BinaryOperator::Multiply ||
+        kind == BinaryOperator::Maximum || kind == BinaryOperator::MaximumNum ||
+        kind == BinaryOperator::Minimum || kind == BinaryOperator::MinimumNum)
+      return binary(operation.getLhs(), operation.getRhs(), operation, kind == BinaryOperator::Multiply);
+  }
+  if (auto reduce = dyn_cast_or_null<dsa::ReduceOp>(writer);
+      reduce && complete(reduce.getOutput())) {
+    auto kind = reduce.getKind();
+    if (kind == BinaryOperator::Add || kind == BinaryOperator::Maximum || kind == BinaryOperator::MaximumNum ||
+        kind == BinaryOperator::Minimum || kind == BinaryOperator::MinimumNum)
+      return std::min(grid(reduce.getInput(), reduce), grid(reduce.getIdentity(), reduce));
   }
   return -149;
 }
@@ -208,7 +208,8 @@ void realizeExponentialWorkspace(func::FuncOp function, dsa::ConfigurationAttr c
   for (auto unary : operations) {
     auto type = cast<MemRefType>(unary.getOutput().getType());
     if (unary.getKind() == UnaryOperator::Exp2) {
-      if (floatGrid(unary.getInput(), unary) >= -126)
+      dsa::StorageAnalysis storage(function);
+      if (floatGrid(unary.getInput(), unary, storage) >= -126)
         unary->setAttr("bangc.input_non_subnormal", UnitAttr::get(function.getContext()));
       continue;
     }
@@ -320,18 +321,15 @@ bool specializeZeroMatrixTiles(func::FuncOp function) {
     if (!matrix.getAccumulate() || !fill || !matchPattern(fill.getValue(), m_Constant(&zero)) ||
         !zero.getValue().isZero() || zero.getValue().isNegative()) continue;
     matrix.setAccumulate(false);
-    auto owner = dsa::storageRoot;
-    Value buffer = owner(matrix.getAccumulator());
-    bool observed = false;
-    for (Operation *op = fill->getNextNode(); op && op != matrix; op = op->getNextNode()) {
-      op->walk([&](Operation *nested) {
-        if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
-          SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-          for (const auto &effect : instances)
-            if (isa<MemoryEffects::Read>(effect.getEffect()) && (!effect.getValue() || owner(effect.getValue()) == buffer)) observed = true;
-        } else if (!isMemoryEffectFree(nested) &&
-                   llvm::any_of(nested->getOperands(), [&](Value value) { return owner(value) == buffer; })) observed = true;
-      });
+    dsa::StorageAnalysis storage(function);
+    auto accesses = storage.accesses(matrix.getAccumulator());
+    bool observed = !accesses.complete || fill->getBlock() != matrix->getBlock();
+    for (const auto &entry : accesses.entries) {
+      if (!isa<MemoryEffects::Read>(entry.effect.getEffect())) continue;
+      Operation *scope = fill->getBlock()->findAncestorOpInBlock(*entry.operation);
+      if (scope && fill->getBlock() == matrix->getBlock() &&
+          fill->isBeforeInBlock(scope) && scope->isBeforeInBlock(matrix))
+        observed = true;
     }
     if (!observed) fill.erase();
     changed = true;
@@ -345,40 +343,19 @@ bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr con
     if (reduce.getAxis() == 1 && (reduce.getKind() == BinaryOperator::MaximumNum ||
         reduce.getKind() == BinaryOperator::MinimumNum)) reductions.push_back(reduce);
   });
-  auto unaliased = [](Value value) {
-    return value.getDefiningOp<memref::AllocaOp>() && llvm::all_of(value.getUsers(), [](Operation *user) {
-      return !llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); }) &&
-          (isa<MemoryEffectOpInterface>(user) || isMemoryEffectFree(user));
-    });
-  };
-  auto writes = [](Operation *op, Value value) {
-    bool written = false;
-    op->walk([&](Operation *nested) {
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == value)) written = true;
-      }
-    });
-    return written;
-  };
   bool changed = false;
   for (auto reduce : reductions) {
+    dsa::StorageAnalysis storage(function);
     Value oldInput = reduce.getInput(), oldScratch = reduce.getScratch();
     auto type = cast<MemRefType>(oldInput.getType());
-    if (!type.getElementType().isF32() || type.getDimSize(0) >= 32 || type.getDimSize(1) < 4 || !unaliased(oldInput)) continue;
-    dsa::CastOp conversion;
-    for (Operation *op = reduce->getPrevNode(); op; op = op->getPrevNode()) {
-      if (auto cast = dyn_cast<dsa::CastOp>(op); cast && cast.getOutput() == oldInput) { conversion = cast; break; }
-      if (writes(op, oldInput)) break;
-    }
-    if (!conversion || !unaliased(conversion.getInput()) ||
-        !cast<MemRefType>(conversion.getInput().getType()).getElementType().isF16()) continue;
-    bool unchanged = true;
-    for (Operation *op = conversion->getNextNode(); op && op != reduce; op = op->getNextNode())
-      if (writes(op, conversion.getInput())) { unchanged = false; break; }
-    if (!unchanged) continue;
+    Value origin = ownedCompleteStorage(oldInput, storage);
+    if (!type.getElementType().isF32() || type.getDimSize(0) >= 32 || type.getDimSize(1) < 4 || !origin) continue;
+    auto conversion = dyn_cast_or_null<dsa::CastOp>(storage.lastWriterBefore(oldInput, reduce));
+    if (!conversion || !dsa::isCompleteStorageViewOf(conversion.getOutput(), origin) ||
+        conversion.getOutput().getType() != oldInput.getType() ||
+        !ownedCompleteStorage(conversion.getInput(), storage) ||
+        !cast<MemRefType>(conversion.getInput().getType()).getElementType().isF16() ||
+        !storage.contentsUnchangedBetween(conversion.getInput(), conversion, reduce)) continue;
     OpBuilder b(reduce);
     Value scratch = allocate(b, reduce.getLoc(), b.getF16Type(), {1, type.getDimSize(1)}, dsa::nramSpace);
     reduce.getInputMutable().assign(conversion.getInput()); reduce.getScratchMutable().assign(scratch);
@@ -401,42 +378,33 @@ bool bindRowScalarOperands(func::FuncOp function) {
   };
   bool changed = false;
   for (auto binary : binaries) {
+    dsa::StorageAnalysis storage(function);
     auto type = cast<MemRefType>(binary.getOutput().getType());
     int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
     if (rows <= 1 || rows >= 16 || columns < 1024 || binary.getApproximate() || binary.getFlushToZero() ||
         binary.getScratch() || !supportedScalarBinary(binary.getKind()) ||
         (!type.getElementType().isF32() && !type.getElementType().isF16())) continue;
     Value previous = binary.getRhs();
-    if (!previous.getDefiningOp<memref::AllocaOp>()) continue;
-    dsa::LoadTileOp broadcast;
-    bool eligible = true;
-    for (Operation *user : previous.getUsers()) {
-      if (user == binary) continue;
-      if (auto load = dyn_cast<dsa::LoadTileOp>(user); load && load.getOutput() == previous && !broadcast) broadcast = load;
-      else eligible = false;
-    }
-    if (!eligible || !broadcast || broadcast->getBlock() != binary->getBlock() || !broadcast->isBeforeInBlock(binary) ||
+    if (!previous.getDefiningOp<memref::AllocaOp>() ||
+        !storage.disjoint(previous, binary.getLhs())) continue;
+    auto broadcast = dyn_cast_or_null<dsa::LoadTileOp>(storage.uniqueWriter(previous));
+    auto accesses = storage.accesses(previous);
+    bool eligible = accesses.complete && llvm::all_of(accesses.entries, [&](const auto &entry) {
+      return entry.operation == binary || entry.operation == broadcast ||
+             isa<MemoryEffects::Allocate>(entry.effect.getEffect());
+    });
+    if (!eligible || !broadcast || !dsa::isCompleteStorageViewOf(broadcast.getOutput(), previous) ||
+        broadcast.getOutput().getType() != previous.getType() ||
+        broadcast->getBlock() != binary->getBlock() || !broadcast->isBeforeInBlock(binary) ||
         broadcast.getAsynchronous() || !exact(broadcast.getRows(), rows) || !exact(broadcast.getColumns(), columns) ||
         !exact(broadcast.getOffset(), 0) || !exact(broadcast.getRowStride(), 1) || !exact(broadcast.getColumnStride(), 0)) continue;
     Value source = broadcast.getSource();
-    auto allocation = source.getDefiningOp<memref::AllocaOp>();
-    if (!allocation || allocation.getType().getShape() != ArrayRef<int64_t>({1, rows}) ||
-        allocation.getType().getElementType() != type.getElementType() || !allocation.getType().getLayout().isIdentity()) continue;
-    for (Operation *user : source.getUsers())
-      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); }) ||
-          (!isa<MemoryEffectOpInterface>(user) && !isMemoryEffectFree(user))) eligible = false;
-    // Keep the captured row scalars unchanged between broadcast and use.
-    for (Operation *op = broadcast->getNextNode(); op && op != binary; op = op->getNextNode()) {
-      if (op->getNumRegions()) { eligible = false; break; }
-      if (!llvm::is_contained(op->getOperands(), source)) continue;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(op)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == source)) eligible = false;
-      } else if (!isMemoryEffectFree(op)) eligible = false;
-    }
-    if (!eligible) continue;
+    auto sourceType = cast<MemRefType>(source.getType());
+    if (!ownedCompleteStorage(source, storage) || sourceType.getShape() != ArrayRef<int64_t>({1, rows}) ||
+        sourceType.getElementType() != type.getElementType() || !sourceType.getLayout().isIdentity() ||
+        !storage.preservesContents(broadcast, source) ||
+        !storage.contentsUnchangedBetween(source, broadcast, binary) ||
+        !storage.preservesContents(binary, source)) continue;
     binary.getRhsMutable().assign(source);
     binary->setAttr("bangc.implementation", StringAttr::get(function.getContext(), "row_scalar"));
     broadcast.erase();
@@ -453,15 +421,15 @@ void realizeRoundedDivisions(func::FuncOp function, dsa::ConfigurationAttr confi
     if (operation.getKind() == BinaryOperator::TrueDivide && !operation.getApproximate() && !operation.getFlushToZero())
       divisions.push_back(operation);
   });
-  auto owner = [](Value value) {
-    while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-    return value.getDefiningOp<memref::AllocaOp>() ? value : Value{};
-  };
   for (auto division : divisions) {
+    dsa::StorageAnalysis storage(function);
     auto type = cast<MemRefType>(division.getOutput().getType());
     if (!type.getElementType().isF32() || type.getNumElements() < 256 || type.getNumElements() % 32 ||
-        !owner(division.getOutput()) || !owner(division.getLhs()) || !owner(division.getRhs()) ||
-        owner(division.getOutput()) == owner(division.getLhs()) || owner(division.getOutput()) == owner(division.getRhs())) continue;
+        !ownedCompleteStorage(division.getOutput(), storage) ||
+        !ownedCompleteStorage(division.getLhs(), storage) ||
+        !ownedCompleteStorage(division.getRhs(), storage) ||
+        !storage.disjoint(division.getOutput(), division.getLhs()) ||
+        !storage.disjoint(division.getOutput(), division.getRhs())) continue;
     auto uniform = uniformFillBefore(division.getRhs(), division);
     Value divisor = uniform ? uniform.getValue() : division.getRhs();
     for (int64_t width = std::min<int64_t>(4096, type.getNumElements()); width >= 64; width /= 2) {
@@ -508,34 +476,45 @@ void fuseNarrowDivisions(func::FuncOp function, dsa::ConfigurationAttr config) {
       divisions.push_back(op);
   });
   for (auto division : divisions) {
-    auto owner = [](Value value) {
-      while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) value = view.getSource();
-      return value.getDefiningOp<memref::AllocaOp>() ? value : Value{};
-    };
+    dsa::StorageAnalysis storage(function);
     Value quotient = division.getOutput();
     auto type = cast<MemRefType>(quotient.getType());
     if (!type.getElementType().isF32() || type.getNumElements() < 128 || type.getNumElements() % 32 ||
         type.getNumElements() > (1 << 24) ||
-        !quotient.getDefiningOp<memref::AllocaOp>() || !owner(division.getLhs()) || !owner(division.getRhs()) ||
-        quotient == owner(division.getLhs()) || quotient == owner(division.getRhs()))
+        !quotient.getDefiningOp<memref::AllocaOp>() ||
+        !ownedCompleteStorage(division.getLhs(), storage) ||
+        !ownedCompleteStorage(division.getRhs(), storage) ||
+        !storage.disjoint(quotient, division.getLhs()) ||
+        !storage.disjoint(quotient, division.getRhs()))
       continue;
     dsa::CastOp narrow;
-    bool unique = true;
-    for (Operation *user : quotient.getUsers()) {
-      if (user == division) continue;
-      auto cast = dyn_cast<dsa::CastOp>(user);
-      if (!cast || cast.getInput() != quotient || narrow) { unique = false; break; }
-      narrow = cast;
+    auto accesses = storage.accesses(quotient);
+    bool unique = accesses.complete;
+    for (const auto &entry : accesses.entries) {
+      if (entry.operation == division ||
+          isa<MemoryEffects::Allocate>(entry.effect.getEffect())) continue;
+      auto conversion = dyn_cast<dsa::CastOp>(entry.operation);
+      if (!isa<MemoryEffects::Read>(entry.effect.getEffect()) || !conversion ||
+          !dsa::isCompleteStorageViewOf(conversion.getInput(), quotient) ||
+          conversion.getInput().getType() != quotient.getType() ||
+          (narrow && narrow != conversion)) { unique = false; break; }
+      narrow = conversion;
     }
     if (!unique || !narrow || narrow->getBlock() != division->getBlock() ||
         !cast<MemRefType>(narrow.getOutput().getType()).getElementType().isF16()) continue;
-    Value outputOwner = owner(narrow.getOutput());
-    if (!outputOwner || outputOwner == owner(division.getLhs()) || outputOwner == owner(division.getRhs())) continue;
+    if (!ownedCompleteStorage(narrow.getOutput(), storage) ||
+        !storage.disjoint(narrow.getOutput(), division.getLhs()) ||
+        !storage.disjoint(narrow.getOutput(), division.getRhs())) continue;
     // No quotient consumer or intervening effect may observe the internal
     // approximation. The fused implementation certifies the final f16 value.
     Operation *next = division->getNextNode();
-    for (; next && next != narrow.getOperation(); next = next->getNextNode())
-      if (!isa<memref::AllocaOp>(next) && !isMemoryEffectFree(next)) break;
+    for (; next && next != narrow.getOperation(); next = next->getNextNode()) {
+      auto effects = storage.effects(next);
+      if (!effects.complete || effects.ordered ||
+          llvm::any_of(effects.entries, [](const auto &entry) {
+            return !isa<MemoryEffects::Allocate>(entry.effect.getEffect());
+          })) break;
+    }
     if (next != narrow.getOperation()) continue;
     OpBuilder builder(narrow);
     Location loc = narrow.getLoc();
@@ -788,7 +767,9 @@ LogicalResult selectNativeImplementations(ModuleOp module) {
     }
     if (auto matrix = dyn_cast<dsa::MatrixTileOp>(op)) {
       op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), "matmul_local_f32_accumulator"));
-      auto owner = dsa::storageRoot(matrix.getRhs()).getDefiningOp<memref::AllocaOp>();
+      dsa::StorageAnalysis storage(function);
+      Value memory = ownedCompleteStorage(matrix.getRhs(), storage);
+      auto owner = memory ? memory.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp();
       if (!owner) { op->emitError("matrix input has no owned prepared storage"); return WalkResult::interrupt(); }
       owner->setAttr("bangc.layout", StringAttr::get(module.getContext(), "matrix_filter_interleaved64"));
     }

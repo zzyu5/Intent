@@ -11,6 +11,10 @@ namespace intent::dsa {
 // borrowed collective argument. Partial or differently strided aliases fail.
 bool isCompleteLocalStorageView(mlir::Value value);
 
+// Exact whole-storage coverage, not merely a common allocation origin. This
+// accepts identity descriptor casts and complete contiguous reinterpretations.
+bool isCompleteStorageViewOf(mlir::Value value, mlir::Value origin);
+
 // Re-expose that storage at its selected capacity rank, reusing an existing
 // matching view or allocation whenever possible. Ownership and elements do not
 // change, and this builder never creates a partial view.

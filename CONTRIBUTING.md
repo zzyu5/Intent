@@ -1133,8 +1133,11 @@ provider 通过公开 include 使用它们，不跨层包含 CPU 的私有源码
 
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
-`StorageAnalysis` 直接使用 MLIR 的 `BufferViewFlowAnalysis`、`BufferOriginAnalysis`、
-AliasAnalysis 和 dominance。标准 views、SCF、CFG 和 select 的来源由其原生模型解释；
+共同 [BufferStorageAnalysis](include/Intent/Analysis/BufferStorage.h) 直接使用 MLIR 的
+`BufferViewFlowAnalysis`、`BufferOriginAnalysis`、AliasAnalysis 和 dominance。
+CPU [StorageAnalysis](include/Intent/Dialect/CPU/Analysis/Storage.h) 只补充 task、
+collective 与公共 ABI 的合同；DSA [StorageAnalysis](include/Intent/Dialect/DSA/Analysis/Storage.h)
+补充借用参数和异步完成查询。标准 views、SCF、CFG 和 select 的来源由其原生模型解释；
 CPU Tasks 和 collective 在 [CPUOpInterfaces.cpp](lib/Dialect/CPU/IR/CPUOpInterfaces.cpp)
 及 [CollectiveHelpers.cpp](lib/Dialect/CPU/IR/CollectiveHelpers.cpp) 实现
 `BufferViewFlowOpInterface`，声明真实 source/capture 借用关系。
@@ -1148,9 +1151,10 @@ collective 在实际 operands 边界描述 effects，内部 scratch 不冒充外
 原子操作同时保留目标读写与 ordering 屏障。新增 operation 应完善接口，避免在 fusion、
 任务分区和 provider 中分别增加访问枚举。`PhysicalProgramAnalysis` 保留 allocation
 预算与 verifier，写入来源同样从共同 effects 查询取得。
-`registerStorageInterfaces` 为 MLIR 20 的 `memref.prefetch` 补原生 effects 模型：
+`registerBufferStorageInterfaces` 为 MLIR 20 的 `memref.prefetch` 补原生 effects 模型：
 目标只读，独立 cache resource 保留提示的存在性；cache 写意向不作为 buffer 内容写入。
-Storage 摘要只排除这个明确的 cache effect，不静默丢弃其它未知 effects。
+Storage 摘要仅按明确的 resource 合同分离非内容 effects，不静默丢弃未知 effects。
+DSA 的 transfer/order resource 保留为移动屏障；它不冒充所有 buffer 的内容写入。
 
 跨原生入口的同步 buffer 借用使用 [CPU `InvokeOp`](include/Intent/Dialect/CPU/IR/CPUOps.td)：
 callee、实际参数及逐参数读写是当前 IR 的一部分，调用通过显式 storage 返回结果，
@@ -1166,6 +1170,14 @@ buffer 内容；`readStable` 还检查 producer 与 consumer 的执行范围，�
 两者都检查 dominance、lifetime 和可能 alias 的写入。`isReadOnly` 表示参数访问角色，
 不能替代存储稳定性证明。常量传播按可能 alias 的 writes/free 使旧事实失效，不能把
 不同 SSA 或不同来源名字当作不相交。
+
+`accesses(memory)` 返回当前 alias 闭包对应、按真实操作去重的 effect 集合。
+`preservesContents` 只证明内容不被写入或释放，`preserves` 还拒绝跨 ordering 移动；
+根据变换实际需要选择，不能用“没有写入”代替读取移动的完整资格。
+DSA 的 `writers`、`lastWriterBefore`、`allUsesCompleteBefore` 从这些事实派生。
+最近 writer 查询跨循环时检查 backedge 内容稳定性，存储消费还区分静态末次使用和
+循环中的动态末次使用。需要整块覆盖时继续查询 [Views.h](include/Intent/Dialect/DSA/IR/Views.h)，
+单一 allocation 来源本身不证明两个 view 的坐标或覆盖范围相同。
 
 来源或 alias 集合的 `complete=false` 保留未知转发、调用逃逸和地址身份观察。
 `lifetime` 是供局部优化使用的严格查询：要求一个明确 lexical end 覆盖完整 alias 使用。
@@ -1534,7 +1546,13 @@ Retained loop/store 的作用域检查共用 `isSingletonExecutionGroup`，从�
 space、segment 与实际 extents 证明单 program；不因中间多了 execution-group owner
 就漏掉已有变换，也不把多 program 的私有状态提升为共享 workspace。
 
-BANG C 的 [Storage.cpp](lib/Target/BangC/Transforms/Storage.cpp) 分开只读 `measureStorage` 和最终 `bindStorage`。前者可供局部复用与供数变换比较资源需求，后者才写入目标偏移；公共 alias/lifetime 查询在 [DSA Analysis](include/Intent/Dialect/DSA/Analysis/PhysicalProgram.h)。新增目标实现需要的 workspace 在目标变换中形成显式 operand，最终由目标 verifier 检查，不能在资源查询或 serializer 中补写。
+BANG C 的 [Storage.cpp](lib/Target/BangC/Transforms/Storage.cpp) 分开只读 `measureStorage` 和最终 `bindStorage`。前者可供局部复用与供数变换比较资源需求，后者才写入目标偏移；别名与 effects 复用共同 BufferStorageAnalysis，DSA 的 [Storage](include/Intent/Dialect/DSA/Analysis/Storage.h) 与 [PhysicalProgram](include/Intent/Dialect/DSA/Analysis/PhysicalProgram.h) 负责异步使用完成和局部存储区间。操作的完成要求统一定义在 [MemoryEffects.h](include/Intent/Dialect/DSA/IR/MemoryEffects.h)：StageTile 等异步操作不能在提交时就结束其 buffer 存活期，缺少可证明完成点时不做破坏性复用。新增目标实现需要的 workspace 在目标变换中形成显式 operand，最终由目标 verifier 检查，不能在资源查询或 serializer 中补写。
+
+这与本地 Triton `lib/Analysis/Alias.cpp:23–61` 通过 view/控制流传播别名、
+`lib/Analysis/Allocation.cpp:303–378` 合并别名存活期的职责一致。
+TileLang `src/transform/storage_rewrite.cc:105–295` 同样把 allocation scope 和最后访问
+作为存储复用依据。Intent 的 DSA 另外保留已有 DMA/group 完成合同，不把 CPU 的同步
+生命周期或 GPU provider 的内部 shared-memory 分配规则套进来。
 
 DSA 的 `isSumOfIntegerProducts` 使用 MLIR 的整数表达式规范化证明地址关系，允许单位 stride 消除、常数结合和交换后的等价索引；供数 matcher 不应依赖某一种 Add/Mul 树形。`BangCTarget.shapes/strides` 是编译变体的 ABI 约束，运行时会核对实参。已有 [MLU 调用适配](experiments/mlu/providers/bangc/common.py) 从实际 tensor 绑定这些事实，并原样传输其 stride/offset；尚未分配的输出不猜布局。不要用忽略已知布局来规避 matcher 缺陷，也不要从 shape 猜连续布局。
 

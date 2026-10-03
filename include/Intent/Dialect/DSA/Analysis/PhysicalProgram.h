@@ -10,20 +10,11 @@ namespace intent::dsa {
 
 // Queries read the current program. Recompute after mutations; no target layout
 // or allocation binding is written while asking about aliases or lifetimes.
-llvm::SmallVector<mlir::Value> storageAliases(mlir::Value value);
 using SignedInterval = std::optional<std::pair<int64_t, int64_t>>;
 SignedInterval integerInterval(mlir::Value value, mlir::func::FuncOp function);
 // Prove an index/i64 address equals a sum of products after integer algebraic
 // normalization. Other operations remain SSA atoms; narrow casts are not peeled.
 bool isSumOfIntegerProducts(mlir::Value value,
     llvm::ArrayRef<std::pair<mlir::Value, mlir::Value>> products);
-FillOp uniformFillBefore(mlir::Value input, mlir::Operation *read);
-
-struct StorageLifetime {
-  mlir::memref::AllocaOp allocation;
-  uint64_t start, finish;
-};
-llvm::SmallVector<StorageLifetime> analyzeStorageLifetimes(mlir::func::FuncOp function);
-
 } // namespace intent::dsa
 #endif

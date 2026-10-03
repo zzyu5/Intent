@@ -2,6 +2,8 @@
 #define INTENT_TARGET_BANGC_TRANSFORMS_PASSDETAIL_H
 #include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"

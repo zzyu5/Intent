@@ -27,10 +27,12 @@ SmallVector<int64_t> contiguousStrides(MemRefType type) {
   return strides;
 }
 
-bool completeAlias(memref::ReinterpretCastOp view) {
+bool completeContiguousView(memref::ReinterpretCastOp view) {
   auto input = cast<MemRefType>(view.getSource().getType());
   auto output = view.getType();
-  return localCapacity(input) && localCapacity(output) &&
+  return input.hasStaticShape() && output.hasStaticShape() &&
+         input.getLayout().isIdentity() && output.getLayout().isIdentity() &&
+         input.getMemorySpace() == output.getMemorySpace() &&
          input.getElementType() == output.getElementType() &&
          input.getNumElements() == output.getNumElements() &&
          view.getOffsets().empty() && view.getSizes().empty() &&
@@ -44,13 +46,40 @@ bool completeAlias(memref::ReinterpretCastOp view) {
 
 bool isCompleteLocalStorageView(Value value) {
   if (!localCapacity(dyn_cast<MemRefType>(value.getType()))) return false;
-  while (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) {
-    if (!completeAlias(view)) return false;
-    value = view.getSource();
+  while (true) {
+    if (auto cast = value.getDefiningOp<memref::CastOp>()) {
+      value = cast.getSource();
+    } else if (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) {
+      if (!completeContiguousView(view))
+        return false;
+      value = view.getSource();
+    } else {
+      break;
+    }
+    if (!localCapacity(dyn_cast<MemRefType>(value.getType())))
+      return false;
   }
   if (value.getDefiningOp<memref::AllocaOp>()) return true;
   auto formal = dyn_cast<BlockArgument>(value);
   return formal && isCollectiveBorrowedArgument(formal);
+}
+
+bool isCompleteStorageViewOf(Value value, Value origin) {
+  if (!value || !origin || !isa<BaseMemRefType>(value.getType()) ||
+      !isa<BaseMemRefType>(origin.getType()))
+    return false;
+  while (value != origin) {
+    if (auto cast = value.getDefiningOp<memref::CastOp>()) {
+      value = cast.getSource();
+    } else if (auto view = value.getDefiningOp<memref::ReinterpretCastOp>()) {
+      if (!completeContiguousView(view))
+        return false;
+      value = view.getSource();
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 FailureOr<Value> materializeCollectiveView(OpBuilder &builder, Location location,
@@ -64,8 +93,13 @@ FailureOr<Value> materializeCollectiveView(OpBuilder &builder, Location location
            failure();
   if (source.getType() == requested) return source;
   Value backing = source;
-  while (auto view = backing.getDefiningOp<memref::ReinterpretCastOp>()) {
-    backing = view.getSource();
+  while (true) {
+    if (auto view = backing.getDefiningOp<memref::ReinterpretCastOp>())
+      backing = view.getSource();
+    else if (auto cast = backing.getDefiningOp<memref::CastOp>())
+      backing = cast.getSource();
+    else
+      break;
     if (backing.getType() == requested) return backing;
   }
   return builder.create<memref::ReinterpretCastOp>(

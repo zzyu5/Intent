@@ -15,35 +15,29 @@ bool realizeAffineRanges(func::FuncOp function, dsa::ConfigurationAttr config) {
     auto type = cast<MemRefType>(range.getOutput().getType());
     int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
     if (columns < 64 || !llvm::isPowerOf2_64(columns) || type.getNumElements() > 65536 || !exact(range.getRows(), rows)) continue;
-    dsa::LoadTileOp copy;
-    bool valid = true;
-    for (Operation *user : range.getRowCoordinates().getUsers()) {
-      if (user == range) continue;
-      if (auto load = dyn_cast<dsa::LoadTileOp>(user); load && load.getOutput() == range.getRowCoordinates() && !copy) copy = load;
-      else valid = false;
-    }
-    if (!valid || !copy || !exact(copy.getRows(), rows) || !exact(copy.getColumns(), 1) || !exact(copy.getOffset(), 0) ||
+    dsa::StorageAnalysis storage(function);
+    auto copy = dyn_cast_or_null<dsa::LoadTileOp>(storage.lastWriterBefore(range.getRowCoordinates(), range));
+    if (!copy || copy.getOutput() != range.getRowCoordinates() ||
+        !exact(copy.getRows(), rows) || !exact(copy.getColumns(), 1) || !exact(copy.getOffset(), 0) ||
         !exact(copy.getRowStride(), 1) || !exact(copy.getColumnStride(), 1)) continue;
-    Value source = copy.getSource();
-    while (auto view = source.getDefiningOp<memref::ReinterpretCastOp>()) source = view.getSource();
-    if (!source.getDefiningOp<memref::AllocaOp>() || cast<MemRefType>(source.getType()).getNumElements() != rows) continue;
-    SmallVector<Value> aliases{source};
+    Value source = storage.uniqueOrigin(copy.getSource());
+    if (!source || !source.getDefiningOp<memref::AllocaOp>() ||
+        !dsa::isCompleteStorageViewOf(copy.getSource(), source) ||
+        cast<MemRefType>(source.getType()).getNumElements() != rows) continue;
+    auto writers = storage.writers(source);
+    if (failed(writers)) continue;
     SmallVector<dsa::FillOp> fills;
     memref::StoreOp initialization;
-    for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
-      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) { aliases.push_back(view.getResult()); continue; }
-      if (auto store = dyn_cast<memref::StoreOp>(user); store && llvm::is_contained(aliases, store.getMemref())) {
+    bool valid = true;
+    for (Operation *user : *writers) {
+      if (auto store = dyn_cast<memref::StoreOp>(user); store && dsa::isCompleteStorageViewOf(store.getMemref(), source)) {
         if (initialization) valid = false;
         initialization = store; continue;
       }
-      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && llvm::is_contained(aliases, fill.getOutput())) { fills.push_back(fill); continue; }
-      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) valid = false;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || llvm::is_contained(aliases, effect.getValue()))) valid = false;
-      } else if (!isMemoryEffectFree(user)) valid = false;
+      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && dsa::isCompleteStorageViewOf(fill.getOutput(), source)) {
+        fills.push_back(fill); continue;
+      }
+      valid = false;
     }
     auto ramp = initialization ? dyn_cast<scf::ForOp>(initialization->getParentOp()) : scf::ForOp();
     if (!valid || !ramp || ramp->isProperAncestor(copy) || !dominance.dominates(ramp, copy) ||

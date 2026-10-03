@@ -1,5 +1,7 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/IR/Views.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -7,8 +9,8 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -20,10 +22,11 @@ namespace {
 bool supportedScalarBinary(BinaryOperator kind) {
   return kind == BinaryOperator::Add || kind == BinaryOperator::Subtract || kind == BinaryOperator::Multiply;
 }
-}
+} // namespace
 void bindUniformOperands(func::FuncOp function) {
   SmallVector<dsa::BinaryOp> binaries;
   function.walk([&](dsa::BinaryOp binary) { binaries.push_back(binary); });
+  bool changed = false;
   for (auto binary : binaries) {
     if (!supportedScalarBinary(binary.getKind()) ||
         binary.getApproximate() || binary.getFlushToZero()) continue;
@@ -33,21 +36,19 @@ void bindUniformOperands(func::FuncOp function) {
     auto fill = uniformFillBefore(previous, binary);
     if (!fill) continue;
     binary.getRhsMutable().assign(fill.getValue());
-    if (llvm::all_of(previous.getUsers(), [&](Operation *user) {
-          auto unused = dyn_cast<dsa::FillOp>(user);
-          return unused && unused.getOutput() == previous;
-        })) {
-      SmallVector<Operation *> fills(previous.getUsers());
-      for (Operation *unused : fills) unused->erase();
-      previous.getDefiningOp()->erase();
-    }
+    changed = true;
   }
   function.walk([&](dsa::SelectOp select) {
     if (!isa<MemRefType>(select.getFalseValue().getType())) return;
     auto fill = uniformFillBefore(select.getFalseValue(), select);
     FloatAttr constant;
-    if (fill && matchPattern(fill.getValue(), m_Constant(&constant))) select.getFalseValueMutable().assign(fill.getValue());
+    if (fill && matchPattern(fill.getValue(), m_Constant(&constant))) {
+      select.getFalseValueMutable().assign(fill.getValue());
+      changed = true;
+    }
   });
+  if (changed)
+    eliminateUnreadLocalWrites(function);
 }
 
 void eliminateOverwrittenFills(func::FuncOp function) {
@@ -56,65 +57,36 @@ void eliminateOverwrittenFills(func::FuncOp function) {
   for (auto fill : fills) {
     Value output = fill.getOutput();
     if (!output.getDefiningOp<memref::AllocaOp>()) continue;
-    SmallVector<Value> aliases{output};
-    bool escaped = false;
-    for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
-      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) {
-        if (!llvm::is_contained(aliases, view.getResult())) aliases.push_back(view.getResult());
-      } else if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) escaped = true;
-    }
-    if (escaped) continue;
-    for (Operation *next = fill->getNextNode(); next; next = next->getNextNode()) {
-      if (next->getNumRegions()) {
-        bool independent = true;
-        next->walk([&](Operation *nested) {
-          if (llvm::any_of(nested->getOperands(), [&](Value operand) { return llvm::is_contained(aliases, operand); }))
-            independent = false;
-          if (nested->getNumRegions()) {
-            if (!isa<scf::ForOp, scf::IfOp>(nested)) independent = false;
-          } else if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
-            SmallVector<MemoryEffects::EffectInstance> instances;
-            effects.getEffects(instances);
-            if (llvm::any_of(instances, [](const auto &effect) { return !effect.getValue(); })) independent = false;
-          } else if (!isMemoryEffectFree(nested)) independent = false;
-        });
-        if (independent) continue;
+    StorageAnalysis storage(function);
+    if (!storage.aliases(output).complete)
+      continue;
+    for (Operation *next = fill->getNextNode(); next;
+         next = next->getNextNode()) {
+      auto effects = storage.effects(next);
+      if (!effects.complete || effects.ordered)
         break;
-      }
-      auto effects = dyn_cast<MemoryEffectOpInterface>(next);
-      if (!effects) {
-        if (isMemoryEffectFree(next)) continue;
-        break;
-      }
-      SmallVector<MemoryEffects::EffectInstance> instances;
-      effects.getEffects(instances);
       bool read = false, written = false;
-      for (const auto &effect : instances) {
-        if (effect.getValue() && !llvm::is_contained(aliases, effect.getValue())) continue;
+      for (const auto &entry : effects.entries) {
+        const auto &effect = entry.effect;
+        if (isa<MemoryEffects::Allocate>(effect.getEffect()) ||
+            storage.disjoint(output, effect.getValue()))
+          continue;
         written |= isa<MemoryEffects::Write>(effect.getEffect());
-        read |= !isa<MemoryEffects::Write, MemoryEffects::Allocate>(effect.getEffect());
+        read |= !isa<MemoryEffects::Write>(effect.getEffect());
         if (!effect.getValue()) read = true;
       }
-      if (auto select = dyn_cast<dsa::SelectOp>(next)) read |= llvm::is_contained(aliases, select.getCondition());
       if (read) break;
       if (!written) continue;
       bool complete = isa<dsa::FillOp, dsa::LoadTileOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::TransposeOp, dsa::UnaryOp, dsa::BinaryOp, dsa::CompareOp,
                           dsa::CastOp, dsa::SelectOp, memref::CopyOp>(next);
       if (auto divide = dyn_cast<dsa::DivideCastOp>(next)) complete = divide.getOutput() == output;
-      // A complete write to an alias may cover only a subview of the owner.
+      // Aliasing alone does not prove that a write covers the original tile.
       if (complete) {
-        auto original = cast<MemRefType>(output.getType());
-        for (const auto &effect : instances) if (isa<MemoryEffects::Write>(effect.getEffect()) &&
-            effect.getValue() && effect.getValue() != output && llvm::is_contained(aliases, effect.getValue())) {
-          auto type = cast<MemRefType>(effect.getValue().getType());
-          complete &= type.getNumElements() == original.getNumElements() && type.getLayout().isIdentity();
-          Value alias = effect.getValue();
-          while (alias != output) {
-            auto view = alias.getDefiningOp<memref::ReinterpretCastOp>();
-            if (!view || view.getStaticOffsets().front() != 0) { complete = false; break; }
-            alias = view.getSource();
-          }
-        }
+        for (const auto &entry : effects.entries)
+          if (isa<MemoryEffects::Write>(entry.effect.getEffect()) &&
+              !storage.disjoint(output, entry.effect.getValue()))
+            complete &=
+                isCompleteStorageViewOf(entry.effect.getValue(), output);
       }
       if (complete) fill.erase();
       break;
@@ -129,29 +101,38 @@ bool eliminateUnreadLocalWrites(func::FuncOp function) {
   });
   bool changed = false;
   for (auto allocation : allocations) {
-    SmallVector<Value> aliases{allocation};
-    for (unsigned i = 0; i < aliases.size(); ++i)
-      for (Operation *user : aliases[i].getUsers())
-        if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
+    StorageAnalysis storage(function);
+    auto aliases = storage.aliases(allocation);
+    if (!aliases.complete)
+      continue;
     SmallVector<Operation *> writes;
     bool unread = true;
-    for (Value alias : aliases) for (Operation *user : alias.getUsers()) {
-      if (isa<memref::ReinterpretCastOp>(user)) continue;
+    for (Operation *user : aliases.users) {
+      if (isBufferStorageAliasOperation(user))
+        continue;
       bool write = false;
-      if (auto fill = dyn_cast<dsa::FillOp>(user)) write = fill.getOutput() == alias;
-      if (auto store = dyn_cast<memref::StoreOp>(user)) write = store.getMemref() == alias;
+      if (auto fill = dyn_cast<dsa::FillOp>(user))
+        write = storage.uniqueOrigin(fill.getOutput()) == allocation;
+      if (auto store = dyn_cast<memref::StoreOp>(user))
+        write = storage.uniqueOrigin(store.getMemref()) == allocation;
       if (auto copy = dyn_cast<memref::CopyOp>(user))
-        write = copy.getTarget() == alias && !llvm::is_contained(aliases, copy.getSource());
+        write = storage.uniqueOrigin(copy.getTarget()) == allocation &&
+                storage.disjoint(allocation, copy.getSource());
       if (auto load = dyn_cast<dsa::LoadTileOp>(user))
-        write = !load.getAsynchronous() && load.getOutput() == alias && !llvm::is_contained(aliases, load.getSource());
+        write = !load.getAsynchronous() &&
+                storage.uniqueOrigin(load.getOutput()) == allocation &&
+                storage.disjoint(allocation, load.getSource());
       if (auto cast = dyn_cast<dsa::CastOp>(user))
-        write = cast.getOutput() == alias && !llvm::is_contained(aliases, cast.getInput());
+        write = storage.uniqueOrigin(cast.getOutput()) == allocation &&
+                storage.disjoint(allocation, cast.getInput());
       if (!write) unread = false;
       else if (!llvm::is_contained(writes, user)) writes.push_back(user);
     }
     if (!unread || writes.empty()) continue;
     for (Operation *write : writes) write->erase();
-    for (Value alias : llvm::reverse(aliases)) if (alias.use_empty()) alias.getDefiningOp()->erase();
+    for (Value alias : llvm::reverse(aliases.values))
+      if (alias.use_empty() && alias.getDefiningOp())
+        alias.getDefiningOp()->erase();
     changed = true;
   }
   return changed;
@@ -162,13 +143,13 @@ bool forwardFullLocalCopies(func::FuncOp function) {
   function.walk([&](Operation *op) {
     if (isa<memref::CopyOp, dsa::LoadTileOp>(op)) copies.push_back(op);
   });
-  auto owner = dsa::storageRoot;
   auto exact = [&](Value value, int64_t expected) {
     auto interval = integerInterval(value, function);
     return interval && interval->first == expected && interval->second == expected;
   };
   bool changed = false;
   for (Operation *copy : copies) {
+    StorageAnalysis storage(function);
     Value source, destination;
     if (auto local = dyn_cast<memref::CopyOp>(copy)) {
       source = local.getSource(); destination = local.getTarget();
@@ -184,57 +165,47 @@ bool forwardFullLocalCopies(func::FuncOp function) {
     }
     auto input = dyn_cast<MemRefType>(source.getType());
     auto output = cast<MemRefType>(destination.getType());
-    Value sourceOwner = owner(source);
+    Value sourceOwner = storage.uniqueOrigin(source);
     if (!input || !input.hasStaticShape() || !output.hasStaticShape() ||
-        input.getMemorySpaceAsInt() != dsa::nramSpace || output.getMemorySpaceAsInt() != dsa::nramSpace ||
+        input.getMemorySpaceAsInt() != dsa::nramSpace ||
+        output.getMemorySpaceAsInt() != dsa::nramSpace ||
         !input.getLayout().isIdentity() || !output.getLayout().isIdentity() ||
-        input.getElementType() != output.getElementType() || input.getNumElements() != output.getNumElements() ||
-        !sourceOwner.getDefiningOp<memref::AllocaOp>() || !destination.getDefiningOp<memref::AllocaOp>() ||
-        sourceOwner == destination) continue;
-    auto destinationAliases = storageAliases(destination), sourceAliases = storageAliases(sourceOwner);
+        input.getElementType() != output.getElementType() ||
+        input.getNumElements() != output.getNumElements() || !sourceOwner ||
+        !sourceOwner.getDefiningOp<memref::AllocaOp>() ||
+        !destination.getDefiningOp<memref::AllocaOp>() ||
+        sourceOwner == destination)
+      continue;
+    if (!isCompleteStorageViewOf(source, sourceOwner))
+      continue;
+    auto destinationAliases = storage.aliases(destination);
+    if (!destinationAliases.complete || !storage.aliases(sourceOwner).complete)
+      continue;
     Operation *last = copy;
     bool eligible = true;
     // A copied snapshot can be forwarded only to read-only consumers. Views
     // retain the entire owned allocation, as required by the DSA verifier.
-    for (Value alias : destinationAliases) for (Operation *user : alias.getUsers()) {
+    for (Operation *user : destinationAliases.users) {
       if (user == copy) continue;
       if (user->getBlock() != copy->getBlock() || !copy->isBeforeInBlock(user)) { eligible = false; break; }
       if (last->isBeforeInBlock(user)) last = user;
-      if (isa<memref::ReinterpretCastOp>(user)) continue;
-      if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) { eligible = false; break; }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || llvm::is_contained(destinationAliases, effect.getValue()))) eligible = false;
-      } else if (!isMemoryEffectFree(user)) eligible = false;
+      auto completion = storage.completionOfUse(user);
+      if (failed(completion) || *completion != user ||
+          !storage.preserves(user, destination))
+        eligible = false;
     }
     if (!eligible || last == copy) continue;
-    for (Value alias : sourceAliases) for (Operation *user : alias.getUsers()) {
-      if (isa<memref::ReinterpretCastOp>(user)) continue;
-      if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
-          (!isa<MemoryEffectOpInterface>(user) && !isMemoryEffectFree(user))) eligible = false;
-    }
     // Preserve the source snapshot through its final redirected read, including
     // writes nested in intervening control flow and writes by that last user.
-    for (Operation *op = copy->getNextNode(); eligible && op; op = op->getNextNode()) {
-      op->walk([&](Operation *nested) {
-        if (auto effects = dyn_cast<MemoryEffectOpInterface>(nested)) {
-          SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-          for (const auto &effect : instances)
-            if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-                (!effect.getValue() || llvm::is_contained(sourceAliases, effect.getValue()))) eligible = false;
-        }
-      });
-      if (op == last) break;
-    }
-    if (!eligible) continue;
+    if (!storage.unchangedBetween(source, copy, last) ||
+        !storage.preserves(last, source))
+      continue;
     OpBuilder builder(copy);
-    Value replacement = source;
-    if (input != output)
-      replacement = builder.create<memref::ReinterpretCastOp>(copy->getLoc(), output, source, int64_t(0),
-          output.getShape(), ArrayRef<int64_t>{output.getDimSize(1), 1});
-    destination.replaceAllUsesExcept(replacement, copy);
+    auto replacement =
+        materializeCollectiveView(builder, copy->getLoc(), source, output);
+    assert(succeeded(replacement) &&
+           "complete copies preserve local storage capacity");
+    destination.replaceAllUsesExcept(*replacement, copy);
     copy->erase();
     if (destination.use_empty()) destination.getDefiningOp()->erase();
     changed = true;
@@ -243,59 +214,19 @@ bool forwardFullLocalCopies(func::FuncOp function) {
 }
 
 bool forwardUniformScalarLoads(func::FuncOp function) {
-  DominanceInfo dominance(function);
-  SmallVector<memref::AllocaOp> allocations;
-  function.walk([&](memref::AllocaOp allocation) { allocations.push_back(allocation); });
+  SmallVector<memref::LoadOp> loads;
+  function.walk([&](memref::LoadOp load) { loads.push_back(load); });
   bool changed = false;
-  for (auto allocation : allocations) {
-    Value buffer = allocation.getResult();
-    SmallVector<Value> aliases{buffer};
-    auto owner = dsa::storageRoot;
-    dsa::FillOp initialization;
-    SmallVector<memref::LoadOp> loads;
-    bool immutable = true;
-    for (unsigned i = 0; i < aliases.size() && immutable; ++i) for (Operation *user : aliases[i].getUsers()) {
-      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) {
-        // DSA verification restricts these to same-dtype, zero-offset views
-        // covering the entire owned allocation.
-        aliases.push_back(view.getResult());
-        continue;
-      }
-      if (auto fill = dyn_cast<dsa::FillOp>(user)) {
-        if (initialization || fill.getOutput() != aliases[i]) { immutable = false; break; }
-        initialization = fill;
-        continue;
-      }
-      if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) {
-        immutable = false;
-        break;
-      }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || owner(effect.getValue()) == buffer)) immutable = false;
-      } else if (!isMemoryEffectFree(user)) immutable = false;
-      if (!immutable) break;
-      if (auto load = dyn_cast<memref::LoadOp>(user)) loads.push_back(load);
-    }
-    if (!immutable || !initialization || loads.empty() ||
-        llvm::any_of(loads, [&](memref::LoadOp load) { return !dominance.dominates(initialization, load); })) continue;
-    for (auto load : loads) {
-      load.getResult().replaceAllUsesWith(initialization.getValue());
-      load.erase();
-    }
-    if (llvm::all_of(aliases, [&](Value alias) {
-          return llvm::all_of(alias.getUsers(), [&](Operation *user) {
-            return user == initialization || isa<memref::ReinterpretCastOp>(user);
-          });
-        })) {
-      initialization.erase();
-      for (Value alias : llvm::reverse(aliases)) alias.getDefiningOp()->erase();
-    }
+  for (auto load : loads) {
+    auto initialization = uniformFillBefore(load.getMemref(), load);
+    if (!initialization)
+      continue;
+    load.getResult().replaceAllUsesWith(initialization.getValue());
+    load.erase();
     changed = true;
   }
+  if (changed)
+    eliminateUnreadLocalWrites(function);
   return changed;
 }
 

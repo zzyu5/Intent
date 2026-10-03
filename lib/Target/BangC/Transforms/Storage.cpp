@@ -60,50 +60,53 @@ Value allocate(OpBuilder &b, Location loc, Type element, ArrayRef<int64_t> shape
   return result;
 }
 
-bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr config) {
-  SmallVector<dsa::BinaryOp> operations;
-  function.walk([&](dsa::BinaryOp operation) { operations.push_back(operation); });
+namespace {
+struct InPlaceCandidate {
+  Operation *operation;
+  unsigned input, output;
+};
+
+bool reuseConsumedStorage(func::FuncOp function, dsa::ConfigurationAttr config,
+                          ArrayRef<InPlaceCandidate> candidates) {
   int64_t currentNram = 0, currentWram = 0;
   measureStorage(function, currentNram, currentWram);
   bool changed = false;
-  for (auto operation : operations) {
-    // These same-dtype native operations support exact output/input aliasing.
-    // Division and operations with additional workspace retain separate storage.
-    if (operation.getApproximate() || operation.getFlushToZero()) continue;
-    if (!isa<MemRefType>(operation.getRhs().getType()) && !supportedScalarBinary(operation.getKind())) continue;
-    switch (operation.getKind()) {
-    case BinaryOperator::Add: case BinaryOperator::Subtract: case BinaryOperator::Multiply:
-    case BinaryOperator::Maximum: case BinaryOperator::Minimum:
-    case BinaryOperator::MaximumNum: case BinaryOperator::MinimumNum: break;
-    default: continue;
-    }
-    Value input = operation.getLhs(), output = operation.getOutput();
-    auto source = input.getDefiningOp<memref::AllocaOp>();
-    auto destination = output.getDefiningOp<memref::AllocaOp>();
-    if (!source || !destination || input == output || output == operation.getRhs() ||
+  for (auto candidate : candidates) {
+    Operation *operation = candidate.operation;
+    Value input = operation->getOperand(candidate.input);
+    Value output = operation->getOperand(candidate.output);
+    dsa::StorageAnalysis storage(function);
+    Value inputOrigin = storage.uniqueOrigin(input), outputOrigin = storage.uniqueOrigin(output);
+    auto source = inputOrigin ? inputOrigin.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp{};
+    auto destination = outputOrigin ? outputOrigin.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp{};
+    if (!source || !destination || source == destination ||
         source->getBlock() != operation->getBlock() || destination->getBlock() != operation->getBlock() ||
         source.getType() != destination.getType() || !source.getType().getLayout().isIdentity() ||
         source.getType().getMemorySpaceAsInt() != dsa::nramSpace ||
-        source.getAlignment().value_or(0) < destination.getAlignment().value_or(0)) continue;
-    Type element = source.getType().getElementType();
-    if (!element.isF16() && !element.isF32()) continue;
-    if (auto loop = dyn_cast<scf::ForOp>(operation->getParentOp()))
-      if (auto uniform = uniformFillBefore(input, operation);
-          uniform && loop.isDefinedOutsideOfLoop(uniform.getValue())) continue;
-    if (llvm::any_of(input.getUsers(), [&](Operation *user) {
-          if (user == operation.getOperation()) return false;
-          Operation *scope = operation->getBlock()->findAncestorOpInBlock(*user);
-          return !scope || !scope->isBeforeInBlock(operation) || user->getNumRegions() ||
-              user->hasTrait<OpTrait::IsTerminator>() ||
-              llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
-        }) || llvm::any_of(output.getUsers(), [&](Operation *user) {
-          if (user == operation.getOperation()) return false;
-          Operation *scope = operation->getBlock()->findAncestorOpInBlock(*user);
-          return !scope || !operation->isBeforeInBlock(scope) || user->hasTrait<OpTrait::IsTerminator>();
+        source.getAlignment().value_or(0) < destination.getAlignment().value_or(0) ||
+        input.getType() != output.getType() ||
+        !dsa::isCompleteStorageViewOf(input, source) ||
+        !dsa::isCompleteStorageViewOf(output, destination) ||
+        !storage.allUsesCompleteBefore(source, operation, operation)) continue;
+    if (llvm::any_of(llvm::enumerate(operation->getOperands()), [&](auto entry) {
+          Value operand = entry.value();
+          return entry.index() != candidate.output && operand != input &&
+              isa<MemRefType>(operand.getType()) &&
+              (!storage.disjoint(operand, input) || !storage.disjoint(operand, output));
+        })) continue;
+    // Descriptor forwarding is harmless; every actual use of the old output
+    // must follow this complete overwrite, including uses through other views.
+    DominanceInfo dominance(function);
+    auto outputUses = storage.accesses(destination);
+    if (!outputUses.complete || !dominance.dominates(source.getResult(), destination) ||
+        llvm::any_of(outputUses.entries, [&](const auto &entry) {
+          return entry.operation != operation &&
+              !isa<MemoryEffects::Allocate>(entry.effect.getEffect()) &&
+              !dominance.properlyDominates(operation, entry.operation);
         })) continue;
     SmallVector<OpOperand *> uses;
-    for (OpOperand &use : output.getUses()) uses.push_back(&use);
-    for (OpOperand *use : uses) use->set(input);
+    for (OpOperand &use : destination.getResult().getUses()) uses.push_back(&use);
+    for (OpOperand *use : uses) use->set(source);
     Operation *next = destination->getNextNode();
     destination->remove();
     int64_t nram = 0, wram = 0;
@@ -112,7 +115,7 @@ bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr con
         nram > 768 * 1024 || wram > 1024 * 1024) {
       OpBuilder restore(next);
       restore.insert(destination.getOperation());
-      for (OpOperand *use : uses) use->set(output);
+      for (OpOperand *use : uses) use->set(destination);
     } else {
       destination->destroy();
       currentNram = nram;
@@ -122,50 +125,40 @@ bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr con
   }
   return changed;
 }
+} // namespace
+
+bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr config) {
+  SmallVector<InPlaceCandidate> candidates;
+  function.walk([&](dsa::BinaryOp operation) {
+    // Exact native input/output aliasing is a provider capability. Storage
+    // liveness and view completeness are proved by the common implementation.
+    if (operation.getApproximate() || operation.getFlushToZero() || operation.getScratch()) return;
+    if (!isa<MemRefType>(operation.getRhs().getType()) && !supportedScalarBinary(operation.getKind())) return;
+    switch (operation.getKind()) {
+    case BinaryOperator::Add: case BinaryOperator::Subtract: case BinaryOperator::Multiply:
+    case BinaryOperator::Maximum: case BinaryOperator::Minimum:
+    case BinaryOperator::MaximumNum: case BinaryOperator::MinimumNum: break;
+    default: return;
+    }
+    Type element = cast<MemRefType>(operation.getOutput().getType()).getElementType();
+    if (!element.isF16() && !element.isF32()) return;
+    if (auto loop = dyn_cast<scf::ForOp>(operation->getParentOp()))
+      if (auto uniform = uniformFillBefore(operation.getLhs(), operation);
+          uniform && loop.isDefinedOutsideOfLoop(uniform.getValue())) return;
+    candidates.push_back({operation, 0, 2});
+  });
+  return reuseConsumedStorage(function, config, candidates);
+}
 
 bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr config) {
-  SmallVector<dsa::UnaryOp> operations;
+  SmallVector<InPlaceCandidate> candidates;
   function.walk([&](dsa::UnaryOp op) {
-    if (op.getKind() == UnaryOperator::Exp2 && op.getApproximate() && op.getFlushToZero()) operations.push_back(op);
+    if (op.getKind() != UnaryOperator::Exp2 || !op.getApproximate() || !op.getFlushToZero() ||
+        !cast<MemRefType>(op.getOutput().getType()).getElementType().isF32() ||
+        (op.getScratch() && !cast<MemRefType>(op.getScratch().getType()).getElementType().isInteger(32))) return;
+    candidates.push_back({op, 0, 1});
   });
-  bool changed = false;
-  for (auto operation : operations) {
-    Value input = operation.getInput(), output = operation.getOutput();
-    auto source = input.getDefiningOp<memref::AllocaOp>(), destination = output.getDefiningOp<memref::AllocaOp>();
-    if (!source || !destination || input == output || source.getType() != destination.getType() ||
-        source->getBlock() != operation->getBlock() || destination->getBlock() != operation->getBlock() ||
-        !source.getType().getElementType().isF32() || !source.getType().getLayout().isIdentity() ||
-        source.getType().getMemorySpaceAsInt() != dsa::nramSpace ||
-        source.getAlignment().value_or(0) < destination.getAlignment().value_or(0) ||
-        (operation.getScratch() && !cast<MemRefType>(operation.getScratch().getType()).getElementType().isInteger(32))) continue;
-    if (llvm::any_of(input.getUsers(), [&](Operation *user) {
-          if (user == operation.getOperation()) return false;
-          Operation *scope = operation->getBlock()->findAncestorOpInBlock(*user);
-          return !scope || !scope->isBeforeInBlock(operation) || user->getNumRegions() ||
-              user->hasTrait<OpTrait::IsTerminator>() ||
-              llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); });
-        }) || llvm::any_of(output.getUsers(), [&](Operation *user) {
-          if (user == operation.getOperation()) return false;
-          Operation *scope = operation->getBlock()->findAncestorOpInBlock(*user);
-          return !scope || !operation->isBeforeInBlock(scope) || user->hasTrait<OpTrait::IsTerminator>();
-        })) continue;
-    // compute_30 exp2 is one pow2.nram instruction. Its FTZ implementation
-    // already supports exact input/output aliasing; the old input is dead here.
-    SmallVector<OpOperand *> uses;
-    for (OpOperand &use : output.getUses()) uses.push_back(&use);
-    for (OpOperand *use : uses) use->set(input);
-    Operation *next = destination->getNextNode();
-    destination->remove();
-    int64_t nram = 0, wram = 0;
-    measureStorage(function, nram, wram);
-    if (nram > config.getLocalBytes() || nram > 768 * 1024 || wram > 1024 * 1024) {
-      OpBuilder restore(next); restore.insert(destination.getOperation());
-      for (OpOperand *use : uses) use->set(output);
-    } else {
-      destination->destroy(); changed = true;
-    }
-  }
-  return changed;
+  return reuseConsumedStorage(function, config, candidates);
 }
 
 void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config) {
@@ -178,29 +171,16 @@ void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config) {
     auto loop = dyn_cast<scf::ForOp>(allocation->getParentOp());
     if (!loop || allocation->getBlock() != loop.getBody()) continue;
     Value buffer = allocation.getResult();
-    dsa::FillOp initialization;
-    bool immutable = true;
-    for (Operation *user : buffer.getUsers()) {
-      if (auto fill = dyn_cast<dsa::FillOp>(user)) {
-        if (initialization || fill->getBlock() != loop.getBody()) { immutable = false; break; }
-        initialization = fill;
-        continue;
-      }
-      if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) {
-        immutable = false; break;
-      }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == buffer)) immutable = false;
-      } else if (!isMemoryEffectFree(user)) immutable = false;
-      if (!immutable) break;
-    }
-    if (!immutable || !initialization || buffer.hasOneUse() || !loop.isDefinedOutsideOfLoop(initialization.getValue()) ||
-        llvm::any_of(buffer.getUsers(), [&](Operation *user) {
-          return user != initialization && !dominance.dominates(initialization, user);
+    dsa::StorageAnalysis storage(function);
+    auto initialization = dyn_cast_or_null<dsa::FillOp>(storage.uniqueWriter(buffer));
+    if (!initialization || initialization->getBlock() != loop.getBody() ||
+        initialization.getOutput() != buffer || buffer.hasOneUse() ||
+        !loop.isDefinedOutsideOfLoop(initialization.getValue())) continue;
+    auto accesses = storage.accesses(buffer);
+    if (!accesses.complete || llvm::any_of(accesses.entries, [&](const auto &entry) {
+          return entry.operation != initialization &&
+              !isa<MemoryEffects::Allocate>(entry.effect.getEffect()) &&
+              !dominance.dominates(initialization, entry.operation);
         })) continue;
     Operation *allocationNext = allocation->getNextNode(), *initializationNext = initialization->getNextNode();
     allocation->moveBefore(loop);

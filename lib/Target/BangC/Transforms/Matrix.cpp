@@ -3,65 +3,48 @@
 using namespace mlir;
 namespace intent::bangc {
 bool paddedInput(Operation *consumer, Value input, Value rows, Value columns) {
-  if (!input.getDefiningOp<memref::AllocaOp>()) return false;
-  // This proof concerns one owned buffer. An escaping view or control operand
-  // requires the general sub-tile path, which materializes independent inputs.
-  for (Operation *user : input.getUsers())
-    if (user->getNumRegions() || llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
-        (!isa<MemoryEffectOpInterface>(user) && !isMemoryEffectFree(user)))
-      return false;
+  dsa::StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
+  Value origin = storage.uniqueOrigin(input);
+  if (!origin || !dsa::isCompleteStorageViewOf(input, origin)) return false;
+  auto matches = [&](Value value) {
+    return value.getType() == input.getType() && dsa::isCompleteStorageViewOf(value, origin);
+  };
   auto sameCount = [](Value lhs, Value rhs) {
     if (lhs == rhs) return true;
     APInt left, right;
     return matchPattern(lhs, m_ConstantInt(&left)) && matchPattern(rhs, m_ConstantInt(&right)) && left == right;
   };
-  for (Operation *previous = consumer->getPrevNode(); previous; previous = previous->getPrevNode()) {
-    if (auto load = dyn_cast<dsa::LoadTileOp>(previous); load && load.getOutput() == input)
+  if (Operation *previous = storage.lastWriterBefore(input, consumer)) {
+    if (auto load = dyn_cast<dsa::LoadTileOp>(previous); load && matches(load.getOutput()))
       return sameCount(load.getRows(), rows) && sameCount(load.getColumns(), columns);
-    if (auto gather = dyn_cast<dsa::GatherRowsOp>(previous); gather && gather.getOutput() == input)
+    if (auto gather = dyn_cast<dsa::GatherRowsOp>(previous); gather && matches(gather.getOutput()))
       return sameCount(gather.getRows(), rows) && sameCount(gather.getColumns(), columns);
-    if (auto gather = dyn_cast<dsa::GroupGatherRowsOp>(previous); gather && gather.getOutput() == input) {
+    if (auto gather = dyn_cast<dsa::GroupGatherRowsOp>(previous); gather && matches(gather.getOutput())) {
       APInt count;
       return sameCount(gather.getRows(), rows) && matchPattern(columns, m_ConstantInt(&count)) &&
           count.getSExtValue() == cast<MemRefType>(input.getType()).getDimSize(1);
     }
-    if (auto conversion = dyn_cast<dsa::CastOp>(previous); conversion && conversion.getOutput() == input) {
+    if (auto conversion = dyn_cast<dsa::CastOp>(previous); conversion && matches(conversion.getOutput())) {
       auto source = cast<MemRefType>(conversion.getInput().getType());
       auto destination = cast<MemRefType>(input.getType());
       // Element conversion preserves the zero padding introduced by LoadTile.
       // Prove it before the conversion, independently of later source reuse.
-      return conversion.getInput() != input && source.getShape() == destination.getShape() &&
+      return storage.disjoint(conversion.getInput(), input) && source.getShape() == destination.getShape() &&
           paddedInput(previous, conversion.getInput(), rows, columns);
     }
-    bool overwritten = false;
-    previous->walk([&](Operation *operation) {
-      // The allocation does not escape and has no aliases. Work on other
-      // buffers, including nested scalar loops, cannot invalidate its padding.
-      if (!llvm::is_contained(operation->getOperands(), input)) return;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == input)) overwritten = true;
-      } else if (!isMemoryEffectFree(operation)) overwritten = true;
-    });
-    if (overwritten) return false;
   }
   return false;
 }
 
 bool consumesMatrixRhs(dsa::MatMulOp matrix) {
   Value input = matrix.getRhs();
-  if (input == matrix.getLhs() || input == matrix.getAccumulator() ||
-      !input.getDefiningOp<memref::AllocaOp>()) return false;
-  return llvm::all_of(input.getUsers(), [&](Operation *user) {
-    if (user == matrix.getOperation()) return true;
-    if (auto load = dyn_cast<dsa::LoadTileOp>(user))
-      return load.getOutput() == input && load.getSource() != input;
-    if (auto fill = dyn_cast<dsa::FillOp>(user)) return fill.getOutput() == input;
-    return false;
-  });
+  dsa::StorageAnalysis storage(matrix->getParentOfType<func::FuncOp>());
+  Value origin = storage.uniqueOrigin(input);
+  return origin && origin.getDefiningOp<memref::AllocaOp>() &&
+      dsa::isCompleteStorageViewOf(input, origin) &&
+      storage.disjoint(input, matrix.getLhs()) &&
+      storage.disjoint(input, matrix.getAccumulator()) &&
+      storage.allUsesCompleteBefore(origin, matrix, matrix);
 }
 
 Value matrixReshapeWorkspace(OpBuilder &b, Location loc, Value input, Value transposed, bool consumeInput) {

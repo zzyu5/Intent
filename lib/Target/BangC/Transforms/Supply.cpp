@@ -11,19 +11,19 @@ void realizeGatherWorkspace(func::FuncOp function, dsa::ConfigurationAttr config
     if (rows < 64 || rows % 64 || rows > 65536) continue;
     OpBuilder b(gather);
     Location loc = gather.getLoc();
-    // Adjacent supplies with identical offsets consume the same immutable
-    // address snapshot. Only pure operations and fresh allocations may lie
-    // between them; writes and control boundaries terminate this reuse.
-    Operation *previous = gather->getPrevNode();
-    while (previous && (isa<memref::AllocaOp>(previous) || isMemoryEffectFree(previous)))
-      previous = previous->getPrevNode();
-    if (auto supply = dyn_cast_or_null<dsa::GatherRowsOp>(previous);
-        supply && supply.getPlan() && supply.getRowOffsets() == gather.getRowOffsets() &&
-        supply.getRows() == gather.getRows() &&
-        cast<MemRefType>(supply.getOutput().getType()).getDimSize(0) == rows) {
-      gather.getPlanMutable().assign(supply.getPlan());
-      continue;
+    dsa::StorageAnalysis storage(function);
+    for (Operation *previous = gather->getPrevNode(); previous; previous = previous->getPrevNode()) {
+      auto supply = dyn_cast<dsa::GatherRowsOp>(previous);
+      if (supply && supply.getPlan() && supply.getRowOffsets() == gather.getRowOffsets() &&
+          supply.getRows() == gather.getRows() &&
+          cast<MemRefType>(supply.getOutput().getType()).getDimSize(0) == rows &&
+          storage.readStable(gather.getRowOffsets(), supply, gather) &&
+          storage.unchangedBetween(supply.getPlan(), supply, gather)) {
+        gather.getPlanMutable().assign(supply.getPlan());
+        break;
+      }
     }
+    if (gather.getPlan()) continue;
     Value scratch = allocate(b, loc, b.getI64Type(), {3, rows}, dsa::nramSpace);
     Value indices = indicesByRows.lookup(rows);
     dsa::IotaOp initialize;
@@ -50,18 +50,21 @@ void realizeGatherWorkspace(func::FuncOp function, dsa::ConfigurationAttr config
   // Submit consecutive independent destinations before the common completion
   // fence. The plan is read-only throughout the group, and remains live until
   // every transfer has been issued.
-  auto owner = dsa::storageRoot;
   for (auto gather : gathers) {
     if (!gather.getPlan() || gather.getAsynchronous()) continue;
+    dsa::StorageAnalysis storage(function);
     SmallVector<dsa::GatherRowsOp> group{gather};
-    SmallVector<Value> outputs{owner(gather.getOutput())};
     Operation *next = gather->getNextNode();
     while (next) {
       if (isa<memref::AllocaOp>(next) || isMemoryEffectFree(next)) { next = next->getNextNode(); continue; }
       auto supply = dyn_cast<dsa::GatherRowsOp>(next);
       if (!supply || supply.getPlan() != gather.getPlan() ||
-          llvm::is_contained(outputs, owner(supply.getOutput()))) break;
-      outputs.push_back(owner(supply.getOutput()));
+          llvm::any_of(group, [&](dsa::GatherRowsOp previous) {
+            return !storage.disjoint(previous.getOutput(), supply.getOutput()) ||
+                !storage.disjoint(previous.getOutput(), supply.getSource()) ||
+                !storage.disjoint(supply.getOutput(), previous.getSource()) ||
+                !storage.disjoint(supply.getOutput(), previous.getPlan());
+          })) break;
       group.push_back(supply);
       next = next->getNextNode();
     }
@@ -109,19 +112,21 @@ void coalesceTileLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
     auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == 0;
   };
-  auto owner = dsa::storageRoot;
   SmallVector<dsa::LoadTileOp> loads;
   function.walk([&](dsa::LoadTileOp load) { if (eligible(load)) loads.push_back(load); });
   for (auto load : loads) {
     if (load.getAsynchronous()) continue;
+    dsa::StorageAnalysis storage(function);
     SmallVector<dsa::LoadTileOp> group{load};
-    SmallVector<Value> destinations{owner(load.getOutput())};
+    SmallVector<Value> destinations{load.getOutput()};
     Operation *next = load->getNextNode();
     while (next) {
       if (isa<memref::AllocaOp>(next) || isMemoryEffectFree(next)) { next = next->getNextNode(); continue; }
       auto supply = dyn_cast<dsa::LoadTileOp>(next);
-      if (!eligible(supply) || llvm::is_contained(destinations, owner(supply.getOutput()))) break;
-      group.push_back(supply); destinations.push_back(owner(supply.getOutput()));
+      if (!eligible(supply) || llvm::any_of(destinations, [&](Value value) {
+            return !storage.disjoint(value, supply.getOutput());
+          })) break;
+      group.push_back(supply); destinations.push_back(supply.getOutput());
       next = next->getNextNode();
     }
     if (group.size() < 2) continue;
@@ -453,6 +458,7 @@ void pipelineRowLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
     dsa::LoadTileOp load;
     dsa::StoreTileOp store;
     bool eligible = true, reduction = false;
+    dsa::StorageAnalysis storage(function);
     for (Operation &op : body->without_terminator()) {
       if (auto transfer = dyn_cast<dsa::LoadTileOp>(op)) {
         if (load || store || transfer.getAsynchronous() || !access(transfer.getSource(), 0)) eligible = false;
@@ -488,10 +494,13 @@ void pipelineRowLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
       if (isa<dsa::LoadTileOp, dsa::StoreTileOp, dsa::StrideOp, dsa::SynchronizeOp>(op)) continue;
       for (Value operand : op.getOperands()) if (auto type = dyn_cast<MemRefType>(operand.getType()))
         if (type.getMemorySpaceAsInt() != dsa::nramSpace) eligible = false;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(op)) {
-        SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-        for (const auto &effect : instances) if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) {
-          Operation *owner = effect.getValue() ? effect.getValue().getDefiningOp() : nullptr;
+      auto effects = storage.effects(&op);
+      if (!effects.complete) eligible = false;
+      for (const auto &entry : effects.entries) {
+        const auto &effect = entry.effect;
+        if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) {
+          Value origin = storage.uniqueOrigin(effect.getValue());
+          Operation *owner = origin ? origin.getDefiningOp() : nullptr;
           if (!owner || !loop->isProperAncestor(owner)) eligible = false;
         }
       }
@@ -589,7 +598,6 @@ void pipelineMatrixLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
     }
     return -1;
   };
-  auto owner = dsa::storageRoot;
   SmallVector<scf::ForOp> loops;
   function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
   for (auto loop : loops) {
@@ -601,15 +609,14 @@ void pipelineMatrixLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
     SmallVector<dsa::LoadTileOp> loads;
     dsa::PrepareMatrixOp prepare;
     dsa::MatrixTileOp matrix;
+    dsa::StorageAnalysis storage(function);
+    auto owner = [&](Value value) { return storage.uniqueOrigin(value); };
     auto readOnlySource = [&](Value source) {
       if (readOnlyArgument(source)) return true;
-      auto allocation = source.getDefiningOp<memref::AllocaOp>();
+      Value origin = owner(source);
+      auto allocation = origin ? origin.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp{};
       if (!allocation || allocation.getType().getMemorySpaceAsInt() != dsa::sharedSpace || loop->isAncestor(allocation)) return false;
-      return llvm::all_of(source.getUsers(), [&](Operation *user) {
-        if (!loop->isAncestor(user)) return true;
-        auto load = dyn_cast<dsa::LoadTileOp>(user);
-        return load && load.getSource() == source;
-      });
+      return storage.aliases(origin).complete && storage.preservesContents(loop, source);
     };
     auto eligible = loop.walk([&](Operation *op) {
       if (op == loop.getOperation()) return WalkResult::advance();
@@ -660,17 +667,16 @@ void pipelineMatrixLoads(func::FuncOp function, dsa::ConfigurationAttr config) {
         loop->isAncestor(accAllocation)) continue;
     bool privateInputs = true;
     for (Value input : {lhs, rhs}) {
-      SmallVector<Value> aliases{input};
-      for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
-        if (!loop->isAncestor(user)) privateInputs = false;
-        if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) aliases.push_back(view.getResult());
-      }
+      auto aliases = storage.aliases(input);
+      if (!aliases.complete || llvm::any_of(aliases.users, [&](Operation *user) {
+            return !loop->isAncestor(user);
+          })) privateInputs = false;
     }
     for (Value scratch : {prepare.getOutput(), prepare.getScratch(), prepare.getReshaped()}) {
       if (!scratch) continue;
       Value allocation = owner(scratch);
       if (allocation == rhs) continue;
-      if (!allocation.getDefiningOp<memref::AllocaOp>() || !loop->isAncestor(allocation.getDefiningOp()))
+      if (!allocation || !allocation.getDefiningOp<memref::AllocaOp>() || !loop->isAncestor(allocation.getDefiningOp()))
         privateInputs = false;
     }
     if (!privateInputs) continue;
@@ -889,12 +895,12 @@ LogicalResult scheduleProgramSupply(ModuleOp module) {
       } else if (!isMemoryEffectFree(op)) eligible = false;
     });
     if (!eligible || pending.empty()) return false;
-    auto owner = dsa::storageRoot;
+    dsa::StorageAnalysis storage(function);
     for (Value input : compute->getOperands()) {
-      Value allocation = owner(input);
-      if (!allocation.getDefiningOp<memref::AllocaOp>() ||
+      Value allocation = storage.uniqueOrigin(input);
+      if (!allocation || !allocation.getDefiningOp<memref::AllocaOp>() ||
           !transferDominance.dominates(allocation.getDefiningOp(), previous)) return false;
-      for (Value output : pending) if (owner(output) == allocation) return false;
+      for (Value output : pending) if (!storage.disjoint(output, input)) return false;
     }
     return true;
   };

@@ -10,15 +10,6 @@
 using namespace mlir;
 namespace intent::dsa {
 
-SmallVector<Value> storageAliases(Value value) {
-  SmallVector<Value> aliases{value};
-  for (unsigned i = 0; i < aliases.size(); ++i)
-    for (Operation *user : aliases[i].getUsers())
-      if (auto view = dyn_cast<memref::ReinterpretCastOp>(user))
-        if (!llvm::is_contained(aliases, view.getResult())) aliases.push_back(view.getResult());
-  return aliases;
-}
-
 SignedInterval integerInterval(Value value, func::FuncOp function) {
   DenseMap<Value, SignedInterval> cache;
   DenseSet<Value> active;
@@ -103,92 +94,6 @@ bool isSumOfIntegerProducts(Value value, ArrayRef<std::pair<Value, Value>> produ
   for (auto [lhs, rhs] : products) expected = expected + expression(lhs) * expression(rhs);
   auto difference = dyn_cast<AffineConstantExpr>(simplifyAffineExpr(actual - expected, 0, symbols));
   return difference && difference.getValue() == 0;
-}
-
-dsa::FillOp uniformFillBefore(Value input, Operation *read) {
-  input = storageRoot(input);
-  if (!input.getDefiningOp<memref::AllocaOp>()) return {};
-  auto aliases = storageAliases(input);
-  for (Value alias : aliases) for (Operation *user : alias.getUsers()) {
-    if (isa<memref::ReinterpretCastOp>(user)) continue;
-    if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); }) ||
-             (!isa<MemoryEffectOpInterface>(user) && !isMemoryEffectFree(user))) return {};
-  }
-  for (Operation *previous = read->getPrevNode(); previous; previous = previous->getPrevNode()) {
-    if (auto fill = dyn_cast<dsa::FillOp>(previous); fill && llvm::is_contained(aliases, fill.getOutput())) return fill;
-    bool changed = false;
-    previous->walk([&](Operation *operation) {
-      if (!llvm::any_of(operation->getOperands(), [&](Value value) { return llvm::is_contained(aliases, value); })) return;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || llvm::is_contained(aliases, effect.getValue()))) changed = true;
-      } else if (!isMemoryEffectFree(operation)) changed = true;
-    });
-    if (changed) return {};
-  }
-  return {};
-}
-
-SmallVector<StorageLifetime> analyzeStorageLifetimes(func::FuncOp function) {
-  DenseMap<Operation *, uint64_t> begin, end;
-  uint64_t clock = 0;
-  std::function<void(Operation *)> number = [&](Operation *op) {
-    begin[op] = clock++;
-    for (Region &region : op->getRegions())
-      for (Block &block : region)
-        for (Operation &nested : block) number(&nested);
-    end[op] = clock++;
-  };
-  number(function);
-  SmallVector<StorageLifetime> allocations;
-  function.walk<WalkOrder::PreOrder>([&](memref::AllocaOp allocation) {
-    uint64_t start = std::numeric_limits<uint64_t>::max(), finish = end[allocation];
-    auto scope = [&](Operation *operation) {
-      // An asynchronous use can complete after the conditional that owns its
-      // buffer. That completion is already outside this lexical allocation.
-      if (!allocation->getParentRegion()->isAncestor(operation->getParentRegion())) return operation;
-      Operation *lifetime = operation;
-      while (operation->getBlock() != allocation->getBlock()) {
-        operation = operation->getParentOp();
-        if (!isa<scf::IfOp>(operation)) lifetime = operation;
-      }
-      return lifetime;
-    };
-    for (Value alias : storageAliases(allocation)) for (Operation *user : alias.getUsers()) {
-      if (isa<memref::ReinterpretCastOp>(user)) continue;
-      start = std::min(start, begin[scope(user)]);
-      Operation *last = user;
-      bool asynchronous = false;
-      if (auto load = dyn_cast<dsa::LoadTileOp>(user)) asynchronous = load.getAsynchronous();
-      if (auto gather = dyn_cast<dsa::GatherRowsOp>(user)) asynchronous = gather.getAsynchronous();
-      if (asynchronous) {
-        Operation *cursor = user;
-        while (true) {
-          Operation *completion = cursor->getNextNode();
-          auto completesIO = [](Operation *op) {
-            if (auto sync = dyn_cast<dsa::SynchronizeOp>(op)) return !sync.getLocalOnly();
-            return isa<dsa::GroupSynchronizeOp, dsa::GroupGatherRowsOp>(op);
-          };
-          while (completion && !completesIO(completion)) completion = completion->getNextNode();
-          if (completion) { last = completion; break; }
-          Operation *parent = cursor->getParentOp();
-          if (isa<scf::IfOp>(parent)) { cursor = parent; continue; }
-          // Do not cross a loop backedge looking for a later fence. Keep the
-          // payload live through the entire loop if this iteration has none.
-          last = isa<func::FuncOp>(parent) ? cursor->getBlock()->getTerminator() : parent;
-          break;
-        }
-      }
-      finish = std::max(finish, end[scope(last)]);
-    }
-    if (start == std::numeric_limits<uint64_t>::max()) start = begin[allocation];
-    allocations.push_back({allocation, start, finish});
-  });
-  llvm::stable_sort(allocations, [](const StorageLifetime &a, const StorageLifetime &b) { return a.start < b.start; });
-  return allocations;
 }
 
 } // namespace intent::dsa

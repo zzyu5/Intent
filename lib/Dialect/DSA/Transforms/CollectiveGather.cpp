@@ -1,4 +1,5 @@
 #include "PassSupport.h"
+#include "StoragePatterns.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
@@ -24,7 +25,9 @@ class GroupRelations {
 public:
   explicit GroupRelations(scf::ForOp work)
       : work(work), function(work->getParentOfType<func::FuncOp>()),
-        interface(intent::getPublicInterface(function)) {}
+        interface(intent::getPublicInterface(function)), storage(function) {}
+
+  StorageAnalysis &getStorage() { return storage; }
 
   bool taskIdentity(Value value) const {
     auto loop = work;
@@ -37,7 +40,8 @@ public:
 
   intent::ViewType readonlyView(Value value) const {
     auto owner = function;
-    auto argument = dyn_cast<BlockArgument>(value);
+    auto argument =
+        dyn_cast_or_null<BlockArgument>(storage.uniqueOrigin(value));
     if (!argument || argument.getOwner() != &owner.front()) return {};
     auto view = intent::getPublicView(interface, argument.getArgNumber());
     return view && view.getAccess() == 0 ? view : intent::ViewType();
@@ -124,46 +128,58 @@ private:
 
   bool uniformBuffer(Value value) {
     if (readonlyView(value)) return true;
-    value = storageRoot(value);
+    value = storage.uniqueOrigin(value);
+    if (!value)
+      return false;
     if (auto known = buffers.find(value); known != buffers.end()) return known->second;
     if (!value.getDefiningOp<memref::AllocaOp>() || !activeBuffers.insert(value).second) return false;
     auto infer = [&]() {
-      auto aliases = storageAliases(value);
-      for (Value alias : aliases)
-        if (auto view = alias.getDefiningOp<memref::ReinterpretCastOp>())
-          for (Value parameter : view->getOperands().drop_front())
-            if (!uniformValue(parameter)) return false;
+      auto aliases = storage.aliases(value);
+      if (!aliases.complete)
+        return false;
+      for (Value alias : aliases.values) {
+        if (alias == value)
+          continue;
+        auto definition = alias.getDefiningOp();
+        // Group-uniform address projections must themselves use group-uniform
+        // coordinates; storage aliasing does not establish that relation.
+        if (!definition || definition->getNumRegions() ||
+            !isBufferStorageAliasOperation(definition))
+          return false;
+        for (Value parameter : definition->getOperands())
+          if (!isa<MemRefType>(parameter.getType()) && !uniformValue(parameter))
+            return false;
+      }
+      auto writers = storage.writers(value);
+      if (failed(writers))
+        return false;
       bool written = false;
-      for (Value alias : aliases) for (Operation *user : alias.getUsers()) {
-        if (isa<memref::ReinterpretCastOp>(user)) continue;
-        if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) return false;
-        auto effects = dyn_cast<MemoryEffectOpInterface>(user);
-        if (!effects) return false;
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        bool writes = false;
-        for (const auto &effect : instances) {
-          if (isa<MemoryEffects::Free>(effect.getEffect())) return false;
-          if (!isa<MemoryEffects::Write>(effect.getEffect())) continue;
-          if (!effect.getValue()) return false;
-          writes |= llvm::is_contained(aliases, effect.getValue());
-        }
-        if (!writes) continue;
+      for (Operation *user : *writers) {
         written = true;
-        if (!isa<memref::StoreOp, FillOp, IotaOp, LoadTileOp, GatherRowsOp, UnaryOp, BinaryOp,
-                 CastOp, SelectOp, CompareOp, CompareRangeOp, CompareRampOp, IndexBinaryOp,
-                 IndexLayoutOp, TransposeOp>(user) || !uniformExecution(user)) return false;
+        if (!isa<memref::StoreOp, FillOp, IotaOp, LoadTileOp, GatherRowsOp,
+                 UnaryOp, BinaryOp, CastOp, SelectOp, CompareOp, CompareRangeOp,
+                 CompareRampOp, IndexBinaryOp, IndexLayoutOp, TransposeOp>(
+                user) ||
+            !uniformExecution(user))
+          return false;
+        auto effects = storage.effects(user);
+        if (!effects.complete || effects.ordered)
+          return false;
         for (Value operand : user->getOperands()) {
           if (!isa<MemRefType>(operand.getType())) {
-            if (!uniformValue(operand)) return false;
+            if (!uniformValue(operand))
+              return false;
             continue;
           }
           bool reads = false, writesOperand = false;
-          for (const auto &effect : instances) if (effect.getValue() == operand) {
-            reads |= isa<MemoryEffects::Read>(effect.getEffect());
-            writesOperand |= isa<MemoryEffects::Write>(effect.getEffect());
-          }
-          if ((!writesOperand || reads) && !uniformBuffer(operand)) return false;
+          for (const auto &entry : effects.entries)
+            if (entry.effect.getValue() == operand) {
+              reads |= isa<MemoryEffects::Read>(entry.effect.getEffect());
+              writesOperand |=
+                  isa<MemoryEffects::Write>(entry.effect.getEffect());
+            }
+          if ((!writesOperand || reads) && !uniformBuffer(operand))
+            return false;
         }
       }
       return written;
@@ -175,6 +191,7 @@ private:
   scf::ForOp work;
   func::FuncOp function;
   InterfaceAttr interface;
+  StorageAnalysis storage;
   DenseMap<Value, bool> control, buffers;
   DenseMap<Value, std::optional<int64_t>> coefficients;
   DenseSet<Value> activeControl, activeBuffers, activeValues;
@@ -210,21 +227,26 @@ bool adjacentIntervals(GatherRowsOp gather, GroupRelations &relations) {
   // Require one complete, current offset snapshot immediately before the read.
   // No other writer or alias can substitute older lane-dependent row addresses.
   Value offsets = gather.getRowOffsets();
+  auto &storage = relations.getStorage();
   auto allocation = offsets.getDefiningOp<memref::AllocaOp>();
   auto loop = dyn_cast_or_null<scf::ForOp>(gather->getPrevNode());
   if (!allocation || !loop || !loop.getInitArgs().empty() || !matchPattern(loop.getLowerBound(), m_Zero()) ||
       !matchPattern(loop.getStep(), m_One()) || loop.getUpperBound() != gather.getRows() ||
       !relations.uniformExecution(loop)) return false;
-  memref::StoreOp store;
-  for (Operation *user : offsets.getUsers()) {
-    if (auto write = dyn_cast<memref::StoreOp>(user)) {
-      if (store || write->getBlock() != loop.getBody() || write.getIndices().size() != 2 ||
-          !matchPattern(write.getIndices()[0], m_Zero()) || write.getIndices()[1] != loop.getInductionVar()) return false;
-      store = write;
-    } else if (user != gather.getOperation()) return false;
-  }
-  if (!store || !storageRoot(gather.getOutput()).getDefiningOp<memref::AllocaOp>() ||
-      storageRoot(gather.getOutput()) == offsets) return false;
+  auto store = dyn_cast_or_null<memref::StoreOp>(storage.uniqueWriter(offsets));
+  if (!store ||
+      !detail::sameCompleteView(storage, store.getMemref(), offsets) ||
+      store->getBlock() != loop.getBody() || store.getIndices().size() != 2 ||
+      !matchPattern(store.getIndices()[0], m_Zero()) ||
+      store.getIndices()[1] != loop.getInductionVar())
+    return false;
+  for (Operation *user : storage.aliases(offsets).users)
+    if (user != store && user != gather && !isBufferStorageAliasOperation(user))
+      return false;
+  Value outputOrigin = storage.uniqueOrigin(gather.getOutput());
+  if (!outputOrigin || !outputOrigin.getDefiningOp<memref::AllocaOp>() ||
+      !storage.disjoint(outputOrigin, offsets))
+    return false;
   auto coefficient = relations.laneCoefficient(store.getValue());
   return coefficient && *coefficient == columns;
 }

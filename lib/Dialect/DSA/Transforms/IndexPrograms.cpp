@@ -1,4 +1,5 @@
 #include "PassSupport.h"
+#include "StoragePatterns.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -8,8 +9,8 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
-#include "mlir/Pass/PassManager.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -23,6 +24,7 @@ bool forwardIndexExpressions(func::FuncOp function) {
   auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
   bool changed = false;
   for (auto store : stores) {
+    StorageAnalysis storage(function);
     Value buffer = store.getMemref();
     auto allocation = buffer.getDefiningOp<memref::AllocaOp>();
     auto producer = dyn_cast<scf::ForOp>(store->getParentOp());
@@ -44,35 +46,38 @@ bool forwardIndexExpressions(func::FuncOp function) {
           llvm::all_of(operation.getResultTypes(), integer);
     });
     if (!pure) continue;
+    auto writes = storage.writers(buffer);
+    if (failed(writes))
+      continue;
+    bool uniqueWrite = llvm::all_of(*writes, [&](Operation *writer) {
+      if (writer == store)
+        return true;
+      auto fill = dyn_cast<dsa::FillOp>(writer);
+      return fill && isCompleteStorageViewOf(fill.getOutput(), buffer) &&
+             fill->getBlock() == producer->getBlock() &&
+             fill->isBeforeInBlock(producer);
+    });
     SmallVector<memref::LoadOp> loads;
-    bool uniqueWrite = true;
-    for (Operation *user : buffer.getUsers()) {
-      if (user == store.getOperation()) continue;
-      if (auto fill = dyn_cast<dsa::FillOp>(user)) {
-        if (fill->getBlock() != producer->getBlock() || !fill->isBeforeInBlock(producer)) uniqueWrite = false;
-        continue;
-      }
-      if (auto load = dyn_cast<memref::LoadOp>(user)) { loads.push_back(load); continue; }
-      if (llvm::any_of(user->getResultTypes(), [](Type result) { return isa<MemRefType>(result); })) {
-        uniqueWrite = false; break;
-      }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == buffer)) uniqueWrite = false;
-      } else if (!isMemoryEffectFree(user)) uniqueWrite = false;
-      if (!uniqueWrite) break;
-    }
+    for (Operation *user : storage.aliases(buffer).users)
+      if (auto load = dyn_cast<memref::LoadOp>(user);
+          load && detail::sameCompleteView(storage, load.getMemref(), buffer))
+        loads.push_back(load);
     if (!uniqueWrite || loads.empty()) continue;
     for (auto load : loads) {
+      StorageAnalysis currentStorage(function);
       auto consumer = dyn_cast<scf::ForOp>(load->getParentOp());
-      if (!consumer || consumer->getBlock() != producer->getBlock() || !producer->isBeforeInBlock(consumer) ||
-          !consumer.getInitArgs().empty() || consumer.getUpperBound() != producer.getUpperBound() ||
-          !matchPattern(consumer.getLowerBound(), m_Zero()) || !matchPattern(consumer.getStep(), m_One()) ||
-          load.getIndices().size() != 2 || !matchPattern(load.getIndices()[0], m_Zero()) ||
-          load.getIndices()[1] != consumer.getInductionVar()) continue;
+      if (!consumer || consumer->getBlock() != producer->getBlock() ||
+          !producer->isBeforeInBlock(consumer) ||
+          !consumer.getInitArgs().empty() ||
+          consumer.getUpperBound() != producer.getUpperBound() ||
+          !matchPattern(consumer.getLowerBound(), m_Zero()) ||
+          !matchPattern(consumer.getStep(), m_One()) ||
+          load.getIndices().size() != 2 ||
+          !matchPattern(load.getIndices()[0], m_Zero()) ||
+          load.getIndices()[1] != consumer.getInductionVar() ||
+          !currentStorage.unchangedBetween(buffer, producer, consumer) ||
+          !currentStorage.preserves(consumer, buffer))
+        continue;
       IRMapping mapping;
       mapping.map(producer.getInductionVar(), consumer.getInductionVar());
       OpBuilder builder(load);
@@ -102,25 +107,24 @@ bool realizeRangeComparisons(func::FuncOp function) {
     return std::nullopt;
   };
   auto uniqueCopy = [&](Value buffer, Operation *consumer) -> Operation * {
-    if (!buffer.getDefiningOp<memref::AllocaOp>()) return {};
-    Operation *copy = nullptr;
-    for (Operation *user : buffer.getUsers()) {
-      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return {};
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances) {
-          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) ||
-              (effect.getValue() && effect.getValue() != buffer)) continue;
-          auto load = dyn_cast<dsa::LoadTileOp>(user);
-          auto transfer = dyn_cast<memref::CopyOp>(user);
-          bool known = (load && load.getOutput() == buffer && load.getSource() != buffer) ||
-              (transfer && transfer.getTarget() == buffer && transfer.getSource() != buffer);
-          if (!known || copy || !dominance.dominates(user, consumer)) return {};
-          copy = user;
-        }
-      } else if (!isMemoryEffectFree(user)) return {};
-    }
+    StorageAnalysis storage(function);
+    Value origin = storage.uniqueOrigin(buffer);
+    if (!origin || !origin.getDefiningOp<memref::AllocaOp>())
+      return {};
+    Operation *copy = storage.uniqueWriter(buffer);
+    if (!copy || !dominance.dominates(copy, consumer))
+      return {};
+    auto load = dyn_cast<dsa::LoadTileOp>(copy);
+    auto transfer = dyn_cast<memref::CopyOp>(copy);
+    bool known =
+        (load && !load.getAsynchronous() &&
+         detail::sameCompleteView(storage, load.getOutput(), buffer) &&
+         storage.disjoint(load.getSource(), buffer)) ||
+        (transfer &&
+         detail::sameCompleteView(storage, transfer.getTarget(), buffer) &&
+         storage.disjoint(transfer.getSource(), buffer));
+    if (!known)
+      return {};
     return copy;
   };
   auto rampBase = [&](Value buffer, int64_t columns, Operation *consumer) -> std::optional<int64_t> {
@@ -139,23 +143,28 @@ bool realizeRangeComparisons(func::FuncOp function) {
       buffer = input;
       consumer = copy;
     }
-    if (!buffer.getDefiningOp<memref::AllocaOp>()) return std::nullopt;
+    StorageAnalysis storage(function);
+    Value origin = storage.uniqueOrigin(buffer);
+    if (!origin || !origin.getDefiningOp<memref::AllocaOp>())
+      return std::nullopt;
     memref::StoreOp store;
     SmallVector<dsa::FillOp> fills;
-    for (Operation *user : buffer.getUsers()) {
-      if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return std::nullopt;
-      if (auto write = dyn_cast<memref::StoreOp>(user); write && write.getMemref() == buffer) {
+    auto writers = storage.writers(buffer);
+    if (failed(writers))
+      return std::nullopt;
+    for (Operation *user : *writers) {
+      if (auto write = dyn_cast<memref::StoreOp>(user);
+          write &&
+          detail::sameCompleteView(storage, write.getMemref(), buffer)) {
         if (store) return std::nullopt;
         store = write; continue;
       }
-      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && fill.getOutput() == buffer) { fills.push_back(fill); continue; }
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances)
-          if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-              (!effect.getValue() || effect.getValue() == buffer)) return std::nullopt;
-      } else if (!isMemoryEffectFree(user)) return std::nullopt;
+      if (auto fill = dyn_cast<dsa::FillOp>(user);
+          fill && isCompleteStorageViewOf(fill.getOutput(), origin)) {
+        fills.push_back(fill);
+        continue;
+      }
+      return std::nullopt;
     }
     auto loop = store ? dyn_cast<scf::ForOp>(store->getParentOp()) : scf::ForOp();
     if (!loop || !loop.getInitArgs().empty() || !dominance.dominates(loop, consumer) ||
@@ -214,25 +223,29 @@ bool foldPresentRange(dsa::ReduceOp reduce, dsa::CompareRangeOp range, dsa::Load
       !exact(copy.getColumns(), 1) || !exact(copy.getOffset(), 0) ||
       !exact(copy.getRowStride(), 1) || !exact(copy.getColumnStride(), 1)) return false;
   Value source = copy.getSource();
-  while (auto view = source.getDefiningOp<memref::ReinterpretCastOp>()) source = view.getSource();
-  if (!source.getDefiningOp<memref::AllocaOp>() || cast<MemRefType>(source.getType()).getNumElements() != rows) return false;
-  SmallVector<Value> aliases{source};
+  StorageAnalysis storage(function);
+  Value origin = storage.uniqueOrigin(source);
+  if (!origin || !origin.getDefiningOp<memref::AllocaOp>() ||
+      !isCompleteStorageViewOf(source, origin) ||
+      cast<MemRefType>(source.getType()).getNumElements() != rows)
+    return false;
   SmallVector<dsa::FillOp> fills;
   memref::StoreOp initialization;
-  for (unsigned i = 0; i < aliases.size(); ++i) for (Operation *user : aliases[i].getUsers()) {
-    if (auto view = dyn_cast<memref::ReinterpretCastOp>(user)) { aliases.push_back(view.getResult()); continue; }
-    if (auto store = dyn_cast<memref::StoreOp>(user); store && llvm::is_contained(aliases, store.getMemref())) {
+  auto writers = storage.writers(source);
+  if (failed(writers))
+    return false;
+  for (Operation *user : *writers) {
+    if (auto store = dyn_cast<memref::StoreOp>(user);
+        store && isCompleteStorageViewOf(store.getMemref(), origin)) {
       if (initialization) return false;
       initialization = store; continue;
     }
-    if (auto fill = dyn_cast<dsa::FillOp>(user); fill && llvm::is_contained(aliases, fill.getOutput())) { fills.push_back(fill); continue; }
-    if (llvm::any_of(user->getResultTypes(), [](Type type) { return isa<MemRefType>(type); })) return false;
-    if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-      SmallVector<MemoryEffects::EffectInstance> instances; effects.getEffects(instances);
-      for (const auto &effect : instances)
-        if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-            (!effect.getValue() || llvm::is_contained(aliases, effect.getValue()))) return false;
-    } else if (!isMemoryEffectFree(user)) return false;
+    if (auto fill = dyn_cast<dsa::FillOp>(user);
+        fill && isCompleteStorageViewOf(fill.getOutput(), origin)) {
+      fills.push_back(fill);
+      continue;
+    }
+    return false;
   }
   auto ramp = initialization ? dyn_cast<scf::ForOp>(initialization->getParentOp()) : scf::ForOp();
   if (!ramp || !ramp.getInitArgs().empty() || ramp->isProperAncestor(copy) ||
@@ -321,23 +334,21 @@ bool foldUniformBooleanTiles(func::FuncOp function) {
 bool foldRangeCounts(func::FuncOp function) {
   DominanceInfo dominance(function);
   auto soleWriter = [&](Value buffer, Operation *consumer) -> Operation * {
-    if (!buffer.getDefiningOp<memref::AllocaOp>()) return nullptr;
-    Operation *writer = nullptr;
-    for (Operation *user : buffer.getUsers()) {
-      if (user->getNumRegions() || llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); }))
+    StorageAnalysis storage(function);
+    Value origin = storage.uniqueOrigin(buffer);
+    if (!origin || !origin.getDefiningOp<memref::AllocaOp>())
+      return nullptr;
+    Operation *writer = storage.uniqueWriter(buffer);
+    if (!writer || !dominance.dominates(writer, consumer))
+      return nullptr;
+    auto completion = storage.completionOfUse(writer);
+    if (failed(completion) || *completion != writer)
+      return nullptr;
+    for (const auto &entry : storage.effects(writer).entries)
+      if (isa<MemoryEffects::Write>(entry.effect.getEffect()) &&
+          !storage.disjoint(buffer, entry.effect.getValue()) &&
+          !detail::sameCompleteView(storage, buffer, entry.effect.getValue()))
         return nullptr;
-      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-        SmallVector<MemoryEffects::EffectInstance> instances;
-        effects.getEffects(instances);
-        for (const auto &effect : instances) {
-          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect())) continue;
-          if (!effect.getValue()) return nullptr;
-          if (effect.getValue() != buffer) continue;
-          if (writer || !isa<MemoryEffects::Write>(effect.getEffect()) || !dominance.dominates(user, consumer)) return nullptr;
-          writer = user;
-        }
-      } else if (!isMemoryEffectFree(user)) return nullptr;
-    }
     return writer;
   };
   SmallVector<dsa::ReduceOp> reductions;
@@ -473,20 +484,12 @@ bool reuseGatherOffsets(func::FuncOp function) {
           previous.loop.getUpperBound() != loop.getUpperBound()) continue;
       // A local coordinate tensor may be read by both expressions, but no
       // intervening mutation or escaping alias may change its contents.
+      StorageAnalysis storage(function);
       bool stable = llvm::all_of(sources, [&](Value source) {
-        if (!source.getDefiningOp<memref::AllocaOp>()) return false;
-        for (Operation *user : source.getUsers()) {
-          if (llvm::any_of(user->getResultTypes(), [](Type t) { return isa<MemRefType>(t); })) return false;
-          if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
-            SmallVector<MemoryEffects::EffectInstance> instances;
-            effects.getEffects(instances);
-            for (const auto &effect : instances)
-              if (isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()) &&
-                  (!effect.getValue() || effect.getValue() == source) && !dominance.dominates(user, previous.loop))
-                return false;
-          } else if (!isMemoryEffectFree(user)) return false;
-        }
-        return true;
+        Value origin = storage.uniqueOrigin(source);
+        return origin && origin.getDefiningOp<memref::AllocaOp>() &&
+               storage.aliases(origin).complete &&
+               storage.readStable(source, previous.loop, loop);
       });
       if (!stable || previous.loop.getBody()->getOperations().size() != loop.getBody()->getOperations().size()) continue;
       IRMapping mapping;
