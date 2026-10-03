@@ -21,7 +21,7 @@ export INTENT_MOJO="$HOME/.venvs/intentdsl-mojo/bin/mojo"
 python -m experiments.cpu mojo \
   --compiler /tmp/intentdsl-build/tools/intent-compile/intent-compile \
   --kernel relu --jobs 1 --worker-timeout 600 \
-  --output experiments/cpu/results/mojo-single.csv
+  --output experiments/cpu/results/mojo-x86.csv
 ```
 
 原 runner 保持 8 个 CPU workers 的预算，并设置空闲线程等待策略。去掉 `--kernel` 执行现有 199 项，不扩大矩阵。
@@ -45,11 +45,7 @@ export PYTHONPATH="$PWD:$PWD/python:$PWD/examples:$INTENT_WEFT_SOURCE_DIR/python
 python -m experiments.cpu weft \
   --compiler /tmp/intentdsl-build/tools/intent-compile/intent-compile \
   --kernel i8_gemv_bias --jobs 1 --worker-timeout 600 \
-  --output experiments/cpu/results/weft-single.csv
+  --output experiments/cpu/results/weft-rvv.csv
 ```
 
 `i8_gemv_bias` 使用 [ime.json](providers/weft/ime.json) 的 k1/CPU3/VLEN256/`spacemit-ime1` 条件；普通 RVV 项使用 [rvv.json](providers/weft/rvv.json)。`INTENT_WEFT_PROFILE` 可显式选择现有部署配置，不能把另一台机器的工具链路径直接套用。远端需要 SSH、profile 中的 clang 与运行库；本机生成 artifact，远端编译和执行。
-
-目录整理后的单点结果保存在 `results/integration-mojo.csv`、`results/integration-weft.csv`。
-
-2026-09-22 两个单点均 pass：Mojo `relu` 完成原数值比较；Weft `i8_gemv_bias` 在 k1 上实际选择 `weft.matrix_i8_i32`，产物报告使用 `spacemit-ime1`。

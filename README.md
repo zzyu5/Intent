@@ -80,7 +80,9 @@ print(y.shape, y.dtype, y.device)
 
 The target is selected on the host. Changing it does not require a device branch in the kernel, but the selected backend must support the program's operations, types, and effects. The GPU providers are Triton and cuTile. In the cuTile environment, run `python examples/softmax.py --target cutile` to use the same definition. [Public host examples](examples/README.md) also show explicit forward/backward composition; [GPU](experiments/gpu/README.md), [CPU](experiments/cpu/README.md), and [MLU](experiments/mlu/README.md) retain the existing measured coverage.
 
-For GPU kernels with read-only `In` tensors, scalar inputs, and fresh `Out` tensors, `artifact.as_torch_op("your_project::name")` returns an opaque PyTorch custom operator with a FakeTensor implementation derived from its declared interface. The fake path does not run a provider or access tensor data. `InOut` and returned aliases are not supported by this adapter. Authors can register their own backward with the returned operator's `register_autograd`; Intent does not infer it.
+For GPU and Mojo CPU artifacts, `artifact.as_torch_op("your_project::name")` returns an opaque PyTorch custom operator with a FakeTensor implementation derived from its declared interface. Declared `Out` tensors are fresh return values; `InOut` arguments are registered as mutations and updated in place. With no `Out`, the call returns `None`. Each `InOut` must have independent Torch storage from every other input; returned aliases are unsupported. The fake path checks the same interface without running a provider or accessing tensor data.
+
+Authors can register their own backward for functional operators with `register_autograd`; Intent does not infer it. PyTorch does not accept that registration for mutable custom operators.
 
 Run `python examples/softmax.py --target triton --torch-compile` for a complete `torch.compile(fullgraph=True)` call. The example first calls the same operator normally to complete provider compilation/tuning before graph capture. The operator remains opaque to PyTorch; its implementation is not fused into surrounding PyTorch operations.
 
@@ -101,7 +103,7 @@ The installed `intent-manual` command starts a read-only stdio MCP server. For c
 
 Start with `read(id="doc/dsl/authoring.md")`, then use `api(name="intent.compile")`, `api(name="I.matmul")`, or `search(query="region_fold")`. The manual ships with the package and needs neither a checkout nor an experiment-generated corpus. It provides declarations, language contracts, and small syntax fragments; complete algorithms live in the public examples. It does not execute code or certify numerical correctness.
 
-For an agent that should compile a user-supplied program, explicitly add a second server using `/absolute/path/to/.venv/bin/intent-compiler-mcp`. Its `compile` tool requires an existing `program_path`, `kernel`, and `target`. It uses the same public compiler pipeline as the CLI below; importing the file executes ordinary module-level Python. Kernel execution and numerical checks remain separate.
+For an agent that should compile a user-supplied program, explicitly add a second server using `/absolute/path/to/.venv/bin/intent-compiler-mcp`. Its `compile` tool requires an existing `program_path` and `kernel`; `target` is required for the shared and provider stages, while `stage="kir"` needs no target or device. It uses the same public compiler pipeline as the CLI below; importing the file executes ordinary module-level Python. Kernel execution and numerical checks remain separate.
 
 ## Inspect and learn
 

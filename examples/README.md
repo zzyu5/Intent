@@ -21,7 +21,7 @@
 
 Forward/backward 示例复用既有的 `4096 × 4097`、f32 backward 定义。作者分别编译两个 kernels，把它们注册为 PyTorch custom ops，再通过 `register_autograd` 提供梯度公式：`setup_context` 保存 probabilities，backward 回调调用已注册的 backward op。普通 Python wrapper 决定这两个 kernels 的关系，compiler 不推导梯度或隐藏增加调用。这里只演示一阶梯度；更高阶梯度需要作者另行提供相应公式。
 
-PyTorch adapter 支持 GPU 和 Mojo CPU runtime 的只读 `In`/scalar 输入及新分配的 `Out`。Runtime 通过 `infer_outputs` 提供 fake 输出，复用普通调用的公共 shape、dtype 和 stride 合同，不调用 provider、不读取 tensor 数据。`InOut`/返回 alias 暂不支持；Weft 和 BANG C 的原生 buffer 接口不冒充 Torch tensor 接口。
+PyTorch adapter 支持 GPU 和 Mojo CPU runtime 的 `In`/scalar 输入、新分配的 `Out`，以及声明为 mutation 的 `InOut`。`InOut` 原位更新，不额外返回；没有 `Out` 时返回 `None`。每个 `InOut` 不得与其他输入共享 Torch storage，返回 alias 仍不支持。Runtime 通过 `infer_outputs` 提供 fake 输出，复用普通调用的公共 shape、dtype 和 stride 合同，不调用 provider、不读取 tensor 数据。`register_autograd` 仅用于 functional custom op，PyTorch 不接受 mutable custom op 的该注册；Weft 和 BANG C 的原生 buffer 接口不冒充 Torch tensor 接口。
 
 两个脚本都接受 `--target triton`、`--target cutile` 和 `--target mojo`，输入 tensor 跟随 artifact 的实际 CPU/CUDA 设备。Mojo 使用公开 `MojoTarget()` 的默认配置；SDK 可通过 `INTENT_MOJO` 指定。换 target 不改变示例算法、shape 或 dtype。示例输出不是 benchmark 或数值验证结论。每个脚本把 host 执行放在 `main` 下，因此也能作为模块加载。
 
