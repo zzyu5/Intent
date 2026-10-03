@@ -8,6 +8,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseSet.h"
 #include <functional>
 using namespace mlir;
 using namespace intent::dsa;
@@ -529,6 +530,47 @@ LogicalResult MatrixTileOp::verify() {
       b.getDimSize(1) == c.getDimSize(1) && storage.disjoint(getAccumulator(), getLhs())
       ? success() : emitOpError("matrix tile requires prepared storage, matching M/K/N shapes and an f32 accumulator");
 }
+FailureOr<DenseI64ArrayAttr>
+intent::dsa::queryFullExtentRequirements(func::FuncOp function) {
+  Attribute attribute = function->getAttr(fullExtentDimensionsAttr);
+  if (!attribute)
+    return function.emitError("DSA entry requires explicit full-extent obligations"), failure();
+  auto dimensions = dyn_cast<DenseI64ArrayAttr>(attribute);
+  if (!dimensions)
+    return function.emitError("DSA full-extent obligations require a dense i64 array"), failure();
+
+  auto configuration = function->getAttrOfType<ConfigurationAttr>("intent_dsa.configuration");
+  if (!configuration || configuration.getTile() <= 0)
+    return function.emitError("DSA full-extent obligations require a positive bound tile capacity"), failure();
+  auto interface = intent::getPublicInterface(function);
+  if (failed(intent::verifyPublicInterface(function, interface))) return failure();
+
+  llvm::SmallDenseSet<int64_t> required, found;
+  for (int64_t identity : dimensions.asArrayRef()) {
+    if (identity <= 0 || !required.insert(identity).second)
+      return function.emitError("DSA full-extent obligations require distinct positive public dimension identities"), failure();
+  }
+  for (Attribute parameter : interface.getArguments()) {
+    auto view = dyn_cast<intent::ViewType>(cast<intent::PublicParameterAttr>(parameter).getType());
+    if (!view) continue;
+    auto tensor = intent::publicViewTensor(view);
+    for (auto [extent, identity] : llvm::zip(
+             tensor.getShape(), intent::publicViewDimensions(view).asArrayRef())) {
+      if (!required.contains(identity)) continue;
+      found.insert(identity);
+      if (!ShapedType::isDynamic(extent) && extent > configuration.getTile())
+        return function.emitError("DSA full-extent public dimension ")
+                   << identity << " exceeds the bound tile capacity "
+                   << configuration.getTile(), failure();
+    }
+  }
+  for (int64_t identity : dimensions.asArrayRef())
+    if (!found.contains(identity))
+      return function.emitError("DSA full-extent obligation names an unknown public dimension: ")
+                 << identity, failure();
+  return dimensions;
+}
+
 LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
   if (failed(mlir::verify(module))) return failure();
   auto functions = llvm::to_vector(module.getOps<func::FuncOp>());
@@ -541,6 +583,7 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
   if (!config || !requirements || !requirements.getDisjointOutputs() ||
       interface.getArguments().size() != function.getNumArguments())
     return function.emitError("DSA kernel requires a complete interface and configuration");
+  if (failed(queryFullExtentRequirements(function))) return failure();
   for (auto [argument, attribute] : llvm::zip(function.getArguments(), interface.getArguments())) {
     auto storageType = [&](Type logical) -> Type {
       if (auto integer = dyn_cast<IntegerType>(logical))

@@ -15,11 +15,16 @@
 #include "Intent/Dialect/DSA/IR/DSAOps.h.inc"
 namespace intent::dsa {
 inline constexpr llvm::StringLiteral entryRequirementsAttr = "intent_dsa.entry_requirements";
+inline constexpr llvm::StringLiteral fullExtentDimensionsAttr = "intent_dsa.full_extent_dimensions";
 constexpr int64_t nramSpace = 1;
 constexpr int64_t matrixSpace = 2;
 constexpr int64_t sharedSpace = 3;
 // Collective formals denote borrowed values, not aliases of identity prototypes.
 bool isCollectiveBorrowedArgument(mlir::BlockArgument argument);
+// Public dimensions required to fit the current configuration's tile capacity.
+// An explicit empty list is valid; an absent or malformed requirement is not.
+mlir::FailureOr<mlir::DenseI64ArrayAttr>
+queryFullExtentRequirements(mlir::func::FuncOp function);
 mlir::LogicalResult verifyProgram(mlir::ModuleOp module);
 mlir::LogicalResult verifyRealizedProgram(mlir::ModuleOp module);
 }

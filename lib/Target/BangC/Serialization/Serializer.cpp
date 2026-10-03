@@ -75,8 +75,10 @@ public:
       } else if (slot.role == NativeSlotRole::Scalar)
         SourceEmitter::bind(argument, name);
     }
+    auto fullExtentRequirements = dsa::queryFullExtentRequirements(function);
+    if (mlir::failed(fullExtentRequirements)) return failure();
     llvm::json::Array fullExtents;
-    for (int64_t value : function->getAttrOfType<DenseI64ArrayAttr>("intent_dsa.full_extent_dimensions").asArrayRef())
+    for (int64_t value : fullExtentRequirements->asArrayRef())
       fullExtents.push_back(value);
     metadata = llvm::json::Object{{"provider", "bangc"}, {"entry_name", function.getName()},
         {"compile_options", serializeCompileOptions(*options)},

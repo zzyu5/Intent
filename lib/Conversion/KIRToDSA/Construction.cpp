@@ -141,7 +141,7 @@ LogicalResult Construction::lower(func::FuncOp source) {
     }
   }
   b.create<func::ReturnOp>(source.getLoc());
-  function->setAttr("intent_dsa.full_extent_dimensions", b.getDenseI64ArrayAttr(fullExtents));
+  function->setAttr(dsa::fullExtentDimensionsAttr, b.getDenseI64ArrayAttr(fullExtents));
   return success();
 }
 
