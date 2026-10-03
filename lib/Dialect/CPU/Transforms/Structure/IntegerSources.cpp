@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "IntegerSources.h"
+#include "ProducerReuse.h"
 #include "../Storage/AccessAliases.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -24,6 +25,7 @@ bool projectedCoordinates(AffineMap map) {
 struct IntegerProducer {
   linalg::GenericOp operation;
   ProducerReplay payload;
+  AffineMap outputProjection;
 };
 
 std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
@@ -41,8 +43,10 @@ std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
     producer = generic;
   }
   if (!producer || producer.getNumResults() || producer.getOutputs().size() != 1 ||
-      producer.getNumReductionLoops() || producer->getBlock() != allocation->getBlock() ||
-      !producer.getIndexingMapsArray().back().isPermutation()) return std::nullopt;
+      producer.getNumReductionLoops() || producer->getBlock() != allocation->getBlock())
+    return std::nullopt;
+  auto projection = fullOutputProjection(allocation, producer.getIndexingMapsArray().back());
+  if (failed(projection)) return std::nullopt;
   Block &body = producer.getRegion().front();
   if (!body.getArguments().back().use_empty()) return std::nullopt;
   if (llvm::any_of(producer.getIndexingMapsArray(), [](AffineMap map) {
@@ -54,37 +58,23 @@ std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
 
   Operation *consumer = producer->getBlock()->findAncestorOpInBlock(*load);
   if (!consumer || consumer == producer || !producer->isBeforeInBlock(consumer)) return std::nullopt;
-  for (auto [number, input] : llvm::enumerate(producer.getInputs())) {
-    if (body.getArgument(number).use_empty()) continue;
-    if (auto type = dyn_cast<MemRefType>(input.getType())) {
-      if (!integer(type.getElementType())) return std::nullopt;
-    } else if (!integer(input.getType())) return std::nullopt;
-  }
-  auto payload = analyzeLinalgProducer(producer, storage);
+  auto payload = analyzeProducerResult(producer, storage);
   if (failed(payload) ||
       !canReplayProducerAt(*payload, producer, load, storage, ValueRange{allocation}))
     return std::nullopt;
-  // Integer-only rematerialization is a policy of this consumer, independent
-  // of the common control/effect/read-stability contract.
-  for (Operation *operation : payload->nodes)
-    if (!llvm::all_of(operation->getResultTypes(), integer) ||
-        (!isa<memref::LoadOp, linalg::IndexOp>(operation) &&
-         !llvm::all_of(operation->getOperandTypes(), integer))) return std::nullopt;
-  return IntegerProducer{producer, std::move(*payload)};
+  return IntegerProducer{producer, std::move(*payload), *projection};
 }
 
-void replay(memref::LoadOp load, const IntegerProducer &source) {
+Value replay(const ProducerReplayGroup &group, const IntegerProducer &source) {
   auto producer = source.operation;
-  OpBuilder builder(load);
-  Location loc = load.getLoc();
+  OpBuilder builder(group.anchor);
+  Location loc = group.anchor->getLoc();
   auto maps = producer.getIndexingMapsArray();
-  SmallVector<Value> coordinates(producer.getNumLoops());
-  for (auto [axis, expr] : llvm::enumerate(maps.back().getResults()))
-    coordinates[cast<AffineDimExpr>(expr).getPosition()] = load.getIndices()[axis];
+  ArrayRef<Value> coordinates = group.coordinates;
   IRMapping mapping;
   Block &body = producer.getRegion().front();
   for (auto [number, input] : llvm::enumerate(producer.getInputs())) {
-    if (body.getArgument(number).use_empty()) continue;
+    if (!llvm::is_contained(source.payload.frontier, body.getArgument(number))) continue;
     Value value = input;
     if (isa<MemRefType>(input.getType())) {
       SmallVector<Value> indices;
@@ -97,13 +87,13 @@ void replay(memref::LoadOp load, const IntegerProducer &source) {
     mapping.map(body.getArgument(number), value);
   }
   body.walk([&](linalg::IndexOp index) {
-    mapping.map(index.getResult(), coordinates[index.getDim()]);
+    if (llvm::is_contained(source.payload.frontier, index.getResult()))
+      mapping.map(index.getResult(), coordinates[index.getDim()]);
   });
-  LogicalResult cloned = cloneProducerPayload(source.payload, builder, mapping);
+  auto cloned = materializeProducerValue(source.payload,
+      body.getTerminator()->getOperand(0), builder, mapping);
   assert(succeeded(cloned) && "integer replay must bind the complete payload frontier");
-  (void)cloned;
-  load.replaceAllUsesWith(mapping.lookupOrDefault(body.getTerminator()->getOperand(0)));
-  load.erase();
+  return *cloned;
 }
 
 } // namespace
@@ -119,10 +109,37 @@ LogicalResult foldIntegerSources(func::FuncOp function) {
       // Every successful replay changes both uses and read placement. Queries
       // deliberately do not survive that rewrite or a dead-buffer deletion.
       StorageAnalysis storage(function);
-      if (auto producer = integerProducer(load, storage)) {
-        replay(load, *producer);
-        changed = true;
+      auto producer = integerProducer(load, storage);
+      if (!producer) continue;
+      Value buffer = load.getMemref();
+      SmallVector<ProducerReplayUse> uses;
+      bool removesProducer = true;
+      for (Operation *user : buffer.getUsers()) {
+        if (user == producer->operation || isRemovableProducerMetadata(user)) continue;
+        auto read = dyn_cast<memref::LoadOp>(user);
+        if (!read) { removesProducer = false; continue; }
+        SmallVector<Value> coordinates;
+        for (AffineExpr expression : producer->outputProjection.getResults())
+          coordinates.push_back(read.getIndices()[cast<AffineDimExpr>(expression).getPosition()]);
+        uses.push_back({read, std::move(coordinates), 1});
       }
+      auto groups = groupProducerReplays(producer->payload,
+          producer->operation.getRegion().front().getTerminator()->getOperand(0),
+          producer->operation, producer->operation->getBlock(), uses,
+          removesProducer, storage);
+      if (failed(groups)) continue;
+      for (const auto &group : *groups) {
+        Value replacement = replay(group, *producer);
+        for (Operation *read : group.uses) {
+          read->getResult(0).replaceAllUsesWith(replacement);
+          read->erase();
+        }
+      }
+      eraseUnusedProducer(producer->operation);
+      changed = true;
+      // Uses, producer lifetime and possible scalar bindings have changed.
+      // Recollect the next batch from the live program, never from this list.
+      break;
     }
     if (changed) eraseDeadPrivateBuffers(function);
   } while (changed);

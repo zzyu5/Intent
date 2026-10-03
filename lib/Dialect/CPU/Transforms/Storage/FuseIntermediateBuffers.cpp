@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
 #include "AccessAliases.h"
 #include "../Vector/ProducerVectorization.h"
+#include "../Structure/ProducerReuse.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -159,7 +160,7 @@ void forwardDestinations(func::FuncOp function) {
   }
 }
 
-bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation) {
+bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation, Value &vectorLimit) {
   auto type = allocation.getType();
   auto vector = load.getVectorType();
   SmallVector<int64_t> strides;
@@ -201,21 +202,28 @@ bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation) {
   if (!traversal || begin != traversal.getInductionVar() || !step || *step != width ||
       !matchPattern(traversal.getLowerBound(), m_Zero())) return false;
   Value end = traversal.getUpperBound();
-  if (auto constant = getConstantIntValue(end))
-    return !extent && *constant >= 0 && *constant <= staticExtent && *constant % width == 0;
+  if (auto constant = getConstantIntValue(end)) {
+    bool complete = !extent && *constant >= 0 && *constant <= staticExtent && *constant % width == 0;
+    if (complete) vectorLimit = end;
+    return complete;
+  }
   // Full blocks use either n - n % width or (n / width) * width.
   // A plain vector.load does not itself promise that its entire slice is in bounds.
   if (auto subtract = end.getDefiningOp<arith::SubIOp>()) {
     auto remainder = subtract.getRhs().getDefiningOp<arith::RemSIOp>();
-    return isExtent(subtract.getLhs()) && remainder && isExtent(remainder.getLhs()) &&
+    bool complete = isExtent(subtract.getLhs()) && remainder && isExtent(remainder.getLhs()) &&
         getConstantIntValue(remainder.getRhs()) == width;
+    if (complete) vectorLimit = end;
+    return complete;
   }
   if (auto product = end.getDefiningOp<arith::MulIOp>()) {
     Value quotient;
     if (getConstantIntValue(product.getLhs()) == width) quotient = product.getRhs();
     else if (getConstantIntValue(product.getRhs()) == width) quotient = product.getLhs();
     auto division = quotient ? quotient.getDefiningOp<arith::DivSIOp>() : arith::DivSIOp{};
-    return division && isExtent(division.getLhs()) && getConstantIntValue(division.getRhs()) == width;
+    bool complete = division && isExtent(division.getLhs()) && getConstantIntValue(division.getRhs()) == width;
+    if (complete) vectorLimit = end;
+    return complete;
   }
   return false;
 }
@@ -223,6 +231,7 @@ bool fullVectorRead(vector::LoadOp load, memref::AllocOp allocation) {
 bool fuse(memref::AllocOp allocation) {
   memref::StoreOp store;
   SmallVector<Operation *> loads;
+  llvm::DenseMap<Operation *, Value> vectorLimits;
   SmallVector<memref::DeallocOp> deallocations;
   for (Operation *user : allocation->getUsers()) {
     if (auto write = dyn_cast<memref::StoreOp>(user)) {
@@ -231,19 +240,15 @@ bool fuse(memref::AllocOp allocation) {
     } else if (auto read = dyn_cast<memref::LoadOp>(user)) {
       loads.push_back(read);
     } else if (auto read = dyn_cast<vector::LoadOp>(user)) {
-      if (!fullVectorRead(read, allocation)) return false;
+      Value limit;
+      if (!fullVectorRead(read, allocation, limit)) return false;
+      vectorLimits[read] = limit;
       loads.push_back(read);
     } else if (auto dealloc = dyn_cast<memref::DeallocOp>(user)) {
       deallocations.push_back(dealloc);
     } else return false;
   }
   if (!store || loads.empty()) return false;
-  llvm::SmallPtrSet<Operation *, 4> consumers;
-  for (Operation *load : loads) {
-    Operation *stage = allocation->getBlock()->findAncestorOpInBlock(*load);
-    if (!stage) return false;
-    consumers.insert(stage);
-  }
   SmallVector<scf::ForOp> loops;
   Operation *root = store;
   while (root->getBlock() != allocation->getBlock()) {
@@ -254,13 +259,28 @@ bool fuse(memref::AllocOp allocation) {
     root = parent;
   }
   std::reverse(loops.begin(), loops.end());
-  if (root->getBlock() != allocation->getBlock() ||
-      loops.size() != store.getIndices().size()) return false;
-  unsigned dynamicAxis = 0;
-  for (auto [axis, loop] : llvm::enumerate(loops)) {
-    if (store.getIndices()[axis] != loop.getInductionVar()) return false;
+  if (root->getBlock() != allocation->getBlock()) return false;
+  SmallVector<AffineExpr> storedAxes;
+  for (Value index : store.getIndices()) {
+    auto loop = llvm::find_if(loops, [&](scf::ForOp loop) {
+      return index == loop.getInductionVar();
+    });
+    if (loop != loops.end()) {
+      storedAxes.push_back(getAffineDimExpr(loop - loops.begin(), allocation.getContext()));
+    } else if (matchPattern(index, m_Zero())) {
+      storedAxes.push_back(getAffineConstantExpr(0, allocation.getContext()));
+    } else return false;
+  }
+  AffineMap outputMap = AffineMap::get(loops.size(), 0, storedAxes, allocation.getContext());
+  auto projection = fullOutputProjection(allocation, outputMap);
+  if (failed(projection)) return false;
+  for (auto [axis, expression] : llvm::enumerate(storedAxes)) {
+    auto dimension = dyn_cast<AffineDimExpr>(expression);
+    if (!dimension) continue;
+    auto loop = loops[dimension.getPosition()];
     if (allocation.getType().isDynamicDim(axis)) {
-      if (loop.getUpperBound() != allocation.getDynamicSizes()[dynamicAxis++]) return false;
+      if (loop.getUpperBound() != allocation.getDynamicSizes()[
+          allocation.getType().getDynamicDimIndex(axis)]) return false;
     } else {
       auto extent = getConstantIntValue(loop.getUpperBound());
       if (!extent || *extent != allocation.getType().getDimSize(axis)) return false;
@@ -281,39 +301,49 @@ bool fuse(memref::AllocOp allocation) {
   if (failed(payload)) return false;
   std::optional<ProducerVectorization> vectorization;
   if (llvm::any_of(loads, [](Operation *load) { return isa<vector::LoadOp>(load); })) {
-    if (loops.empty()) return false;
-    vectorization.emplace(*payload, loops.back().getInductionVar());
-    if (!vectorization->canWiden(store.getValue())) return false;
+    // SIMD advances the last memory axis, which need not be the last producer
+    // loop after a permutation or the removal of unit output axes.
+    if (auto dimension = dyn_cast<AffineDimExpr>(storedAxes.back())) {
+      vectorization.emplace(*payload, loops[dimension.getPosition()].getInductionVar());
+      if (!vectorization->canWiden(store.getValue())) return false;
+    }
   }
-  if (consumers.size() != 1) {
-    auto integer = [](Type type) { return isa<IndexType, IntegerType>(type); };
-    if (!integer(store.getValue().getType()) || llvm::any_of(payload->nodes, [&](Operation *operation) {
-          return !llvm::all_of(operation->getResultTypes(), integer);
-        })) return false;
-  }
-  for (Operation *load : loads)
-    if (!canReplayProducerAt(*payload, root, load, storage)) return false;
+  SmallVector<ProducerReplayUse> uses;
   for (Operation *load : loads) {
-    IRMapping mapping;
     ValueRange indices = isa<memref::LoadOp>(load) ? cast<memref::LoadOp>(load).getIndices()
                                                  : cast<vector::LoadOp>(load).getIndices();
-    for (auto [loop, coordinate] : llvm::zip(loops, indices))
-      mapping.map(loop.getInductionVar(), coordinate);
-    OpBuilder builder(load);
+    int64_t width = isa<vector::LoadOp>(load)
+        ? cast<vector::LoadOp>(load).getVectorType().getDimSize(0) : 1;
+    uses.push_back({load, llvm::to_vector(indices), width, vectorLimits.lookup(load)});
+  }
+  auto groups = groupProducerReplays(*payload, store.getValue(), root,
+      allocation->getBlock(), uses, /*removesProducer=*/true, storage);
+  if (failed(groups)) return false;
+  for (const auto &group : *groups) {
+    IRMapping mapping;
+    for (auto [loop, expression] : llvm::zip(loops, projection->getResults()))
+      mapping.map(loop.getInductionVar(), group.coordinates[
+          cast<AffineDimExpr>(expression).getPosition()]);
+    OpBuilder builder(group.anchor);
     Value replacement;
-    if (auto vector = dyn_cast<vector::LoadOp>(load)) {
+    if (isa<vector::LoadOp>(group.uses.front()) && vectorization) {
       IRMapping vectors;
       auto replayed = vectorization->materialize(store.getValue(),
-          vector.getVectorType().getDimSize(0), builder, mapping, vectors);
+          group.vectorWidth, builder, mapping, vectors);
       assert(succeeded(replayed) && "buffer replay must bind the proven vector payload");
       replacement = *replayed;
     } else {
       auto replayed = materializeProducerValue(*payload, store.getValue(), builder, mapping);
       assert(succeeded(replayed) && "buffer replay must bind the complete coordinate frontier");
       replacement = *replayed;
+      if (isa<vector::LoadOp>(group.uses.front()))
+        replacement = builder.create<vector::BroadcastOp>(group.anchor->getLoc(),
+            group.uses.front()->getResult(0).getType(), replacement);
     }
-    load->getResult(0).replaceAllUsesWith(replacement);
-    load->erase();
+    for (Operation *load : group.uses) {
+      load->getResult(0).replaceAllUsesWith(replacement);
+      load->erase();
+    }
   }
   root->erase();
   for (memref::DeallocOp dealloc : deallocations) dealloc.erase();

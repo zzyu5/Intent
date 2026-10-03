@@ -6,6 +6,7 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "IntegerSources.h"
+#include "ProducerReuse.h"
 #include "ContiguousAccesses.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -25,28 +26,32 @@ namespace {
 struct PointwiseProducer {
   linalg::GenericOp operation;
   ProducerReplay payload;
+  AffineMap outputProjection;
 };
 
 std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *consumer,
                                                   StorageAnalysis &storage) {
-  if (!buffer.getDefiningOp<memref::AllocOp>()) return std::nullopt;
+  auto allocation = buffer.getDefiningOp<memref::AllocOp>();
+  if (!allocation) return std::nullopt;
+  auto lifetime = storage.lifetime(allocation);
+  if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
   linalg::GenericOp producer;
-  for (Operation *user : buffer.getUsers()) {
+  for (Operation *user : lifetime->aliases.users) {
     if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
       if (!llvm::is_contained(generic.getOutputs(), buffer)) {
-        if (user != consumer) return std::nullopt;
+        if (!storage.preserves(user, buffer)) return std::nullopt;
         continue;
       }
       if (producer) return std::nullopt;
       producer = generic;
-    } else if (isa<ReduceOp>(user)) {
-      if (user != consumer) return std::nullopt;
-    } else if (!isa<memref::DimOp, memref::DeallocOp>(user)) return std::nullopt;
+    } else if (!isa<memref::DimOp, memref::DeallocOp>(user) &&
+               !storage.preserves(user, buffer)) return std::nullopt;
   }
   if (!producer || producer == consumer || producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer) || producer.getOutputs().size() != 1 ||
-      producer.getNumResults() || producer.getNumReductionLoops() ||
-      !producer.getIndexingMapsArray().back().isIdentity()) return std::nullopt;
+      producer.getNumResults() || producer.getNumReductionLoops()) return std::nullopt;
+  auto projection = fullOutputProjection(buffer, producer.getIndexingMapsArray().back());
+  if (failed(projection)) return std::nullopt;
   Block &body = producer.getRegion().front();
   if (!body.getArguments().back().use_empty()) return std::nullopt;
   // CPU Reduce's scalar combine has a deliberately narrower contract than a
@@ -55,45 +60,13 @@ std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *cons
     for (Operation &operation : body.without_terminator())
       if (operation.getNumRegions() || !isMemoryEffectFree(&operation))
         return std::nullopt;
-  auto payload = analyzeLinalgProducer(producer, storage);
+  auto payload = analyzeProducerResult(producer, storage);
   if (failed(payload)) return std::nullopt;
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
   ValueRange outputs = generic ? ValueRange(generic.getOutputs()) : ValueRange{};
   if (!canReplayProducerAt(*payload, producer, consumer, storage, outputs))
     return std::nullopt;
-  return PointwiseProducer{producer, std::move(*payload)};
-}
-
-void eraseUnusedProducer(linalg::GenericOp producer) {
-  Value buffer = producer.getOutputs()[0];
-  auto allocation = buffer.getDefiningOp<memref::AllocOp>();
-  if (!allocation) return;
-  for (Operation *user : buffer.getUsers())
-    if (user != producer && !isa<memref::DimOp, memref::DeallocOp>(user)) return;
-  SmallVector<Operation *> uses(buffer.getUsers());
-  for (Operation *user : uses) {
-    if (auto dimension = dyn_cast<memref::DimOp>(user)) {
-      auto axis = dimension.getConstantIndex();
-      if (!axis) return;
-      OpBuilder b(dimension);
-      Value extent;
-      if (allocation.getType().isDynamicDim(*axis)) {
-        unsigned position = 0;
-        for (int64_t i = 0; i < *axis; ++i)
-          position += allocation.getType().isDynamicDim(i);
-        extent = allocation.getDynamicSizes()[position];
-      } else {
-        extent = b.create<arith::ConstantIndexOp>(dimension.getLoc(),
-            allocation.getType().getDimSize(*axis));
-      }
-      dimension.getResult().replaceAllUsesWith(extent);
-      dimension.erase();
-    }
-  }
-  producer.erase();
-  SmallVector<Operation *> remaining(buffer.getUsers());
-  for (Operation *user : remaining) cast<memref::DeallocOp>(user).erase();
-  allocation.erase();
+  return PointwiseProducer{producer, std::move(*payload), *projection};
 }
 
 bool fuseOne(Operation *consumer, unsigned inputNumber,
@@ -107,19 +80,53 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
           return cast<AffineMapAttr>(a).getValue();
         }));
   auto producerMaps = producer.getIndexingMapsArray();
+  AffineMap coordinates = source.outputProjection.compose(oldMaps[inputNumber]);
+  Value buffer = producer.getOutputs()[0];
+  SmallVector<unsigned> fusedInputs;
+  for (auto [number, input] : llvm::enumerate(oldInputs))
+    if (input == buffer && oldMaps[number] == oldMaps[inputNumber])
+      fusedInputs.push_back(number);
+  bool removesProducer = llvm::all_of(buffer.getUses(), [&](OpOperand &use) {
+    Operation *user = use.getOwner();
+    return user == producer || isRemovableProducerMetadata(user) ||
+        (user == consumer && llvm::is_contained(fusedInputs, use.getOperandNumber()));
+  });
+  // Reduce operands include extent and initial before their input segment.
+  if (reduce)
+    removesProducer = llvm::all_of(buffer.getUsers(), [&](Operation *user) {
+      return user == producer || user == consumer || isRemovableProducerMetadata(user);
+    }) && llvm::all_of(llvm::enumerate(oldInputs), [&](auto item) {
+      return item.value() != buffer || llvm::is_contained(fusedInputs, item.index());
+    });
+  SmallVector<int64_t> iterationExtents;
+  if (generic) iterationExtents = generic.getStaticLoopRanges();
+  else {
+    iterationExtents.assign(coordinates.getNumDims(), ShapedType::kDynamic);
+    if (iterationExtents.size() == 1)
+      if (auto extent = getConstantIntValue(reduce.getExtent())) iterationExtents[0] = *extent;
+  }
+  Value yielded = producer.getRegion().front().getTerminator()->getOperand(0);
+  if (!shouldFuseProducerResult(source.payload, yielded, coordinates,
+                                iterationExtents, removesProducer))
+    return false;
   SmallVector<linalg::IndexOp> indices;
-  producer.getRegion().walk([&](linalg::IndexOp index) { indices.push_back(index); });
+  producer.getRegion().walk([&](linalg::IndexOp index) {
+    if (llvm::is_contained(source.payload.frontier, index.getResult())) indices.push_back(index);
+  });
   if (reduce && !indices.empty()) return false;
   for (auto index : indices)
-    if (!isa<AffineDimExpr, AffineConstantExpr>(oldMaps[inputNumber].getResult(index.getDim())))
+    if (!isa<AffineDimExpr, AffineConstantExpr>(coordinates.getResult(index.getDim())))
       return false;
   SmallVector<Value> inputs;
   SmallVector<AffineMap> maps;
   for (auto [i, input] : llvm::enumerate(oldInputs)) {
-    if (i == inputNumber) {
+    if (llvm::is_contained(fusedInputs, i)) {
+      if (i != fusedInputs.front()) continue;
       for (auto [j, operand] : llvm::enumerate(producer.getInputs())) {
+        if (!llvm::is_contained(source.payload.frontier,
+                               producer.getRegion().front().getArgument(j))) continue;
         inputs.push_back(operand);
-        maps.push_back(producerMaps[j].compose(oldMaps[i]));
+        maps.push_back(producerMaps[j].compose(coordinates));
       }
     } else {
       inputs.push_back(input);
@@ -139,29 +146,34 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
   auto populate = [&](OpBuilder &b, Block &target, Block &oldBody, unsigned prefix) {
     IRMapping mapping;
     unsigned current = prefix;
+    Value produced;
     if (prefix) mapping.map(oldBody.getArgument(0), target.getArgument(0));
     for (unsigned i = 0; i < oldInputs.size(); ++i) {
-      if (i != inputNumber) {
+      if (!llvm::is_contained(fusedInputs, i)) {
         mapping.map(oldBody.getArgument(prefix + i), target.getArgument(current++));
+        continue;
+      }
+      if (produced) {
+        mapping.map(oldBody.getArgument(prefix + i), produced);
         continue;
       }
       IRMapping producerMapping;
       Block &body = producer.getRegion().front();
       for (unsigned j = 0; j < producer.getInputs().size(); ++j)
-        producerMapping.map(body.getArgument(j), target.getArgument(current++));
+        if (llvm::is_contained(source.payload.frontier, body.getArgument(j)))
+          producerMapping.map(body.getArgument(j), target.getArgument(current++));
       for (auto index : indices) {
-        AffineExpr coordinate = oldMaps[inputNumber].getResult(index.getDim());
+        AffineExpr coordinate = coordinates.getResult(index.getDim());
         Value value;
         if (auto dimension = dyn_cast<AffineDimExpr>(coordinate))
           value = b.create<linalg::IndexOp>(index.getLoc(), dimension.getPosition());
         else value = b.create<arith::ConstantIndexOp>(index.getLoc(), cast<AffineConstantExpr>(coordinate).getValue());
         producerMapping.map(index.getResult(), value);
       }
-      LogicalResult cloned = cloneProducerPayload(source.payload, b, producerMapping);
+      auto cloned = materializeProducerValue(source.payload, yielded, b, producerMapping);
       assert(succeeded(cloned) && "structured replay must bind the complete payload frontier");
-      (void)cloned;
-      mapping.map(oldBody.getArgument(prefix + i),
-          producerMapping.lookupOrDefault(body.getTerminator()->getOperand(0)));
+      produced = *cloned;
+      mapping.map(oldBody.getArgument(prefix + i), produced);
     }
     if (generic)
       mapping.map(oldBody.getArguments().back(), target.getArguments().back());
@@ -389,7 +401,7 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
         auto producer = pointwiseProducer(input, consumer, analysis);
         if (!producer) continue;
         changed = fuseOne(consumer, number, *producer);
-        break;
+        if (changed) break;
       }
       if (changed) break;
     }
