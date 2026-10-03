@@ -40,243 +40,6 @@ static bool impliesLogicalUpperBound(Value predicate, MakeRangeOp range,
 static Value broadcast(OpBuilder &builder, Location location, FragmentType result,
                 Value value);
 
-// A source-slice replay owns its seeds, dominance scope and invariant-value
-// memoization. Only identical root selections reuse an invariant result.
-class RangeValueReplay {
-public:
-  RangeValueReplay(OpBuilder &builder, Location location, func::FuncOp kernel,
-                   PhysicalExprAttr blockedExtent, Value replacement,
-                   IRMapping &mapping, Operation *insertionAnchor)
-      : builder(builder), location(location), kernel(kernel),
-        blockedExtent(blockedExtent), replacement(replacement),
-        mapping(mapping), insertionAnchor(insertionAnchor) {
-    if (insertionAnchor)
-      dominance.emplace(kernel);
-  }
-
-  FailureOr<Value> replay(Value value, ArrayRef<MakeRangeOp> roots) {
-  if (Value mapped = mapping.lookupOrNull(value))
-    return mapped;
-  if (isInvariant(value, roots))
-    return value;
-  if (auto extract = value.getDefiningOp<ExtractOp>()) {
-    if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
-      Value field = record.getFields()[extract.getField()];
-      FailureOr<Value> replayed = replay(field, roots);
-      if (failed(replayed))
-        return failure();
-      mapping.map(value, *replayed);
-      return *replayed;
-    }
-  }
-  if (auto range = value.getDefiningOp<MakeRangeOp>())
-    if (llvm::any_of(roots, [&](MakeRangeOp root) {
-          return range == root || sameLogicalRange(range, root);
-        })) {
-      auto original = range.getResult().getType();
-      auto coordinate = cast<FragmentType>(replacement.getType());
-      auto target = FragmentType::get(
-          value.getContext(), original.getElementType(), coordinate.getShape(),
-          original.getAxisMaps(), original.getValidity(), original.getOwner());
-      return projectPhysicalValueToSchema(builder, location, replacement, target);
-    }
-  bool relocate = insertionAnchor && dominance &&
-                  !dominance->dominates(value, insertionAnchor);
-  auto originalResultType = dyn_cast<FragmentType>(value.getType());
-  if (!originalResultType) {
-    if (!relocate)
-      return rememberInvariant(value, roots);
-    Operation *producer = value.getDefiningOp();
-    if (!producer || producer->getNumRegions() != 0 ||
-        producer->getNumResults() != 1 ||
-        (!isa<arith::ConstantOp>(producer) &&
-         !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                               /*allowAccesses=*/true)))
-      return failure();
-    for (Value operand : producer->getOperands()) {
-      FailureOr<Value> replayed = replay(operand, roots);
-      if (failed(replayed))
-        return failure();
-      if (*replayed != operand && !mapping.lookupOrNull(operand))
-        mapping.map(operand, *replayed);
-    }
-    Operation *clone = builder.clone(*producer, mapping);
-    mapping.map(value, clone->getResult(0));
-    return clone->getResult(0);
-  }
-  if (!kernel)
-    return failure();
-  PhysicalRangeAxisFact selected =
-      PhysicalProgramAnalysis(kernel).rangeAxes(value, roots);
-  if (!selected.isExact()) {
-    InFlightDiagnostic diagnostic =
-        value.getDefiningOp()
-            ? value.getDefiningOp()->emitOpError(
-                  "selected range roots have no exact fragment-axis projection")
-            : kernel.emitError(
-                  "selected range roots have no exact fragment-axis projection");
-    for (Operation *blocker : selected.blockers)
-      diagnostic << "; blocker=" << blocker->getName();
-    diagnostic << "; value_type=" << value.getType();
-    if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-      diagnostic << "; broadcast_input_type=" << broadcast.getValue().getType();
-    return failure();
-  }
-  if (selected.fragmentAxes.empty() && !relocate)
-    return rememberInvariant(value, roots);
-  Operation *producer = value.getDefiningOp();
-  if (!producer || (isa<MakeRangeOp>(producer) && !relocate)) {
-    if (producer)
-      producer->emitOpError(
-          "selected range root was not bound to its blocked replacement");
-    return failure();
-  }
-  if (!isa<MakeRangeOp>(producer) &&
-      !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                            /*allowAccesses=*/true)) {
-    producer->emitOpError(
-        "selected range value is not a replayable physical value node");
-    return failure();
-  }
-  if (producer->getNumRegions() != 0 || producer->getNumResults() != 1) {
-    producer->emitOpError(
-        "selected range value does not have a single replayable result");
-    return failure();
-  }
-  SmallVector<MakeRangeOp> operandRoots(roots.begin(), roots.end());
-  for (unsigned axis : selected.fragmentAxes)
-    for (MakeRangeOp root :
-         PhysicalProgramAnalysis(kernel).axisRanges(value, axis).roots)
-      if (!llvm::is_contained(operandRoots, root))
-        operandRoots.push_back(root);
-  for (Value operand : producer->getOperands()) {
-    FailureOr<Value> replayed = replay(operand, operandRoots);
-    if (failed(replayed)) {
-      producer->emitOpError(
-          "selected range value has an operand that cannot be replayed");
-      return failure();
-    }
-    if (*replayed != operand && !mapping.lookupOrNull(operand))
-      mapping.map(operand, *replayed);
-  }
-  SmallVector<Attribute> targetShape(originalResultType.getShape().begin(),
-                                     originalResultType.getShape().end());
-  for (unsigned axis : selected.fragmentAxes)
-    targetShape[axis] = blockedExtent;
-  FragmentType targetType = FragmentType::get(
-      originalResultType.getContext(), originalResultType.getElementType(),
-      ArrayAttr::get(originalResultType.getContext(), targetShape),
-      originalResultType.getAxisMaps(), originalResultType.getValidity(),
-      originalResultType.getOwner());
-  if (auto reshape = dyn_cast<ReshapeOp>(producer)) {
-    PhysicalRangeAxisFact input =
-        PhysicalProgramAnalysis(kernel).rangeAxes(reshape.getValue(), roots);
-    if (!input.isExact()) {
-      reshape.emitOpError(
-          "reshape input has no exact selected-range axis projection");
-      return failure();
-    }
-    if (input.fragmentAxes.empty()) {
-      Value input = mapping.lookupOrDefault(reshape.getValue());
-      auto broadcast = builder.create<BroadcastOp>(location, targetType, input);
-      if (!mapping.lookupOrNull(value))
-        mapping.map(value, broadcast.getResult());
-      return broadcast.getResult();
-    }
-  }
-  IRMapping cloneMapping(mapping);
-  Value accumulator;
-  if (auto contract = dyn_cast<ContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  else if (auto contract = dyn_cast<ScaledContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  else if (auto contract = dyn_cast<SparseContractOp>(producer))
-    accumulator = contract.getAccumulator();
-  if (accumulator) {
-    Value current = mapping.lookupOrDefault(accumulator);
-    if (current.getType() != targetType) {
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, location, current, targetType);
-      if (failed(projected)) {
-        producer->emitOpError(
-            "replayed structured value accumulator cannot adopt its result schema");
-        return failure();
-      }
-      cloneMapping.map(accumulator, *projected);
-    }
-  }
-  if (isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp, LoadOp>(producer)) {
-    for (Value operand : producer->getOperands()) {
-      if (auto load = dyn_cast<LoadOp>(producer);
-          load && operand != load.getValid() && operand != load.getFill())
-        continue;
-      Value current = cloneMapping.lookupOrDefault(operand);
-      auto fragment = dyn_cast<FragmentType>(current.getType());
-      if (!fragment)
-        continue;
-      auto operandTarget = FragmentType::get(
-          targetType.getContext(), fragment.getElementType(),
-          targetType.getShape(), targetType.getAxisMaps(),
-          targetType.getValidity(), targetType.getOwner());
-      if (current.getType() == operandTarget)
-        continue;
-      FailureOr<Value> projected = projectPhysicalValueToSchema(
-          builder, location, current, operandTarget);
-      if (failed(projected)) {
-        InFlightDiagnostic diagnostic = producer->emitOpError(
-            "replayed operand cannot adopt the selected range relation")
-            << "; operand=" << current.getType()
-            << "; target=" << operandTarget;
-        if (Operation *definition = current.getDefiningOp())
-          diagnostic << "; operand_producer=" << definition->getName()
-                     << "; operand_location=" << definition->getLoc();
-        auto selectedOperand =
-            PhysicalProgramAnalysis(kernel).rangeAxes(operand, roots);
-        diagnostic << "; selected_operand_axes="
-                   << selectedOperand.fragmentAxes.size();
-        return failure();
-      }
-      cloneMapping.map(operand, *projected);
-    }
-  }
-  Operation *clone = builder.clone(*producer, cloneMapping);
-  auto resultType = dyn_cast<FragmentType>(clone->getResult(0).getType());
-  if (!resultType) {
-    clone->emitOpError("replayed value did not preserve a fragment result");
-    return failure();
-  }
-  clone->getResult(0).setType(targetType);
-  if (!mapping.lookupOrNull(value))
-    mapping.map(value, clone->getResult(0));
-  return clone->getResult(0);
-
-  }
-
-private:
-  bool isInvariant(Value value, ArrayRef<MakeRangeOp> roots) const {
-    auto found = invariantValues.find(value);
-    return found != invariantValues.end() &&
-           llvm::any_of(found->second, [&](const auto &selected) {
-             return ArrayRef<MakeRangeOp>(selected) == roots;
-           });
-  }
-
-  Value rememberInvariant(Value value, ArrayRef<MakeRangeOp> roots) {
-    invariantValues[value].emplace_back(roots.begin(), roots.end());
-    return value;
-  }
-
-  OpBuilder &builder;
-  Location location;
-  func::FuncOp kernel;
-  PhysicalExprAttr blockedExtent;
-  Value replacement;
-  IRMapping &mapping;
-  Operation *insertionAnchor;
-  std::optional<DominanceInfo> dominance;
-  llvm::DenseMap<Value, SmallVector<SmallVector<MakeRangeOp>>> invariantValues;
-};
-
 LogicalResult prepareRetainedContractionReads(func::FuncOp kernel) {
   // Close retained read snapshots before creating any contraction slices.
   // Materializing one operand later can otherwise retarget an existing slice
@@ -291,14 +54,14 @@ LogicalResult prepareRetainedContractionReads(func::FuncOp kernel) {
         auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
         PhysicalReplayFact replay = analysis.replayability(
             value, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, /*insertionAnchor=*/nullptr,
-            mapping.getDimensionId());
+            /*allowAccesses=*/true, mapping.getDimensionId());
         if (!replay.isReplayable())
           continue;
-        bool retain = llvm::any_of(replay.accesses, [&](Operation *access) {
-          auto load = dyn_cast<LoadOp>(access);
-          return load && !canReplayReadAt(load, contract);
-        });
+        IRMapping bindings;
+        bool retain = !analysis.replayAt(
+            value, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
+            /*allowAccesses=*/true, contract, bindings,
+            mapping.getDimensionId()).isReplayable();
         if (retain && !analysis.axisRealization(value, axis).physicalized &&
             failed(realizeFullCoverageDimension(kernel, value, axis)))
           return WalkResult::interrupt();
@@ -405,15 +168,10 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
                *current == *dimension;
       }))
     return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
       value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
-  bool preserveValue = !replay.isReplayable() ||
-      llvm::any_of(replay.accesses, [&](Operation *access) {
-        auto load = dyn_cast<LoadOp>(access);
-        return load && !canReplayReadAt(load, insertionAnchor);
-      });
-  if (preserveValue) {
+      /*allowAccesses=*/true, insertionAnchor, mapping, *dimension);
+  if (!replay.isReplayable()) {
     Operation *owner = value.getDefiningOp() ? value.getDefiningOp()
                                            : kernel.getOperation();
     PhysicalProgramAnalysis analysis(kernel);
@@ -431,9 +189,9 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
     mapping.map(value, *sliced);
     return sliced;
   }
-  RangeValueReplay materialization(builder, location, kernel, blockedExtent,
-                                   replacement, mapping, nullptr);
-  FailureOr<Value> result = materialization.replay(value, roots);
+  FailureOr<Value> result = materializeReplayedRanges(
+      builder, location, value, blockedExtent, roots, replacement, mapping,
+      insertionAnchor);
   if (failed(result))
     (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
         ->emitError("coordinate replay could not rebuild the current value graph");
@@ -538,9 +296,9 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
   FailureOr<int64_t> dimension = queryRangeDimension(root);
   if (!kernel || !(sourceAxisIdentity(root) == source) || failed(dimension))
     return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
       value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, insertionAnchor, *dimension);
+      /*allowAccesses=*/true, insertionAnchor, mapping, *dimension);
   if (!replay.isReplayable()) {
     InFlightDiagnostic diagnostic =
         value.getDefiningOp()
@@ -552,9 +310,9 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
       diagnostic << "; blocker=" << blocker->getName();
     return failure();
   }
-  RangeValueReplay materialization(builder, location, kernel, blockedExtent,
-                                   replacement, mapping, insertionAnchor);
-  return materialization.replay(value, ArrayRef<MakeRangeOp>(root));
+  return materializeReplayedRanges(builder, location, value, blockedExtent,
+                                  ArrayRef<MakeRangeOp>(root), replacement,
+                                  mapping, insertionAnchor);
 }
 
 LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,
@@ -1002,8 +760,9 @@ FailureOr<Value> materializeResultCapture(
     }
     auto source = sourceAxisIdentity(cast<AxisMapAttr>(
         cast<FragmentType>(value.getType()).getAxisMaps()[axis]));
-    if (!analysis.replayability(value, source, PhysicalReplayScope::ValueGraph,
-                               /*allowAccesses=*/true, insertionAnchor)
+    IRMapping bindings;
+    if (!analysis.replayAt(value, source, PhysicalReplayScope::ValueGraph,
+        /*allowAccesses=*/true, insertionAnchor, bindings)
              .isReplayable()) {
       insertionAnchor->emitError("result capture cannot be replayed at its use")
           << "; axis=" << axis << "; value=" << value;
@@ -1034,7 +793,7 @@ FailureOr<Value> materializeResultCapture(
     options.segmentTail = tail;
     options.materializeZeroFill = true;
     auto replayed = materializeReplayedValue(
-        builder, location, value, source, extent, mapping, options);
+        builder, location, value, source, extent, mapping, insertionAnchor, options);
     if (failed(replayed)) {
       insertionAnchor->emitError("result capture axis could not be materialized")
           << "; axis=" << axis << "; value=" << value;

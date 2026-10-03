@@ -43,10 +43,21 @@ materializeZeroValue(mlir::OpBuilder &builder, mlir::Location location,
 mlir::FailureOr<mlir::Value>
 materializeZeroFragment(mlir::OpBuilder &builder, mlir::Location location,
                         FragmentType target);
+// insertionAnchor is the original semantic position of the rewrite. The
+// builder may be in a newly constructed block, including at its empty end.
+// Prebound mappings are preserved snapshots, available at that actual point.
 mlir::FailureOr<mlir::Value> materializeReplayedValue(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     PhysicalSourceAxis source, PhysicalExprAttr blockedExtent,
-    mlir::IRMapping &mapping, ReplayMaterializationOptions options = {});
+    mlir::IRMapping &mapping, mlir::Operation *insertionAnchor,
+    ReplayMaterializationOptions options = {});
+// Replay all occurrences selected by one exact set of range roots. This keeps
+// the range-set projection distinct from the single occurrence API above.
+mlir::FailureOr<mlir::Value> materializeReplayedRanges(
+    mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
+    PhysicalExprAttr blockedExtent, llvm::ArrayRef<MakeRangeOp> roots,
+    mlir::Value replacement, mlir::IRMapping &mapping,
+    mlir::Operation *insertionAnchor);
 mlir::FailureOr<mlir::Value>
 projectPredicateToFragmentAxis(mlir::OpBuilder &builder, mlir::Location location,
                                mlir::Value predicate, FragmentType target,

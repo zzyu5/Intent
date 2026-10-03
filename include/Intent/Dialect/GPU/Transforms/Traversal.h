@@ -3,8 +3,18 @@
 
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace intent::gpu {
+
+// Attach the loop to current IR before building a body that queries dominance,
+// resource snapshots or enclosing program facts. The callback owns its yield.
+mlir::scf::ForOp createTraversalLoop(
+    mlir::OpBuilder &builder, mlir::Location location, mlir::Value lower,
+    mlir::Value upper, mlir::Value step, mlir::ValueRange initialValues,
+    llvm::function_ref<void(mlir::OpBuilder &, mlir::Location, mlir::Value,
+                            mlir::ValueRange)> buildBody);
 
 mlir::FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
                                                        MakeRangeOp range);

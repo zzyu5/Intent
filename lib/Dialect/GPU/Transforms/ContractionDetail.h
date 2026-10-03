@@ -127,7 +127,7 @@ FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
                                    PhysicalExprAttr blockedExtent,
                                    MakeRangeOp root, Value replacement,
                                    IRMapping &mapping,
-                                   Operation *insertionAnchor = nullptr);
+                                   Operation *insertionAnchor);
 
 bool isIntegerConstant(Value value, int64_t expected);
 

@@ -2,6 +2,7 @@
 #include "Intent/Dialect/GPU/Transforms/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -551,7 +552,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         FailureOr<Value> index = replaySourceValue(
             rowBuilder, location, kernel, assumption.getIndex(),
             sourceAxisIdentity(*rowMap),
-            unitM, rowRange, rows, rowReplay);
+            unitM, rowRange, rows, rowReplay, contract.getOperation());
         if (failed(index))
           return assumption.emitOpError(
               "blocked contraction could not replay an in-bounds assertion");
@@ -566,7 +567,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
           FailureOr<Value> replayed = replaySourceValue(
               rowBuilder, location, kernel, coordinate,
               sourceAxisIdentity(*rowMap),
-              unitM, rowRange, rows, rowReplay);
+              unitM, rowRange, rows, rowReplay, contract.getOperation());
           if (failed(replayed))
             return path.store.emitOpError(
                 "blocked contraction could not replay an output coordinate graph");
@@ -776,7 +777,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
           FailureOr<Value> columnValidity = replaySourceValue(
               rowBuilder, location, kernel, replayed,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
-              columnReplay);
+              columnReplay, &*rowBuilder.getInsertionPoint());
           if (failed(columnValidity))
             return path.store.emitOpError(
                 "blocked contraction could not replay output column validity");
@@ -1346,7 +1347,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   Value accumulator = builder.create<SplatOp>(
       location, blockedResultType, *initialAccumulator);
   bool loopBodyFailed = false;
-  auto loop = builder.create<scf::ForOp>(
+  auto loop = createTraversalLoop(builder,
       location, blockRange->getStart(), blockStop, blockKValue,
       ValueRange{accumulator},
       [&](OpBuilder &nested, Location nestedLocation, Value blockStart,
@@ -1429,7 +1430,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
             rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
             sourceAxisIdentity(*columnMap),
             unitN, *rhsScaleColumnRange, columns,
-            rhsScaleReplay);
+            rhsScaleReplay, contract.getOperation());
         if (failed(rhsScaleColumn)) {
           loopBodyFailed = true;
           return;

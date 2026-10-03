@@ -57,7 +57,8 @@ Value createInvocationWorkspace(func::FuncOp kernel, Location location,
 
 FailureOr<Value> materializeRetainedSlice(
     OpBuilder &builder, Location location, Value value, unsigned axis,
-    PhysicalExprAttr blockedExtent, Value coordinates, Operation *insertionAnchor) {
+    PhysicalExprAttr blockedExtent, Value coordinates, Operation *insertionAnchor,
+    AxisMapAttr resultMapping) {
   auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
   auto original = dyn_cast<FragmentType>(value.getType());
   if (!kernel || !original || axis >= original.getShape().size() ||
@@ -77,9 +78,15 @@ FailureOr<Value> materializeRetainedSlice(
       !analysis.axisRealization(value, axis).physicalized)
     return kernel.emitError("retained value has no realized slice coordinate relation");
   SmallVector<Attribute> shape(original.getShape().begin(), original.getShape().end());
+  SmallVector<Attribute> mappings(original.getAxisMaps().begin(), original.getAxisMaps().end());
   shape[axis] = blockedExtent;
+  if (resultMapping)
+    mappings[axis] = AxisMapAttr::get(
+        original.getContext(), resultMapping.getSourceId(),
+        resultMapping.getSourceAxis(), resultMapping.getDimensionId(), axis,
+        resultMapping.getDerived());
   auto target = FragmentType::get(original.getContext(), original.getElementType(),
-      builder.getArrayAttr(shape), original.getAxisMaps(),
+      builder.getArrayAttr(shape), builder.getArrayAttr(mappings),
       original.getValidity(), original.getOwner());
   auto coordinate = cast<FragmentType>(coordinates.getType());
   Value start = builder.create<SplatOp>(location, coordinate, (*authority).getStart());
@@ -531,23 +538,27 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
         replayAxes.push_back(axis);
     }
   }
+  IRMapping replayBindings;
   auto replayAt = [&](Operation *anchor, bool &blocked, bool allowContractions) {
     bool reads = false;
     for (Value value : retained)
       for (auto [axis, dimension] : replayAxes) {
-        auto replay = analysis.replayability(value, axis,
-            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, anchor, dimension);
+        auto replay = analysis.replayAt(value, axis,
+            PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, anchor,
+            replayBindings, dimension);
         if (!replay.isReplayable())
           return false;
         if (!allowContractions && !replay.contractions.empty())
           return false;
         for (Operation *access : replay.accesses) {
           auto load = dyn_cast<LoadOp>(access);
-          if (!load || !canReplayReadAt(load, anchor))
+          if (!load)
             return false;
           reads = true;
-          blocked |= !canReplayReadAt(load, store);
         }
+        blocked |= !analysis.replayAt(
+            value, axis, PhysicalReplayScope::ValueGraph,
+            /*allowAccesses=*/true, store, replayBindings, dimension).isReplayable();
       }
     return reads || static_cast<bool>(buffer);
   };
@@ -638,9 +649,9 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
     }
     for (Value value : retained)
       for (auto [axis, dimension] : replayAxes) {
-        auto replay = analysis.replayability(
+        auto replay = analysis.replayAt(
             value, axis, PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, store, dimension);
+            /*allowAccesses=*/true, store, replayBindings, dimension);
         if (!replay.isReplayable())
           return false;
         for (Operation *access : replay.accesses) {
@@ -726,7 +737,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
         if (direct && store.getValid()) {
           auto predicate = materializeReplayedValue(
               nested, store.getLoc(), store.getValid(), source,
-              queryLaunchExpression(chunk), mapping, options);
+              queryLaunchExpression(chunk), mapping, clobber, options);
           if (failed(predicate))
             return store.emitOpError("buffer write validity cannot be replayed");
           auto combined = materializeValidityConjunction(
@@ -738,7 +749,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
         for (auto [original, snapshot] : llvm::zip(retained, workspaces)) {
           FailureOr<Value> value = materializeReplayedValue(
               nested, store.getLoc(), original, source,
-              queryLaunchExpression(chunk), mapping, options);
+              queryLaunchExpression(chunk), mapping, clobber, options);
           if (failed(value))
             return store.emitOpError("retained value has no bounded producer replay");
           auto written = nested.create<StoreOp>(store.getLoc(), snapshot,
@@ -763,7 +774,7 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
         if (store.getValid() && !indirect) {
           FailureOr<Value> predicate = materializeReplayedValue(
               nested, store.getLoc(), store.getValid(), source,
-              queryLaunchExpression(chunk), mapping, options);
+              queryLaunchExpression(chunk), mapping, store, options);
           if (failed(predicate))
             return store.emitOpError("retained output validity cannot be replayed");
           auto type = cast<FragmentType>(valid.getType());
@@ -980,11 +991,12 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
   if (!insertionAnchor)
     return false;
   PhysicalSourceAxis axis = sourceAxisIdentity(ranges[chunkAxis]);
-  auto replay = analysis.replayability(source, axis, PhysicalReplayScope::ValueGraph,
-                                      /*allowAccesses=*/true, insertionAnchor);
+  IRMapping replayBindings;
+  auto replay = analysis.replayAt(source, axis, PhysicalReplayScope::ValueGraph,
+                                 /*allowAccesses=*/true, insertionAnchor,
+                                 replayBindings);
   if (!replay.isReplayable() || llvm::any_of(replay.accesses, [&](Operation *access) {
-        auto load = dyn_cast<LoadOp>(access);
-        return !load || !canReplayReadAt(load, insertionAnchor);
+        return !isa<LoadOp>(access);
       }))
     return false;
   SmallVector<Value> dependencies{source};
@@ -1058,7 +1070,8 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
             options.segmentTail = nested.create<CompareOp>(gather.getLoc(), tailType,
                 coordinates[chunkAxis], end, ComparePredicate::Lt);
             FailureOr<Value> value = materializeReplayedValue(
-                nested, gather.getLoc(), source, axis, chunkExtent, mapping, options);
+                nested, gather.getLoc(), source, axis, chunkExtent, mapping,
+                insertionAnchor, options);
             if (failed(value))
               return gather.emitOpError("retained gather source has no bounded producer replay");
             nested.create<StoreOp>(gather.getLoc(), workspace, coordinates, *value,

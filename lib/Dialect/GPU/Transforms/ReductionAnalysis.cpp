@@ -427,13 +427,12 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
         return isUnitStepRange(range);
       }))
     return failure();
-  PhysicalReplayFact replay = analysis.replayability(
+  PhysicalReplayFact replay = analysis.replayAt(
       source, plan->sourceIdentity, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, reduce);
+      /*allowAccesses=*/true, reduce, IRMapping{});
   if (!replay.isReplayable() ||
       llvm::any_of(replay.accesses, [&](Operation *access) {
-        auto load = dyn_cast<LoadOp>(access);
-        return !load || !canReplayReadAt(load, reduce);
+        return !isa<LoadOp>(access);
       }))
     return failure();
 

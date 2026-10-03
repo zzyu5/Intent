@@ -216,16 +216,9 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
   for (int64_t dimension : valueDimensions) {
     if (!llvm::is_contained(traversalDimensions, dimension))
       continue;
-    // Pure scalar/pointwise nodes are proved by replaying their operands below.
-    // A bound operand can already hold a snapshot made before an intervening
-    // store; following its old graph would incorrectly require another load.
-    if (producer->getNumRegions() == 0 &&
-        isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                             /*allowAccesses=*/false))
-      continue;
-    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
         value, source, PhysicalReplayScope::ValueGraph,
-        /*allowAccesses=*/true, insertionAnchor, dimension);
+        /*allowAccesses=*/true, insertionAnchor, mapping, dimension);
     if (!replay.isReplayable()) {
       InFlightDiagnostic diagnostic = producer->emitOpError(
           "pointwise value has no exact insertion-point replay fact");
@@ -604,6 +597,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              bool effectLocal,
                                              ArrayRef<LoadOp> retainedReads,
                                              llvm::function_ref<void(StoreOp, StoreOp)> replaceStore) {
+  IRMapping replayBindings;
   if (stores.empty())
     return range.emitOpError(
         "reuse-sensitive pointwise traversal has no write effect");
@@ -728,9 +722,10 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       for (int64_t dimension : valueDimensions)
         if (llvm::is_contained(dimensions, dimension) &&
             !replayAnalysis
-                 .replayability(value, logicalSource,
+                 .replayAt(value, logicalSource,
                                 PhysicalReplayScope::ValueGraph,
-                                /*allowAccesses=*/true, anchor, dimension)
+                                /*allowAccesses=*/true, anchor, replayBindings,
+                                dimension)
                  .isReplayable())
           return false;
       return true;
@@ -1154,6 +1149,7 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
 }
 
 LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePressure) {
+  IRMapping replayBindings;
   reuseTraversalRanges.clear();
   effectLocalStores.clear();
   llvm::MapVector<Attribute, MakeRangeOp> effectLocalAuthorities;
@@ -1171,10 +1167,10 @@ LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePr
       FailureOr<int64_t> dimension = queryRangeDimension(range);
       if (failed(dimension))
         continue;
-      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+      PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
           store.getValue(), sourceAxisIdentity(range),
           PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
-          store.getOperation(), *dimension);
+          store.getOperation(), replayBindings, *dimension);
       bool regionReduction = !replay.structuredPrograms.empty() &&
           llvm::all_of(replay.structuredPrograms, [&](Operation *operation) {
             auto fold = dyn_cast<RegionFoldOp>(operation);
@@ -1231,12 +1227,13 @@ LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePr
         PhysicalReplayFact replay = failed(dimension)
                                         ? PhysicalReplayFact()
                                         : PhysicalProgramAnalysis(kernel)
-                                              .replayability(
+                                              .replayAt(
                                                   store.getValue(),
                                                   sourceAxisIdentity(range),
                                                   PhysicalReplayScope::ValueGraph,
                                                   /*allowAccesses=*/true,
                                                   store.getOperation(),
+                                                  replayBindings,
                                                   static_cast<int64_t>(*dimension));
         PhysicalAxisProjection valueProjection =
             queryFragmentAxis(store.getValue().getType(),
@@ -1264,10 +1261,10 @@ LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePr
         if (FailureOr<uint64_t> dimension = rangeDimension(range);
             succeeded(dimension))
           sourceDimension = *dimension;
-        PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+        PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
             store.getValue(), sourceAxisIdentity(range),
             PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
-            store.getOperation(), sourceDimension);
+            store.getOperation(), replayBindings, sourceDimension);
         FailureOr<Attribute> key = effectLocalKey(range);
         bool postStructuredWriteback =
             succeeded(key) &&
@@ -1354,6 +1351,7 @@ LogicalResult PointwiseRewrite::selectWritebackCandidates(bool accountResourcePr
 
 
 LogicalResult PointwiseRewrite::realizeWritebacks() {
+  IRMapping replayBindings;
   SmallVector<MakeRangeOp> realized;
   SmallVector<MakeRangeOp> retainedFragments;
   for (MakeRangeOp range : dynamicRanges) {
@@ -1392,9 +1390,10 @@ LogicalResult PointwiseRewrite::realizeWritebacks() {
         if (!llvm::is_contained(*traversalDimensions, dimension))
           continue;
         PhysicalProgramAnalysis analysis(kernel);
-        PhysicalReplayFact replay = analysis.replayability(
+        PhysicalReplayFact replay = analysis.replayAt(
             store.getValue(), source, PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, store.getOperation(), dimension);
+            /*allowAccesses=*/true, store.getOperation(), replayBindings,
+            dimension);
         llvm::SmallPtrSet<Operation *, 32> materializationVisited;
         bool materializedFork =
             replay.crossesAccess && hasMaterializedReductionStoreFork(

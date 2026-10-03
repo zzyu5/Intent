@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -201,8 +202,8 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
                               massIdentity, momentIdentity};
   bool bodyFailed = false;
   std::string bodyFailure;
-  auto loop = builder.create<scf::ForOp>(
-      location, pattern.authority.getStart(), pattern.authority.getLogicalStop(),
+  auto loop = createTraversalLoop(
+      builder, location, pattern.authority.getStart(), pattern.authority.getLogicalStop(),
       chunk.getResult(), initials,
       [&](OpBuilder &nested, Location nestedLocation, Value chunkStart,
           ValueRange carries) {
@@ -238,7 +239,7 @@ LogicalResult realizeOnlineSummary(OnlineSummaryPattern pattern,
         auto replay = [&](Value value) -> FailureOr<Value> {
           return materializeReplayedValue(
               nested, nestedLocation, value, pattern.traversal, chunkExtent,
-              mapping, options);
+              mapping, pattern.moment, options);
         };
         FailureOr<Value> replayedValidity = replay(pattern.memberValidity);
         FailureOr<Value> replayedScore = replay(pattern.score);

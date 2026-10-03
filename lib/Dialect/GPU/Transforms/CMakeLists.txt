@@ -8,6 +8,13 @@ add_mlir_library(MLIRIntentGPUTransforms
   ContractionBlocking.cpp
   RealizeVectorContractions.cpp
   RealizeAccessComposition.cpp
+  AccessCoordinates.cpp
+  AccessExpressions.cpp
+  AccessLoads.cpp
+  AccessGathers.cpp
+  AccessGatherProjection.cpp
+  AccessReductions.cpp
+  AccessReshapes.cpp
   PredicateScalarControl.cpp
   RealizePointwiseBlocking.cpp
   PointwiseAnalysis.cpp
@@ -25,6 +32,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   ReductionAnalysis.cpp
   ReductionParameters.cpp
   ReductionValues.cpp
+  ReductionReads.cpp
   ReductionCoverage.cpp
   ReductionDecomposition.cpp
   ReductionTraversal.cpp
@@ -42,6 +50,8 @@ add_mlir_library(MLIRIntentGPUTransforms
   OnlineSummary.cpp
   Passes.cpp
   ValueMaterialization.cpp
+  ReplayMaterialization.cpp
+  RegionSources.cpp
   ValueRelations.cpp
   SchemaMutation.cpp
   Traversal.cpp

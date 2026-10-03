@@ -180,14 +180,10 @@ FailureOr<bool> collapseMultiReductionContract(ContractOp contract) {
       if (failed(dimension))
         return false;
       auto source = sourceAxisIdentity(ranges.roots.front());
-      auto replay = analysis.replayability(
+      auto replay = analysis.replayAt(
           operand, source, PhysicalReplayScope::ValueGraph,
-          /*allowAccesses=*/true, /*insertionAnchor=*/nullptr, *dimension);
-      if (!replay.isReplayable() ||
-          llvm::any_of(replay.accesses, [&](Operation *access) {
-            auto read = dyn_cast<LoadOp>(access);
-            return read && !canReplayReadAt(read, contract);
-          }))
+          /*allowAccesses=*/true, contract, IRMapping{}, *dimension);
+      if (!replay.isReplayable())
         return false;
       for (MakeRangeOp range : ranges.roots) {
         auto realization = analysis.axisRealization(range.getResult(), 0);

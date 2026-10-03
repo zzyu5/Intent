@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -370,12 +371,23 @@ public:
   PhysicalLockstepTraversalFact
   lockstepTraversal(mlir::ValueRange sources,
                     llvm::ArrayRef<unsigned> fragmentAxes);
+  /// Query the source graph independently of a destination. This establishes
+  /// structural eligibility only; an actual rewrite must use replayAt.
   PhysicalReplayFact replayability(
       mlir::Value value,
       std::optional<PhysicalSourceAxis> source = std::nullopt,
       PhysicalReplayScope scope = PhysicalReplayScope::Coordinate,
       bool allowAccesses = true,
-      mlir::Operation *insertionAnchor = nullptr,
+      std::optional<int64_t> sourceDimension = std::nullopt);
+  /// Prove motion to an existing semantic position. Bound SSA values are the
+  /// completed frontier of this rewrite and are reused, not read again.
+  /// Unlike a structural replayability query, this requires a non-null anchor.
+  /// With no source selector, every unbound shaped producer is replayed;
+  /// otherwise independent values that dominate the anchor may be reused.
+  PhysicalReplayFact replayAt(
+      mlir::Value value, std::optional<PhysicalSourceAxis> source,
+      PhysicalReplayScope scope, bool allowAccesses,
+      mlir::Operation *insertionAnchor, const mlir::IRMapping &bindings,
       std::optional<int64_t> sourceDimension = std::nullopt);
   PhysicalReductionDependencyFact reductionDependency(
       mlir::Value value, PhysicalSourceAxis source,
@@ -417,6 +429,7 @@ private:
                      mlir::Operation *insertionAnchor,
                      std::optional<int64_t> sourceDimension,
                      mlir::DominanceInfo *dominance,
+                     const mlir::IRMapping *bindings,
                      PhysicalReplayFact &result,
                      ReplayVisits &visited);
   llvm::SmallVector<mlir::Value, 2>

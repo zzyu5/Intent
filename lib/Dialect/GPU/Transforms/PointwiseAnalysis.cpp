@@ -1011,9 +1011,9 @@ StructuredRangeUses classifyStructuredRanges(
           if (failed(mapping))
             return false;
           auto source = sourceAxisIdentity(*mapping);
-          auto replay = analysis.replayability(
+          auto replay = analysis.replayAt(
               axis.operand, source, PhysicalReplayScope::Coordinate,
-              /*allowAccesses=*/true, contract.getOperation(),
+              /*allowAccesses=*/true, contract.getOperation(), IRMapping{},
               mapping->getDimensionId());
           return replay.isReplayable() &&
                  llvm::any_of(replay.accesses, [&](Operation *access) {

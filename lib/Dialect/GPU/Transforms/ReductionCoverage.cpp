@@ -438,9 +438,9 @@ FailureOr<bool> realizeStaticPaddingReduce(ReduceOp reduce,
     PhysicalSourceAxis reductionSource{sourceMap.getSourceId(),
                                        sourceMap.getSourceAxis(),
                                        sourceMap.getDerived()};
-    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayability(
+    PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
         reduce.getSources()[component], reductionSource,
-        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, reduce);
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, reduce, IRMapping{});
     if (!replay.isReplayable()) {
       InFlightDiagnostic diagnostic = reduce.emitOpError(
           "static reduction producer has no exact shared replay fact");

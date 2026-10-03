@@ -30,6 +30,18 @@ using namespace mlir;
 
 namespace intent::gpu {
 
+scf::ForOp createTraversalLoop(
+    OpBuilder &builder, Location location, Value lower, Value upper, Value step,
+    ValueRange initialValues,
+    llvm::function_ref<void(OpBuilder &, Location, Value, ValueRange)> buildBody) {
+  auto loop = builder.create<scf::ForOp>(
+      location, lower, upper, step, initialValues,
+      [](OpBuilder &, Location, Value, ValueRange) {});
+  OpBuilder bodyBuilder(loop.getBody(), loop.getBody()->begin());
+  buildBody(bodyBuilder, location, loop.getInductionVar(), loop.getRegionIterArgs());
+  return loop;
+}
+
 FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
                                                  MakeRangeOp range) {
   auto expression = [&](PhysicalExprKind kind, int64_t value = 0,

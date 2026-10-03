@@ -2,6 +2,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Predication.h"
@@ -209,8 +210,8 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   };
   OpBuilder builder(match.loop);
   bool failedBody = false;
-  builder.create<scf::ForOp>(
-      scan.getLoc(), match.loop.getLowerBound(), match.loop.getUpperBound(), chunk,
+  createTraversalLoop(
+      builder, scan.getLoc(), match.loop.getLowerBound(), match.loop.getUpperBound(), chunk,
       ValueRange{match.identity},
       [&](OpBuilder &nested, Location location, Value offset, ValueRange carry) {
         auto yield = nested.create<scf::YieldOp>(location, carry);
@@ -244,7 +245,8 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
         options.segmentMapping = mapping;
         options.materializeZeroFill = true;
         FailureOr<Value> replayed = materializeReplayedValue(
-            nested, location, scan.getSources().front(), source, extent, replay, options);
+            nested, location, scan.getSources().front(), source, extent, replay,
+            match.loop, options);
         if (failed(replayed)) {
           failedBody = true;
           return;

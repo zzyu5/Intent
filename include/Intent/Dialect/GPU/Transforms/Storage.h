@@ -14,7 +14,7 @@ mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
 mlir::FailureOr<mlir::Value> materializeRetainedSlice(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     unsigned axis, PhysicalExprAttr blockedExtent, mlir::Value coordinates,
-    mlir::Operation *insertionAnchor);
+    mlir::Operation *insertionAnchor, AxisMapAttr resultMapping = {});
 
 } // namespace intent::gpu
 

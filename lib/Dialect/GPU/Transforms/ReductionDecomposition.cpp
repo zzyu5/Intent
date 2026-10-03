@@ -277,6 +277,10 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       return reduce.emitOpError(
           "multi-axis reduction sources do not share one exact outer traversal");
 
+  for (const auto &component : accesses)
+    if (failed(prepareReductionReads(component, reduce, kernel)))
+      return failure();
+
   SmallVector<int64_t> retainedInnerAxes;
   SmallVector<int64_t> innerAxes;
   for (int64_t axis : reduce.getAxes()) {
@@ -492,7 +496,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
             FailureOr<Value> reducedCoordinate = materializeReplayedValue(
                 nested, nestedLocation,
                 load.getCoordinates()[access.coordinateIndex],
-                accessSource, outerSliceExtent, mapping);
+                accessSource, outerSliceExtent, mapping, reduce);
             if (failed(reducedCoordinate)) {
               bodyFailed = true;
               failureReason =
@@ -531,7 +535,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               }
               FailureOr<Value> replayedCoordinate = materializeReplayedValue(
                   nested, nestedLocation, original, coordinateSource,
-                  coordinateExtent, mapping, coordinateOptions);
+                  coordinateExtent, mapping, reduce, coordinateOptions);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
                 failureReason =
@@ -547,7 +551,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               for (auto [source, extent] : replayAxes) {
                 FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, valid, source, extent,
-                    mapping);
+                    mapping, reduce);
                 if (failed(replayed)) {
                   bodyFailed = true;
                   failureReason =
@@ -563,7 +567,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
               for (auto [source, extent] : replayAxes) {
                 FailureOr<Value> replayed = materializeReplayedValue(
                     nested, nestedLocation, fill, source, extent,
-                    mapping);
+                    mapping, reduce);
                 if (failed(replayed)) {
                   bodyFailed = true;
                   failureReason =
@@ -573,16 +577,22 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 fill = *replayed;
               }
             }
-            auto slicedLoad = nested.create<LoadOp>(
-                nestedLocation, slicedType, load.getResource(), coordinates,
-                valid, fill, load.getSourceAxes());
-            mapping.map(load.getResult(), slicedLoad.getResult());
+            auto slicedLoad = materializeReductionRead(
+                nested, nestedLocation, access, slicedType, coordinates,
+                valid, fill, mapping.lookupOrNull(access.range.getResult()),
+                reduce);
+            if (failed(slicedLoad)) {
+              bodyFailed = true;
+              failureReason = "outer reduction could not preserve its source read";
+              return;
+            }
+            mapping.map(load.getResult(), *slicedLoad);
           }
           ReplayMaterializationOptions replayOptions;
           replayOptions.fragmentAxis = plan.reductionAxis;
           FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
-              outerSliceExtent, mapping, replayOptions);
+              outerSliceExtent, mapping, reduce, replayOptions);
           if (failed(replayed)) {
             bodyFailed = true;
             failureReason = "outer-axis source graph could not be sliced";

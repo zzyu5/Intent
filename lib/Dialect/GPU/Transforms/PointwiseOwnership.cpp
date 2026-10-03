@@ -38,13 +38,14 @@ LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel) {
       if (!axis)
         continue;
       auto source = sourceAxisIdentity(*range);
-      auto replay = analysis.replayability(
+      IRMapping mapping;
+      auto replay = analysis.replayAt(
           store.getValue(), source, PhysicalReplayScope::ValueGraph,
-          /*allowAccesses=*/true, store);
+          /*allowAccesses=*/true, store, mapping);
       auto replayable = [&](Value value) {
-        return !value || analysis.replayability(
+        return !value || analysis.replayAt(
             value, source, PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, store).isReplayable();
+            /*allowAccesses=*/true, store, mapping).isReplayable();
       };
       if (!replay.isReplayable() || replay.crossesStructuredProgram ||
           !llvm::all_of(replay.contractions, [](Operation *operation) {
@@ -69,7 +70,6 @@ LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel) {
           }))
         continue;
       OpBuilder builder(store);
-      IRMapping mapping;
       auto original = cast<AxisMapAttr>(type.getAxisMaps()[0]);
       auto selected = AxisMapAttr::get(
           kernel.getContext(), nextSource++, original.getSourceAxis(),
@@ -93,19 +93,20 @@ LogicalResult separateReductionOutputOccurrences(func::FuncOp kernel) {
       options.segmentMapping = selected;
       auto payload = materializeReplayedValue(
           builder, store.getLoc(), store.getValue(), source, extent, mapping,
-          options);
+          store, options);
       if (failed(payload))
         return store.emitOpError("reduction output occurrence cannot be separated");
       options.fragmentAxis = 0;
       auto addressValue = materializeReplayedValue(
-          builder, store.getLoc(), coordinate, source, extent, mapping, options);
+          builder, store.getLoc(), coordinate, source, extent, mapping, store,
+          options);
       if (failed(addressValue))
         return store.emitOpError("reduction output address cannot be separated");
       if (store.getValid()) {
         options.fragmentAxis = *axis;
         auto valid = materializeReplayedValue(
             builder, store.getLoc(), store.getValid(), source, extent, mapping,
-            options);
+            store, options);
         if (failed(valid))
           return store.emitOpError("reduction output validity cannot be separated");
         store.getValidMutable().assign(*valid);

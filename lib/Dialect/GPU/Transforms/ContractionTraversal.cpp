@@ -235,9 +235,10 @@ FailureOr<bool> realizeStructuredNativeReduction(
         parameter->getCategory() ==
             ParameterCategory::Coverage;
     auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
-    retainedSource |= !analysis.replayability(
+    retainedSource |= !analysis.replayAt(
         operand, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
-        /*allowAccesses=*/true, contract, mapping.getDimensionId()).isReplayable();
+        /*allowAccesses=*/true, contract, IRMapping{},
+        mapping.getDimensionId()).isReplayable();
   }
   if (fullReduction && retainedSource &&
       freeAxesReadyForReductionTraversal(contract, kernel)) {
@@ -519,7 +520,7 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
   Value one = builder.create<arith::ConstantIndexOp>(location, 1);
   bool bodyFailed = false;
   SmallVector<ContractOp> nativeProducts;
-  auto loop = builder.create<scf::ForOp>(
+  auto loop = createTraversalLoop(builder,
       location, lhsRange.getLogicalStart(), logicalEnd, blockKValue,
       ValueRange{contract.getAccumulator()},
       [&](OpBuilder &nested, Location nestedLocation, Value kStart,
@@ -1111,7 +1112,7 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
   Value metadataExtent = builder.create<PhysicalExprOp>(
       location, builder.getIndexType(), unitMetadataK);
   bool bodyFailed = false;
-  auto loop = builder.create<scf::ForOp>(
+  auto loop = createTraversalLoop(builder,
       location, denseRange.getLogicalStart(), denseLogicalEnd,
       blockKValue, ValueRange{contract.getAccumulator()},
       [&](OpBuilder &nested, Location nestedLocation, Value denseStart,

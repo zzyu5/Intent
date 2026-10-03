@@ -742,7 +742,7 @@ FailureOr<bool> projectContractResult(ContractOp contract) {
       options.materializeZeroFill = true;
       auto projected = materializeReplayedValue(
           builder, contract.getLoc(), operand, sourceAxisIdentity(mapping),
-          projectedExtent, replay, options);
+          projectedExtent, replay, contract, options);
       if (failed(projected))
         return contract.emitOpError("cannot project a contraction input");
       operand = *projected;

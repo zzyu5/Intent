@@ -178,9 +178,12 @@ void PhysicalProgramAnalysis::analyzeReplay(
     PhysicalReplayScope scope, bool allowAccesses,
     Operation *insertionAnchor, std::optional<int64_t> sourceDimension,
     DominanceInfo *dominance,
+    const IRMapping *bindings,
     PhysicalReplayFact &result,
     ReplayVisits &visited) {
   if (!value)
+    return;
+  if (bindings && bindings->lookupOrNull(value))
     return;
   ReplayContext context{source, sourceDimension};
   auto ensureEnclosingReplay = [&](Operation *parent) {
@@ -198,7 +201,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
       return false;
     if (!llvm::is_contained(visited.lookup(root), context))
       analyzeReplay(root->getResult(0), source, scope, allowAccesses,
-                    insertionAnchor, sourceDimension, dominance, result, visited);
+                    insertionAnchor, sourceDimension, dominance, bindings, result, visited);
     return result.state != PhysicalFactState::Unknown &&
            llvm::is_contained(visited.lookup(root), context);
   };
@@ -219,7 +222,8 @@ void PhysicalProgramAnalysis::analyzeReplay(
       scope == PhysicalReplayScope::ValueGraph && source && sourceDimension &&
       visited.count(definition) && !visited.lookup(definition).empty() &&
       !llvm::is_contained(visited.lookup(definition), context);
-  if (insertionAnchor && dominance && !recheckRegion &&
+  bool mayReuse = source || !isa<FragmentType, RecordType>(value.getType());
+  if (insertionAnchor && dominance && mayReuse && !recheckRegion &&
       dominance->dominates(value, insertionAnchor) &&
       !carriesRequestedTraversal) {
     SmallPtrSet<Operation *, 16> dependencyVisited;
@@ -237,7 +241,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
         return;
       }
       analyzeReplay(record.getFields()[field], source, scope, allowAccesses,
-                    insertionAnchor, sourceDimension, dominance, result,
+                    insertionAnchor, sourceDimension, dominance, bindings, result,
                     visited);
       return;
     }
@@ -277,7 +281,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     }
     for (Value related : outer)
       analyzeReplay(related, source, scope, allowAccesses, insertionAnchor,
-                    sourceDimension, dominance, result, visited);
+                    sourceDimension, dominance, bindings, result, visited);
     return;
   }
   Operation *operation = value.getDefiningOp();
@@ -368,12 +372,12 @@ void PhysicalProgramAnalysis::analyzeReplay(
     }
     for (Value operand : operation->getOperands())
       analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
-                    sourceDimension, dominance, result, visited);
+                    sourceDimension, dominance, bindings, result, visited);
     for (Region &region : operation->getRegions())
       for (Block &block : region)
         for (Value yielded : block.getTerminator()->getOperands())
           analyzeReplay(yielded, source, scope, allowAccesses, insertionAnchor,
-                        sourceDimension, dominance, result, visited);
+                        sourceDimension, dominance, bindings, result, visited);
     return;
   }
   if (!physicalValue) {
@@ -385,9 +389,19 @@ void PhysicalProgramAnalysis::analyzeReplay(
       result.state = PhysicalFactState::Unknown;
       return;
     }
+    if (isAccessNode(operation)) {
+      result.crossesAccess = true;
+      appendUnique(result.accesses, operation);
+      if (auto load = dyn_cast<LoadOp>(operation);
+          load && insertionAnchor && !canReplayReadAt(load, insertionAnchor)) {
+        appendUnique(result.blockers, operation);
+        result.state = PhysicalFactState::Unknown;
+        return;
+      }
+    }
     for (Value operand : operation->getOperands())
       analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
-                    sourceDimension, dominance, result, visited);
+                    sourceDimension, dominance, bindings, result, visited);
     return;
   }
   if (isAccessNode(operation)) {
@@ -436,7 +450,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     for (Value operand : fold.getOperands())
       if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
         analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
-                      sourceDimension, dominance, result, visited);
+                      sourceDimension, dominance, bindings, result, visited);
     return;
   } else if (auto scan = dyn_cast<RegionScanOp>(operation)) {
     result.crossesStructuredProgram = true;
@@ -466,7 +480,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
     for (Value operand : scan.getOperands())
       if (typeCarriesTraversal(operand.getType(), *source, *sourceDimension))
         analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
-                      sourceDimension, dominance, result, visited);
+                      sourceDimension, dominance, bindings, result, visited);
     return;
   } else if (!isPhysicalReplayNode(operation, scope, allowAccesses)) {
     appendUnique(result.blockers, operation);
@@ -540,7 +554,7 @@ void PhysicalProgramAnalysis::analyzeReplay(
                               : std::nullopt;
           analyzeReplay(broadcast.getValue(), sourceAxisIdentity(mapping), scope,
                         allowAccesses, insertionAnchor, inputDimension,
-                        dominance, result, visited);
+                        dominance, bindings, result, visited);
           return;
         }
       }
@@ -548,23 +562,35 @@ void PhysicalProgramAnalysis::analyzeReplay(
   }
   for (Value operand : operation->getOperands())
     analyzeReplay(operand, source, scope, allowAccesses, insertionAnchor,
-                  sourceDimension, dominance, result, visited);
+                  sourceDimension, dominance, bindings, result, visited);
 }
 
 PhysicalReplayFact PhysicalProgramAnalysis::replayability(
     Value value, std::optional<PhysicalSourceAxis> source,
     PhysicalReplayScope scope, bool allowAccesses,
-    Operation *insertionAnchor,
     std::optional<int64_t> sourceDimension) {
   PhysicalReplayFact result;
   result.state = PhysicalFactState::Exact;
   ReplayVisits visited;
-  std::optional<DominanceInfo> dominance;
-  if (insertionAnchor)
-    dominance.emplace(kernel);
-  analyzeReplay(value, source, scope, allowAccesses, insertionAnchor,
-                sourceDimension, dominance ? &*dominance : nullptr, result,
+  analyzeReplay(value, source, scope, allowAccesses, nullptr,
+                sourceDimension, nullptr, nullptr, result,
                 visited);
+  return result;
+}
+
+PhysicalReplayFact PhysicalProgramAnalysis::replayAt(
+    Value value, std::optional<PhysicalSourceAxis> source,
+    PhysicalReplayScope scope, bool allowAccesses, Operation *insertionAnchor,
+    const IRMapping &bindings, std::optional<int64_t> sourceDimension) {
+  PhysicalReplayFact result;
+  if (!insertionAnchor ||
+      insertionAnchor->getParentOfType<func::FuncOp>() != kernel)
+    return result;
+  result.state = PhysicalFactState::Exact;
+  ReplayVisits visited;
+  DominanceInfo dominance(kernel);
+  analyzeReplay(value, source, scope, allowAccesses, insertionAnchor,
+                sourceDimension, &dominance, &bindings, result, visited);
   return result;
 }
 

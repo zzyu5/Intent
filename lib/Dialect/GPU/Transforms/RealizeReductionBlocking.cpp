@@ -38,10 +38,10 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
             [&](Value source) {
               auto type = cast<FragmentType>(source.getType());
               auto mapping = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
-              return !analysis.replayability(
+              return !analysis.replayAt(
                   source, sourceAxisIdentity(mapping),
                   PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
-                  reduce, mapping.getDimensionId()).isReplayable();
+                  reduce, IRMapping{}, mapping.getDimensionId()).isReplayable();
             }))
       // Chunking cannot reduce a fully retained, non-replayable producer.
       // Keep its current SSA value for the provider-native reduction.
@@ -171,6 +171,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
           (!sameScalarValue(access.load.getFill(), identity) ||
            failed(scalarSource(access.load.getValid()))))
         hasDerivedSource = true;
+      hasDerivedSource |= !canReplayReadAt(access.load, reduce);
       sourceLoads.push_back(access.load);
       sourceRanges.push_back(access.range);
       coordinateIndices.push_back(access.coordinateIndex);
@@ -272,7 +273,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     FailureOr<Value> reducedCoordinate = materializeReplayedValue(
         builder, reduce.getLoc(),
         load.getCoordinates()[coordinateIndices[component]],
-        sourceAxisIdentity(range), blockExtent, coordinateMapping);
+        sourceAxisIdentity(range), blockExtent, coordinateMapping, reduce);
     if (failed(reducedCoordinate))
       return reduce.emitOpError(
           "could not replay translated full-coverage reduction coordinate");

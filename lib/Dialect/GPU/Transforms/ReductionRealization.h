@@ -9,6 +9,17 @@ namespace intent::gpu::reduction {
 // Private realization entry points. The public pass driver owns their order
 // and refreshes worklists after rewrites; these are not independently run passes.
 
+// Preserve unstable source snapshots before creating a new chunk traversal.
+mlir::LogicalResult prepareReductionReads(
+    llvm::ArrayRef<RootAccess> accesses, ReduceOp reduce,
+    mlir::func::FuncOp kernel);
+
+mlir::FailureOr<mlir::Value> materializeReductionRead(
+    mlir::OpBuilder &builder, mlir::Location location, RootAccess access,
+    FragmentType resultType, mlir::ValueRange coordinates,
+    mlir::Value valid, mlir::Value fill, mlir::Value traversalCoordinate,
+    ReduceOp reduce);
+
 mlir::FailureOr<bool> realizeStaticPaddingReduce(
     ReduceOp reduce, mlir::func::FuncOp kernel);
 

@@ -67,19 +67,9 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     accesses.push_back(std::move(roots));
     traversalRanges.push_back(traversal.authority);
   }
-  // Preserve reads before creating the chunk traversal. Full-coverage
-  // materialization retargets the original coordinate domain; doing it inside
-  // the loop would also retarget the freshly created chunk coordinates.
   for (const auto &component : accesses)
-    for (RootAccess access : component)
-      if (!canReplayReadAt(access.load, reduce) &&
-          !PhysicalProgramAnalysis(kernel)
-               .axisRealization(access.load.getResult(), access.fragmentAxis)
-               .physicalized &&
-          failed(realizeFullCoverageDimension(
-              kernel, access.load.getResult(), access.fragmentAxis)))
-        return reduce.emitOpError(
-            "reduction could not materialize its retained source read");
+    if (failed(prepareReductionReads(component, reduce, kernel)))
+      return failure();
   for (Type result : reduce.getResultTypes())
     if (auto fragment = dyn_cast<FragmentType>(result))
       if (llvm::any_of(fragment.getShape(), [](Attribute extent) {
@@ -374,7 +364,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               }
               return materializeReplayedValue(
                   nested, nestedLocation, value, plan.sourceIdentity,
-                  chunkExtent, mapping, accessOptions);
+                  chunkExtent, mapping, reduce, accessOptions);
             };
             if (load.getValid()) {
               FailureOr<Value> original = replayAccessValue(load.getValid());
@@ -441,7 +431,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
               coordinateOptions.fragmentAxis = coordinateAxis;
               FailureOr<Value> replayedCoordinate = cartesian
                   ? materializeReplayedValue(nested, nestedLocation, coordinate,
-                        plan.sourceIdentity, chunkExtent, mapping, coordinateOptions)
+                        plan.sourceIdentity, chunkExtent, mapping, reduce,
+                        coordinateOptions)
                   : replayAccessValue(coordinate);
               if (failed(replayedCoordinate)) {
                 bodyFailed = true;
@@ -465,23 +456,15 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 coordinate = *projected;
               }
             }
-            Value blockedLoad;
-            if (canReplayReadAt(load, reduce)) {
-              blockedLoad = nested.create<LoadOp>(
-                  nestedLocation, blockedRoot, load.getResource(), coordinates,
-                  valid, fill, load.getSourceAxes());
-            } else {
-              FailureOr<Value> retained = materializeRetainedSlice(
-                  nested, nestedLocation, load.getResult(), access.fragmentAxis,
-                  chunkExtent, coordinates[access.coordinateIndex], reduce);
-              if (failed(retained)) {
-                bodyFailed = true;
-                bodyFailure = "could not preserve the original reduction read";
-                return;
-              }
-              blockedLoad = *retained;
+            auto blockedLoad = materializeReductionRead(
+                nested, nestedLocation, access, blockedRoot, coordinates,
+                valid, fill, coordinate, reduce);
+            if (failed(blockedLoad)) {
+              bodyFailed = true;
+              bodyFailure = "could not preserve the original reduction read";
+              return;
             }
-            mapping.map(load.getResult(), blockedLoad);
+            mapping.map(load.getResult(), *blockedLoad);
             if (!sourceTail) {
               auto tail = predicateForReductionSource(
                   nested, nestedLocation, coordinateValid, blockedPredicate,
@@ -497,7 +480,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           replayOptions.fragmentAxis = plan.reductionAxis;
           FailureOr<Value> replayed = materializeReplayedValue(
               nested, nestedLocation, plan.source, plan.sourceIdentity,
-              chunkExtent, mapping, replayOptions);
+              chunkExtent, mapping, reduce, replayOptions);
           if (failed(replayed) || !sourceTail) {
             if (failed(replayed)) {
               bodyFailed = true;
