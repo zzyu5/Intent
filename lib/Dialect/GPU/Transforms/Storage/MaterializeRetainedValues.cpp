@@ -6,9 +6,10 @@
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
-#include "Intent/Dialect/GPU/Transforms/Mapping/ProgramInterface.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -29,31 +30,6 @@ bool isZero(Value value) {
 }
 
 } // namespace
-
-Value createInvocationWorkspace(func::FuncOp kernel, Location location,
-                                Type elementType, ArrayAttr shape,
-                                uint64_t owner) {
-  uint64_t instance = 1;
-  for (BlockArgument argument : kernel.getArguments()) {
-    if (auto buffer = dyn_cast<BufferType>(argument.getType()))
-      instance = std::max(instance, buffer.getInstance() + 1);
-  }
-  kernel.walk([&](BufferOp buffer) {
-    instance = std::max(instance, buffer.getResult().getType().getInstance() + 1);
-  });
-  OpBuilder builder(kernel.getContext());
-  auto type = BufferType::get(
-      kernel.getContext(), elementType, shape,
-      BufferScopeAttr::get(kernel.getContext(), BufferScope::InvocationWorkspace),
-      instance, owner,
-      BufferInitializationAttr::get(kernel.getContext(), BufferInitialization::FirstWrite),
-      /*visibility=*/1);
-  auto binding = ArgumentBindingAttr::get(kernel.getContext(),
-      nextArgumentReference(kernel), ArgumentKind::Workspace,
-      IntegerAttr{}, ArgumentRefAttr{}, IntegerAttr{}, IntegerAttr{});
-  auto argument = appendArgument(kernel, type, binding);
-  return succeeded(argument) ? Value(*argument) : Value{};
-}
 
 FailureOr<Value> materializeRetainedSlice(
     OpBuilder &builder, Location location, Value value, unsigned axis,
@@ -228,17 +204,9 @@ bool hasLaunchUniformBounds(scf::ForOp loop, func::FuncOp kernel) {
 }
 
 bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
-  if (loop->hasAttr(reductionSourcesAttr) || !hasLaunchUniformBounds(loop, kernel))
+  if (loop->hasAttr(reductionSourcesAttr) ||
+      !isProgramAllocationContext(loop, kernel))
     return false;
-  for (Operation *parent = loop->getParentOp(); parent != kernel;
-       parent = parent->getParentOp()) {
-    if (auto group = dyn_cast<ExecutionGroupOp>(parent);
-        group && isSingletonExecutionGroup(group, kernel))
-      continue;
-    auto branch = dyn_cast<scf::IfOp>(parent);
-    if (!branch || !isLaunchUniformScalar(branch.getCondition(), kernel))
-      return false;
-  }
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   for (auto [slot, initial] : llvm::enumerate(loop.getInitArgs())) {
     auto type = dyn_cast<FragmentType>(initial.getType());
@@ -292,8 +260,9 @@ bool materializeLoopState(scf::ForOp loop, func::FuncOp kernel) {
       continue;
 
     OpBuilder builder(loop);
-    Value workspace = createInvocationWorkspace(
-        kernel, loop.getLoc(), type.getElementType(), type.getShape(), type.getOwner());
+    Value workspace = createProgramBuffer(
+        builder, loop.getLoc(), type.getElementType(), type.getShape(),
+        type.getOwner()).getResult();
     Value zero = builder.create<arith::ConstantIndexOp>(loop.getLoc(), 0);
     Value one = builder.create<arith::ConstantIndexOp>(loop.getLoc(), 1);
     SmallVector<Value> coordinates;
@@ -697,8 +666,9 @@ FailureOr<bool> materializeRetainedStoreAlongAxis(StoreOp store,
   for (Value value : retained) {
     auto type = cast<FragmentType>(value.getType());
     workspaces.push_back(direct ? store.getResource() :
-        createInvocationWorkspace(kernel, store.getLoc(),
-            type.getElementType(), builder.getArrayAttr(shape), type.getOwner()));
+        createInvocationBuffer(kernel, store.getLoc(),
+            type.getElementType(), builder.getArrayAttr(shape),
+            type.getOwner()).getResult());
   }
   Value workspace = workspaces.front();
   auto workspaceBuffer = dyn_cast<BufferType>(workspace.getType());
@@ -1018,9 +988,9 @@ FailureOr<bool> materializeRetainedGather(GatherOp gather, func::FuncOp kernel) 
     if (chunkExtent == full)
       return false;
   }
-  Value workspace = createInvocationWorkspace(
+  Value workspace = createInvocationBuffer(
       kernel, gather.getLoc(), payload.getElementType(),
-      builder.getArrayAttr(shape), payload.getOwner());
+      builder.getArrayAttr(shape), payload.getOwner()).getResult();
   if (!readerChunk) {
     auto instance = cast<BufferType>(workspace.getType()).getInstance();
     auto parameter = getOrCreatePhysicalParameter(kernel,
@@ -1152,13 +1122,6 @@ static LogicalResult materializeRetainedValuesImpl(ModuleOp module) {
     }
     if (changed)
       continue;
-    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-    if (!llvm::all_of(space, [](Attribute attribute) {
-          auto extent = cast<PhysicalExprAttr>(attribute);
-          return extent.getKind() == PhysicalExprKind::Constant &&
-                 extent.getValue() == 1;
-        }))
-      return success();
     SmallVector<scf::ForOp> loops;
     kernel.walk([&](scf::ForOp loop) { loops.push_back(loop); });
     for (scf::ForOp loop : loops)
@@ -1168,6 +1131,13 @@ static LogicalResult materializeRetainedValuesImpl(ModuleOp module) {
       }
     if (changed)
       continue;
+    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+    if (!llvm::all_of(space, [](Attribute attribute) {
+          auto extent = cast<PhysicalExprAttr>(attribute);
+          return extent.getKind() == PhysicalExprKind::Constant &&
+                 extent.getValue() == 1;
+        }))
+      return success();
     SmallVector<StoreOp> stores;
     kernel.walk([&](StoreOp store) { stores.push_back(store); });
     for (StoreOp store : stores) {

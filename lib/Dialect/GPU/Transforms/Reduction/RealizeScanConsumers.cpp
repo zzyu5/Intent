@@ -7,6 +7,7 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Predication.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -144,7 +145,13 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
           if (!store)
             return true;
           auto buffer = dyn_cast<BufferType>(store.getResource().getType());
-          return buffer && buffer.getScope().getValue() == BufferScope::InvocationWorkspace;
+          if (!buffer)
+            return false;
+          auto scope = buffer.getScope().getValue();
+          return scope == BufferScope::InvocationWorkspace ||
+                 ((scope == BufferScope::ProgramPrivate ||
+                   scope == BufferScope::IterationPrivate) &&
+                  store.getResource().getDefiningOp<BufferOp>());
         });
     if (!matched && !privateWrites)
       return std::nullopt;
@@ -373,18 +380,10 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
 FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
                                        PhysicalProgramAnalysis &analysis) {
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
-  auto group = dyn_cast<ExecutionGroupOp>(scan->getParentOp());
   if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
       scan.getCaptures().size() || scan.getAxis() != 0 || scan.getReverse() ||
-      !group || group->getBlock() != &kernel.front() ||
+      !isProgramAllocationContext(scan, kernel) ||
       !type || type.getShape().size() != 1)
-    return false;
-  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-  if (!llvm::all_of(space, [](Attribute attribute) {
-        auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() == PhysicalExprKind::Constant &&
-               extent.getValue() == 1;
-      }))
     return false;
   SmallVector<GatherOp> readers;
   SmallVector<StoreOp> stores;
@@ -451,9 +450,9 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   }
 
   OpBuilder builder(scan);
-  Value workspace = createInvocationWorkspace(
-      kernel, scan.getLoc(), type.getElementType(),
-      builder.getArrayAttr({stop}), type.getOwner());
+  Value workspace = createProgramBuffer(
+      builder, scan.getLoc(), type.getElementType(),
+      builder.getArrayAttr({stop}), type.getOwner()).getResult();
   builder.setInsertionPointAfter(scan);
   Value zero = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 0);
   Value one = builder.create<arith::ConstantIndexOp>(scan.getLoc(), 1);

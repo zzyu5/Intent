@@ -1,22 +1,13 @@
 #include "Gathers.h"
-#include "Intent/Target/Triton/Analysis/Configuration.h"
-#include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
-#include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
-#include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/IRMapping.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/MapVector.h"
-#include <algorithm>
 #include <limits>
-#include <optional>
 
 
 using namespace mlir;
@@ -24,32 +15,11 @@ using namespace mlir;
 namespace intent::triton::detail {
 
 LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
-  auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
-  if (!space || space.size() != 1)
-    return success();
-  auto configurations = gpu::ParameterSpace::read(kernel);
-  if (failed(configurations)) return failure();
-  auto tuples = configurations->configurations(gpu::ConfigurationStage::Shared);
-  if (failed(tuples)) return failure();
-  int64_t maximumPrograms = 0;
-  for (DictionaryAttr tuple : *tuples) {
-    NamedAttrList bindings;
-    Builder attributes(kernel.getContext());
-    for (gpu::ParameterAttr schema : configurations->extentDeclarations()) {
-      if (schema.getCandidates().size() == 1)
-        bindings.set(schema.getName(), attributes.getI64IntegerAttr(schema.getCandidates()[0]));
-    }
-    for (NamedAttribute entry : tuple)
-      bindings.set(entry.getName(), entry.getValue());
-    auto count = evaluateCompileTimeExpression(
-        cast<gpu::PhysicalExprAttr>(space[0]), bindings.getDictionary(kernel.getContext()));
-    if (!count || *count <= 0)
-      return success();
-    maximumPrograms = std::max(maximumPrograms, *count);
-  }
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   llvm::MapVector<Value, SmallVector<gpu::GatherOp>> readers;
   kernel.walk([&](gpu::GatherOp gather) {
+    if (!gpu::isProgramAllocationContext(gather, kernel))
+      return;
     auto source = dyn_cast<gpu::FragmentType>(gather.getSource().getType());
     auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
     if (!source || gather.getCoordinates().empty() ||
@@ -106,43 +76,20 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
   });
   if (readers.empty())
     return success();
-  OpBuilder entry(&kernel.front(), kernel.front().begin());
-  gpu::ProgramIdOp programId;
-  kernel.walk([&](gpu::ProgramIdOp operation) {
-    if (operation.getAxis() == 0)
-      programId = operation;
-  });
-  if (programId) {
-    if (programId->getBlock() != &kernel.front() ||
-        programId.getOperation() != &kernel.front().front())
-      programId->moveBefore(&kernel.front(), kernel.front().begin());
-  } else {
-    programId = entry.create<gpu::ProgramIdOp>(kernel.getLoc(), entry.getIndexType(), 0);
-  }
-  Value program = programId.getResult();
-  entry.setInsertionPointAfter(programId);
-  auto prefix = gpu::PhysicalExprAttr::get(kernel.getContext(),
-      gpu::PhysicalExprKind::Constant, maximumPrograms,
-      entry.getStringAttr(""), entry.getArrayAttr({}));
   for (auto &readerGroup : readers) {
     auto &gathers = readerGroup.second;
     Value source = gathers.front().getSource();
     auto payload = cast<gpu::FragmentType>(source.getType());
-    SmallVector<Attribute> shape{prefix};
-    llvm::append_range(shape, payload.getShape());
-    Value workspace = gpu::createInvocationWorkspace(
-        kernel, source.getLoc(), payload.getElementType(),
-        entry.getArrayAttr(shape), payload.getOwner());
-    // The maximum is evaluated over every shared tuple; the private prefix
-    // remains valid while Triton chooses its local configuration.
-    entry.create<gpu::AssumeInBoundsOp>(source.getLoc(), program, workspace, 0);
     OpBuilder builder(kernel.getContext());
     if (Operation *definition = source.getDefiningOp())
       builder.setInsertionPointAfter(definition);
     else
       builder.setInsertionPointToStart(cast<BlockArgument>(source).getOwner());
-    SmallVector<Value> coordinates{program};
-    SmallVector<int64_t> sourceAxes{0};
+    Value storage = gpu::createProgramBuffer(
+        builder, source.getLoc(), payload.getElementType(), payload.getShape(),
+        payload.getOwner()).getResult();
+    SmallVector<Value> coordinates;
+    SmallVector<int64_t> sourceAxes;
     SmallVector<Value> ordinals;
     for (auto [axis, attribute] : llvm::enumerate(payload.getShape())) {
       auto mapping = cast<gpu::AxisMapAttr>(payload.getAxisMaps()[axis]);
@@ -161,9 +108,9 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
           mapping.getDerived());
       ordinals.push_back(ordinal);
       coordinates.push_back(ordinal);
-      sourceAxes.push_back(axis + 1);
+      sourceAxes.push_back(axis);
     }
-    builder.create<gpu::StoreOp>(source.getLoc(), workspace, coordinates, source,
+    builder.create<gpu::StoreOp>(source.getLoc(), storage, coordinates, source,
                                  Value(), sourceAxes);
     for (gpu::GatherOp gather : gathers) {
       builder.setInsertionPoint(gather);
@@ -172,7 +119,7 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
       for (auto [coordinate, axis] :
            llvm::zip(gather.getCoordinates(), gather.getSourceAxes()))
         selected[axis] = coordinate;
-      SmallVector<Value> access{program};
+      SmallVector<Value> access;
       for (unsigned axis = 0; axis < payload.getShape().size(); ++axis) {
         Value coordinate = selected[axis] ? selected[axis] : ordinals[axis];
         if (result) {
@@ -184,7 +131,7 @@ LogicalResult materializeOversizedGathers(func::FuncOp kernel) {
         }
         access.push_back(coordinate);
       }
-      auto load = builder.create<gpu::LoadOp>(gather.getLoc(), gather.getResult().getType(), workspace,
+      auto load = builder.create<gpu::LoadOp>(gather.getLoc(), gather.getResult().getType(), storage,
           access, gather.getValid(), gather.getFill(), sourceAxes);
       if (Attribute origin = gather->getAttr(gpu::originAttr))
         load->setAttr(gpu::originAttr, origin);

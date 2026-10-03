@@ -202,9 +202,13 @@ LogicalResult AtomicCompareExchangeOp::verify() {
 
 LogicalResult BufferOp::verify() {
   auto type = getResult().getType();
-  if (type.isInvocationWorkspace())
-    return emitOpError(
-        "invocation workspace must be an explicit hidden ABI resource");
+  if (type.isInvocationWorkspace()) {
+    auto kernel = getOperation()->getParentOfType<func::FuncOp>();
+    if (!kernel || getOperation()->getBlock() != &kernel.front())
+      return emitOpError("invocation allocation must belong to the kernel entry block");
+    if (type.getInitialization().getValue() != BufferInitialization::FirstWrite)
+      return emitOpError("invocation allocation requires explicit first writes");
+  }
   if ((type.getInitialization().getValue() ==
        BufferInitialization::FullValue) !=
       static_cast<bool>(getInitialValue()))

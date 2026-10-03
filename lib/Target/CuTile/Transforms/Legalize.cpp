@@ -9,6 +9,7 @@
 #include "Program.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
@@ -27,8 +28,10 @@ LogicalResult prepareProgram(ModuleOp module) {
   if (failed(gpu::contraction::normalizeMatrixContractShapes(*kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
-  if (failed(gpu::materializeProgramBuffers(module)) ||
-      failed(gpu::lowerInvocationWorkspaces(module)))
+  auto profiles = gpu::TuningProfiles::from(module);
+  if (failed(profiles) ||
+      failed(prepareLaunchConfigurations(*kernel, *profiles)) ||
+      failed(gpu::lowerWorkspaceAllocations(module)))
     return failure();
   gpu::foldExactConstantDivisions(*kernel);
   return gpu::verifyGPUProgram(module);

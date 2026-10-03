@@ -1,6 +1,7 @@
 #include "AccessRelations.h"
 #include "IndexBounds.h"
 #include "ScalarExpressions.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
@@ -15,39 +16,6 @@ namespace intent::gpu {
 using namespace detail;
 
 namespace {
-
-bool expressionAtMost(PhysicalExprAttr lhs, PhysicalExprAttr rhs,
-                      unsigned depth = 0) {
-  if (!lhs || !rhs || depth >= 32)
-    return false;
-  if (lhs == rhs)
-    return true;
-  auto left = constantPhysicalExpression(lhs);
-  auto right = constantPhysicalExpression(rhs);
-  if (left && right)
-    return *left <= *right;
-  if (lhs.getOperands().size() == 2) {
-    auto first = cast<PhysicalExprAttr>(lhs.getOperands()[0]);
-    auto second = cast<PhysicalExprAttr>(lhs.getOperands()[1]);
-    if (lhs.getKind() == PhysicalExprKind::Minimum)
-      return expressionAtMost(first, rhs, depth + 1) ||
-             expressionAtMost(second, rhs, depth + 1);
-    if (lhs.getKind() == PhysicalExprKind::Maximum)
-      return expressionAtMost(first, rhs, depth + 1) &&
-             expressionAtMost(second, rhs, depth + 1);
-  }
-  if (rhs.getOperands().size() == 2) {
-    auto first = cast<PhysicalExprAttr>(rhs.getOperands()[0]);
-    auto second = cast<PhysicalExprAttr>(rhs.getOperands()[1]);
-    if (rhs.getKind() == PhysicalExprKind::Maximum)
-      return expressionAtMost(lhs, first, depth + 1) ||
-             expressionAtMost(lhs, second, depth + 1);
-    if (rhs.getKind() == PhysicalExprKind::Minimum)
-      return expressionAtMost(lhs, first, depth + 1) &&
-             expressionAtMost(lhs, second, depth + 1);
-  }
-  return false;
-}
 
 bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
   auto leftType = dyn_cast<FragmentType>(lhs.getType());
@@ -377,16 +345,18 @@ bool upperBoundWithinResource(Value value, Value resource, unsigned axis) {
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
   if (!extent)
     return false;
-  if (provenBound && expressionAtMost(provenBound, extent))
+  func::FuncOp kernel = resource.getParentRegion()
+                            ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
+                            : func::FuncOp();
+  PhysicalExprAttr exact = queryLaunchExpression(stripScalarIdentity(value));
+  if ((exact && configurationExpressionAtMost(kernel, exact, extent)) ||
+      (provenBound && configurationExpressionAtMost(kernel, provenBound, extent)))
     return true;
   auto kind = extent.getKind();
   if (kind == PhysicalExprKind::Constant)
     return bound && *bound >= 0 && *bound <= extent.getValue();
   if (kind != PhysicalExprKind::Parameter)
     return false;
-  func::FuncOp kernel = resource.getParentRegion()
-                            ? resource.getParentRegion()->getParentOfType<func::FuncOp>()
-                            : func::FuncOp();
   FailureOr<ParameterAttr> parameter =
       kernel ? queryParameterBySymbol(kernel, extent.getParameterReference().getName())
              : FailureOr<ParameterAttr>(failure());
@@ -547,7 +517,7 @@ bool coordinateRangeWithinResource(Value coordinate, Value resource,
       !coordinateKnownNonNegative(coordinate))
     return false;
   if (integerConstant(range.getStart()) == 0 &&
-      matchesResourceExtent(range.getExtent(), resource, axis))
+      upperBoundWithinResource(range.getExtent(), resource, axis))
     return true;
   if (Value limit = queryCompleteTileLimit(range);
       limit && upperBoundWithinResource(limit, resource, axis))

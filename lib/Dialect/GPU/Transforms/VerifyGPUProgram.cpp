@@ -8,6 +8,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
@@ -49,12 +50,15 @@ void collectTypeExpressions(Type type,
 }
 
 bool hasObservableEffect(Operation *operation) {
-  if (auto store = dyn_cast<StoreOp>(operation))
-    if (auto buffer = dyn_cast<BufferType>(store.getResource().getType());
-        buffer && buffer.isInvocationWorkspace() && !store->hasAttr(originAttr))
-      return false;
   auto access = dyn_cast<AccessOpInterface>(operation);
-  return access && access.writesMemory();
+  if (!access || !access.writesMemory()) return false;
+  Value resource = access.getAccessResource();
+  // Compiler-created scratch writes are not additional author effects. An
+  // author's buffer write still carries its origin and participates in coverage.
+  if (!operation->hasAttr(originAttr) &&
+      (isa<BufferType>(resource.getType()) || isInvocationWorkspace(resource)))
+    return false;
+  return true;
 }
 
 bool mutuallyExclusiveEffects(Operation *lhs, Operation *rhs) {
@@ -114,6 +118,18 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
     }
     return success();
   };
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  bool singleton = llvm::all_of(space, [](Attribute extent) {
+    return constantPhysicalExpression(cast<PhysicalExprAttr>(extent)) == 1;
+  });
+  auto verifyResource = [&](Value resource, Operation *owner) -> LogicalResult {
+    if (failed(verifyUses(resource))) return failure();
+    if (isInvocationWorkspace(resource) && !singleton &&
+        !analysis.hasDisjointWorkspaceSlices(resource))
+      return owner->emitOpError(
+          "invocation workspace has no proven disjoint program slices");
+    return success();
+  };
   llvm::DenseSet<uint64_t> instances;
   LogicalResult result = success();
   kernel.walk([&](BufferOp buffer) {
@@ -125,12 +141,7 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
       result = failure();
       return WalkResult::interrupt();
     }
-    if (type.isInvocationWorkspace()) {
-      buffer.emitOpError("invocation workspace must be a kernel argument");
-      result = failure();
-      return WalkResult::interrupt();
-    }
-    if (failed(verifyUses(buffer.getResult()))) {
+    if (failed(verifyResource(buffer.getResult(), buffer))) {
       result = failure();
       return WalkResult::interrupt();
     }
@@ -138,28 +149,11 @@ LogicalResult verifyBufferResources(func::FuncOp kernel,
   });
   if (failed(result))
     return failure();
-  for (BlockArgument argument : kernel.getArguments()) {
-    auto buffer = dyn_cast<BufferType>(argument.getType());
-    if (!buffer)
-      continue;
-    if (!buffer.isInvocationWorkspace() ||
-        buffer.getInitialization().getValue() != BufferInitialization::FirstWrite ||
-        !instances.insert(buffer.getInstance()).second)
-      return kernel.emitError(
-          "workspace requires a unique invocation allocation and explicit first writes");
-    auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-    if (!llvm::all_of(space, [](Attribute extent) {
-          auto expression = cast<PhysicalExprAttr>(extent);
-          return expression.getKind() ==
-                     PhysicalExprKind::Constant &&
-                 expression.getValue() == 1;
-        }) && !analysis.hasDisjointWorkspaceSlices(argument))
-      return kernel.emitError(
-          "workspace accesses have no proven disjoint program slices");
-    if (failed(verifyUses(argument)))
+  for (BlockArgument argument : kernel.getArguments())
+    if (isInvocationWorkspace(argument) &&
+        failed(verifyResource(argument, kernel)))
       return failure();
-  }
-  return result;
+  return success();
 }
 
 } // namespace

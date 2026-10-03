@@ -233,7 +233,7 @@ Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14
 | 公共 scalar/view 合同及 metadata | [Intent/IR/Interface](include/Intent/Dialect/Intent/IR/Interface.h)：构造、验证和 `serializePublicInterface` |
 | GPU 参数身份、metadata producer 与公共参数对应关系 | [GPU/IR/ProgramInterface](include/Intent/Dialect/GPU/IR/ProgramInterface.h)：typed binding、轻量查询和 intrinsic verifier |
 | 一次 GPU analysis 中的参数查询 | [GPU/Analysis/ProgramInterface](include/Intent/Dialect/GPU/Analysis/ProgramInterface.h)：读取当前 signature；改动后重建 snapshot |
-| 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/Mapping/ProgramInterface.h)：同步维护 function type 与参数属性 |
+| GPU allocation 转为 workspace ABI | [GPU/Transforms/Storage/Workspace](include/Intent/Dialect/GPU/Transforms/Storage/Workspace.h)：唯一终端 lowering；通过 [ProgramInterface](include/Intent/Dialect/GPU/Transforms/Mapping/ProgramInterface.h) 同步维护 function type、参数属性与 stride slots |
 | CPU/DSA 的外部原生参数槽 | [Serialization/NativeABI](include/Intent/Serialization/NativeABI.h)：从最终 physical entry 展开参数，供源码签名和 metadata 共用 |
 | Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析、shape/stride 关系及 `BindingRelations` 的自动输出构造资格；不观察或缓存实际 tensor |
 | 公共实参绑定 | [runtime/invocation.py](python/intent/runtime/invocation.py)：按同一声明生成 allocating/explicit binders，统一 shape/stride、Out 分配与作者 alias 检查 |
@@ -252,6 +252,9 @@ Intrinsic verifier 拒绝依赖环、缺失 producer 和 allocation 对尚未选
 参数的依赖；canonical Dimension 的 owner 必须是公共 view。Coverage bound 保留
 不依赖 physical parameter 的已有边界。Python 在加载接口时从相同声明计算一次执行
 顺序，调用时读取本次实参；不输出另一张有独立语义的计划表。
+最终 Workspace binding 只绑定完整的 `ViewType`；变换中的 `BufferOp` 不提前成为
+函数参数。合法 Deferred coverage 已由 host 确定，可参与 allocation shape，不能用
+它的 coverage bound 代替实际选出的容量，也不能把未选择的 Shared/Provider 参数交给分配器。
 
 Pass 查询 `getArgumentBinding`、`queryArgumentExpression`、`getPublicView` 等入口，
 不要扫描 generated names 或把槽位再存回 view type。新的参数通过 mutation owner
@@ -863,7 +866,40 @@ GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`
 | value projection、replay、validity 与显式常量 | [Transforms/Value/ValueMaterialization.h](include/Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h) | replay 必须给出原语义位置和已绑定 SSA frontier；生成位置由 builder 表达，不能用空 anchor 跳过读取证明 |
 | 改写后的 value/access/aggregate 关系闭合 | [Transforms/Value/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/Value/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
-| predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Control/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
+| predication 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Control/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage/Storage.h) | 保持 effects、坐标、读取快照与 lifetime；不由 provider 字符串猜测 |
+| allocation 声明与终端 workspace lowering | [Transforms/Storage/Workspace.h](include/Intent/Dialect/GPU/Transforms/Storage/Workspace.h) | `createProgramBuffer` / `createInvocationBuffer` 形成当前 IR 资源；`lowerWorkspaceAllocations` 唯一地形成 host ABI |
+| workspace 分配容量 | [Analysis/Workspace.h](include/Intent/Dialect/GPU/Analysis/Workspace.h) | `workspaceAllocationShape` 按完整 Shared rows 替换参数，再形成逐轴矩形包络；只读查询不分配资源或选择候选 |
+
+GPU 的作者 buffer、retained value 和 provider gather scratch 都先成为显式 `BufferOp`，
+scope、初始化、实际读写与 lifetime 留在当前程序。Program/iteration-private allocation
+保持词法访问顺序；invocation allocation 放在 kernel entry，并在多 program 时证明访问
+切片互不冲突。Provider 只声明所需存储及访问，不自行追加 workspace ABI 或计算一套
+host allocation shape。
+
+[LowerWorkspace.cpp](lib/Dialect/GPU/Transforms/Storage/LowerWorkspace.cpp) 在参数绑定
+稳定后统一消费这些 allocation。私有资源以实际 `ProgramId` 作为地址前缀，形成互不
+重叠的 workspace slices；invocation 资源保留原坐标。终端产生实际分配形状的 `ViewType`
+和 stride 参数，原 Buffer 的 `Dim` 仍读取当前候选 extent。较大的分配容量不改变逻辑
+coverage、初始化位置或访问的 validity；atomic 的 physical sharing 随 backing resource
+更新，原 memory order 保留。纯或 isolated helper 不能隐式捕获新 ABI 参数。
+
+分配包络先将每个完整 Shared tuple 代入原表达式，再对同一结果轴取 `Maximum`，
+不能先对各参数 domain 独立取最大值再组合。它是同 rank 的矩形容量，可能大于任一
+单独候选的体积，不是新增候选或 winner。ABI leaves 与有正式 coverage binding 的
+Deferred 参数保留，由现有 host 依赖顺序求值；缺失候选、未选 Provider 参数和非法
+具体算术在此边界诊断。
+表达式替换由 [ConfigurationExpressions.h](include/Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h)
+的 `instantiateConfigurationExpression` 统一完成。Workspace 包络和访问上界证明
+消费同一 checked 算术；`configurationExpressionAtMost` 按当前完整配置行分别比较，
+保留同一行的参数相关性和 ABI leaves。它不以参数独立最大值替代组合关系；缺行或
+无法证明时返回未知，Shared 阶段尚可能被 provider 扩展的 resident 初值不参与有限界证明。
+
+职责对照：本地 Triton `include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:571–587`
+以 `GlobalScratchAllocOp` 声明每 program 的存储需求；
+`lib/Conversion/TritonGPUToLLVM/GlobalScratchMemoryAllocation.cpp:74–104,118–143`
+统一分配 offset 并发布总 size/alignment；`third_party/nvidia/backend/driver.py:304–319`
+按 metadata、实际 grid 与 CTA 数调用 allocator。Intent 的 Shared tuple 包络服务于
+候选选择前的 invocation 分配，具体候选的执行结构仍在 IR 中。
 
 GPU 算术、cast、select 与纯 shape projection 的范围传递由 [IR/IntegerRanges.cpp](lib/Dialect/GPU/IR/IntegerRanges.cpp) 注册标准 `InferIntRangeInterface` external models，再调用共同的 `inferInteger*` 原语。新增运算在所属 operation 的接口模型中接线；[Analysis/IntegerRanges.cpp](lib/Dialect/GPU/Analysis/IntegerRanges.cpp) 只提供 GPU 固有事实，`IndexBounds` 保留坐标和控制关系证明，不再维护另一份算术范围计算。
 
@@ -1498,7 +1534,8 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 | Triton | [Collective/](lib/Target/Triton/Transforms/Collective/) | 原生 reduce/scan callback 与 scan tail，各自保留完整物化过程 |
 | Triton | [Supply.cpp](lib/Target/Triton/Transforms/Supply/Supply.cpp) | ordered access dependencies、CTA 同步与 load-loop policy |
 | Triton | [Values.cpp](lib/Target/Triton/Transforms/Value/Values.cpp) | 形成 contract/value 表示；只读 contraction 约束位于 [Analysis/Contractions.h](include/Intent/Target/Triton/Analysis/Contractions.h) |
-| cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeRewrite.h](lib/Target/CuTile/Transforms/NativeRewrite.h) | 收集本次输入、声明 provider 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
+| cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeRewrite.h](lib/Target/CuTile/Transforms/NativeRewrite.h) | 收集本次输入、按实际访问声明 access/load 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
+| cuTile | [Configuration/Configurations.cpp](lib/Target/CuTile/Transforms/Configuration/Configurations.cpp) | 在 workspace lowering 前声明 launch 参数并稳定 resident bindings；同一 launch tuple 枚举服务准备和最终候选形成 |
 | cuTile | [Access/TilePlan.cpp](lib/Target/CuTile/Transforms/Access/TilePlan.cpp)、同组 `Bounds` / `Coordinates` | 只读 tile 资格、对齐与坐标分解 |
 | cuTile | [Access/Accesses.cpp](lib/Target/CuTile/Transforms/Access/Accesses.cpp) 与 `Loads` / `Extraction` / `Atomics` / `Stores` | 按原次序构造各类访问；`TileIndices` 形成真实坐标与 guard，`AccessFormSelection` 共用一次变换的配置物化状态 |
 | cuTile | [CollapseArrayViews.cpp](lib/Target/CuTile/Transforms/Access/CollapseArrayViews.cpp) | 从已有原生 tile load 形成具有真实 collapsed layout 的条件视图，保留原访问语义 |
@@ -1507,7 +1544,7 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 | Triton / cuTile | 各自的 [Triton Program.h](include/Intent/Target/Triton/Analysis/Program.h)、[cuTile Program.h](include/Intent/Target/CuTile/Analysis/Program.h) | 验证当前 provider IR 的类型、形式、候选与资源要求；由调用者传入同一终端 operation registry |
 | Triton / cuTile | 各自的 [Triton Numerical.h](include/Intent/Target/Triton/Serialization/Numerical.h)、[cuTile Numerical.h](include/Intent/Target/CuTile/Serialization/Numerical.h) | 同一 typed translation 负责数值合法性、源码表达式和所需依赖，保留 SDK 各自的转换与数学接口 |
 
-这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与其携带的 resolved profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 提交替换后才进入后续循环与配置变换。
+这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与其携带的 resolved profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 在 prepare 中稳定 allocation 所需的 launch/resident 绑定，native replacements 提交后再完成循环与完整候选验证。
 
 最终 pass 和 serializer 都调用同一个只读 program verifier，验证当前 IR 与终端
 operation registry，不把 `legalized` 标记当作验证证书。Analysis 只依赖 IR 与分析库；
@@ -1554,7 +1591,7 @@ array、bounds 与 eligibility，[cuTile contract](python/intent/runtime/cutile/
 这与 cuTile SDK 的 `_ir/type.py:524–572` 中 `ArrayTy` 用实际 shape、strides 和 index dtype 描述数组一致；
 无需从已改变 rank 的访问反推一份原始参数轴表。
 
-对齐推断中的参数域必须是当前证明可依赖的域。`ResidentWorkers` 会由 provider 配置重绑定，公共关系查询不把它的临时候选当作常量或整除事实；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
+对齐推断中的参数域必须是当前证明可依赖的域。Provider preparation 之前的 `ResidentWorkers` 初值不是最终配置事实，公共关系查询不能据此证明常量或整除；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
 
 Triton/cuTile 的 `Transforms/Configuration/Configurations.cpp` 负责候选选择与写回；各自的
 `Analysis/Configuration.cpp` 收集和验证当前 IR 的目标约束。共同归约资源查询及要求
@@ -1562,6 +1599,11 @@ Triton/cuTile 的 `Transforms/Configuration/Configurations.cpp` 负责候选选�
 筛选仍在 Transforms。Triton 的 tensor/descriptor/collective 约束与 cuTile 的
 resident-capacity 关系由同一查询同时服务变换和终端验证。新增设备约束进入对应
 只读模块，不复制参数解析器或下层的布局、MMA、资源分配器。
+cuTile 的 `prepareLaunchConfigurations` 使用唯一的相关 launch tuple 枚举，根据
+CTA/occupancy 得到所有最终 resident 值，并将其投影回既有 Shared 行；Provider
+bindings 不写进 Shared 行。Workspace 随后才求包络。最终 complete candidates 复用
+同一 launch 枚举和原 memory-form 相关性，通过 resident 等式及其它 requirements
+筛选，不再改写 resident domain 或扩大此前分配容量所依赖的参数取值。
 
 矩阵 primitive 需要的二维物理投影由现有
 [ContractionProjection.cpp](lib/Dialect/GPU/Transforms/Contraction/ContractionProjection.cpp) 依据
@@ -1586,9 +1628,10 @@ Pointwise blocking、retained gather 和 reduction blocking 共用
 `minimumFragmentRegisterFootprint`，统一 dtype word 数、当前参数域最小值和饱和乘积。
 调用方明确选择当前 physical shape，或包含 construction scalar seed 的完整逻辑容量，
 再按自身策略判断预算；不能把任意非单调表达式的各叶最小值当作表达式下界。
-Retained loop/store 的作用域检查共用 `isSingletonExecutionGroup`，从当前 program
-space、segment 与实际 extents 证明单 program；不因中间多了 execution-group owner
-就漏掉已有变换，也不把多 program 的私有状态提升为共享 workspace。
+Retained loop/scan 和 provider program scratch 通过 `isProgramAllocationContext`
+检查可声明私有 allocation 的控制作用域，终端再形成 program-private slices。
+需要单 program 的 retained-store 路径继续用 `isSingletonExecutionGroup` 检查当前
+space、segment 与 extents；作用域扩展不能把私有状态变成未经证明的 invocation 共享状态。
 
 BANG C 的 [Storage.cpp](lib/Target/BangC/Transforms/Storage.cpp) 分开只读 `measureStorage` 和最终 `bindStorage`。前者可供局部复用与供数变换比较资源需求，后者才写入目标偏移；别名与 effects 复用共同 BufferStorageAnalysis，DSA 的 [Storage](include/Intent/Dialect/DSA/Analysis/Storage.h) 与 [PhysicalProgram](include/Intent/Dialect/DSA/Analysis/PhysicalProgram.h) 负责异步使用完成和局部存储区间。操作的完成要求统一定义在 [MemoryEffects.h](include/Intent/Dialect/DSA/IR/MemoryEffects.h)：StageTile 等异步操作不能在提交时就结束其 buffer 存活期，缺少可证明完成点时不做破坏性复用。新增目标实现需要的 workspace 在目标变换中形成显式 operand，最终由目标 verifier 检查，不能在资源查询或 serializer 中补写。
 

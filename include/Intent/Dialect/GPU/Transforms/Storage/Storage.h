@@ -7,10 +7,6 @@
 
 namespace intent::gpu {
 
-mlir::Value createInvocationWorkspace(mlir::func::FuncOp kernel,
-                                      mlir::Location location,
-                                      mlir::Type elementType,
-                                      mlir::ArrayAttr shape, uint64_t owner);
 mlir::FailureOr<mlir::Value> materializeRetainedSlice(
     mlir::OpBuilder &builder, mlir::Location location, mlir::Value value,
     unsigned axis, PhysicalExprAttr blockedExtent, mlir::Value coordinates,

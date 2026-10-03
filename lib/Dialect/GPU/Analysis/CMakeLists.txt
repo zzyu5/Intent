@@ -1,4 +1,6 @@
 add_mlir_library(MLIRIntentGPUAnalysis
+  Workspace.cpp
+  ConfigurationExpressions.cpp
   PhysicalProgram.cpp
   ScalarExpressions.cpp
   IndexBounds.cpp

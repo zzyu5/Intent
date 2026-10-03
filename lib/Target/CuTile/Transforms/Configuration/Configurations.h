@@ -11,6 +11,8 @@ mlir::FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
     mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles,
     llvm::StringRef family, llvm::StringRef name, gpu::ParameterRole role,
     bool (*isLegal)(int64_t));
+mlir::LogicalResult prepareLaunchConfigurations(
+    mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles);
 mlir::LogicalResult materializeClosedConfigs(mlir::func::FuncOp kernel);
 mlir::LogicalResult finalizeConfigurationRequirements(mlir::func::FuncOp kernel);
 } // namespace intent::cutile

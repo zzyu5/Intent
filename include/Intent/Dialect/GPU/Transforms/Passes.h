@@ -24,8 +24,6 @@ mlir::LogicalResult vectorizeBufferLoops(mlir::ModuleOp module);
 mlir::LogicalResult promoteBufferValues(mlir::ModuleOp module);
 mlir::LogicalResult schedulePrivateStores(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
-mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);
-mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);
 mlir::LogicalResult orientLoopContractions(mlir::ModuleOp module);
 mlir::LogicalResult realizeVectorContractions(mlir::ModuleOp module);
 mlir::LogicalResult normalizeContractionSources(mlir::ModuleOp module);

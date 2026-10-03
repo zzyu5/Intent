@@ -37,8 +37,7 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
   bool requiresSingleCTA = false;
   for (BlockArgument argument : kernel.getArguments()) {
     auto binding = gpu::getArgumentBinding(argument);
-    requiresSingleCTA |= isa<gpu::BufferType>(argument.getType()) ||
-                         (binding && binding.getKind() == gpu::ArgumentKind::Workspace);
+    requiresSingleCTA |= binding && binding.getKind() == gpu::ArgumentKind::Workspace;
   }
   kernel.walk([&](CtaBarrierOp) { requiresSingleCTA = true; });
   gpu::ParameterAttr stageDeclaration;

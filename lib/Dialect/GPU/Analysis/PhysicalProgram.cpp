@@ -1,6 +1,7 @@
 #include "PhysicalProgramDetail.h"
 #include "ScalarExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -246,23 +247,31 @@ bool PhysicalProgramAnalysis::isProgramOwnedRange(MakeRangeOp range) const {
 }
 
 bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
-  auto type = dyn_cast<BufferType>(buffer.getType());
-  if (!type)
+  ArrayAttr shape;
+  if (auto type = dyn_cast<BufferType>(buffer.getType()))
+    shape = type.getShape();
+  else if (auto view = dyn_cast<ViewType>(buffer.getType());
+           view && isInvocationWorkspace(buffer))
+    shape = view.getLayout().getExtents();
+  else
     return false;
   SmallVector<AccessOpInterface> accesses;
-  for (Operation *user : buffer.getUsers()) {
+  for (OpOperand &use : buffer.getUses()) {
+    Operation *user = use.getOwner();
     if (isa<DimOp, AssumeInBoundsOp>(user))
       continue;
     auto access = dyn_cast<AccessOpInterface>(user);
-    if (!access || (access.getAccessKind() != AccessKind::Load &&
-                    access.getAccessKind() != AccessKind::Store))
+    if (!access || !access.isMemoryAccess() ||
+        &use != &access.getAccessResourceOperand())
       return false;
     accesses.push_back(access);
   }
+  if (accesses.empty())
+    return true;
   auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
   // Every access must identify the whole program, including all grid axes.
   bool programPrefix = space && !space.empty() &&
-                       type.getShape().size() >= space.size();
+                       shape.size() >= space.size();
   for (AccessOpInterface access : accesses) {
     if (!programPrefix)
       break;
@@ -278,9 +287,9 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
       }
     }
   }
-  if (programPrefix && !accesses.empty())
+  if (programPrefix)
     return true;
-  for (unsigned axis = 0; axis < type.getShape().size(); ++axis) {
+  for (unsigned axis = 0; axis < shape.size(); ++axis) {
     MakeRangeOp owner;
     bool consistent = true;
     for (AccessOpInterface access : accesses) {
@@ -290,8 +299,10 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
       auto range = position == sourceAxes.end() ? MakeRangeOp() :
           stripRangeProjection(coordinates[position - sourceAxes.begin()])
               .getDefiningOp<MakeRangeOp>();
+      // Program-owned intervals establish disjointness independently of the
+      // backing allocation's candidate envelope. Access bounds are checked
+      // separately against that allocation's actual shape.
       if (!range || !isExclusiveProgramRange(range, kernel) ||
-          queryLaunchExpression(range.getLogicalStop()) != type.getShape()[axis] ||
           (owner && (!sameLogicalRange(owner, range) ||
                      !sameScalarExpression(owner.getStart(), range.getStart()) ||
                      !sameScalarExpression(owner.getExtent(), range.getExtent())))) {

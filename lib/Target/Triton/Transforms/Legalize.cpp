@@ -12,6 +12,7 @@
 #include "Intent/Dialect/GPU/Transforms/Contraction/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/IR/Verifier.h"
 
@@ -27,8 +28,7 @@ LogicalResult prepareTritonMemory(ModuleOp module) {
   if (failed(kernel))
     return failure();
   detail::foldIntegerScanTails(*kernel);
-  if (failed(gpu::materializeProgramBuffers(module)) ||
-      failed(detail::materializeOversizedGathers(*kernel)) ||
+  if (failed(detail::materializeOversizedGathers(*kernel)) ||
       failed(detail::legalizeLargeScalarGathers(*kernel)) ||
       failed(detail::legalizeMaskedGather(*kernel)) ||
       failed(detail::legalizeExpandingGathers(*kernel)) ||
@@ -44,15 +44,13 @@ LogicalResult formTritonProgram(ModuleOp module) {
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
-  bool requiresCtaSynchronization =
-      llvm::any_of(kernel->getArgumentTypes(), [](Type type) {
-        return isa<gpu::BufferType>(type);
-      }) || detail::hasOrderedViewDependencies(*kernel);
+  bool requiresCtaSynchronization = detail::hasOrderedViewDependencies(*kernel);
+  kernel->walk([&](gpu::BufferOp) { requiresCtaSynchronization = true; });
   auto localOptions = declareProviderOptions(
       *kernel, *profiles, requiresCtaSynchronization,
       detail::findLoadPipelineLoops(*kernel));
   if (failed(localOptions) || failed(gpu::verifyGPUProgram(module)) ||
-      failed(gpu::lowerInvocationWorkspaces(module)))
+      failed(gpu::lowerWorkspaceAllocations(module)))
     return failure();
   if (failed(detail::legalizeOrderedViewDependencies(*kernel)) ||
       failed(detail::legalizeSplitGatherPairs(*kernel)))

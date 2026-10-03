@@ -71,6 +71,9 @@ intent::ViewType getPublicView(Value value) {
 }
 
 bool isInvocationWorkspace(Value value) {
+  if (value)
+    if (auto buffer = dyn_cast<BufferType>(value.getType()))
+      return buffer.isInvocationWorkspace();
   auto argument = dyn_cast_or_null<BlockArgument>(value);
   auto binding = argument ? getArgumentBinding(argument) : ArgumentBindingAttr{};
   return binding && binding.getKind() == ArgumentKind::Workspace;
@@ -187,9 +190,8 @@ private:
       case ArgumentKind::Dimension:
       case ArgumentKind::Stride: return visit(binding.getSource());
       case ArgumentKind::Workspace: {
-        auto view = dyn_cast<ViewType>(argument.getType());
-        ArrayAttr shape = view ? view.getLayout().getExtents()
-                               : cast<BufferType>(argument.getType()).getShape();
+        auto view = cast<ViewType>(argument.getType());
+        ArrayAttr shape = view.getLayout().getExtents();
         for (Attribute extent : shape)
           if (failed(expression(cast<PhysicalExprAttr>(extent), true))) return failure();
         return success();
@@ -264,11 +266,10 @@ LogicalResult verifyProgramInterface(func::FuncOp kernel) {
           return kernel.emitError("static public extent disagrees with its physical view");
       }
     } else if (binding.getKind() == ArgumentKind::Workspace) {
-      auto buffer = dyn_cast<BufferType>(type);
       auto view = dyn_cast<ViewType>(type);
-      if ((!buffer || !buffer.isInvocationWorkspace()) && (!view || view.getAccess() != 2))
-        return kernel.emitError("workspace binding requires a workspace buffer or lowered physical view");
-      auto shape = view ? view.getLayout().getExtents() : buffer.getShape();
+      if (!view || view.getAccess() != 2)
+        return kernel.emitError("workspace ABI binding requires a lowered physical view");
+      auto shape = view.getLayout().getExtents();
       for (Attribute attribute : shape)
         if (auto extent = constantPhysicalExpression(cast<PhysicalExprAttr>(attribute));
             extent && *extent < 0)
