@@ -15,11 +15,13 @@ add_mlir_library(MLIRIntentCPUTransforms
   Contraction/NormalizeContractions.cpp
   Contraction/Passes.cpp
 
-  Collective/FuseReductionTraversals.cpp
   Collective/Histograms.cpp
   Collective/NormalizeReductions.cpp
   Collective/Passes.cpp
   Collective/SliceCollectives.cpp
+
+  Control/TraversalAccesses.cpp
+  Control/TraversalFusion.cpp
 
   Region/GroupRegionComputations.cpp
   Region/Passes.cpp

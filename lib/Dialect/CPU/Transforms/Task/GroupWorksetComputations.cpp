@@ -1,5 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Task/Tasks.h"
+#include "Intent/Dialect/CPU/Transforms/Control/Traversals.h"
+#include "../Control/TraversalFusion.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
@@ -43,99 +45,6 @@ bool injectiveSlice(Value memory) {
   return cast<MemRefType>(memory.getType()).getLayout().isIdentity();
 }
 
-// Preserve the original leading coordinate through views before a row slice.
-Value leadingRoot(Value memory) {
-  while (true) {
-    if (auto cast = memory.getDefiningOp<memref::CastOp>()) memory = cast.getSource();
-    else if (auto view = memory.getDefiningOp<memref::SubViewOp>(); view && leadingView(view)) memory = view.getSource();
-    else return memory;
-  }
-}
-
-bool owned(Value memory, Value coordinate, Value root) {
-  if (auto cast = memory.getDefiningOp<memref::CastOp>()) return owned(cast.getSource(), coordinate, root);
-  auto view = memory.getDefiningOp<memref::SubViewOp>();
-  if (!view) return false;
-  if (owned(view.getSource(), coordinate, root)) return true;
-  return view.getSourceType().getRank() && leadingRoot(view.getSource()) == root &&
-      view.getMixedOffsets()[0] == OpFoldResult(coordinate) &&
-      getConstantIntValue(view.getMixedSizes()[0]) == 1 &&
-      getConstantIntValue(view.getMixedStrides()[0]) == 1;
-}
-
-struct Access {
-  Value root;
-  bool write, row;
-};
-
-FailureOr<SmallVector<Access>> accesses(scf::ParallelOp loop, StorageAnalysis &storage) {
-  SmallVector<Access> result;
-  Value coordinate = loop.getInductionVars()[0];
-  auto effects = storage.effects(loop);
-  if (!effects.complete || effects.ordered) return failure();
-  for (const StorageEffect &entry : effects.entries) {
-    const auto &effect = entry.effect;
-    if (isa<MemoryEffects::Allocate>(effect.getEffect())) continue;
-    Value memory = effect.getValue();
-    if (!memory || !isa<MemRefType>(memory.getType())) return failure();
-    Value root = storage.uniqueOrigin(memory);
-    if (!root) return failure();
-    if (isa<MemoryEffects::Free>(effect.getEffect())) {
-      auto allocation = root.getDefiningOp<memref::AllocOp>();
-      if (!allocation || !loop->isAncestor(allocation)) return failure();
-      continue;
-    }
-    if (!isa<MemoryEffects::Read, MemoryEffects::Write>(effect.getEffect()))
-      return failure();
-    ValueRange indices;
-    if (auto load = dyn_cast<memref::LoadOp>(entry.operation))
-      indices = load.getIndices();
-    else if (auto store = dyn_cast<memref::StoreOp>(entry.operation))
-      indices = store.getIndices();
-    bool row = owned(memory, coordinate, root) ||
-        (!indices.empty() && indices[0] == coordinate && leadingRoot(memory) == root);
-    result.push_back({root, isa<MemoryEffects::Write>(effect.getEffect()), row});
-  }
-  return result;
-}
-
-bool fuse(scf::ParallelOp first, scf::ParallelOp second, ArrayRef<Operation *> between) {
-  if (!workset(second) || !sameExtent(first.getUpperBound()[0], second.getUpperBound()[0])) return false;
-  auto function = first->getParentOfType<func::FuncOp>();
-  StorageAnalysis storage(function);
-  auto lhs = accesses(first, storage), rhs = accesses(second, storage);
-  if (failed(lhs) || failed(rhs)) return false;
-  for (const auto &left : *lhs)
-    for (const auto &right : *rhs) {
-      if (!left.write && !right.write) continue;
-      if (left.root == right.root) {
-        auto type = dyn_cast<MemRefType>(left.root.getType());
-        if (!left.row || !right.row || !type || !type.getLayout().isIdentity()) return false;
-        continue;
-      }
-      if (!storage.disjoint(left.root, right.root)) return false;
-    }
-  DominanceInfo dominance(function);
-  llvm::SmallPtrSet<Operation *, 16> movable;
-  for (Operation *operation : between) {
-    if (isa<memref::DeallocOp>(operation)) continue;
-    if (operation->getNumRegions() ||
-        (!isa<memref::AllocOp>(operation) && !isMemoryEffectFree(operation))) return false;
-    if (llvm::any_of(operation->getOperands(), [&](Value value) {
-          return !dominance.dominates(value, first) && !movable.contains(value.getDefiningOp());
-        })) return false;
-    movable.insert(operation);
-  }
-  for (Operation *operation : between)
-    if (!isa<memref::DeallocOp>(operation)) operation->moveBefore(first);
-  OpBuilder b(first.getBody()->getTerminator());
-  IRMapping mapping;
-  mapping.map(second.getInductionVars()[0], first.getInductionVars()[0]);
-  for (Operation &operation : second.getBody()->without_terminator()) b.clone(operation, mapping);
-  second.erase();
-  return true;
-}
-
 void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
   auto type = allocation.getType();
   if (!type.getRank() || !type.getLayout().isIdentity()) return;
@@ -145,6 +54,8 @@ void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
     if (!sameExtent(value, loop.getUpperBound()[0])) return;
   } else if (getConstantIntValue(*size) != getConstantIntValue(loop.getUpperBound()[0])) return;
   Value coordinate = loop.getInductionVars()[0];
+  StorageAnalysis storage(loop->getParentOfType<func::FuncOp>());
+  if (!storage.aliases(allocation).complete) return;
   DominanceInfo dominance(loop->getParentOfType<func::FuncOp>());
   SmallVector<Value> memories{allocation.getResult()};
   SmallVector<Operation *> views, direct;
@@ -170,9 +81,21 @@ void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
         continue;
       }
       if (auto view = dyn_cast<memref::SubViewOp>(user)) {
+        if (!detail::containedSubview(view)) return;
         if (view.getMixedOffsets()[0] == OpFoldResult(coordinate) &&
             getConstantIntValue(view.getMixedSizes()[0]) == 1 &&
             getConstantIntValue(view.getMixedStrides()[0]) == 1 && loop->isAncestor(view)) {
+          // A subview may legally describe storage outside its source view.
+          // Shrinking the owner requires every downstream descriptor to remain
+          // within this row, not just the first row-selection operation.
+          auto aliases = storage.aliases(view);
+          if (!aliases.complete) return;
+          for (Value alias : aliases.values) {
+            if (alias == view.getResult()) continue;
+            if (auto child = alias.getDefiningOp<memref::SubViewOp>()) {
+              if (!detail::containedSubview(child)) return;
+            } else if (!alias.getDefiningOp<memref::CastOp>()) return;
+          }
           rows.push_back(view);
           continue;
         }
@@ -278,11 +201,11 @@ LogicalResult groupWorksetComputations(func::FuncOp function, const Implementati
   SmallVector<Value> extents;
   for (auto loop : function.front().getOps<scf::ParallelOp>())
     if (workset(loop)) extents.push_back(loop.getUpperBound()[0]);
-  if (extents.empty()) return success();
-  if (failed(exposeStructuredWorksets(function, implementations, extents))) return failure();
+  if (!extents.empty() && failed(exposeStructuredWorksets(function, implementations, extents)))
+    return failure();
   SmallVector<Operation *> transfers;
   for (Operation &operation : function.front())
-    if (isa<linalg::FillOp, memref::CopyOp>(operation)) transfers.push_back(&operation);
+    if (!extents.empty() && isa<linalg::FillOp, memref::CopyOp>(operation)) transfers.push_back(&operation);
   for (Operation *operation : transfers) {
     StorageAnalysis storage(function);
     Value output, input;
@@ -318,28 +241,11 @@ LogicalResult groupWorksetComputations(func::FuncOp function, const Implementati
     operation->erase();
   }
   if (failed(applyPatternsGreedily(function, RewritePatternSet(function.getContext())))) return failure();
+  if (failed(fuseSharedTraversals(function))) return failure();
   SmallVector<scf::ParallelOp> groups;
-  for (Operation *operation = &function.front().front(); operation; ) {
-    auto first = dyn_cast<scf::ParallelOp>(operation);
-    if (!workset(first)) { operation = operation->getNextNode(); continue; }
-    bool changed = false;
-    while (true) {
-      SmallVector<Operation *> between;
-      Operation *next = first->getNextNode();
-      while (next && (isa<memref::AllocOp, memref::DeallocOp>(next) ||
-                      (!next->getNumRegions() && isMemoryEffectFree(next)))) {
-        between.push_back(next);
-        next = next->getNextNode();
-      }
-      auto second = dyn_cast_or_null<scf::ParallelOp>(next);
-      if (!second || !fuse(first, second, between)) break;
-      changed = true;
-    }
-    if (changed) groups.push_back(first);
-    operation = first->getNextNode();
-  }
+  function.walk([&](scf::ParallelOp loop) { if (workset(loop)) groups.push_back(loop); });
   for (auto loop : groups) {
-    SmallVector<memref::AllocOp> allocations(function.front().getOps<memref::AllocOp>());
+    SmallVector<memref::AllocOp> allocations(loop->getBlock()->getOps<memref::AllocOp>());
     for (auto allocation : allocations) localize(allocation, loop);
   }
   return success();

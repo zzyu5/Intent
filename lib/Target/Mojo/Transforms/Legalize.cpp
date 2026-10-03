@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Collective/Collectives.h"
+#include "Intent/Dialect/CPU/Transforms/Control/Traversals.h"
 #include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
 #include "Intent/Dialect/CPU/Transforms/Task/Tasks.h"
@@ -230,7 +231,7 @@ LogicalResult vectorizeNativeProgram(ModuleOp module) {
       if (!loop->hasAttr("intent_cpu.implementation"))
         loop->setAttr("intent_cpu.implementation", programBinding);
     });
-    if (failed(cpu::fuseReductionTraversals(function))) return failure();
+    if (failed(cpu::fuseSharedTraversals(function))) return failure();
     SmallVector<scf::ForOp> loops;
     function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
     auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");

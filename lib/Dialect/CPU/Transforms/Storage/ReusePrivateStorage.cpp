@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -16,6 +17,9 @@ void eraseDeadPrivateBuffers(func::FuncOp function) {
   SmallVector<memref::AllocOp> allocations;
   function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
   for (auto allocation : llvm::reverse(allocations)) {
+    StorageAnalysis storage(function);
+    auto aliases = storage.aliases(allocation);
+    if (!aliases.complete || aliases.values.size() != 1) continue;
     SmallVector<Operation *> users;
     llvm::SmallPtrSet<Operation *, 8> seen;
     for (Operation *user : allocation.getResult().getUsers())
@@ -29,6 +33,8 @@ void eraseDeadPrivateBuffers(func::FuncOp function) {
         });
       }
       if (auto copy = dyn_cast<memref::CopyOp>(user)) return copy.getTarget() == allocation.getResult();
+      if (auto store = dyn_cast<memref::StoreOp>(user)) return store.getMemref() == allocation.getResult();
+      if (auto store = dyn_cast<vector::StoreOp>(user)) return store.getBase() == allocation.getResult();
       if (auto dimension = dyn_cast<memref::DimOp>(user)) return dimension.getConstantIndex().has_value();
       return isa<memref::DeallocOp>(user);
     });

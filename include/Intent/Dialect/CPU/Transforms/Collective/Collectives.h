@@ -10,7 +10,6 @@ mlir::LogicalResult normalizeScalarReductions(mlir::func::FuncOp function);
 // Outside existing parallel scopes, partial groups consume the function's
 // bound task grain and module capabilities.
 mlir::LogicalResult realizeHistograms(mlir::func::FuncOp function);
-mlir::LogicalResult fuseReductionTraversals(mlir::func::FuncOp function);
 
 } // namespace intent::cpu
 #endif
