@@ -11,6 +11,8 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/SetVector.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -194,6 +196,11 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
 namespace {
 
 LogicalResult partition(scf::ParallelOp root, int64_t grain) {
+  // Rectangularity depends on invariant bounds, not where their producers were
+  // first materialized. Native LICM keeps effects and zero-trip speculation safe.
+  root.walk<WalkOrder::PostOrder>([](scf::ParallelOp parallel) {
+    moveLoopInvariantCode(cast<LoopLikeOpInterface>(parallel.getOperation()));
+  });
   auto function = root->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);
   StorageAnalysis analysis(function);

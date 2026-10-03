@@ -11,6 +11,17 @@ Type uniformElementType(Type type) {
   return type;
 }
 
+Value uniformScalarSource(Value value) {
+  while (value && isa<FragmentType>(value.getType())) {
+    UniformExpression expression = describeUniformValue(value);
+    if (expression.kind != UniformKind::Forward ||
+        expression.operands.size() != 1)
+      return {};
+    value = expression.operands.front();
+  }
+  return value && value.getType().isIntOrIndexOrFloat() ? value : Value();
+}
+
 UniformExpression describeUniformValue(Value value) {
   UniformExpression result = describeScalarValue(value);
   result.type = uniformElementType(value.getType());

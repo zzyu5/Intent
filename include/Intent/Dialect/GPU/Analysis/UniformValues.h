@@ -7,5 +7,8 @@
 namespace intent::gpu {
 UniformExpression describeUniformValue(mlir::Value value);
 mlir::Type uniformElementType(mlir::Type type);
+// Return the scalar SSA leaf only when every intervening fragment operation
+// forwards a uniform value. A reshape of varying data has no scalar leaf.
+mlir::Value uniformScalarSource(mlir::Value value);
 }
 #endif

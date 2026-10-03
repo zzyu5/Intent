@@ -350,17 +350,9 @@ FailureOr<FragmentType> queryValueSchema(func::FuncOp kernel,
     auto source = dyn_cast<FragmentType>(contributor.getType());
     if (!source)
       continue;
-    Value scalar = contributor;
-    while (isa<FragmentType>(scalar.getType())) {
-      UniformExpression expression = describeUniformValue(scalar);
-      if (expression.kind != UniformKind::Forward ||
-          expression.operands.size() != 1)
-        break;
-      scalar = expression.operands.front();
-    }
     // A scalar splat follows the consumer's coordinates. Its old width is not
     // an independent extent authority when that consumer is retiled.
-    if (!isa<FragmentType>(scalar.getType()))
+    if (uniformScalarSource(contributor))
       continue;
     SmallVector<bool> sourceAuthority(source.getShape().size(), false);
     bool hasAuthority = false;

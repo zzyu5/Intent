@@ -28,7 +28,6 @@ bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
     return false;
   if (auto mapping = queryDecodedCoordinate(value))
       return mapping->extents[mapping->axis] == extent &&
-             valueKnownNonNegative(mapping->linear, depth + 1) &&
              llvm::all_of(mapping->extents, [&](Value bound) {
                return valueKnownNonNegative(bound, depth + 1);
              });
@@ -84,8 +83,7 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   if (auto transpose = value.getDefiningOp<TransposeOp>())
     return valueKnownNonNegative(transpose.getValue(), depth + 1);
   if (auto coordinate = queryDecodedCoordinate(value))
-    return valueKnownNonNegative(coordinate->linear, depth + 1) &&
-           llvm::all_of(coordinate->extents, [&](Value extent) {
+    return llvm::all_of(coordinate->extents, [&](Value extent) {
              return valueKnownNonNegative(extent, depth + 1);
            });
   if (auto coordinate = value.getDefiningOp<WorksetCoordinateOp>())
@@ -365,16 +363,17 @@ IndexBounds queryIndexBounds(Value value) {
       return {};
     }
     if (auto mapping = queryDecodedCoordinate(current)) {
-        if (!valueKnownNonNegative(mapping->linear) ||
-            !llvm::all_of(mapping->extents, [](Value extent) {
+        if (!llvm::all_of(mapping->extents, [](Value extent) {
               return valueKnownNonNegative(extent);
             }))
           return {};
         Value extent = stripScalarIdentity(
             mapping->extents[mapping->axis]);
-        if (std::optional<int64_t> constant = integerConstant(extent))
+        if (std::optional<int64_t> constant = integerConstant(extent)) {
+          if (*constant <= 0) return {};
           return {true, expression(PhysicalExprKind::Constant,
-                                   std::max<int64_t>(*constant - 1, 0))};
+                                   *constant - 1)};
+        }
         PhysicalExprAttr upper;
         if (auto physical = extent.getDefiningOp<PhysicalExprOp>())
           upper = physical.getExpression();

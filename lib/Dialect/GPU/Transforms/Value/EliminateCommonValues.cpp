@@ -194,6 +194,12 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   if (failed(kernel))
     return failure();
   foldScalarIntegerValues(*kernel);
+  // A custom fragment splat is uniform without being an IntegerAttr operand
+  // for MLIR's SelectOp fold adaptor. Fold its selected SSA value everywhere,
+  // including predicates that prove bounds for a separately reused coordinate.
+  kernel->walk<WalkOrder::PostOrder>([](SelectOp select) {
+    foldConstantSelection(select);
+  });
   RewritePatternSet patterns(module.getContext());
   ReshapeOp::getCanonicalizationPatterns(patterns, module.getContext());
   TransposeOp::getCanonicalizationPatterns(patterns, module.getContext());

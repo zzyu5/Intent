@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h"
+#include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -127,6 +128,21 @@ public:
   }
   if (selected.fragmentAxes.empty() && !relocate)
     return rememberInvariant(value, roots);
+  if (isa<BlockArgument>(value) && !relocate &&
+      selected.fragmentAxes.size() == 1 &&
+      PhysicalProgramAnalysis(kernel)
+          .axisRealization(value, selected.fragmentAxes.front()).physicalized) {
+    // A dominating loop/helper argument is an existing SSA snapshot. Its
+    // selected lanes are gathered from that value; there is no producer to
+    // clone, and following an outer range does not authorize replaying state.
+    auto slice = materializeRetainedSlice(
+        builder, location, value, selected.fragmentAxes.front(), blockedExtent,
+        replacement, insertionAnchor);
+    if (failed(slice))
+      return failure();
+    mapping.map(value, *slice);
+    return *slice;
+  }
   Operation *producer = value.getDefiningOp();
   if (!producer || (isa<MakeRangeOp>(producer) && !relocate)) {
     if (producer)

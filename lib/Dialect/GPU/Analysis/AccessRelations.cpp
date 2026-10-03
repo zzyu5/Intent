@@ -343,39 +343,7 @@ namespace detail {
 
 bool matchesResourceExtent(Value value, Value resource, unsigned axis) {
   PhysicalExprAttr extent = resourceExtentExpression(resource, axis);
-  if (!extent)
-    return false;
-  Value stripped = stripScalarIdentity(value);
-  if (stripped != value)
-    return matchesResourceExtent(stripped, resource, axis);
-  if (std::optional<int64_t> constant = integerConstant(value))
-    return extent.getKind() ==
-               PhysicalExprKind::Constant &&
-           *constant == extent.getValue();
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    return queryArgumentExpression(argument) == extent;
-  }
-  if (auto dim = value.getDefiningOp<DimOp>()) {
-    auto view = dyn_cast<ViewType>(resource.getType());
-    return view && dim.getView() == resource && dim.getAxis() == axis;
-  }
-  if (auto expression = value.getDefiningOp<PhysicalExprOp>())
-    return expression.getExpression() == extent;
-  if (auto parameter = queryParameter(value))
-    return extent.getKind() ==
-               PhysicalExprKind::Parameter &&
-           parameter.getName() == extent.getParameterReference().getName();
-  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<RangeOp>();
-    if (!range)
-      return false;
-    if (bound.getBound() == 0)
-      return matchesResourceExtent(range.getStart(), resource, axis);
-    if (bound.getBound() == 1)
-      return matchesResourceExtent(range.getStop(), resource, axis);
-    return matchesResourceExtent(range.getStep(), resource, axis);
-  }
-  return false;
+  return extent && valueMatchesExtent(stripScalarIdentity(value), extent);
 }
 
 bool capacityCoversResourceExtent(Value value, Value resource, unsigned axis) {

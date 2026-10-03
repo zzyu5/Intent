@@ -164,6 +164,18 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
             PhysicalAxisRealizationFact::ExtentAuthority::Range;
         return result;
       }
+      if (*size > 1) {
+        // Splat defines every lane of its declared physical fragment. A
+        // non-unit static axis therefore has its own extent authority even
+        // without a coordinate-producing operand. This is physical capacity,
+        // not a proof about an independent logical range's active members.
+        // Keep a unit axis distinguishable from a construction scalar seed.
+        result.state = PhysicalFactState::Exact;
+        result.physicalized = true;
+        result.extentAuthority =
+            PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+        return result;
+      }
     }
   }
 

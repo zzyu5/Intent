@@ -50,14 +50,15 @@ void PythonEmitter::addCommonOperations(Emitters &emitters) {
   });
   emitters.add<DelinearizeOp>(valid, [](DelinearizeOp op, PythonEmitter &e) {
     std::string remaining = e.valueString(op.getLinear());
-    SmallVector<std::string> coordinates(op.getCoordinates().size());
-    for (int64_t axis = static_cast<int64_t>(coordinates.size()) - 1; axis >= 0; --axis) {
+    for (int64_t axis = static_cast<int64_t>(op.getCoordinates().size()) - 1; axis >= 0; --axis) {
       std::string extent = e.valueString(op.getExtents()[axis]);
-      coordinates[axis] = "(" + remaining + " % " + extent + ")";
-      remaining = "(" + remaining + " // " + extent + ")";
+      std::string quotient = e.newName();
+      e.line(quotient + " = " + e.expressionSyntax.integerDivision(
+          PhysicalExprKind::FloorDiv, remaining, extent));
+      e.assign(op.getCoordinates()[axis],
+               "(" + remaining + " - " + quotient + " * " + extent + ")");
+      remaining = quotient;
     }
-    for (auto [coordinate, expression] : llvm::zip(op.getCoordinates(), coordinates))
-      e.assign(coordinate, expression);
     return success();
   });
   emitters.add<MakeRangeOp>(valid, [](MakeRangeOp op, PythonEmitter &e) {

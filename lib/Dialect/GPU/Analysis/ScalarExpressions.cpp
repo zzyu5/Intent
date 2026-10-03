@@ -45,6 +45,10 @@ Value stripBroadcast(Value value) {
 Value stripScalarIdentity(Value value) {
   value = stripBroadcast(value);
   while (true) {
+    if (Value scalar = uniformScalarSource(value); scalar && scalar != value) {
+      value = scalar;
+      continue;
+    }
     if (auto cast = value.getDefiningOp<CastOp>()) {
       if (cast.getValue().getType() == cast.getResult().getType()) {
         value = stripBroadcast(cast.getValue());

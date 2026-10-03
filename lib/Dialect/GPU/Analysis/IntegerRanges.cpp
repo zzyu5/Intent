@@ -63,17 +63,18 @@ std::optional<ConstantIntRanges> inferGPUFacts(Value value,
                                                     : range.getStep());
   }
   if (auto coordinate = queryDecodedCoordinate(value)) {
-    if (!analysis.isNonNegative(coordinate->linear) ||
-        !llvm::all_of(coordinate->extents, [&](Value extent) {
+    // Mathematical decoding takes a divisor-sign remainder on every axis.
+    // Thus defined executions with nonnegative extents have bounded coordinates
+    // even when the linear expression cannot be proved free of signed wrap.
+    // A zero divisor has no defined decoded value.
+    if (!llvm::all_of(coordinate->extents, [&](Value extent) {
           return analysis.isNonNegative(extent);
         }))
       return std::nullopt;
     auto extent = analysis.range(coordinate->extents[coordinate->axis]);
-    if (!extent)
+    if (!extent || extent->smax().isZero())
       return std::nullopt;
-    APInt maximum = extent->smax();
-    if (!maximum.isZero())
-      --maximum;
+    APInt maximum = extent->smax() - 1;
     return ConstantIntRanges::fromSigned(APInt(64, 0), maximum);
   }
   if (auto range = value.getDefiningOp<MakeRangeOp>()) {
