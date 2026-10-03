@@ -592,11 +592,11 @@ gather、transpose 和 contraction 轴属性按实际映射修改，不能统一
 expand-dims 转换中同步处理 shape、axis 与 encoding，并保留其它原操作属性。
 
 [RangeProvenance](lib/Dialect/GPU/Analysis/RangeProvenance.cpp) 使用轴组追踪范围；
-[ValueRelations](lib/Dialect/GPU/Transforms/Value/ValueRelations.cpp) 负责关系工作队列，
-通过 [SchemaMutation](include/Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h)
-执行三类改写：`closeSchemaBoundary` 从当前 producer 闭合 product、控制和 structured
+[Relations/Worklist](lib/Dialect/GPU/Transforms/Value/Relations/Worklist.cpp) 负责唯一关系工作队列。
+[SchemaMutation](include/Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h)
+提供共享改写：关系闭合使用 `closeSchemaBoundary` 从当前 producer 闭合 product、控制和 structured
 helper 的 schema；`projectSchemaBoundary` 将已选 schema 投影到对应 incoming 槽，
-不反向改写被多个组件共享的 seed SSA；`rewriteClonedPhysicalTypes` 先保存未改写源
+不反向改写被多个组件共享的 seed SSA。克隆消费者使用 `rewriteClonedPhysicalTypes`，先保存未改写源
 operation 的轴关系，统一改写 clone 的结果与 region formal 类型，再用实际 operands
 传递结果的轴关系。
 `retargetSourceExtent` / `retargetDimensionExtent` 返回 `LogicalResult`，调用方须将
@@ -605,6 +605,10 @@ operation 的轴关系，统一改写 clone 的结果与 region formal 类型，
 与 region helper 展开复用这些入口传递分段形状。Pointwise coverage、访问组合和
 online-summary 查询也消费相同的物理轴组，不能把逻辑 reshape 轴直接用作物理下标。
 Triton/cuTile 的局部资格判断也读同一关系。
+具体规则相邻放在 `Value/Relations/`：`Pointwise`、`Access`、`Contraction` 和
+`Structured` 各自处理操作关系，`ExtentPropagation` 负责 extent 穿过聚合值与控制流
+边界的传播。规则共用私有 `Worklist.h` 的类型更新与通知机制，不各建队列；对外仍使用
+[ValueRelations.h](include/Intent/Dialect/GPU/Transforms/Value/ValueRelations.h)。
 坐标对应不证明数值相等：cast 舍入、逻辑 singleton、effects 和可重放资格仍由
 各自分析或变换检查，不能仅因物理 extent 为 1 就消除整条逻辑轴。
 
@@ -720,7 +724,13 @@ KIR 的验证入口直接属于 operation，按合同分布在
 
 公开的 transformation 入口必须完成自身改写所需的 relation closure，使调用方得到满足 postcondition 的 current program。中间 repair helper 不因可以被调用就成为独立 pass；pipeline 负责次序，不应成为调用者必须记忆的隐式修复配方。
 
-例如，[realizeRegionFolds / realizeRegionScans](lib/Dialect/GPU/Transforms/Region/RealizeRegionFold.cpp) 在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/Value/ValueRelations.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
+例如，[Region/Realization.h](include/Intent/Dialect/GPU/Transforms/Region/Realization.h) 的 fold/scan 两个入口在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/Value/Relations/Worklist.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
+
+[RealizeRegionFold.cpp](lib/Dialect/GPU/Transforms/Region/RealizeRegionFold.cpp) 与
+[RealizeRegionScan.cpp](lib/Dialect/GPU/Transforms/Region/RealizeRegionScan.cpp) 分别拥有真实
+遍历和状态构造。相邻的 `RegionPredicates` 负责范围分区与 identity 证明，
+`RegionSummary` 负责 summary/carry 的字段处理，`RegionCoRealization` 负责已存在的
+online/additive 合流。它们是组内机制，不是新增独立 pass。
 
 Region 的私有 [RegionCloning.cpp](lib/Dialect/GPU/Transforms/Region/RegionCloning.cpp) 负责
 helper 参数与 source slice 的 extent 绑定及内联；
@@ -736,6 +746,12 @@ helper 参数与 source slice 的 extent 绑定及内联；
 ownership、buffer loop 和 scan consumer 传回完整变换。
 
 ### GPU 中直接可复用的接口
+
+GPU 操作定义仍由 [GPUOps.h](include/Intent/Dialect/GPU/IR/GPUOps.h) 公开，具体验证与
+类型推导位于 [IR/Operations/](lib/Dialect/GPU/IR/Operations/)：`Program`、`Values`、
+`Shape`、`Access`、`Contraction`、`Collective` 按操作族归属。`GPUOps.cpp` 只编译
+TableGen 生成定义；少量跨操作族的共同验证放在私有 `Verification`，不复制 shape
+或 pure-helper 检查。修改某类操作时，其 infer/verify 实现与相关辅助函数相邻。
 
 [GPU Passes.h](include/Intent/Dialect/GPU/Transforms/Passes.h) 只暴露完整变换与验证入口。实现内部需要的查询与改写按下表包含具体头文件，不通过一个通用 Utilities 模块取得所有能力。
 
@@ -761,6 +777,11 @@ pass。跨组需要稳定复用的构造接口在 `include/Intent/Dialect/GPU/Tr
 `Pointwise.h`、`RegionCloning.h` 是私有实现接口；`ExecutionSchema.h` 是多个组的共享接口。
 这与本地 Triton 的 `Transforms/Pipeliner/`、`Transforms/WarpSpecialization/` 分组及
 `WarpSpecialization/PartitionAttrs.h` 私有头的组织方式一致；子目录不必各建一份库。
+
+[Mapping/UniformBranches.h](include/Intent/Dialect/GPU/Transforms/Mapping/UniformBranches.h)
+拥有 launch-uniform 分支的资格与重组入口，复用调用方传入的现有 shared transformations，
+再合回一次 launch 和原 ABI。实际克隆与 mapping 改写在 Mapping 组，顶层 `Passes.cpp`
+只负责调度这项已有策略。
 
 GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`、
 `Region`、`Control`、`Value`、`Storage`、`Mapping`、`Configuration` 分组，
@@ -830,7 +851,7 @@ buffer/public view/workspace，沿标准 region、branch、view 接口传播来�
 共享 GPU 的 `ExecutionGroupOp`（[GPUOps.td](include/Intent/Dialect/GPU/IR/GPUOps.td)）
 拥有实际执行 body、坐标 block arguments、runtime/launch extents、coordinate roles
 及 segment 范围；mapping 和 traversal 改写维护这一个 owner。
-Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/ProgramGrid.cpp) 先读取它调整网格，
+Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/Mapping/ProgramGrid.cpp) 先读取它调整网格，
 再由 [Triton prepareTritonMemory](lib/Target/Triton/Transforms/Legalize.cpp)、
 [cuTile prepareProgram](lib/Target/CuTile/Transforms/Legalize.cpp) 各自调用共同的
 `lowerExecutionGroups`，生成纯 `DelinearizeOp` 坐标计算并展开 body。
@@ -1388,19 +1409,20 @@ artifacts 注册为 forward/backward operators，作者通过 `register_autograd
 
 原生编译与产物寿命由 provider runtime 负责。Mojo 的 [compilation.py](python/intent/runtime/mojo/compilation.py) 组织候选和加载，[toolchain.py](python/intent/runtime/mojo/toolchain.py) 查询已支持工具链的依赖身份，公共 [compiler/cache.py](python/intent/compiler/cache.py) 提供输入比较、锁与发布机制。新增 SDK import 时同步 serializer 的 `native_dependencies`；无法证明依赖闭合时继续原编译并说明缓存不可复用原因。失败不发布成功产物，已加载的库不原位覆写；这些机制不改变算法、候选或算子计时范围。
 
-Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、prepare-memory、native-forms 和 finalize；[Legalize.cpp](lib/Target/Triton/Transforms/Legalize.cpp) 通过私有 [Legalization.h](lib/Target/Triton/Transforms/Legalization.h) 组合完整阶段。cuTile 的 [Passes.cpp](lib/Target/CuTile/Transforms/Passes.cpp) 调度 prepare、native-program 和 finalize，私有入口在 [Legalize.h](lib/Target/CuTile/Transforms/Legalize.h)。按实际职责选择相邻模块，不把新增规则继续堆入 driver：
+Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、prepare-memory、native-forms 和 finalize；[Legalize.cpp](lib/Target/Triton/Transforms/Legalize.cpp) 通过私有 [Program.h](lib/Target/Triton/Transforms/Program.h) 组合完整阶段。cuTile 的 [Passes.cpp](lib/Target/CuTile/Transforms/Passes.cpp) 调度 prepare、native-program 和 finalize，私有入口在 [Program.h](lib/Target/CuTile/Transforms/Program.h)。按实际职责选择相邻模块，不把新增规则继续堆入 driver：
 
 | Provider | 模块 | 职责 |
 |---|---|---|
-| Triton | [AccessForms.cpp](lib/Target/Triton/Transforms/AccessForms.cpp) | 从当前 access facts 形成 tensor descriptor 或普通 pointer 访问；对齐与坐标投影复用 GPU 分析 |
-| Triton | [Collectives.cpp](lib/Target/Triton/Transforms/Collectives.cpp) | gather/scatter 的目标表达、scan tail 与原生 reduce/scan callback |
-| Triton | [Supply.cpp](lib/Target/Triton/Transforms/Supply.cpp) | ordered access dependencies、CTA 同步与 load-loop policy |
-| Triton | [Values.cpp](lib/Target/Triton/Transforms/Values.cpp) | 形成 contract/value 表示；只读 contraction 约束位于 [Analysis/Contractions.h](include/Intent/Target/Triton/Analysis/Contractions.h) |
-| cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeAccess.h](lib/Target/CuTile/Transforms/NativeAccess.h) | 收集本次输入、声明 provider 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
-| cuTile | [NativeAccessAnalysis.cpp](lib/Target/CuTile/Transforms/NativeAccessAnalysis.cpp) | 只读坐标、shape 与原生访问资格 |
-| cuTile | [NativeAccess.cpp](lib/Target/CuTile/Transforms/NativeAccess.cpp) | 构造原生 memory/extraction forms 及保持语义的 guards |
-| cuTile | [CollapseArrayViews.cpp](lib/Target/CuTile/Transforms/CollapseArrayViews.cpp) | 从已有原生 tile load 形成具有真实 collapsed layout 的条件视图，保留原访问语义 |
-| cuTile | [ComputeForms.cpp](lib/Target/CuTile/Transforms/ComputeForms.cpp) | 构造 reduce、scan、histogram 和 MMA primitives |
+| Triton | [AccessForms.cpp](lib/Target/Triton/Transforms/Access/AccessForms.cpp) | 从当前 access facts 形成 tensor descriptor 或普通 pointer 访问；对齐与坐标投影复用 GPU 分析 |
+| Triton | [Access/](lib/Target/Triton/Transforms/Access/) | gather 的规范化、实现选择、临时存储及 scatter；共用组内的资格与构造接口 |
+| Triton | [Collective/](lib/Target/Triton/Transforms/Collective/) | 原生 reduce/scan callback 与 scan tail，各自保留完整物化过程 |
+| Triton | [Supply.cpp](lib/Target/Triton/Transforms/Supply/Supply.cpp) | ordered access dependencies、CTA 同步与 load-loop policy |
+| Triton | [Values.cpp](lib/Target/Triton/Transforms/Value/Values.cpp) | 形成 contract/value 表示；只读 contraction 约束位于 [Analysis/Contractions.h](include/Intent/Target/Triton/Analysis/Contractions.h) |
+| cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeRewrite.h](lib/Target/CuTile/Transforms/NativeRewrite.h) | 收集本次输入、声明 provider 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
+| cuTile | [Access/TilePlan.cpp](lib/Target/CuTile/Transforms/Access/TilePlan.cpp)、同组 `Bounds` / `Coordinates` | 只读 tile 资格、对齐与坐标分解 |
+| cuTile | [Access/Accesses.cpp](lib/Target/CuTile/Transforms/Access/Accesses.cpp) 与 `Loads` / `Extraction` / `Atomics` / `Stores` | 按原次序构造各类访问；`TileIndices` 形成真实坐标与 guard，`AccessFormSelection` 共用一次变换的配置物化状态 |
+| cuTile | [CollapseArrayViews.cpp](lib/Target/CuTile/Transforms/Access/CollapseArrayViews.cpp) | 从已有原生 tile load 形成具有真实 collapsed layout 的条件视图，保留原访问语义 |
+| cuTile | [ComputeForms.cpp](lib/Target/CuTile/Transforms/Compute/ComputeForms.cpp) | 构造 reduce、scan、histogram 和 MMA primitives |
 | cuTile | [Legalize.cpp](lib/Target/CuTile/Transforms/Legalize.cpp)、[Control/Loops.h](include/Intent/Target/CuTile/Transforms/Control/Loops.h) | 前者组合准备和收尾；后者形成有范围证明的原生循环或显式宽整数循环 |
 | Triton / cuTile | 各自的 [Triton Program.h](include/Intent/Target/Triton/Analysis/Program.h)、[cuTile Program.h](include/Intent/Target/CuTile/Analysis/Program.h) | 验证当前 provider IR 的类型、形式、候选与资源要求；由调用者传入同一终端 operation registry |
 | Triton / cuTile | 各自的 [Triton Numerical.h](include/Intent/Target/Triton/Serialization/Numerical.h)、[cuTile Numerical.h](include/Intent/Target/CuTile/Serialization/Numerical.h) | 同一 typed translation 负责数值合法性、源码表达式和所需依赖，保留 SDK 各自的转换与数学接口 |
@@ -1450,7 +1472,7 @@ array、bounds 与 eligibility，[cuTile contract](python/intent/runtime/cutile/
 
 对齐推断中的参数域必须是当前证明可依赖的域。`ResidentWorkers` 会由 provider 配置重绑定，公共关系查询不把它的临时候选当作常量或整除事实；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
 
-Triton/cuTile 的 `Transforms/Configurations.cpp` 负责候选选择与写回；各自的
+Triton/cuTile 的 `Transforms/Configuration/Configurations.cpp` 负责候选选择与写回；各自的
 `Analysis/Configuration.cpp` 收集和验证当前 IR 的目标约束。共同归约资源查询及要求
 验证位于 [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h)，候选
 筛选仍在 Transforms。Triton 的 tensor/descriptor/collective 约束与 cuTile 的

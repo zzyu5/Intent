@@ -7,9 +7,11 @@
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 #include "Intent/Target/CuTile/Transforms/Passes.h"
+#include "Intent/Target/CuTile/Transforms/Configuration/TuningProfiles.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"
 #include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
+#include "Intent/Target/Triton/Transforms/Configuration/TuningProfiles.h"
 
 using namespace mlir;
 

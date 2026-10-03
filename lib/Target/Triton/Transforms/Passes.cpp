@@ -1,5 +1,6 @@
 #include "Intent/Target/Triton/Transforms/Passes.h"
-#include "Legalization.h"
+#include "Program.h"
+#include "Intent/Target/Triton/Transforms/Mapping/ProgramGrid.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Target/Triton/IR/TritonDialect.h"

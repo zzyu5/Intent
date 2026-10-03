@@ -1,6 +1,9 @@
-#include "NativeAccess.h"
-#include "Configurations.h"
-#include "Legalize.h"
+#include "NativeRewrite.h"
+#include "Access/Accesses.h"
+#include "Compute/ComputeForms.h"
+#include "Intent/Target/CuTile/Analysis/Program.h"
+#include "Configuration/Configurations.h"
+#include "Program.h"
 #include "mlir/IR/Verifier.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
@@ -10,15 +13,6 @@
 
 using namespace mlir;
 namespace intent::cutile {
-Type withElementType(Type type, Type elementType) {
-  auto fragment = dyn_cast<gpu::FragmentType>(type);
-  if (!fragment)
-    return elementType;
-  return gpu::FragmentType::get(
-      fragment.getContext(), elementType, fragment.getShape(),
-      fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
-}
-
 bool containsFragment(Type type) {
   if (isa<gpu::FragmentType>(type))
     return true;
@@ -62,58 +56,33 @@ StringRef occupancyProfileFamily(func::FuncOp kernel,
 }
 
 
-void NativeFormRewriter::replace(Operation *operation, ValueRange values) {
-  assert(operation->getNumResults() == values.size());
-  replacements.push_back({operation, llvm::to_vector(values)});
-}
-void NativeFormRewriter::erase(Operation *operation) {
-  assert(operation->use_empty());
-  replacements.push_back({operation, {}});
-}
-void NativeFormRewriter::commit() {
-  for (Replacement &replacement : replacements)
-    if (!replacement.values.empty())
-      replacement.operation->getResults().replaceAllUsesWith(replacement.values);
-  // Destroy inner operations before their owners even if a future native form
-  // consumes nested input operations in a different construction order.
-  auto depth = [](Operation *operation) {
-    unsigned result = 0;
-    while ((operation = operation->getParentOp())) ++result;
-    return result;
-  };
-  llvm::stable_sort(replacements, [&](const Replacement &a, const Replacement &b) {
-    return depth(a.operation) > depth(b.operation);
-  });
-  for (Replacement &replacement : replacements)
-    replacement.operation->erase();
-  replacements.clear();
-}
-
 LogicalResult formNativeProgram(ModuleOp module) {
   auto profiles = gpu::TuningProfiles::from(module);
   if (failed(profiles)) return failure();
   auto physicalKernel = gpu::getPhysicalKernel(module);
   if (failed(physicalKernel)) return failure();
   func::FuncOp kernel = *physicalKernel;
-  NativeProgramInputs inputs;
+  NativeAccessInputs accesses;
+  NativeComputeInputs computations;
+  SmallVector<gpu::AssumeInBoundsOp> assumptions;
   NativeProgramFeatures features;
   kernel.walk([&](Operation *operation) {
     features.observe(operation);
-    if (auto op = dyn_cast<gpu::LoadOp>(operation)) inputs.loads.push_back(op);
-    else if (auto op = dyn_cast<gpu::GatherOp>(operation)) inputs.gathers.push_back(op);
-    else if (auto op = dyn_cast<gpu::StoreOp>(operation)) inputs.stores.push_back(op);
-    else if (auto op = dyn_cast<gpu::AtomicRMWOp>(operation)) inputs.atomics.push_back(op);
-    else if (auto op = dyn_cast<gpu::ContractOp>(operation)) inputs.contracts.push_back(op);
-    else if (auto op = dyn_cast<gpu::ScaledContractOp>(operation)) inputs.scaledContracts.push_back(op);
-    else if (auto op = dyn_cast<gpu::ReduceOp>(operation)) inputs.reductions.push_back(op);
-    else if (auto op = dyn_cast<gpu::HistogramOp>(operation)) inputs.histograms.push_back(op);
-    else if (auto op = dyn_cast<gpu::ScanOp>(operation)) inputs.scans.push_back(op);
-    else if (auto op = dyn_cast<gpu::AssumeInBoundsOp>(operation)) inputs.assumptions.push_back(op);
+    if (auto op = dyn_cast<gpu::LoadOp>(operation)) accesses.loads.push_back(op);
+    else if (auto op = dyn_cast<gpu::GatherOp>(operation)) accesses.gathers.push_back(op);
+    else if (auto op = dyn_cast<gpu::StoreOp>(operation)) accesses.stores.push_back(op);
+    else if (auto op = dyn_cast<gpu::AtomicRMWOp>(operation)) accesses.atomics.push_back(op);
+    else if (auto op = dyn_cast<gpu::ContractOp>(operation)) computations.contracts.push_back(op);
+    else if (auto op = dyn_cast<gpu::ScaledContractOp>(operation)) computations.scaledContracts.push_back(op);
+    else if (auto op = dyn_cast<gpu::ReduceOp>(operation)) computations.reductions.push_back(op);
+    else if (auto op = dyn_cast<gpu::HistogramOp>(operation)) computations.histograms.push_back(op);
+    else if (auto op = dyn_cast<gpu::ScanOp>(operation)) computations.scans.push_back(op);
+    else if (auto op = dyn_cast<gpu::AssumeInBoundsOp>(operation)) assumptions.push_back(op);
   });
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  if (!inputs.scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
-    return inputs.scaledContracts.front().emitOpError(
+  if (!computations.scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
+    return computations.scaledContracts.front().emitOpError(
         "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
   if (features.occupancySensitive &&
       failed(declareProviderParameter(
@@ -133,12 +102,12 @@ LogicalResult formNativeProgram(ModuleOp module) {
     return failure();
 
   NativeFormRewriter rewriter;
-  if (failed(formNativeAccesses(kernel, *profiles, inputs, features.matrixCompute,
+  if (failed(formNativeAccesses(kernel, *profiles, accesses, features.matrixCompute,
                                 rewriter)) ||
-      failed(formComputePrimitives(kernel, inputs, rewriter)))
+      failed(formComputePrimitives(kernel, computations, rewriter)))
     return failure();
   rewriter.commit();
-  for (gpu::AssumeInBoundsOp assumption : inputs.assumptions)
+  for (gpu::AssumeInBoundsOp assumption : assumptions)
     assumption.erase();
   gpu::eraseDeadPhysicalValues(kernel);
   return mlir::verify(module);

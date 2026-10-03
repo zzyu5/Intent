@@ -9,7 +9,11 @@ configure_file("${PROJECT_SOURCE_DIR}/lib/Dialect/GPU/Transforms/Configuration/T
 set(intent_profile_files "${CMAKE_CURRENT_BINARY_DIR}/profiles/shared.json")
 foreach(provider Triton CuTile Mojo Weft)
   string(TOLOWER "${provider}" provider_name)
-  configure_file("${PROJECT_SOURCE_DIR}/lib/Target/${provider}/Transforms/TuningProfiles.json"
+  set(profile_directory "${PROJECT_SOURCE_DIR}/lib/Target/${provider}/Transforms")
+  if(provider STREQUAL "Triton" OR provider STREQUAL "CuTile")
+    string(APPEND profile_directory "/Configuration")
+  endif()
+  configure_file("${profile_directory}/TuningProfiles.json"
                  "${CMAKE_CURRENT_BINARY_DIR}/profiles/${provider_name}.json" COPYONLY)
   list(APPEND intent_profile_files
        "${CMAKE_CURRENT_BINARY_DIR}/profiles/${provider_name}.json")

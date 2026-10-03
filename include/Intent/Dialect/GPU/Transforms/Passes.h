@@ -23,10 +23,6 @@ mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
 mlir::LogicalResult vectorizeBufferLoops(mlir::ModuleOp module);
 mlir::LogicalResult promoteBufferValues(mlir::ModuleOp module);
 mlir::LogicalResult schedulePrivateStores(mlir::ModuleOp module);
-/// Realizes region operations and closes their inlined value/access relations
-/// before returning to the pipeline's executable-program verification boundary.
-mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
-mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 mlir::LogicalResult realizeContractionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult materializeProgramBuffers(mlir::ModuleOp module);
 mlir::LogicalResult lowerInvocationWorkspaces(mlir::ModuleOp module);

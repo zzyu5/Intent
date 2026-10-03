@@ -18,6 +18,8 @@ struct SourcePlan {
   bool retainSnapshot = false;
 };
 
+PhysicalExprAttr parameterExtent(ParameterRefAttr parameter);
+
 FragmentType replaceSliceAxis(FragmentType source, unsigned axis,
                               PhysicalExprAttr extent,
                               AxisMapAttr segmentMapping);

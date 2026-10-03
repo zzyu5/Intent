@@ -38,6 +38,10 @@ add_mlir_library(MLIRIntentGPUTransforms
   Reduction/ReductionValues.cpp
 
   Region/RealizeRegionFold.cpp
+  Region/RealizeRegionScan.cpp
+  Region/RegionCoRealization.cpp
+  Region/RegionPredicates.cpp
+  Region/RegionSummary.cpp
   Region/RegionCloning.cpp
   Region/RegionScanOutputs.cpp
   Region/RegionSources.cpp
@@ -54,7 +58,12 @@ add_mlir_library(MLIRIntentGPUTransforms
   Value/SchemaMutation.cpp
   Value/SimplifyRangePredicates.cpp
   Value/ValueMaterialization.cpp
-  Value/ValueRelations.cpp
+  Value/Relations/Access.cpp
+  Value/Relations/Contraction.cpp
+  Value/Relations/ExtentPropagation.cpp
+  Value/Relations/Pointwise.cpp
+  Value/Relations/Structured.cpp
+  Value/Relations/Worklist.cpp
 
   Storage/LowerWorkspace.cpp
   Storage/MaterializeRetainedValues.cpp
@@ -64,6 +73,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Mapping/ExecutionGroups.cpp
   Mapping/ProgramInterface.cpp
   Mapping/RefineProgramMapping.cpp
+  Mapping/UniformBranches.cpp
 
   Configuration/ConfigurationAnalysis.cpp
   Configuration/ConfigurationConstraints.cpp

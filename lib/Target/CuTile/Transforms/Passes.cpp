@@ -1,5 +1,5 @@
 #include "Intent/Target/CuTile/Transforms/Passes.h"
-#include "Legalize.h"
+#include "Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "Intent/Target/CuTile/IR/CuTileDialect.h"

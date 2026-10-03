@@ -4,6 +4,13 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   PhysicalExpressions.cpp
   TypeVerification.cpp
   GPUOps.cpp
+  Operations/Program.cpp
+  Operations/Values.cpp
+  Operations/Shape.cpp
+  Operations/Access.cpp
+  Operations/Contraction.cpp
+  Operations/Collective.cpp
+  Operations/Verification.cpp
   Canonicalization.cpp
   AccessOpInterface.cpp
   FragmentOpInterface.cpp

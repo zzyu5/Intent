@@ -10,6 +10,13 @@ using namespace mlir;
 
 namespace intent::gpu::region {
 
+PhysicalExprAttr parameterExtent(ParameterRefAttr parameter) {
+  return PhysicalExprAttr::get(
+      parameter.getContext(),
+      PhysicalExprKind::Parameter, 0,
+      parameter, ArrayAttr::get(parameter.getContext(), {}));
+}
+
 FragmentType replaceSliceAxis(FragmentType source, unsigned axis,
                               PhysicalExprAttr extent,
                               AxisMapAttr segmentMapping) {

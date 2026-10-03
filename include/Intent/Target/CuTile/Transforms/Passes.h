@@ -6,17 +6,13 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 
-namespace intent::gpu { struct TuningProfileSchema; }
 namespace intent::cutile {
 
 #define GEN_PASS_DECL
 #include "Intent/Target/CuTile/Transforms/Passes.h.inc"
 
 void registerCuTilePasses();
-const gpu::TuningProfileSchema &tuningProfileSchema();
 void buildCuTilePipeline(mlir::OpPassManager &manager);
-mlir::LogicalResult collapseArrayViews(mlir::ModuleOp module);
-mlir::LogicalResult refineMMALoops(mlir::ModuleOp module);
 
 } // namespace intent::cutile
 
