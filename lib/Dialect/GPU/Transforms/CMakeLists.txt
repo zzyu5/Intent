@@ -58,6 +58,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Value/ReplayMaterialization.cpp
   Value/ReplayPolicy.cpp
   Value/SchemaMutation.cpp
+  Value/ScopePlacement.cpp
   Value/SimplifyRangePredicates.cpp
   Value/ValueMaterialization.cpp
   Value/Relations/Access.cpp

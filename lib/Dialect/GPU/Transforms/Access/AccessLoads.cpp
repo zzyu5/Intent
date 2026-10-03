@@ -1,4 +1,5 @@
 #include "AccessComposition.h"
+#include "../Value/ScopePlacement.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -525,8 +526,6 @@ bool reuseStableLoads(func::FuncOp kernel) {
     while (cursor != block->begin()) {
       --cursor;
       Operation *candidate = &*cursor;
-      if (candidate->getNumRegions() != 0)
-        break;
       if (auto available = dyn_cast<LoadOp>(candidate)) {
         if (!sameRead(available, current))
           continue;
@@ -555,9 +554,8 @@ void sinkStableLoadChains(func::FuncOp kernel) {
     Operation *producer = pending.pop_back_val();
     for (Operation *user : producer->getUsers()) {
       if (user->getBlock() != producer->getBlock() ||
-          !isa<CastOp, BitcastOp, ReshapeOp, TransposeOp, BroadcastOp,
-               SelectOp, BinaryOp, UnaryOp>(user) ||
-          !isMemoryEffectFree(user) || !selected.insert(user).second)
+          !placement::isMovableValueOperation(user) ||
+          !selected.insert(user).second)
         continue;
       pending.push_back(user);
     }
@@ -580,22 +578,7 @@ void sinkStableLoadChains(func::FuncOp kernel) {
     }
     if (!firstUse || operation->getNextNode() == firstUse)
       continue;
-    if (auto load = dyn_cast<LoadOp>(operation)) {
-      if (canReplayReadAt(load, firstUse))
-        load->moveBefore(firstUse);
-      continue;
-    }
-    bool crossesEffect = false;
-    for (Operation *next = operation->getNextNode(); next != firstUse;
-         next = next->getNextNode()) {
-      // ABI views can alias. Do not cross writes, atomics, synchronization,
-      // or an unknown effect while shortening an immutable load's live range.
-      if (!isMemoryEffectFree(next) && !isa<LoadOp, GatherOp>(next)) {
-        crossesEffect = true;
-        break;
-      }
-    }
-    if (!crossesEffect)
+    if (placement::canMoveBefore(operation, firstUse))
       operation->moveBefore(firstUse);
   }
 }

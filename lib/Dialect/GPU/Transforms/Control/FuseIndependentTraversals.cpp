@@ -1,17 +1,17 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
+#include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
+#include "../Access/AccessComposition.h"
+#include "../Value/ScopePlacement.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Transforms/RegionUtils.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SetVector.h"
-
-#include <functional>
+#include "llvm/ADT/DenseMap.h"
 
 using namespace mlir;
 
@@ -37,106 +37,198 @@ bool sameBound(Value lhs, Value rhs, ArrayAttr tuples) {
   });
 }
 
-bool collectViewReads(scf::ForOp loop, bool allowScratchWrites,
-                      llvm::DenseSet<Value> &reads) {
-  return !loop.walk([&](Operation *operation) {
-    if (operation == loop)
-      return WalkResult::advance();
-    if (auto load = dyn_cast<LoadOp>(operation)) {
-      auto view = dyn_cast<ViewType>(load.getResource().getType());
-      if (!view || view.getAccess() != 0)
-        return WalkResult::interrupt();
-      reads.insert(load.getResource());
-      return WalkResult::advance();
+// Equivalence under the one induction-variable substitution that sibling
+// fusion actually performs. In particular, equal initial values do not make
+// two loop-carried arguments the same evolving value.
+class SharedTraversalValues {
+public:
+  SharedTraversalValues(scf::ForOp first, scf::ForOp second)
+      : first(first), second(second) {}
+
+  bool hasReusableWork() {
+    bool usefulSharing = false;
+    firstSize = std::distance(first.getBody()->begin(),
+                              first.getBody()->getTerminator()->getIterator());
+    for (auto [rightIndex, rhs] :
+         llvm::enumerate(second.getBody()->without_terminator())) {
+      if (rhs.use_empty())
+        continue;
+      for (auto [leftIndex, lhs] :
+           llvm::enumerate(first.getBody()->without_terminator())) {
+        if (!equivalent(&lhs, &rhs))
+          continue;
+        shared.emplace_back(leftIndex, rightIndex);
+        usefulSharing |= useful(&rhs);
+        break;
+      }
     }
-    if (auto store = dyn_cast<StoreOp>(operation))
-      return allowScratchWrites && isa<BufferType>(store.getResource().getType())
-                 ? WalkResult::advance() : WalkResult::interrupt();
-    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(operation))
-      return WalkResult::interrupt();
-    return isMemoryEffectFree(operation) ? WalkResult::advance()
-                                        : WalkResult::interrupt();
-  }).wasInterrupted();
+    return usefulSharing;
+  }
+
+  void mergeClonedValues(scf::ForOp fused) {
+    SmallVector<Operation *> body;
+    for (Operation &operation : fused.getBody()->without_terminator())
+      body.push_back(&operation);
+    // The native sibling utility clones the complete first body followed by
+    // the complete second body. All pairs refer to this one fresh body; they
+    // are never reused after a subsequent rewrite.
+    for (auto [left, right] : shared)
+      body[firstSize + right]->replaceAllUsesWith(body[left]->getResults());
+    for (auto [left, right] : llvm::reverse(shared))
+      body[firstSize + right]->erase();
+  }
+
+private:
+  bool useful(Operation *operation) {
+    if (operation->use_empty())
+      return false;
+    if (isa<LoadOp>(operation))
+      return true;
+    return placement::isMovableValueOperation(operation) &&
+           operation->hasTrait<OpTrait::Elementwise>() &&
+           llvm::any_of(operation->getResultTypes(),
+                        [](Type type) { return isa<FragmentType>(type); });
+  }
+
+  bool equivalent(Value lhs, Value rhs) {
+    if (lhs == rhs)
+      return true;
+    if (lhs.getType() != rhs.getType())
+      return false;
+    if (lhs == first.getInductionVar() && rhs == second.getInductionVar())
+      return true;
+    auto left = dyn_cast<OpResult>(lhs);
+    auto right = dyn_cast<OpResult>(rhs);
+    if (!left || !right || left.getResultNumber() != right.getResultNumber())
+      return false;
+    auto key = std::make_pair(lhs, rhs);
+    if (auto found = values.find(key); found != values.end())
+      return found->second;
+    bool same = equivalent(left.getOwner(), right.getOwner());
+    values.try_emplace(key, same);
+    return same;
+  }
+
+  bool equivalent(Operation *lhs, Operation *rhs) {
+    if (lhs->getNumRegions() || rhs->getNumRegions() ||
+        lhs->getName() != rhs->getName() ||
+        !llvm::equal(lhs->getResultTypes(), rhs->getResultTypes()) ||
+        lhs->getNumOperands() != rhs->getNumOperands())
+      return false;
+    if (isa<LoadOp>(lhs)) {
+      // Only the reads in the two traversals have a joint independence proof.
+      // Distinct captured reads may have observed different memory contents.
+      if (lhs->getBlock() != first.getBody() ||
+          rhs->getBlock() != second.getBody())
+        return false;
+    } else if (!placement::isMovableValueOperation(lhs) ||
+               !placement::isMovableValueOperation(rhs)) {
+      return false;
+    }
+    NamedAttrList leftAttrs(lhs->getAttrs()), rightAttrs(rhs->getAttrs());
+    leftAttrs.erase(originAttr);
+    rightAttrs.erase(originAttr);
+    if (leftAttrs != rightAttrs ||
+        lhs->getPropertiesAsAttribute() != rhs->getPropertiesAsAttribute())
+      return false;
+    return llvm::all_of(llvm::zip(lhs->getOperands(), rhs->getOperands()),
+                        [&](auto pair) {
+      return equivalent(std::get<0>(pair), std::get<1>(pair));
+    });
+  }
+
+  scf::ForOp first, second;
+  llvm::DenseMap<std::pair<Value, Value>, bool> values;
+  SmallVector<std::pair<unsigned, unsigned>> shared;
+  unsigned firstSize = 0;
+};
+
+PhysicalExprAttr carryFootprint(Type type, Builder &builder) {
+  if (auto fragment = dyn_cast<FragmentType>(type))
+    return fragmentRegisterFootprint(fragment);
+  auto constant = [&](int64_t words) {
+    return PhysicalExprAttr::get(builder.getContext(), PhysicalExprKind::Constant,
+                                 words, builder.getStringAttr(""),
+                                 builder.getArrayAttr({}));
+  };
+  if (auto record = dyn_cast<RecordType>(type)) {
+    PhysicalExprAttr total = constant(0);
+    for (Attribute field : record.getFieldTypes()) {
+      auto words = carryFootprint(cast<TypeAttr>(field).getValue(), builder);
+      if (!words)
+        return {};
+      total = PhysicalExprAttr::get(builder.getContext(), PhysicalExprKind::Add,
+                                    0, builder.getStringAttr(""),
+                                    builder.getArrayAttr({total, words}));
+    }
+    return total;
+  }
+  if (!type.isIntOrIndexOrFloat())
+    return {};
+  unsigned bits = type.isIndex() ? 64 : type.getIntOrFloatBitWidth();
+  return constant(std::max(1u, (bits + 31) / 32));
 }
 
-bool hoistInputsBefore(Operation *first, Operation *second,
-                       func::FuncOp kernel) {
-  DominanceInfo dominance(kernel);
-  SmallVector<Operation *> hoist;
-  llvm::DenseSet<Value> visited;
-  std::function<bool(Value)> availableBeforeFirst = [&](Value value) {
-    if (dominance.properlyDominates(value, first))
-      return true;
-    if (!visited.insert(value).second)
-      return true;
-    Operation *producer = value.getDefiningOp();
-    if (!producer || producer->getBlock() != first->getBlock() ||
-        !first->isBeforeInBlock(producer) ||
-        !producer->isBeforeInBlock(second) || producer->getNumRegions())
-      return false;
-    if (!isMemoryEffectFree(producer)) {
-      auto load = dyn_cast<LoadOp>(producer);
-      if (!load || !canReplayReadAt(load, first))
-        return false;
-    }
-    if (!llvm::all_of(producer->getOperands(), availableBeforeFirst))
-      return false;
-    if (!llvm::is_contained(hoist, producer))
-      hoist.push_back(producer);
+bool boundedCombinedCarries(scf::ForOp first, scf::ForOp second,
+                            func::FuncOp kernel) {
+  if (!first.getNumResults() || !second.getNumResults())
     return true;
-  };
-  llvm::SetVector<Value> captures;
-  for (Region &region : second->getRegions())
-    getUsedValuesDefinedAbove(region, region, captures);
-  if (!llvm::all_of(second->getOperands(), availableBeforeFirst) ||
-      !llvm::all_of(captures, availableBeforeFirst))
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return false;
-  for (Operation *operation : hoist)
-    operation->moveBefore(first);
-  return true;
+  Builder builder(kernel.getContext());
+  PhysicalExprAttr total;
+  for (scf::ForOp loop : {first, second}) {
+    for (Type type : loop.getResultTypes()) {
+      auto words = carryFootprint(type, builder);
+      if (!words)
+        return false;
+      total = !total ? words : PhysicalExprAttr::get(
+          kernel.getContext(), PhysicalExprKind::Add, 0,
+          builder.getStringAttr(""), builder.getArrayAttr({total, words}));
+    }
+  }
+  auto limit = PhysicalExprAttr::get(
+      kernel.getContext(), PhysicalExprKind::Constant,
+      capabilities.getRegistersPerUnit(), builder.getStringAttr(""),
+      builder.getArrayAttr({}));
+  // This limits the newly simultaneous carried payload. It is not a register
+  // allocation or occupancy proof, and does not change the candidate set.
+  return configurationExpressionAtMost(kernel, total, limit);
+}
+
+bool compatibleLoopAttributes(scf::ForOp first, scf::ForOp second) {
+  NamedAttrList lhs(first->getAttrs()), rhs(second->getAttrs());
+  for (StringRef name : {originAttr, reductionSourcesAttr,
+                         independentIterationAttr}) {
+    lhs.erase(name);
+    rhs.erase(name);
+  }
+  return lhs == rhs;
 }
 
 bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
              ArrayAttr tuples) {
-  if (second.getNumResults()) {
-    auto directContraction = [](scf::ForOp loop) {
-      if (loop.getNumResults() != 1) return false;
-      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-      auto contract = yield.getOperand(0).getDefiningOp<ContractOp>();
-      return contract && contract.getAccumulator() == loop.getRegionIterArgs()[0];
-    };
-    if (!directContraction(first) || !directContraction(second))
-      return false;
-  }
   if (first->getBlock() != second->getBlock() ||
       !first->isBeforeInBlock(second) ||
       !sameBound(first.getLowerBound(), second.getLowerBound(), tuples) ||
       !sameBound(first.getUpperBound(), second.getUpperBound(), tuples) ||
       !sameBound(first.getStep(), second.getStep(), tuples))
     return false;
-  for (NamedAttribute attribute : first->getDiscardableAttrs())
-    if (attribute.getName() != originAttr &&
-        attribute.getName() != reductionSourcesAttr &&
-        attribute.getName() != independentIterationAttr)
-      return false;
-  for (NamedAttribute attribute : second->getDiscardableAttrs())
-    if (attribute.getName() != originAttr &&
-        attribute.getName() != reductionSourcesAttr &&
-        attribute.getName() != independentIterationAttr)
-      return false;
-  llvm::DenseSet<Value> firstReads, secondReads;
-  if (!collectViewReads(first, false, firstReads) ||
-      !collectViewReads(second, true, secondReads) ||
-      !llvm::any_of(firstReads, [&](Value value) {
-        return secondReads.contains(value);
-      }))
+  SharedTraversalValues shared(first, second);
+  if (!compatibleLoopAttributes(first, second) ||
+      !boundedCombinedCarries(first, second, kernel) ||
+      !shared.hasReusableWork())
+    return false;
+  ResourceAliasAnalysis aliases;
+  if (!placement::independentMemoryEffects(first, second, aliases))
     return false;
   for (Operation *operation = first->getNextNode(); operation != second;
        operation = operation->getNextNode())
-    if (!isMemoryEffectFree(operation))
+    if (!placement::independentMemoryEffects(operation, second, aliases))
       return false;
 
-  if (!hoistInputsBefore(first, second, kernel))
+  if (!placement::moveInputsBefore(first, second, kernel))
     return false;
 
   // The complete candidate set proves equal granularity even when the two
@@ -153,8 +245,11 @@ bool tryFuse(scf::ForOp first, scf::ForOp second, func::FuncOp kernel,
   bool independent = first->hasAttr(independentIterationAttr) &&
                      second->hasAttr(independentIterationAttr);
   IRRewriter rewriter(kernel.getContext());
+  Location location = rewriter.getFusedLoc({first.getLoc(), second.getLoc()});
   second->moveBefore(first);
   scf::ForOp fused = mlir::fuseIndependentSiblingForLoops(first, second, rewriter);
+  shared.mergeClonedValues(fused);
+  fused->setLoc(location);
   fused->setAttrs(attributes);
   if (!sources.empty())
     fused->setAttr(reductionSourcesAttr, rewriter.getArrayAttr(sources));
@@ -183,7 +278,7 @@ ReduceOp tryFuse(ReduceOp first, ReduceOp second, func::FuncOp kernel) {
         return {};
     }
   }
-  if (!hoistInputsBefore(first, second, kernel))
+  if (!placement::moveInputsBefore(first, second, kernel))
     return {};
 
   SmallVector<Value> sources, identities, captures;
@@ -283,7 +378,12 @@ LogicalResult fuseIndependentTraversals(ModuleOp module) {
         break;
     }
   } while (changed);
-  return eliminateCommonValues(module);
+  if (failed(eliminateCommonValues(module)))
+    return failure();
+  if (access::reuseStableLoads(kernel) && failed(eliminateCommonValues(module)))
+    return failure();
+  access::sinkStableLoadChains(kernel);
+  return success();
 }
 
 } // namespace intent::gpu
