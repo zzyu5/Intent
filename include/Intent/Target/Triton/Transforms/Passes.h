@@ -16,7 +16,6 @@ const gpu::TuningProfileSchema &tuningProfileSchema();
 void buildTritonPipeline(mlir::OpPassManager &manager);
 
 mlir::LogicalResult legalizeProgramGrid(mlir::ModuleOp module);
-mlir::LogicalResult verifyTritonProgram(mlir::ModuleOp module);
 
 } // namespace intent::triton
 

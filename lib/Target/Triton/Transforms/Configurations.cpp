@@ -1,6 +1,5 @@
 #include "Configurations.h"
 #include "ConfigurationFacts.h"
-#include "ConfigurationRequirements.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
@@ -52,68 +51,6 @@ StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
 }
 
 } // namespace
-
-std::optional<int64_t> evaluateCompileTimeExpression(
-    gpu::PhysicalExprAttr expression, DictionaryAttr bindings) {
-  return gpu::evaluatePhysicalExpression(expression, [&](gpu::PhysicalExprAttr leaf)
-      -> std::optional<int64_t> {
-    if (leaf.getKind() != gpu::PhysicalExprKind::Parameter)
-      return std::nullopt;
-    auto value = bindings ? bindings.getAs<IntegerAttr>(leaf.getParameterReference().getName()) : IntegerAttr();
-    return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
-  });
-}
-
-bool isTritonFragmentExtent(Attribute attribute) {
-  auto expression = dyn_cast<gpu::PhysicalExprAttr>(attribute);
-  if (!expression)
-    return false;
-  auto kind = expression.getKind();
-  return kind != gpu::PhysicalExprKind::ScalarABI &&
-         isTritonExpression(expression) &&
-         llvm::all_of(expression.getOperands(), isTritonFragmentExtent);
-}
-
-bool isTritonExpression(gpu::PhysicalExprAttr expression) {
-  auto kind = expression.getKind();
-  switch (kind) {
-  case gpu::PhysicalExprKind::Constant:
-  case gpu::PhysicalExprKind::Parameter:
-  case gpu::PhysicalExprKind::Dimension:
-  case gpu::PhysicalExprKind::ScalarABI:
-    return expression.getOperands().empty();
-  case gpu::PhysicalExprKind::Add:
-  case gpu::PhysicalExprKind::Multiply:
-  case gpu::PhysicalExprKind::CeilDiv:
-  case gpu::PhysicalExprKind::Minimum:
-  case gpu::PhysicalExprKind::Subtract:
-  case gpu::PhysicalExprKind::FloorDiv:
-  case gpu::PhysicalExprKind::Maximum:
-    if (expression.getOperands().size() != 2)
-      return false;
-    break;
-  case gpu::PhysicalExprKind::Select:
-    if (expression.getOperands().size() != 3)
-      return false;
-    break;
-  case gpu::PhysicalExprKind::NextPowerOfTwo:
-    if (expression.getOperands().size() != 1)
-      return false;
-    break;
-  default:
-    return false;
-  }
-  return llvm::all_of(expression.getOperands(), [](Attribute operand) {
-    return isTritonExpression(cast<gpu::PhysicalExprAttr>(operand));
-  });
-}
-
-std::optional<int64_t> descriptorElementBytes(Type type) {
-  unsigned bitWidth = type.getIntOrFloatBitWidth();
-  if (bitWidth < 8 || bitWidth % 8 != 0)
-    return std::nullopt;
-  return bitWidth / 8;
-}
 
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
                                       TensorDescriptorChoiceOp descriptorChoice,
@@ -230,6 +167,21 @@ FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
       loop->setAttr(loopStagesAttr, stages->getReference());
   }
   return localOptions;
+}
+
+LogicalResult finalizeConfigurationRequirements(func::FuncOp kernel) {
+  auto space = gpu::ParameterSpace::read(kernel);
+  if (failed(space))
+    return failure();
+  auto rows = space->configurations(gpu::ConfigurationStage::Complete);
+  auto requirements = collectConfigurationRequirements(kernel);
+  if (failed(rows) || failed(requirements))
+    return failure();
+  auto accepted = gpu::filterConfigurationRequirements(kernel, *rows, *requirements);
+  if (failed(accepted))
+    return failure();
+  return gpu::writeConfigurations(kernel, *accepted,
+                                 gpu::ConfigurationStage::Complete, *requirements);
 }
 
 } // namespace intent::triton

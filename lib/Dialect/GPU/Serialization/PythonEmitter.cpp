@@ -60,29 +60,6 @@ void PythonEmitter::addCommonOperations(Emitters &emitters) {
       e.assign(coordinate, expression);
     return success();
   });
-  emitters.add<BinaryOp>(valid, [](BinaryOp op, PythonEmitter &e) {
-    bool compileTime = (op.getResult().getType().isIndex() || op.getResult().getType().isInteger(1)) &&
-        e.constexprValues.contains(op.getLhs()) && e.constexprValues.contains(op.getRhs());
-    e.assign(op.getResult(), e.binaryExpression(op), compileTime); return success();
-  });
-  emitters.add<UnaryOp>(valid, [](UnaryOp op, PythonEmitter &e) {
-    e.assign(op.getResult(), e.unaryExpression(op)); return success();
-  });
-  emitters.add<CompareOp>(valid, [](CompareOp op, PythonEmitter &e) {
-    StringRef token;
-    switch (op.getPredicate()) {
-    case ComparePredicate::Eq: token = "=="; break;
-    case ComparePredicate::Ne: token = "!="; break;
-    case ComparePredicate::Lt: token = "<"; break;
-    case ComparePredicate::Le: token = "<="; break;
-    case ComparePredicate::Gt: token = ">"; break;
-    case ComparePredicate::Ge: token = ">="; break;
-    }
-    e.assign(op.getResult(), "(" + e.valueString(op.getLhs()) + " " + token.str() + " " +
-             e.valueString(op.getRhs()) + ")", op.getResult().getType().isInteger(1) &&
-             e.constexprValues.contains(op.getLhs()) && e.constexprValues.contains(op.getRhs()));
-    return success();
-  });
   emitters.add<MakeRangeOp>(valid, [](MakeRangeOp op, PythonEmitter &e) {
     e.assign(op.getResult(), e.makeRange(op)); return success();
   });
@@ -92,17 +69,6 @@ void PythonEmitter::addCommonOperations(Emitters &emitters) {
   emitters.add<BroadcastOp>(valid, [](BroadcastOp op, PythonEmitter &e) {
     e.assign(op.getResult(), e.broadcastValue(op.getValue(), op.getResult().getType()));
     return success();
-  });
-  emitters.add<CastOp>(valid, [](CastOp op, PythonEmitter &e) {
-    e.assign(op.getResult(), e.castValue(op.getValue(), op.getResult().getType(), false));
-    return success();
-  });
-  emitters.add<BitcastOp>(valid, [](BitcastOp op, PythonEmitter &e) {
-    e.assign(op.getResult(), e.castValue(op.getValue(), op.getResult().getType(), true));
-    return success();
-  });
-  emitters.add<SelectOp>(valid, [](SelectOp op, PythonEmitter &e) {
-    e.assign(op.getResult(), e.select(op)); return success();
   });
   emitters.add<ReshapeOp>(valid, [](ReshapeOp op, PythonEmitter &e) {
     e.assign(op.getResult(), e.reshape(op)); return success();

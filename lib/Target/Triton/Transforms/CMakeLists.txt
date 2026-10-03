@@ -5,10 +5,8 @@ add_mlir_library(MLIRIntentTritonTransforms
   Collectives.cpp
   Supply.cpp
   Values.cpp
-  Verify.cpp
   Configurations.cpp
   ConfigurationFacts.cpp
-  ConfigurationRequirements.cpp
   ProgramGrid.cpp
 
   DEPENDS
@@ -24,5 +22,6 @@ add_mlir_library(MLIRIntentTritonTransforms
   MLIRIntentGPUDialect
   MLIRIntentGPUTransforms
   MLIRIntentTritonDialect
+  MLIRIntentTritonAnalysis
   MLIRIntentTritonSerialization
 )

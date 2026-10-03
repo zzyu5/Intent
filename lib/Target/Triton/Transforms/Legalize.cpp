@@ -1,5 +1,6 @@
 #include "Legalization.h"
-#include "ConfigurationRequirements.h"
+#include "Intent/Target/Triton/Analysis/Program.h"
+#include "Intent/Target/Triton/Serialization/Serializer.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h"
@@ -81,10 +82,7 @@ LogicalResult finalizeTritonProgram(ModuleOp module) {
       failed(finalizeConfigurationRequirements(*kernel)))
     return failure();
   detail::sinkSelectProducers(*kernel);
-  if (failed(verifyTritonProgram(module)))
-    return failure();
-  (*kernel)->setAttr(detail::legalizedAttr, UnitAttr::get(module.getContext()));
-  return success();
+  return verifyTritonProgram(module, verifySourceOperation);
 }
 
 } // namespace intent::triton

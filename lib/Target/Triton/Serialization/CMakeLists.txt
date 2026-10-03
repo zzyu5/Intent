@@ -1,5 +1,6 @@
 add_mlir_library(MLIRIntentTritonSerialization
   Serializer.cpp
+  Numerical.cpp
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
@@ -9,4 +10,5 @@ add_mlir_library(MLIRIntentTritonSerialization
   MLIRIntentGPUDialect
   MLIRIntentGPUSerialization
   MLIRIntentTritonDialect
+  MLIRIntentTritonAnalysis
 )

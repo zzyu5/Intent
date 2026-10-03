@@ -444,7 +444,7 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
       return;
     // Native unrolling preserves the accumulator chain and handles the tail;
     // independent reads from later iterations can overlap the current update.
-    loop->setAttr("intent_gpu.triton.loop_unroll_factor",
+    loop->setAttr(loopUnrollFactorAttr,
                   IntegerAttr::get(IntegerType::get(kernel.getContext(), 32),
                                    factor));
   });

@@ -9,9 +9,11 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/SmallVector.h"
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -66,19 +68,23 @@ private:
 // Registration uses operation classes; names only identify registered MLIR ops.
 template <typename Context> class OperationEmitters {
 public:
+  using Dependencies = llvm::SmallVector<std::string>;
+
   template <typename Op, typename Check, typename Emit>
-  void add(Check check, Emit emit) {
+  void add(Check check, Emit emit,
+           std::function<mlir::FailureOr<Dependencies>(Op)> dependencies = {}) {
     auto inserted = handlers.try_emplace(Op::getOperationName(),
-                                        handler<Op>(std::move(check), std::move(emit)));
+        handler<Op>(std::move(check), std::move(emit), std::move(dependencies)));
     assert(inserted.second && "source operation was registered twice");
     (void)inserted;
   }
 
   template <typename Op, typename Check, typename Emit>
-  void replace(Check check, Emit emit) {
+  void replace(Check check, Emit emit,
+               std::function<mlir::FailureOr<Dependencies>(Op)> dependencies = {}) {
     auto found = handlers.find(Op::getOperationName());
     assert(found != handlers.end() && "cannot replace an unregistered source operation");
-    found->second = handler<Op>(std::move(check), std::move(emit));
+    found->second = handler<Op>(std::move(check), std::move(emit), std::move(dependencies));
   }
 
   bool contains(mlir::Operation *operation) const {
@@ -101,20 +107,47 @@ public:
     return found->second.emit(operation, context);
   }
 
+  // Dependencies are terminal source spellings owned by the same handler as
+  // legality and emission. Recompute them from the current program; no import
+  // inventory or execution decision survives an IR rewrite.
+  mlir::FailureOr<Dependencies> collectDependencies(mlir::Operation *root) const {
+    std::set<std::string> required;
+    auto walk = root->walk([&](mlir::Operation *operation) {
+      auto found = handlers.find(operation->getName().getStringRef());
+      if (found == handlers.end()) {
+        operation->emitOpError("has no registered source translation");
+        return mlir::WalkResult::interrupt();
+      }
+      auto dependencies = found->second.dependencies(operation);
+      if (mlir::failed(dependencies)) return mlir::WalkResult::interrupt();
+      required.insert(dependencies->begin(), dependencies->end());
+      return mlir::WalkResult::advance();
+    });
+    if (walk.wasInterrupted()) return mlir::failure();
+    return Dependencies(required.begin(), required.end());
+  }
+
 private:
   struct Handler {
     std::function<mlir::LogicalResult(mlir::Operation *)> check;
     std::function<mlir::LogicalResult(mlir::Operation *, Context &)> emit;
+    std::function<mlir::FailureOr<Dependencies>(mlir::Operation *)> dependencies;
   };
 
   template <typename Op, typename Check, typename Emit>
-  static Handler handler(Check check, Emit emit) {
+  static Handler handler(Check check, Emit emit,
+      std::function<mlir::FailureOr<Dependencies>(Op)> dependencies) {
     return {
         [check = std::move(check)](mlir::Operation *operation) {
           return check(mlir::cast<Op>(operation));
         },
         [emit = std::move(emit)](mlir::Operation *operation, Context &context) {
           return emit(mlir::cast<Op>(operation), context);
+        },
+        [dependencies = std::move(dependencies)](mlir::Operation *operation)
+            -> mlir::FailureOr<Dependencies> {
+          return dependencies ? dependencies(mlir::cast<Op>(operation))
+                              : mlir::FailureOr<Dependencies>(Dependencies{});
         }};
   }
 

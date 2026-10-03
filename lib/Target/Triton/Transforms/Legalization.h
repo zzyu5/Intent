@@ -2,6 +2,7 @@
 #define INTENT_TARGET_TRITON_TRANSFORMS_LEGALIZATION_H
 
 #include "Configurations.h"
+#include "Intent/Target/Triton/IR/Program.h"
 #include "Intent/Target/Triton/Transforms/Passes.h"
 
 namespace intent::triton {
@@ -13,10 +14,6 @@ mlir::LogicalResult formTritonProgram(mlir::ModuleOp module);
 mlir::LogicalResult finalizeTritonProgram(mlir::ModuleOp module);
 
 namespace detail {
-inline constexpr llvm::StringLiteral contractFormAttr =
-    "intent_gpu.triton.contract_form";
-inline constexpr llvm::StringLiteral legalizedAttr = "intent_gpu.triton.legalized";
-
 // AccessForms owns source representations of already-decided GPU accesses.
 mlir::FailureOr<TensorDescriptorChoiceOp> materializeTensorDescriptorForms(
     mlir::func::FuncOp kernel, llvm::ArrayRef<TritonLocalOptions> localOptions);
@@ -39,8 +36,6 @@ llvm::SmallVector<mlir::scf::ForOp> findLoadPipelineLoops(mlir::func::FuncOp ker
 void selectOrderedLoadUnrolling(mlir::func::FuncOp kernel);
 
 // Values owns provider compute forms and value-graph representation.
-gpu::ConfigurationRequirementAttr
-contractionExpansionRequirement(gpu::ContractOp contract);
 void selectContractForms(mlir::func::FuncOp kernel);
 void canonicalizeBroadcastProjections(mlir::func::FuncOp kernel);
 void sinkSelectProducers(mlir::func::FuncOp kernel);

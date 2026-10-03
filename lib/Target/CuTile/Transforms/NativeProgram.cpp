@@ -10,10 +10,6 @@
 
 using namespace mlir;
 namespace intent::cutile {
-bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities) {
-  return capabilities && capabilities.getComputeCapabilityMajor() >= 10;
-}
-
 Type withElementType(Type type, Type elementType) {
   auto fragment = dyn_cast<gpu::FragmentType>(type);
   if (!fragment)
@@ -91,20 +87,6 @@ void NativeFormRewriter::commit() {
   for (Replacement &replacement : replacements)
     replacement.operation->erase();
   replacements.clear();
-}
-
-void NativeProgramFeatures::observe(Operation *operation) {
-  bool matrix = isa<gpu::ContractOp, gpu::ScaledContractOp, MMAOp,
-                    ScaledMMAOp>(operation);
-  matrixCompute |= matrix;
-  occupancySensitive |= matrix ||
-      isa<gpu::ReduceOp, gpu::HistogramOp, gpu::ScanOp, ReduceOp, ScanOp>(operation);
-}
-
-NativeProgramFeatures queryNativeProgramFeatures(func::FuncOp kernel) {
-  NativeProgramFeatures features;
-  kernel.walk([&](Operation *operation) { features.observe(operation); });
-  return features;
 }
 
 LogicalResult formNativeProgram(ModuleOp module) {

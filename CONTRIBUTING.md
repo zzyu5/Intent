@@ -919,16 +919,16 @@ host metadata binding，不依赖某个比较 SSA 值仍然存活。
 
 新增条件时，先在所属 family/provider 从当前 typed facts 构造一次 requirement，
 再交给 [Resources](lib/Dialect/GPU/Transforms/Configuration/Resources.cpp) 筛选和发布。
-[Triton ConfigurationRequirements](lib/Target/Triton/Transforms/ConfigurationRequirements.cpp)
+[Triton Configuration](lib/Target/Triton/Analysis/Configuration.cpp)
 从当前 range、fragment 和 descriptor 取得条件，包括真实 block shape、元素上限、
 连续字节与多 stage 对齐；descriptor 条件由当前 choice 参数激活。
-[cuTile Configurations](lib/Target/CuTile/Transforms/Configurations.cpp) 保留共同归约预算
+[cuTile Configuration](lib/Target/CuTile/Analysis/Configuration.cpp) 保留共同归约预算
 的适用范围，并表达 resident workers 与 CTA/occupancy 的派生等式。
 候选形成与最终发布调用同一收集器；最终 verifier 重新读取当前 IR，核对条件集合及
 候选绑定。条件集合不依赖遍历顺序，候选行仍保留原顺序。普通分支内 primitive assertion
 留在原分支。Serializer 只导出当前 attributes，不识别 `cf.assert` 的比较形状。
 
-Triton contraction 的展开元素上限由 [Values.cpp](lib/Target/Triton/Transforms/Values.cpp)
+Triton contraction 的展开元素上限由 [Contractions.cpp](lib/Target/Triton/Analysis/Contractions.cpp)
 中的 `contractionExpansionRequirement` 与 form 选择共用当前 operand shapes，进入同一
 候选条件收集器。已选展开形式读取实际 constexpr 分支条件；数据相关分支不能免除
 原生编译合法性。未选分支逐个条件化 shape 因子，避免无用乘积先溢出；native dot
@@ -1395,15 +1395,32 @@ Triton 的 [Passes.cpp](lib/Target/Triton/Transforms/Passes.cpp) 调度 grid、p
 | Triton | [AccessForms.cpp](lib/Target/Triton/Transforms/AccessForms.cpp) | 从当前 access facts 形成 tensor descriptor 或普通 pointer 访问；对齐与坐标投影复用 GPU 分析 |
 | Triton | [Collectives.cpp](lib/Target/Triton/Transforms/Collectives.cpp) | gather/scatter 的目标表达、scan tail 与原生 reduce/scan callback |
 | Triton | [Supply.cpp](lib/Target/Triton/Transforms/Supply.cpp) | ordered access dependencies、CTA 同步与 load-loop policy |
-| Triton | [Values.cpp](lib/Target/Triton/Transforms/Values.cpp)、[Verify.cpp](lib/Target/Triton/Transforms/Verify.cpp) | 前者形成 contract/value 表示，后者验证完整 Triton surface |
+| Triton | [Values.cpp](lib/Target/Triton/Transforms/Values.cpp) | 形成 contract/value 表示；只读 contraction 约束位于 [Analysis/Contractions.h](include/Intent/Target/Triton/Analysis/Contractions.h) |
 | cuTile | [NativeProgram.cpp](lib/Target/CuTile/Transforms/NativeProgram.cpp)、[NativeAccess.h](lib/Target/CuTile/Transforms/NativeAccess.h) | 收集本次输入、声明 provider 参数并统一提交 native replacements；原 GPU SSA 保留到相关 facts 消费完成 |
 | cuTile | [NativeAccessAnalysis.cpp](lib/Target/CuTile/Transforms/NativeAccessAnalysis.cpp) | 只读坐标、shape 与原生访问资格 |
 | cuTile | [NativeAccess.cpp](lib/Target/CuTile/Transforms/NativeAccess.cpp) | 构造原生 memory/extraction forms 及保持语义的 guards |
 | cuTile | [CollapseArrayViews.cpp](lib/Target/CuTile/Transforms/CollapseArrayViews.cpp) | 从已有原生 tile load 形成具有真实 collapsed layout 的条件视图，保留原访问语义 |
 | cuTile | [ComputeForms.cpp](lib/Target/CuTile/Transforms/ComputeForms.cpp) | 构造 reduce、scan、histogram 和 MMA primitives |
-| cuTile | [Legalize.cpp](lib/Target/CuTile/Transforms/Legalize.cpp) | 共享输入准备、宽索引与循环收尾、完整 surface 验证 |
+| cuTile | [Legalize.cpp](lib/Target/CuTile/Transforms/Legalize.cpp)、[Control/Loops.h](include/Intent/Target/CuTile/Transforms/Control/Loops.h) | 前者组合准备和收尾；后者形成有范围证明的原生循环或显式宽整数循环 |
+| Triton / cuTile | 各自的 [Triton Program.h](include/Intent/Target/Triton/Analysis/Program.h)、[cuTile Program.h](include/Intent/Target/CuTile/Analysis/Program.h) | 验证当前 provider IR 的类型、形式、候选与资源要求；由调用者传入同一终端 operation registry |
+| Triton / cuTile | 各自的 [Triton Numerical.h](include/Intent/Target/Triton/Serialization/Numerical.h)、[cuTile Numerical.h](include/Intent/Target/CuTile/Serialization/Numerical.h) | 同一 typed translation 负责数值合法性、源码表达式和所需依赖，保留 SDK 各自的转换与数学接口 |
 
 这些私有 facts 和待提交 replacements 只服务一次变换；阶段之间传递当前 IR 与其携带的 resolved profiles，不保留另一份执行计划。Triton 的局部候选在 native-forms 阶段内闭合为 IR configs；cuTile 提交替换后才进入后续循环与配置变换。
+
+最终 pass 和 serializer 都调用同一个只读 program verifier，验证当前 IR 与终端
+operation registry，不把 `legalized` 标记当作验证证书。Analysis 只依赖 IR 与分析库；
+registry 由调用者传入，因此检查可以复用而不造成 Serialization/Transforms 循环依赖。
+Triton 的 contract form、loop unroll 等真实执行属性仍保存在 IR，公共声明与合法性在
+[IR/Program.h](include/Intent/Target/Triton/IR/Program.h)，不能用阶段标记代替。
+
+新增 GPU 数值操作时，修改相应 `Serialization/Numerical.cpp` 的 typed translation，
+通过 [Source.h](include/Intent/Serialization/Source.h) 登记检查、发射和依赖。依赖从当前
+操作查询后统一去重，不能另在 preamble 维护数学操作名单。转换记录只是一次源码拼写的
+结果，不保存执行计划、不选择分块。库精度、NaN、逐操作 approximate/FTZ 和 dtype
+转换必须兑现 Intent 合同；例如本地 Triton
+`third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:245–246`
+使用饱和 E5M2 指令，Intent 的普通 E5M2 转换则按 RN-even 溢出到无穷，因此目标转换
+显式补齐结果编码，不能直接继承 SDK 默认。普通 cast 与 bitcast 保持独立。
 
 Triton descriptor 的 offsets 在 pass 中显式形成 `i32` SSA，serializer 只拼写已决定的
 操作数；shape、stride 和 block shape 通过当前 view layout 与 launch-expression 查询取得。
@@ -1433,7 +1450,12 @@ array、bounds 与 eligibility，[cuTile contract](python/intent/runtime/cutile/
 
 对齐推断中的参数域必须是当前证明可依赖的域。`ResidentWorkers` 会由 provider 配置重绑定，公共关系查询不把它的临时候选当作常量或整除事实；coverage capacity 也不等于 logical extent。分支内额外对齐条件由调用方提供局部叶证明，不能传播成其它分支的全局性质。新增整数规则先核对位宽、回绕与除法合同，再接入共同查询，避免在各 provider 重写递归证明。
 
-Triton/cuTile 的 `Transforms/Configurations.cpp` 负责各自的候选策略与资源合法性，使用共同的参数绑定分析。Triton 的 tensor/descriptor/collective 约束从当前 IR 一次收集后逐候选求值；cuTile 保留 launch 与 memory hints 的相关候选及 resident-capacity 绑定。新增设备约束时在对应模块处理，不复制参数解析器，也不把 Triton TTGIR 的布局、MMA 或 pipeline 再实现一遍。
+Triton/cuTile 的 `Transforms/Configurations.cpp` 负责候选选择与写回；各自的
+`Analysis/Configuration.cpp` 收集和验证当前 IR 的目标约束。共同归约资源查询及要求
+验证位于 [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h)，候选
+筛选仍在 Transforms。Triton 的 tensor/descriptor/collective 约束与 cuTile 的
+resident-capacity 关系由同一查询同时服务变换和终端验证。新增设备约束进入对应
+只读模块，不复制参数解析器或下层的布局、MMA、资源分配器。
 
 矩阵 primitive 需要的二维物理投影由现有
 [ContractionProjection.cpp](lib/Dialect/GPU/Transforms/Contraction/ContractionProjection.cpp) 依据

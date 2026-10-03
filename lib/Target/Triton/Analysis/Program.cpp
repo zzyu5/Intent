@@ -1,22 +1,19 @@
-#include "Legalization.h"
-#include "ConfigurationRequirements.h"
+#include "Intent/Target/Triton/Analysis/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
-#include "Intent/Target/Triton/IR/Configuration.h"
-#include "Intent/Target/Triton/Serialization/Serializer.h"
-#include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Target/Triton/Analysis/Configuration.h"
+#include "Intent/Target/Triton/IR/Configuration.h"
+#include "Intent/Target/Triton/IR/Program.h"
+#include "Intent/Target/Triton/IR/TritonOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/TypeUtilities.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
-#include "llvm/ADT/StringSet.h"
-#include <algorithm>
-#include <limits>
-#include <optional>
+#include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 
-namespace intent::triton::detail {
+namespace intent::triton {
+namespace {
 bool isTritonScalarType(Type type) {
   if (type.isIndex() || isa<Float16Type, BFloat16Type, Float32Type,
                             Float64Type, Float8E4M3FNType,
@@ -43,7 +40,6 @@ bool isTritonDataType(Type type) {
   return false;
 }
 
-
 LogicalResult verifyAccess(gpu::AccessOpInterface access) {
   Operation *operation = access.getOperation();
   auto view = dyn_cast<gpu::ViewType>(access.getAccessResource().getType());
@@ -60,7 +56,9 @@ LogicalResult verifyAccess(gpu::AccessOpInterface access) {
   return success();
 }
 
-LogicalResult verifyKernel(func::FuncOp kernel) {
+LogicalResult verifyKernel(
+    func::FuncOp kernel,
+    llvm::function_ref<LogicalResult(Operation *)> verifySource) {
   auto space = kernel->getAttrOfType<ArrayAttr>(gpu::programSpaceAttr);
   if (!space || space.empty() || space.size() > 3)
     return kernel.emitError(
@@ -86,19 +84,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
     return failure();
 
   WalkResult result = kernel.walk([&](Operation *operation) {
-    if (auto unary = dyn_cast<gpu::UnaryOp>(operation);
-        unary && unary.getApproximate() &&
-        unary.getOperatorKind() == UnaryOperator::Tanh) {
-      auto capabilities =
-          kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-      if (!capabilities ||
-          10 * capabilities.getComputeCapabilityMajor() +
-                  capabilities.getComputeCapabilityMinor() < 75) {
-        unary.emitOpError(
-            "native approximate tanh requires compute capability 7.5 or newer");
-        return WalkResult::interrupt();
-      }
-    }
     if (isa<gpu::AtomicLoadOp>(operation)) {
       operation->emitOpError(
           "has no Triton atomic-load primitive with preserved memory-order semantics");
@@ -172,11 +157,6 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
         return WalkResult::interrupt();
       }
       auto form = contract->getAttrOfType<StringAttr>(contractFormAttr);
-      if (form && form.getValue() != "multiply_sum" &&
-          form.getValue() != "fma") {
-        contract.emitOpError("has an unknown Triton contraction form");
-        return WalkResult::interrupt();
-      }
       if (form && form.getValue() == "fma" &&
           !contract.getAccumulator().getType().getElementType().isF32()) {
         contract.emitOpError(
@@ -296,27 +276,33 @@ LogicalResult verifyKernel(func::FuncOp kernel) {
       }
     }
 
-    return succeeded(verifySourceOperation(operation))
+    return succeeded(verifySource(operation))
         ? WalkResult::advance() : WalkResult::interrupt();
   });
   return result.wasInterrupted() ? failure() : success();
 }
 
+} // namespace
 
-} // namespace intent::triton::detail
-
-namespace intent::triton {
-LogicalResult verifyTritonProgram(ModuleOp module) {
+LogicalResult verifyTritonProgram(
+    ModuleOp module,
+    llvm::function_ref<LogicalResult(Operation *)> verifySource) {
   if (failed(mlir::verify(module.getOperation())))
     return failure();
   SmallVector<func::FuncOp> kernels;
-  module.walk([&](func::FuncOp function) {
-    if (function->hasAttr(gpu::kernelAttr))
+  WalkResult attributes = module.walk([&](Operation *operation) {
+    if (failed(verifyProgramAttributes(operation)))
+      return WalkResult::interrupt();
+    if (auto function = dyn_cast<func::FuncOp>(operation);
+        function && function->hasAttr(gpu::kernelAttr))
       kernels.push_back(function);
+    return WalkResult::advance();
   });
+  if (attributes.wasInterrupted())
+    return failure();
   if (kernels.size() != 1)
     return module.emitError("Triton provider program requires one physical kernel");
-  return detail::verifyKernel(kernels.front());
+  return verifyKernel(kernels.front(), verifySource);
 }
 
 } // namespace intent::triton

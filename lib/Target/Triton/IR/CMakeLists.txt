@@ -2,6 +2,7 @@ add_mlir_dialect_library(MLIRIntentTritonDialect
   TritonDialect.cpp
   TritonOps.cpp
   Configuration.cpp
+  Program.cpp
 
   DEPENDS
   IntentTritonIncGen

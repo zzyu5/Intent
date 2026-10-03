@@ -9,84 +9,10 @@
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 namespace intent::cutile {
-namespace {
-
-FailureOr<SmallVector<gpu::ConfigurationRequirementAttr>>
-collectConfigurationRequirements(func::FuncOp kernel) {
-  auto parameters = gpu::ParameterSpace::read(kernel);
-  if (failed(parameters))
-    return failure();
-  SmallVector<ValueRange> reductionSources;
-  kernel.walk([&](ReduceOp reduce) {
-    reductionSources.push_back(reduce.getSources());
-  });
-  auto requirements = gpu::collectReductionRequirements(
-      kernel, reductionSources,
-      gpu::ReductionRequirementScope::InvocationDependent);
-  auto resident = parameters->find(gpu::ParameterRole::ResidentWorkers);
-  auto ctas = parameters->find(gpu::ParameterRole::ProviderCTAs);
-  auto occupancy = parameters->find(gpu::ParameterRole::ProviderOccupancy);
-  if (resident && ctas && occupancy) {
-    auto capabilities =
-        kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-    if (!capabilities || capabilities.getComputeUnits() <= 0)
-      return kernel.emitError("cuTile resident binding requires a positive compute-unit count"),
-             failure();
-    Builder builder(kernel.getContext());
-    auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
-                          Attribute symbol, ArrayRef<Attribute> operands) {
-      return gpu::PhysicalExprAttr::get(kernel.getContext(), kind, value,
-                                       symbol, builder.getArrayAttr(operands));
-    };
-    auto parameter = [&](gpu::ParameterAttr declaration) {
-      return expression(gpu::PhysicalExprKind::Parameter, 0,
-                        declaration.getReference(), {});
-    };
-    auto computeUnits = expression(gpu::PhysicalExprKind::Constant,
-        capabilities.getComputeUnits(), builder.getStringAttr(""), {});
-    auto clusters = expression(gpu::PhysicalExprKind::FloorDiv, 0,
-        builder.getStringAttr(""), {computeUnits, parameter(ctas)});
-    auto capacity = expression(gpu::PhysicalExprKind::Multiply, 0,
-        builder.getStringAttr(""), {clusters, parameter(occupancy)});
-    requirements.push_back(gpu::ConfigurationRequirementAttr::get(
-        kernel.getContext(), gpu::ConfigurationRequirementKind::Legality,
-        gpu::ConfigurationRequirementMetric::ResidentWorkers,
-        gpu::ConfigurationRequirementPredicate::Equal, parameter(resident),
-        capacity, gpu::ParameterRefAttr(),
-        builder.getStringAttr("cuTile resident workers must match the CTA and occupancy binding")));
-  }
-  return requirements;
-}
-
-} // namespace
-
 const gpu::TuningProfileSchema &tuningProfileSchema() {
   static const StringRef columns[] = {"value"};
   static const gpu::TuningProfileSchema schema{"cutile", columns};
   return schema;
-}
-
-bool isLegalAccessForm(int64_t value) {
-  return value == nativeAccessForm || value == gatherAccessForm ||
-         value == nativeNoTMAForm;
-}
-
-bool isLegalOccupancy(int64_t value) { return value >= 1 && value <= 32; }
-
-bool isLegalWorkerWarps(int64_t value) {
-  return value == inferredWorkerWarps || value == 4 || value == 8;
-}
-
-bool isLegalCTAs(int64_t value) {
-  return value >= 1 && value <= 16 && llvm::isPowerOf2_64(value);
-}
-
-bool isCuTileProviderRole(gpu::ParameterRole role) {
-  return role == gpu::ParameterRole::ProviderAccessForm ||
-         role == gpu::ParameterRole::ProviderOccupancy ||
-         role == gpu::ParameterRole::ProviderLoadPolicy ||
-         role == gpu::ParameterRole::ProviderWarps ||
-         role == gpu::ParameterRole::ProviderCTAs;
 }
 
 FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
@@ -260,13 +186,6 @@ LogicalResult finalizeConfigurationRequirements(func::FuncOp kernel) {
     return failure();
   return gpu::writeConfigurations(kernel, *accepted,
                                  gpu::ConfigurationStage::Complete, *requirements);
-}
-
-LogicalResult verifyClosedConfigs(func::FuncOp kernel) {
-  auto requirements = collectConfigurationRequirements(kernel);
-  if (failed(requirements))
-    return failure();
-  return gpu::verifyConfigurationRequirements(kernel, *requirements);
 }
 
 } // namespace intent::cutile

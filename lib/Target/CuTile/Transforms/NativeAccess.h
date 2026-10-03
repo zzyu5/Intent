@@ -3,6 +3,8 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
+#include "Intent/Target/CuTile/Analysis/Program.h"
+#include "Intent/Target/CuTile/Analysis/IndexBounds.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 
@@ -23,15 +25,6 @@ private:
   };
   llvm::SmallVector<Replacement> replacements;
 };
-
-// The same operation classification applies before and after native formation.
-// A caller observes its current IR; this is never retained across a phase.
-struct NativeProgramFeatures {
-  bool matrixCompute = false;
-  bool occupancySensitive = false;
-  void observe(mlir::Operation *operation);
-};
-NativeProgramFeatures queryNativeProgramFeatures(mlir::func::FuncOp kernel);
 
 struct NativeProgramInputs {
   llvm::SmallVector<gpu::LoadOp> loads;
@@ -76,8 +69,6 @@ mlir::FailureOr<unsigned> nativeAccessRangeAxis(gpu::AccessOpInterface access,
     unsigned coordinateIndex, gpu::MakeRangeOp range);
 mlir::Value uniformScalarFill(mlir::Value fill);
 bool isUnitExtent(mlir::Attribute attribute);
-bool isProvably(mlir::Value value, int64_t expected);
-mlir::Value stripIndexIdentities(mlir::Value value);
 mlir::FailureOr<llvm::SmallVector<mlir::Value>> uniformAlignmentFactors(
     mlir::Value value, mlir::Value divisor, unsigned depth = 0);
 bool isAlignedPeriodicTile(mlir::Value start, mlir::Value extent, mlir::Value period);
@@ -87,7 +78,6 @@ bool scalarCoordinatesInView(mlir::ValueRange coordinates, gpu::ViewType view,
 mlir::Type withElementType(mlir::Type type, mlir::Type elementType);
 mlir::Value materializeFullTileCondition(mlir::OpBuilder &builder,
     mlir::Location location, mlir::Value resource, gpu::FragmentType tile);
-bool supportsE8M0ScaledMMA(gpu::CapabilitiesAttr capabilities);
 mlir::LogicalResult formNativeAccesses(mlir::func::FuncOp kernel,
     const gpu::TuningProfiles &profiles, const NativeProgramInputs &inputs,
     bool matrixCompute, NativeFormRewriter &rewriter);

@@ -1,4 +1,5 @@
 #include "Intent/Target/Triton/Serialization/Serializer.h"
+#include "Intent/Target/Triton/Serialization/Numerical.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
@@ -10,7 +11,9 @@
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
 #include "Intent/Dialect/GPU/Serialization/PythonEmitter.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
+#include "Intent/Target/Triton/IR/Program.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
+#include "Intent/Target/Triton/Analysis/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -40,7 +43,7 @@ public:
   LogicalResult emit(std::string &metadata) {
     bindArguments();
     if (failed) return failure();
-    emitPreamble();
+    if (mlir::failed(emitPreamble())) return failure();
     emitHelpers();
     emitKernel();
     return failed ? failure() : emitMetadata(metadata);
@@ -50,6 +53,7 @@ public:
     static const Emitters emitters = [] {
       Emitters result;
       gpu::PythonEmitter::addCommonOperations(result);
+      addNumericalOperations(result);
       addNative<CtaBarrierOp>(result);
       addBinding<TensorDescriptorChoiceOp>(result);
       addBinding<TensorDescriptorAllocatorOp>(result);
@@ -93,20 +97,9 @@ private:
   void emitTyped(ScanOp op) { emitCollective(*op.getOperation()); }
 
   void emitConstant(arith::ConstantOp constant) override {
-      std::string value = literal(constant.getValue());
-      if (auto floating = dyn_cast<FloatAttr>(constant.getValue())) {
-        value = "tl.full((), " + value + ", " +
-                pythonType(constant.getType()) + ")";
-        // Triton's scalar constructor canonicalizes both zero signs to +0.
-        if (floating.getValue().isNegZero())
-          value = "(-" + value + ")";
-        assign(constant.getResult(), value);
-      } else {
-        values[constant.getResult()] = value;
-        constexprValues.insert(constant.getResult());
-      }
-      return;
-      }
+    if (mlir::failed(emitNumericalConstant(constant, *this)))
+      failed = true;
+  }
 
   std::string programId(gpu::ProgramIdOp op) override {
     return "tl.program_id(" + std::to_string(op.getAxis()) + ")";
@@ -122,8 +115,13 @@ private:
         ", " + pythonType(op.getResult().getType().getElementType()) + ")";
   }
   std::string castValue(Value value, Type type, bool bitcast) override {
-    return "tl.cast(" + valueString(value) + ", " + pythonType(elementType(type)) +
-        (bitcast ? ", bitcast=True)" : ")");
+    auto expression = numericalCast(kernel, value.getType(), type,
+                                    valueString(value), bitcast);
+    if (mlir::failed(expression)) {
+      failed = true;
+      return {};
+    }
+    return std::move(*expression);
   }
   std::string reshape(gpu::ReshapeOp op) override {
     auto source = cast<gpu::FragmentType>(op.getValue().getType());
@@ -143,7 +141,7 @@ private:
     return "tl.permute(" + valueString(value) + ", " + axisTuple(permutation) + ")";
   }
   std::string forRange(scf::ForOp loop) override {
-    auto unroll = loop->getAttrOfType<IntegerAttr>("intent_gpu.triton.loop_unroll_factor");
+    auto unroll = loop->getAttrOfType<IntegerAttr>(loopUnrollFactorAttr);
     auto stages = loop->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
     std::string result = unroll || stages ? "tl.range(" : "range(";
     result += valueString(loop.getLowerBound()) + ", " + valueString(loop.getUpperBound()) + ", " + valueString(loop.getStep());
@@ -227,10 +225,14 @@ private:
     }
   }
 
-  void emitPreamble() {
-    output << "import triton\nimport triton.language as tl\n"
-              "from triton.language.extra import libdevice\n"
-              "from intent.runtime.triton.math import contract_fma\n\n";
+  LogicalResult emitPreamble() {
+    auto dependencies = sourceOperations().collectDependencies(kernel);
+    if (mlir::failed(dependencies)) return failure();
+    output << "import triton\nimport triton.language as tl\n";
+    for (const std::string &dependency : *dependencies)
+      output << dependency << "\n";
+    output << "from intent.runtime.triton.math import contract_fma\n\n";
+    return success();
   }
 
   void emitHelpers() {
@@ -354,8 +356,7 @@ private:
       }
 
   void emitTyped(gpu::ContractOp contract) {
-      auto form = contract->getAttrOfType<StringAttr>(
-          "intent_gpu.triton.contract_form");
+      auto form = contract->getAttrOfType<StringAttr>(contractFormAttr);
       if (form && form.getValue() == "fma") {
         assign(contract.getResult(),
                "contract_fma(" + valueString(contract.getLhs()) + ", " +
@@ -532,148 +533,6 @@ private:
       line(call + ")");
       return;
       }
-
-  std::string binaryExpression(gpu::BinaryOp binary) {
-    auto infix = [&](StringRef spelling) {
-      return "(" + valueString(binary.getLhs()) + " " + spelling.str() + " " +
-             valueString(binary.getRhs()) + ")";
-    };
-    auto call = [&](StringRef function, StringRef propagateNan = {}) {
-      std::string result = function.str() + "(" + valueString(binary.getLhs()) +
-                           ", " + valueString(binary.getRhs());
-      if (!propagateNan.empty())
-        result += ", propagate_nan=tl.PropagateNan." + propagateNan.str();
-      return result + ")";
-    };
-    if (binary.getResult().getType().isIndex() &&
-        constexprValues.contains(binary.getLhs()) &&
-        constexprValues.contains(binary.getRhs())) {
-      if (binary.getOperatorKind() == BinaryOperator::Maximum)
-        return call("max");
-      if (binary.getOperatorKind() == BinaryOperator::Minimum)
-        return call("min");
-    }
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add: return infix("+");
-    case BinaryOperator::Subtract: return infix("-");
-    case BinaryOperator::Multiply: return infix("*");
-    case BinaryOperator::TrueDivide: {
-      if (binary.getApproximate())
-        return "tl.inline_asm_elementwise(\"div.approx" +
-               std::string(binary.getFlushToZero() ? ".ftz" : "") +
-               ".f32 $0, $1, $2;\", constraints=\"=f,f,f\", args=[" +
-               valueString(binary.getLhs()) + ", " + valueString(binary.getRhs()) +
-               "], dtype=tl.float32, is_pure=True, pack=1)";
-      Type element = elementType(binary.getResult().getType());
-      auto floating = cast<FloatType>(element);
-      std::string computation = floating.getWidth() < 32
-                                    ? "tl.float32" : pythonType(element);
-      std::string result =
-          "libdevice.div_rn(tl.cast(" + valueString(binary.getLhs()) + ", " +
-          computation + "), tl.cast(" + valueString(binary.getRhs()) + ", " +
-          computation + "))";
-      return floating.getWidth() < 32
-                 ? "tl.cast(" + result + ", " + pythonType(element) + ")"
-                 : result;
-    }
-    case BinaryOperator::FloorDivide:
-    case BinaryOperator::Remainder: {
-      Type element = elementType(binary.getResult().getType());
-      auto integer = dyn_cast<IntegerType>(element);
-      bool remainder = binary.getOperatorKind() == BinaryOperator::Remainder;
-      if (integer && integer.isUnsigned())
-        return infix(remainder ? "%" : "//");
-      std::string rem = infix("%");
-      std::string rhs = valueString(binary.getRhs());
-      // Triton integer division truncates. A Python constexpr remainder already
-      // has the divisor's sign, so this correction also preserves constexprs.
-      std::string adjust = "((" + rem + " != 0) & ((" + rem +
-                           " < 0) != (" + rhs + " < 0)))";
-      return remainder ? "(" + rem + " + " + adjust + " * " + rhs + ")"
-                       : "(" + infix("//") + " - " + adjust + ")";
-    }
-    case BinaryOperator::Power: return call("libdevice.pow");
-    case BinaryOperator::Maximum: return call("tl.maximum", "ALL");
-    case BinaryOperator::Minimum: return call("tl.minimum", "ALL");
-    case BinaryOperator::MaximumNum: return call("tl.maximum", "NONE");
-    case BinaryOperator::MinimumNum: return call("tl.minimum", "NONE");
-    case BinaryOperator::LogicalAnd:
-    case BinaryOperator::BitwiseAnd: return infix("&");
-    case BinaryOperator::LogicalOr:
-    case BinaryOperator::BitwiseOr: return infix("|");
-    case BinaryOperator::BitwiseXor: return infix("^");
-    case BinaryOperator::LeftShift: return infix("<<");
-    case BinaryOperator::RightShift: return infix(">>");
-    }
-    llvm_unreachable("unhandled Intent binary operator");
-  }
-
-  std::string unaryExpression(gpu::UnaryOp unary) {
-    std::string input = valueString(unary.getInput());
-    auto libraryCall = [&](StringRef function) {
-      Type element = elementType(unary.getResult().getType());
-      auto floating = cast<FloatType>(element);
-      std::string computation = floating.getWidth() < 32
-                                    ? "tl.float32" : pythonType(element);
-      std::string result = function.str() + "(tl.cast(" + input + ", " +
-                           computation + "))";
-      return floating.getWidth() < 32
-                 ? "tl.cast(" + result + ", " + pythonType(element) + ")"
-                 : result;
-    };
-    switch (unary.getOperatorKind()) {
-    case UnaryOperator::Negate:
-      return "(-" + input + ")";
-    case UnaryOperator::Not:
-      return "(~" + input + ")";
-    case UnaryOperator::Exp:
-      return libraryCall("libdevice.exp");
-    case UnaryOperator::Exp2:
-      if (unary.getApproximate())
-        return "tl.inline_asm_elementwise(\"ex2.approx" +
-               std::string(unary.getFlushToZero() ? ".ftz" : "") +
-               ".f32 $0, $1;\", constraints=\"=f,f\", args=[" + input +
-               "], dtype=tl.float32, is_pure=True, pack=1)";
-      return libraryCall("libdevice.exp2");
-    case UnaryOperator::Log:
-      return libraryCall("libdevice.log");
-    case UnaryOperator::Log1p:
-      return libraryCall("libdevice.log1p");
-    case UnaryOperator::Lgamma:
-      return libraryCall("libdevice.lgamma");
-    case UnaryOperator::Sin:
-      return libraryCall("libdevice.sin");
-    case UnaryOperator::Asin:
-      return libraryCall("libdevice.asin");
-    case UnaryOperator::Cos:
-      return libraryCall("libdevice.cos");
-    case UnaryOperator::Floor:
-      return "tl.floor(" + input + ")";
-    case UnaryOperator::Erf:
-      return libraryCall("libdevice.erf");
-    case UnaryOperator::Erfc:
-      return libraryCall("libdevice.erfc");
-    case UnaryOperator::I0:
-      return libraryCall("libdevice.cyl_bessel_i0");
-    case UnaryOperator::Rsqrt:
-      return libraryCall("libdevice.rsqrt");
-    case UnaryOperator::Sigmoid:
-      return "tl.sigmoid(" + input + ")";
-    case UnaryOperator::Tanh:
-      if (unary.getApproximate())
-        return "tl.inline_asm_elementwise(\"tanh.approx.f32 $0, $1;\", "
-               "constraints=\"=f,f\", args=[" + input +
-               "], dtype=tl.float32, is_pure=True, pack=1)";
-      return libraryCall("libdevice.tanh");
-    case UnaryOperator::Abs:
-      return "tl.abs(" + input + ")";
-    case UnaryOperator::Sqrt:
-      return libraryCall("libdevice.sqrt_rn");
-    default:
-      failed = true;
-      return "<unsupported-unary>";
-    }
-  }
 
   std::string atomicSemantics(AtomicOrdering ordering) const {
     switch (ordering) {
@@ -887,18 +746,13 @@ LogicalResult verifySourceOperation(Operation *operation) {
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source,
                                std::string &metadata) {
-  SmallVector<func::FuncOp> kernels;
-  for (func::FuncOp function : module.getOps<func::FuncOp>())
-    if (function->hasAttr(gpu::kernelAttr))
-      kernels.push_back(function);
-  if (kernels.size() != 1)
-    return module.emitError(
-        "Triton serialization requires one provider-legalized kernel");
-  func::FuncOp kernel = kernels.front();
-  if (!kernel->hasAttr("intent_gpu.triton.legalized"))
-    return kernel.emitError("Triton program was not provider-legalized");
+  if (failed(verifyTritonProgram(module, verifySourceOperation)))
+    return failure();
+  auto kernel = gpu::getPhysicalKernel(module);
+  if (failed(kernel))
+    return failure();
   llvm::raw_string_ostream stream(source);
-  Serializer serializer(kernel, stream);
+  Serializer serializer(*kernel, stream);
   LogicalResult result = serializer.emit(metadata);
   stream.flush();
   return result;

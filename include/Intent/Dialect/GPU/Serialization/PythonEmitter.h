@@ -44,6 +44,11 @@ public:
               bool compileTime = false);
   void assignResults(mlir::ResultRange results, llvm::StringRef expression);
   bool isConstexprExpression(PhysicalExprAttr expression) const;
+  bool isConstexprValue(mlir::Value value) const { return constexprValues.contains(value); }
+  void bindConstexpr(mlir::Value value, llvm::StringRef expression) {
+    bind(value, expression);
+    constexprValues.insert(value);
+  }
 
   virtual const Emitters &operationEmitters() const = 0;
   virtual void emitConstant(mlir::arith::ConstantOp operation) = 0;
@@ -54,8 +59,6 @@ public:
                                 bool bitcast) = 0;
   virtual std::string reshape(ReshapeOp operation) = 0;
   virtual std::string join(JoinOp operation) = 0;
-  virtual std::string unaryExpression(UnaryOp operation) = 0;
-  virtual std::string binaryExpression(BinaryOp operation) = 0;
   virtual std::string broadcastValue(mlir::Value value,
                                      FragmentType result) = 0;
   virtual std::string controlValueString(mlir::Value value);

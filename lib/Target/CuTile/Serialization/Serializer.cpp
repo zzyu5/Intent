@@ -1,4 +1,5 @@
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
+#include "Intent/Target/CuTile/Serialization/Numerical.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
@@ -9,6 +10,7 @@
 #include "Intent/Dialect/GPU/Serialization/Interface.h"
 #include "Intent/Dialect/GPU/Serialization/PythonEmitter.h"
 #include "Intent/Target/CuTile/Analysis/Tuning.h"
+#include "Intent/Target/CuTile/Analysis/Program.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -49,7 +51,7 @@ public:
   LogicalResult emit(std::string &metadata) {
     bindArguments();
     if (failed) return failure();
-    emitPreamble();
+    if (mlir::failed(emitPreamble())) return failure();
     emitCollectiveHelpers();
     emitKernel();
     return failed ? failure() : emitMetadata(metadata);
@@ -59,11 +61,16 @@ public:
     static const Emitters emitters = [] {
       Emitters result;
       gpu::PythonEmitter::addCommonOperations(result);
+      addNumericalOperations(result);
       addBinding<ArrayViewOp>(result);
       addNative<TileLoadOp>(result);
       addNative<ScalarLoadOp>(result);
       addNative<GatherLoadOp>(result);
-      addNative<MMAOp>(result);
+      addNative<MMAOp>(result, [](MMAOp operation) -> FailureOr<Emitters::Dependencies> {
+        if (operation.getReductionChunk())
+          return Emitters::Dependencies{libraryMathImport.str()};
+        return Emitters::Dependencies{};
+      });
       addNative<ScaledMMAOp>(result);
       addNative<ReduceOp>(result);
       addNative<ScanOp>(result);
@@ -81,11 +88,13 @@ public:
   const Emitters &operationEmitters() const override { return sourceOperations(); }
 
 private:
-  template <typename Op> static void addNative(Emitters &result) {
+  template <typename Op> static void addNative(
+      Emitters &result,
+      std::function<FailureOr<Emitters::Dependencies>(Op)> dependencies = {}) {
     result.add<Op>([](Op) { return success(); }, [](Op op, gpu::PythonEmitter &emitter) {
       static_cast<Serializer &>(emitter).emitTyped(op);
       return failure(emitter.hasFailed());
-    });
+    }, std::move(dependencies));
   }
   template <typename Op> static void addBinding(Emitters &result) {
     result.add<Op>([](Op) { return success(); },
@@ -111,7 +120,7 @@ private:
         ", dtype=" + pythonType(op.getResult().getType().getElementType()) + ")";
   }
   std::string castValue(Value value, Type type, bool bitcast) override {
-    return std::string(bitcast ? "ct.bitcast(" : "ct.astype(") + valueString(value) + ", " + pythonType(elementType(type)) + ")";
+    return numericalCast(*this, value, type, bitcast);
   }
   std::string reshape(gpu::ReshapeOp op) override {
     return "ct.reshape(" + valueString(op.getValue()) + ", " + fragmentShape(cast<gpu::FragmentType>(op.getResult().getType())) + ")";
@@ -126,8 +135,7 @@ private:
         "), ct.reshape(" + valueString(op.getRhs()) + ", " + expanded + ")), axis=" + std::to_string(op.getAxis()) + ")";
   }
   std::string select(gpu::SelectOp op) override {
-    return "ct.where(" + valueString(op.getCondition()) + ", " + valueString(op.getTrueValue()) +
-        ", " + valueString(op.getFalseValue()) + ")";
+    return numericalSelect(*this, op);
   }
   std::string permute(Value value, ArrayRef<int64_t> permutation) override {
     return "ct.permute(" + valueString(value) + ", " + axisTuple(permutation) + ")";
@@ -214,21 +222,11 @@ private:
       reserveName(name.getKey());
   }
 
-  void emitPreamble() {
-    bool libraryMath = false;
-    kernel.walk([&](gpu::UnaryOp unary) {
-      libraryMath |= unary.getOperatorKind() == UnaryOperator::Asin ||
-                     unary.getOperatorKind() == UnaryOperator::Erf ||
-                     unary.getOperatorKind() == UnaryOperator::Erfc ||
-                     unary.getOperatorKind() == UnaryOperator::I0 ||
-                     unary.getOperatorKind() == UnaryOperator::Lgamma ||
-                     unary.getOperatorKind() == UnaryOperator::Log1p;
-    });
-    kernel.walk([&](MMAOp mma) {
-      libraryMath |= mma.getReductionChunk().has_value();
-    });
-    if (libraryMath)
-      output << "from intent.runtime.cutile import math as cutile_math\n";
+  LogicalResult emitPreamble() {
+    auto dependencies = sourceOperations().collectDependencies(kernel);
+    if (mlir::failed(dependencies)) return failure();
+    for (const std::string &dependency : *dependencies)
+      output << dependency << "\n";
     output << "from typing import Annotated\n"
               "import cuda.tile as ct\n"
               "from intent.runtime.cutile import array_index_kernels\n\n"
@@ -243,6 +241,7 @@ private:
               "    value = value | (value >> 16)\n"
               "    value = value | (value >> 32)\n"
               "    return value + 1\n\n";
+    return success();
   }
 
   void emitCollectiveHelpers() {
@@ -568,96 +567,6 @@ private:
       }
       }
 
-  std::string binaryExpression(gpu::BinaryOp binary) {
-    auto infix = [&](StringRef spelling) {
-      return "(" + valueString(binary.getLhs()) + " " + spelling.str() + " " +
-             valueString(binary.getRhs()) + ")";
-    };
-    auto nativeMinMax = [&](StringRef spelling) {
-      return spelling.str() + "(" + valueString(binary.getLhs()) + ", " +
-             valueString(binary.getRhs()) + ")";
-    };
-    auto propagatingMinMax = [&](StringRef spelling) {
-      std::string lhs = valueString(binary.getLhs());
-      std::string rhs = valueString(binary.getRhs());
-      std::string native = spelling.str() + "(" + lhs + ", " + rhs + ")";
-      return "ct.where(ct.isnan(" + lhs + "), " + lhs +
-             ", ct.where(ct.isnan(" + rhs + "), " + rhs + ", " + native + "))";
-    };
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add: return infix("+");
-    case BinaryOperator::Subtract: return infix("-");
-    case BinaryOperator::Multiply: return infix("*");
-    case BinaryOperator::TrueDivide:
-      if (binary.getApproximate())
-        return "ct.truediv(" + valueString(binary.getLhs()) + ", " +
-               valueString(binary.getRhs()) +
-               ", rounding_mode=ct.RoundingMode.APPROX, flush_to_zero=" +
-               (binary.getFlushToZero() ? "True" : "False") + ")";
-      return infix("/");
-    case BinaryOperator::FloorDivide: return infix("//");
-    case BinaryOperator::Remainder: return infix("%");
-    case BinaryOperator::Power: return infix("**");
-    case BinaryOperator::MaximumNum: return nativeMinMax("ct.maximum");
-    case BinaryOperator::MinimumNum: return nativeMinMax("ct.minimum");
-    case BinaryOperator::Maximum:
-      return elementType(binary.getResult().getType()).isIntOrIndex()
-                 ? nativeMinMax("ct.maximum")
-                 : propagatingMinMax("ct.maximum");
-    case BinaryOperator::Minimum:
-      return elementType(binary.getResult().getType()).isIntOrIndex()
-                 ? nativeMinMax("ct.minimum")
-                 : propagatingMinMax("ct.minimum");
-    case BinaryOperator::LogicalAnd:
-    case BinaryOperator::BitwiseAnd: return infix("&");
-    case BinaryOperator::LogicalOr:
-    case BinaryOperator::BitwiseOr: return infix("|");
-    case BinaryOperator::BitwiseXor: return infix("^");
-    case BinaryOperator::LeftShift: return infix("<<");
-    case BinaryOperator::RightShift: return infix(">>");
-    }
-    llvm_unreachable("unhandled Intent binary operator");
-  }
-
-  std::string unaryExpression(gpu::UnaryOp unary) {
-    std::string input = valueString(unary.getInput());
-    auto call = [&](StringRef function) {
-      return function.str() + "(" + input + ")";
-    };
-    switch (unary.getOperatorKind()) {
-    case UnaryOperator::Negate: return "(-" + input + ")";
-    case UnaryOperator::Not: return "(~" + input + ")";
-    case UnaryOperator::Exp: return call("ct.exp");
-    case UnaryOperator::Exp2:
-      if (unary.getApproximate())
-        return "ct.exp2(" + input + ", flush_to_zero=" +
-               (unary.getFlushToZero() ? "True" : "False") + ")";
-      return call("ct.exp2");
-    case UnaryOperator::Log: return call("ct.log");
-    case UnaryOperator::Sin: return call("ct.sin");
-    case UnaryOperator::Cos: return call("ct.cos");
-    case UnaryOperator::Floor: return call("ct.floor");
-    case UnaryOperator::Rsqrt: return call("ct.rsqrt");
-    case UnaryOperator::Sigmoid:
-      return "ct.astype(1.0 / (1.0 + ct.exp(-ct.astype(" + input +
-             (elementType(unary.getInput().getType()).isF64()
-                  ? ", ct.float64))), " : ", ct.float32))), ") +
-             pythonType(elementType(unary.getResult().getType())) + ")";
-    case UnaryOperator::Tanh:
-      return unary.getApproximate()
-                 ? "ct.tanh(" + input + ", rounding_mode=ct.RoundingMode.APPROX)"
-                 : call("ct.tanh");
-    case UnaryOperator::Abs: return call("ct.abs");
-    case UnaryOperator::Sqrt: return call("ct.sqrt");
-    case UnaryOperator::Erf: return call("cutile_math.erf");
-    case UnaryOperator::Log1p: return call("cutile_math.log1p");
-    case UnaryOperator::Lgamma: return call("cutile_math.lgamma");
-    case UnaryOperator::Erfc: return call("cutile_math.erfc");
-    case UnaryOperator::I0: return call("cutile_math.i0");
-    case UnaryOperator::Asin: return call("cutile_math.asin");
-    }
-    llvm_unreachable("unhandled Intent unary operator");
-  }
 
   std::string broadcastValue(Value value, gpu::FragmentType target) override {
     auto source = dyn_cast<gpu::FragmentType>(value.getType());
@@ -801,11 +710,11 @@ LogicalResult verifySourceOperation(Operation *operation) {
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source,
                                std::string &metadata) {
+  if (failed(verifyCuTileProgram(module, verifySourceOperation)))
+    return failure();
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
-  if (!(*kernel)->hasAttr("intent_cutile.legalized"))
-    return (*kernel).emitError("cuTile program was not provider-legalized");
   llvm::raw_string_ostream stream(source);
   Serializer serializer(*kernel, stream);
   LogicalResult result = serializer.emit(metadata);

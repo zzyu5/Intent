@@ -15,7 +15,6 @@ namespace intent::cutile {
 void registerCuTilePasses();
 const gpu::TuningProfileSchema &tuningProfileSchema();
 void buildCuTilePipeline(mlir::OpPassManager &manager);
-mlir::LogicalResult verifyCuTileProgram(mlir::ModuleOp module);
 mlir::LogicalResult collapseArrayViews(mlir::ModuleOp module);
 mlir::LogicalResult refineMMALoops(mlir::ModuleOp module);
 

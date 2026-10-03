@@ -12,11 +12,6 @@
 
 using namespace mlir;
 namespace intent::cutile {
-bool isProvably(Value value, int64_t expected) {
-  std::optional<int64_t> actual = gpu::IndexRelations().constant(value);
-  return actual && *actual == expected;
-}
-
 bool sameScalarFill(Value lhs, Value rhs) {
   if (lhs == rhs)
     return true;
@@ -102,49 +97,6 @@ bool collectTileCoordinates(Value value, NativeTileAxisPlan &axis,
     }
   }
   return false;
-}
-
-Value stripIndexIdentities(Value value) {
-  while (auto binary = value.getDefiningOp<gpu::BinaryOp>()) {
-    switch (binary.getOperatorKind()) {
-    case BinaryOperator::Add:
-      if (isProvably(binary.getLhs(), 0)) {
-        value = binary.getRhs();
-        continue;
-      }
-      if (isProvably(binary.getRhs(), 0)) {
-        value = binary.getLhs();
-        continue;
-      }
-      break;
-    case BinaryOperator::Subtract:
-      if (isProvably(binary.getRhs(), 0)) {
-        value = binary.getLhs();
-        continue;
-      }
-      break;
-    case BinaryOperator::Multiply:
-      if (isProvably(binary.getLhs(), 1)) {
-        value = binary.getRhs();
-        continue;
-      }
-      if (isProvably(binary.getRhs(), 1)) {
-        value = binary.getLhs();
-        continue;
-      }
-      break;
-    case BinaryOperator::FloorDivide:
-      if (isProvably(binary.getRhs(), 1)) {
-        value = binary.getLhs();
-        continue;
-      }
-      break;
-    default:
-      break;
-    }
-    break;
-  }
-  return value;
 }
 
 std::optional<int64_t> dimensionIdentity(BlockArgument argument) {

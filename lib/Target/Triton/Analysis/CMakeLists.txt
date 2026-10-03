@@ -1,15 +1,14 @@
-add_mlir_library(MLIRIntentCuTileAnalysis
-  Tuning.cpp
+add_mlir_library(MLIRIntentTritonAnalysis
   Program.cpp
   Configuration.cpp
-  IndexBounds.cpp
+  Contractions.cpp
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR
   MLIRSCFDialect
-  MLIRSideEffectInterfaces
-  MLIRIntentCuTileDialect
   MLIRIntentGPUAnalysis
+  MLIRIntentGPUDialect
+  MLIRIntentTritonDialect
 )

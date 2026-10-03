@@ -9,6 +9,19 @@
 
 namespace intent::gpu {
 
+enum class ReductionRequirementScope { AllCandidates, InvocationDependent };
+
+// Collect from current IR for candidate filtering and invocation specialization.
+llvm::SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
+    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::ValueRange> sourceGroups,
+    ReductionRequirementScope scope);
+
+// Verify the current condition set and rows without changing either. Conditions
+// have set semantics; candidate row order remains significant.
+mlir::LogicalResult verifyConfigurationRequirements(
+    mlir::func::FuncOp kernel,
+    llvm::ArrayRef<ConfigurationRequirementAttr> expected);
+
 PhysicalExprAttr fragmentElementCount(FragmentType fragment);
 PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
 PhysicalExprAttr reductionRegisterFootprint(mlir::ValueRange sources,
