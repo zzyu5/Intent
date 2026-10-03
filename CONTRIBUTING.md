@@ -110,11 +110,11 @@ CLI 的对应参数是 `--numerics`、`--online-reduction true|false`、
 导出 `metadata.compile_options`，`GeneratedProgram.compile_options` 读取并验证它。
 选项进入原编译调用和缓存身份，保存、恢复与 materialize 保留原 policy。
 
-[OnlineSummary.cpp](lib/Dialect/GPU/Transforms/OnlineSummary.cpp) 从当前
+[OnlineSummary.cpp](lib/Dialect/GPU/Transforms/Reduction/OnlineSummary.cpp) 从当前
 contraction、权重、max/sum 和坐标投影识别 normalized summary；record helper
 通过字段适配复用这份证明。新增规则不要依赖可被合法 fold 消除的 record、extract
 或同类型 cast。相同 SSA 来源也不够：reshape/broadcast 后的 reference 必须仍对应
-每个归约行的保留轴。[RealizeOnlineReduction.cpp](lib/Dialect/GPU/Transforms/RealizeOnlineReduction.cpp)
+每个归约行的保留轴。[RealizeOnlineReduction.cpp](lib/Dialect/GPU/Transforms/Reduction/RealizeOnlineReduction.cpp)
 再检查数值权限、重放与 dominance，并完成实际改写。
 Shared IR 续编译沿用已绑定的 policy，`generate_from_ir` 不提供重选入口；
 需要改变许可时，从原作者程序重新编译，不能由 runtime fast-math 覆盖。
@@ -233,7 +233,7 @@ Intent 的显式目标描述对应其 `python/triton/backends/compiler.py:8–14
 | 公共 scalar/view 合同及 metadata | [Intent/IR/Interface](include/Intent/Dialect/Intent/IR/Interface.h)：构造、验证和 `serializePublicInterface` |
 | GPU 参数身份、metadata producer 与公共参数对应关系 | [GPU/IR/ProgramInterface](include/Intent/Dialect/GPU/IR/ProgramInterface.h)：typed binding、轻量查询和 intrinsic verifier |
 | 一次 GPU analysis 中的参数查询 | [GPU/Analysis/ProgramInterface](include/Intent/Dialect/GPU/Analysis/ProgramInterface.h)：读取当前 signature；改动后重建 snapshot |
-| 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/ProgramInterface.h)：同步维护 function type 与参数属性 |
+| 追加 workspace/metadata 或转换 workspace 类型 | [GPU/Transforms/ProgramInterface](include/Intent/Dialect/GPU/Transforms/Mapping/ProgramInterface.h)：同步维护 function type 与参数属性 |
 | CPU/DSA 的外部原生参数槽 | [Serialization/NativeABI](include/Intent/Serialization/NativeABI.h)：从最终 physical entry 展开参数，供源码签名和 metadata 共用 |
 | Python 公共参数与调用关系 | [runtime/interface.py](python/intent/runtime/interface.py)：唯一声明解析、shape/stride 关系及 `BindingRelations` 的自动输出构造资格；不观察或缓存实际 tensor |
 | 公共实参绑定 | [runtime/invocation.py](python/intent/runtime/invocation.py)：按同一声明生成 allocating/explicit binders，统一 shape/stride、Out 分配与作者 alias 检查 |
@@ -380,7 +380,7 @@ TileLang `src/transform/lower_tile_op.cc:410–445` 先检查 shape/layout 合�
 可能给同一 KIR 类型附加不同执行前缀，因此桥接以当前 value 和作用域为单位。
 
 阶段之间转交分块责任时，应使用接收方的实际能力查询。
-[PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/PointwiseAnalysis.cpp) 只有在
+[PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseAnalysis.cpp) 只有在
 `hasRangeContractForm` 成立时才把输出 ranges 交给 contraction realization；
 坐标可重放本身不证明后续阶段能够接管，否则仍由普通 pointwise ownership 负责。
 
@@ -529,9 +529,29 @@ Unary、binary、compare、select、cast、broadcast、transpose 和 reshape 的
 需要分解一个多轴乘积而没有足够关系时，查询失败，不猜测某个维度的除法。
 关系只在当前改写内使用；修改 operands、types 或 reassociation 后重新查询。
 
+增加独立执行轴时，使用 [ExecutionSchema](include/Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h)。
+调用方先决定执行域，再由 `lift`/`project` 构造 scalar、fragment、record 的目标类型，
+并取得原轴和执行轴到目标轴的实际位置。已存在的轴不再插入；操作中的 reduction、
+gather、transpose 和 contraction 轴属性按实际映射修改，不能统一加上请求的轴数。
+这类 rank 变化和上面的同 rank extent 传递有不同前提，共用当前 IR 的类型与关系，
+不增加另一份持久执行计划。
+
+`cloneWithSchema` 保留原操作的属性与 properties，按真实映射后的 operands 和选定结果
+完成类型投影；普通 elementwise/product 可以从操作数推导，具有独立轴选择的操作必须
+给出结果 schema。Ownership、归约 combine 和带谓词的控制流共同消费这份机制。
+原位改写先保存本次操作数的类型，因为 producer 修改后不能再用新类型解释旧轴编号。
+新优化需要改变执行域时在这里扩展通用机制；是否允许重排、读取、复制、屏蔽 effects
+以及怎样处理 inactive carry，继续由所属 transformation 决定。
+
+职责参考是本地 Triton `lib/Dialect/TritonGPU/Transforms/Utility.cpp:840–872` 的
+`cloneWithInferType`：先用 MLIR 克隆保留操作，再根据实际 operands 推导结果。
+它主要传递 encoding；Intent 的 workset rank 变化还必须明确维护轴位置，不能直接
+套用 encoding 传递。Triton 的 `TritonToTritonGPUPass.cpp:134–188` 同样在
+expand-dims 转换中同步处理 shape、axis 与 encoding，并保留其它原操作属性。
+
 [RangeProvenance](lib/Dialect/GPU/Analysis/RangeProvenance.cpp) 使用轴组追踪范围；
-[ValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp) 负责关系工作队列，
-通过 [SchemaMutation](include/Intent/Dialect/GPU/Transforms/SchemaMutation.h)
+[ValueRelations](lib/Dialect/GPU/Transforms/Value/ValueRelations.cpp) 负责关系工作队列，
+通过 [SchemaMutation](include/Intent/Dialect/GPU/Transforms/Value/SchemaMutation.h)
 执行三类改写：`closeSchemaBoundary` 从当前 producer 闭合 product、控制和 structured
 helper 的 schema；`projectSchemaBoundary` 将已选 schema 投影到对应 incoming 槽，
 不反向改写被多个组件共享的 seed SSA；`rewriteClonedPhysicalTypes` 先保存未改写源
@@ -539,7 +559,7 @@ operation 的轴关系，统一改写 clone 的结果与 region formal 类型，
 传递结果的轴关系。
 `retargetSourceExtent` / `retargetDimensionExtent` 返回 `LogicalResult`，调用方须将
 边界投影失败传回完整 transformation，不能继续报告成功。
-[ValueMaterialization](lib/Dialect/GPU/Transforms/ValueMaterialization.cpp)
+[ValueMaterialization](lib/Dialect/GPU/Transforms/Value/ValueMaterialization.cpp)
 与 region helper 展开复用这些入口传递分段形状。Pointwise coverage、访问组合和
 online-summary 查询也消费相同的物理轴组，不能把逻辑 reshape 轴直接用作物理下标。
 Triton/cuTile 的局部资格判断也读同一关系。
@@ -599,7 +619,7 @@ Schema 闭合使用 `queryAccessCoordinateAxes` 的已知轴对；它可以返�
 Verifier、value relations、Triton pointer/descriptor 与 cuTile native access 共用这两个查询，
 新增访问规则不再各自实现 Cartesian、重复 provenance 或 singleton 轴匹配。
 需要展开实际 coordinate SSA 时，两个 provider 共用
-[ValueMaterialization](include/Intent/Dialect/GPU/Transforms/ValueMaterialization.h) 的
+[ValueMaterialization](include/Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h) 的
 `materializeAccessCoordinate`，由它按同一投影形成 transpose、显式扩轴和 broadcast。
 它不重放 producer 或重新分块；目标访问选择和 load orientation 仍由 provider 决定。
 
@@ -609,17 +629,17 @@ Verifier、value relations、Triton pointer/descriptor 与 cuTile native access 
 这种边界对应 Triton `TritonOpInterfaces.td:130–173` 中分别声明 predicate 和 atomic
 语义的做法；Intent 的 KIR 逻辑索引与 GPU 物理访问继续使用各自的接口。
 
-访问组合的完整入口仍是 [RealizeAccessComposition.cpp](lib/Dialect/GPU/Transforms/RealizeAccessComposition.cpp)，
+访问组合的完整入口仍是 [RealizeAccessComposition.cpp](lib/Dialect/GPU/Transforms/Access/RealizeAccessComposition.cpp)，
 它保持规则次序、工作队列和最终关系闭合；相邻实现按改写对象组织：
 
 | 私有模块 | 职责 |
 |---|---|
-| [AccessCoordinates.cpp](lib/Dialect/GPU/Transforms/AccessCoordinates.cpp) | 消费明确绑定，重建 scalar/fragment 坐标、validity 与 fill；不重读未授权的 load |
-| [AccessExpressions.cpp](lib/Dialect/GPU/Transforms/AccessExpressions.cpp) | 整数索引重组和已被 mask 蕴含的坐标简化 |
-| [AccessLoads.cpp](lib/Dialect/GPU/Transforms/AccessLoads.cpp) | select/load、load/gather 组合，以及共享读取快照证明下的 load 复用与移动 |
-| [AccessGathers.cpp](lib/Dialect/GPU/Transforms/AccessGathers.cpp)、[AccessGatherProjection.cpp](lib/Dialect/GPU/Transforms/AccessGatherProjection.cpp) | gather 穿过值计算、reshape、broadcast，及已有片段和 identity 访问复用 |
-| [AccessReductions.cpp](lib/Dialect/GPU/Transforms/AccessReductions.cpp) | gather/reduce 组合，保留普通归约与 scan 的不同顺序合同 |
-| [AccessReshapes.cpp](lib/Dialect/GPU/Transforms/AccessReshapes.cpp) | 多轴 reshape 与实际读写坐标的组合 |
+| [AccessCoordinates.cpp](lib/Dialect/GPU/Transforms/Access/AccessCoordinates.cpp) | 消费明确绑定，重建 scalar/fragment 坐标、validity 与 fill；不重读未授权的 load |
+| [AccessExpressions.cpp](lib/Dialect/GPU/Transforms/Access/AccessExpressions.cpp) | 整数索引重组和已被 mask 蕴含的坐标简化 |
+| [AccessLoads.cpp](lib/Dialect/GPU/Transforms/Access/AccessLoads.cpp) | select/load、load/gather 组合，以及共享读取快照证明下的 load 复用与移动 |
+| [AccessGathers.cpp](lib/Dialect/GPU/Transforms/Access/AccessGathers.cpp)、[AccessGatherProjection.cpp](lib/Dialect/GPU/Transforms/Access/AccessGatherProjection.cpp) | gather 穿过值计算、reshape、broadcast，及已有片段和 identity 访问复用 |
+| [AccessReductions.cpp](lib/Dialect/GPU/Transforms/Access/AccessReductions.cpp) | gather/reduce 组合，保留普通归约与 scan 的不同顺序合同 |
+| [AccessReshapes.cpp](lib/Dialect/GPU/Transforms/Access/AccessReshapes.cpp) | 多轴 reshape 与实际读写坐标的组合 |
 
 这些实现通过私有 `AccessComposition.h` 连接，不能被当作任意次序执行的新 pass。
 
@@ -646,11 +666,11 @@ KIR 的验证入口直接属于 operation，按合同分布在
 
 一个实际的共享入口是 [matchOnlineSummaryCombine](include/Intent/Analysis/OnlineSummaryCombine.h)：它只读 combine graph，识别 validity、guarded maximum、指数缩放和 weighted sum 关系，返回指向当前 SSA 的 `OnlineSummaryCombineRelations`。调用方提供投影与常量查询规则；它不创建 IR，也不选择 tile、storage 或 loops。
 
-[Canonical matcher](lib/Analysis/OnlineSummary.cpp) 的 `matchOnlineSummary` 和 [GPU matcher](lib/Dialect/GPU/Transforms/OnlineSummary.cpp) 的 `matchOnlineSummaryMerge` 共用这个核心，同时保留各自的四字段 summary 识别、axis/shape/cast 检查、候选枚举及 GPU physical schema 检查。扩展共同 combine 规则时从共享核心开始；调整 fragment 投影时改 GPU 适配层。CPU 当前没有接入这个 matcher，不能把这项复用描述成所有 family 已共用。
+[Canonical matcher](lib/Analysis/OnlineSummary.cpp) 的 `matchOnlineSummary` 和 [GPU matcher](lib/Dialect/GPU/Transforms/Reduction/OnlineSummary.cpp) 的 `matchOnlineSummaryMerge` 共用这个核心，同时保留各自的四字段 summary 识别、axis/shape/cast 检查、候选枚举及 GPU physical schema 检查。扩展共同 combine 规则时从共享核心开始；调整 fragment 投影时改 GPU 适配层。CPU 当前没有接入这个 matcher，不能把这项复用描述成所有 family 已共用。
 
 [ContractionAxes.h](include/Intent/Analysis/ContractionAxes.h) 统一 contraction 的 reduction/batch 配对、free axes 与操作数轴到结果轴的位置关系。CPU construction 和 GPU 当前 IR 查询共用这份纯轴关系；GPU 的 projection、vector realization 与 provider 原生矩阵检查消费相同结果。结果位置按正式 operand axis 推导，同一 source 或 dimension 在两边出现不代表同一个结果轴。该分析不读取 SSA、不选择 packing/tile，也不替各 provider 扩大原生 rank 或 dtype 支持。
 
-同一接口中的 `ProductContractionAxes::get` 从两个操作数到乘积公共域的投影、已证明的逻辑 unit 轴及归约轴，推导 contraction 配对、保留的原操作数轴和结果排列。CPU 的 [ContractionSources](lib/Dialect/CPU/Transforms/ContractionSources.cpp) 与 GPU 的 [ContractionSources](lib/Dialect/GPU/Transforms/ContractionSources.cpp) 共用它识别乘法后求和的轴关系。CPU 的显式 contraction 查询也使用这个核心，但不将合法的 `K=1` 配对当成广播消除。调用方分别证明数值合同、唯一数值消费者和存储或 SSA 关系；物理 tile 大小为 1 不构成逻辑 singleton 的证明。新增共同轴规则改此分析；存储快照、方向选择、blocking 与目标支持改各自消费者。
+同一接口中的 `ProductContractionAxes::get` 从两个操作数到乘积公共域的投影、已证明的逻辑 unit 轴及归约轴，推导 contraction 配对、保留的原操作数轴和结果排列。CPU 的 [ContractionSources](lib/Dialect/CPU/Transforms/ContractionSources.cpp) 与 GPU 的 [ContractionSources](lib/Dialect/GPU/Transforms/Contraction/ContractionSources.cpp) 共用它识别乘法后求和的轴关系。CPU 的显式 contraction 查询也使用这个核心，但不将合法的 `K=1` 配对当成广播消除。调用方分别证明数值合同、唯一数值消费者和存储或 SSA 关系；物理 tile 大小为 1 不构成逻辑 singleton 的证明。新增共同轴规则改此分析；存储快照、方向选择、blocking 与目标支持改各自消费者。
 
 [IntegerRelations.h](include/Intent/Analysis/IntegerRelations.h) 的 `foldIntegerDifference` 复用 `UniformExpression` 描述，只读折叠加减、常数乘法及等宽整数/index cast 的变化系数。[CPU VectorizeLoops](lib/Dialect/CPU/Transforms/VectorizeLoops.cpp) 用它判断循环坐标差值，再检查连续 stride、别名与依赖；[DSA CollectiveGather](lib/Dialect/DSA/Transforms/CollectiveGather.cpp) 用它判断四个参与者之间的地址差值，保留自己的 task 商余关系、只读视图、局部 buffer 写入和控制一致性证明。CPU 的这个 vectorizer 当前由 Mojo legalization 调用，共享 CPU family 不意味着所有 provider 都调用它。
 
@@ -658,30 +678,74 @@ KIR 的验证入口直接属于 operation，按合同分布在
 
 公开的 transformation 入口必须完成自身改写所需的 relation closure，使调用方得到满足 postcondition 的 current program。中间 repair helper 不因可以被调用就成为独立 pass；pipeline 负责次序，不应成为调用者必须记忆的隐式修复配方。
 
-例如，[realizeRegionFolds / realizeRegionScans](lib/Dialect/GPU/Transforms/RealizeRegionFold.cpp) 在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/ValueRelations.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
+例如，[realizeRegionFolds / realizeRegionScans](lib/Dialect/GPU/Transforms/Region/RealizeRegionFold.cpp) 在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/Value/ValueRelations.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
+
+Region 的私有 [RegionCloning.cpp](lib/Dialect/GPU/Transforms/Region/RegionCloning.cpp) 负责
+helper 参数与 source slice 的 extent 绑定及内联；
+[RegionScanOutputs.cpp](lib/Dialect/GPU/Transforms/Region/RegionScanOutputs.cpp) 负责 scan
+输出消费者的坐标、分段和 tail 克隆。同 rank 的切片变换使用
+`rewriteClonedPhysicalTypes` 保存源操作关系、更新 clone results/formals；不再只改
+顶层 result 类型。新增独立执行轴则使用 `ExecutionSchema`，两种变换的选择由调用方明确。
+
+带谓词的控制流由 [PredicateScalarControl.cpp](lib/Dialect/GPU/Transforms/Control/PredicateScalarControl.cpp)
+检查资格和组织 pass，[PredicatedCloning.cpp](lib/Dialect/GPU/Transforms/Control/PredicatedCloning.cpp)
+负责实际 active mask、读写 guard、SCF 与 inactive carry。后者复用共同 schema 克隆，
+但保留 predication 所需的惰性求值、无效输入保护及循环终止语义；克隆失败必须由
+ownership、buffer loop 和 scan consumer 传回完整变换。
 
 ### GPU 中直接可复用的接口
 
 [GPU Passes.h](include/Intent/Dialect/GPU/Transforms/Passes.h) 只暴露完整变换与验证入口。实现内部需要的查询与改写按下表包含具体头文件，不通过一个通用 Utilities 模块取得所有能力。
+
+[GPU Transforms](lib/Dialect/GPU/Transforms/) 按稳定职责组织子目录；顶层只保留
+`Passes.cpp`、`VerifyGPUProgram.cpp` 和单一构建库的 CMake 声明。
+
+| 子目录 | 放入的实现 |
+|---|---|
+| `Access/` | 访问坐标组合、load/gather/reshape/归约访问的实现 |
+| `Contraction/` | contraction 分析、供数、分块、结果投影与遍历 |
+| `Pointwise/` | workset 选择、执行域提升、coverage、ownership 与写回 |
+| `Reduction/` | collective 分解、参数、combine、归约/scan 消费者及 online reduction |
+| `Region/` | region fold/scan、source 准备、helper 绑定及输出克隆 |
+| `Control/` | predication、遍历构造与融合、buffer loop 向量化 |
+| `Value/` | 多组变换共用的 schema、投影、重放、关系闭合与局部值正规化 |
+| `Storage/` | 私有值提升、保留值物化、store 调度与 workspace lowering |
+| `Mapping/` | execution group、program mapping 和接口改写 |
+| `Configuration/` | profiles、参数、候选及资源约束 |
+
+新增 pass 先按实际职责选择组，再接入顶层 pipeline；组内多个 helper 不因此成为独立
+pass。跨组需要稳定复用的构造接口在 `include/Intent/Dialect/GPU/Transforms/` 的对应
+子目录，只有同一实现组或同一库内部使用的头留在相邻 `lib` 子目录。例如
+`Pointwise.h`、`RegionCloning.h` 是私有实现接口；`ExecutionSchema.h` 是多个组的共享接口。
+这与本地 Triton 的 `Transforms/Pipeliner/`、`Transforms/WarpSpecialization/` 分组及
+`WarpSpecialization/PartitionAttrs.h` 私有头的组织方式一致；子目录不必各建一份库。
+
+GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`、
+`Region`、`Control`、`Value`、`Storage`、`Mapping`、`Configuration` 分组，
+仍由同一个 `MLIRIntentGPUTransforms` 库构建；顶层保留 pipeline 和完整程序验证入口。
+公共头按相同职责放在 `include/Intent/Dialect/GPU/Transforms/` 下，组内实现头留在
+`lib/`。`Reduction/OnlineSummary.h` 由 reduction 与 region 的实现共同使用，仍是
+同库私有接口；这类依赖用明确的相对路径表达，不为目录整理扩大公共 API。
 
 | 需要的能力 | 接口 | 使用方式 |
 |---|---|---|
 | 当前 value/access 的坐标、范围和复用事实 | [Analysis/PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) | 只读 current IR；相关 def-use、类型或范围改变后重算 |
 | 资源 allocation 身份与别名 | [Analysis/ResourceAlias.h](include/Intent/Dialect/GPU/Analysis/ResourceAlias.h) | 从真实 allocation、公共参数和标准 control-flow/view forwarding 查询；不同 SSA 不代表不重叠，未知返回 MayAlias；资源定义或控制流改写后重建 |
 | GPU 类型与形状属性自身的不变量 | [IR/TypeVerification.h](include/Intent/Dialect/GPU/IR/TypeVerification.h) | `verifyGPUTypeInvariants` 用 MLIR `AttrTypeWalker` 复用各类型/属性的 `verify`；完整 GPU verifier 在操作验证前调用，避免 release 构造绕过 checked constructor 后漏检 |
-| 执行组构造、重建与 provider 展开 | [Transforms/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
+| 执行组构造、重建与 provider 展开 | [Transforms/Mapping/ExecutionGroups.h](include/Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h) | shared 变换维护真实 body 与坐标参数；`lowerExecutionGroups` 在 provider 准备入口统一展开 |
 | scalar/fragment schema与投影轴 | [Analysis/ValueSchema.h](include/Intent/Dialect/GPU/Analysis/ValueSchema.h) | 只读查询当前类型与轴关系，不创建值、不选择 blocking |
+| 已选执行域的类型提升、轴重映射和克隆 | [Transforms/Value/ExecutionSchema.h](include/Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h) | 实际 `oldToNew`/`executionToNew` 映射与 `cloneWithSchema`；不选择执行轴，不接管 effects 或控制策略 |
 | 普通值运算的 operand/result 轴关系与形状传递 | [IR/FragmentOpInterface.h](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) | 按操作数位置查询；改写前取得关系，传递 extents，数值与重放资格由调用方证明 |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
 | range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
 | 常量、大小关系与访问对齐 | [Analysis/IndexRelations.h](include/Intent/Dialect/GPU/Analysis/IndexRelations.h) | `IndexRelations` 共用于范围谓词、Triton descriptor 与 cuTile tile access；按 typed index 与回绕合同证明，不创建 guard 或选择原生 form |
 | 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `ParameterSpace::read` 读取 kernel 声明；不依赖 SSA 读取是否存在；改变声明后重读 |
 | fragment 结构资源估计 | [Analysis/Resources.h](include/Intent/Dialect/GPU/Analysis/Resources.h) | `FragmentResourceAnalysis` 缓存稳定 IR 的类型与参数使用关系；类型或 IR 改写后重建。估计不代替下层布局、寄存器分配和 occupancy |
-| 静态与 specialization 后的候选条件 | [Transforms/Resources.h](include/Intent/Dialect/GPU/Transforms/Resources.h) | 从当前 IR 收集 typed requirements，静态筛选与 runtime 绑定求值使用同一条件；analysis 不隐藏改写 |
-| value projection、replay、validity 与显式常量 | [Transforms/ValueMaterialization.h](include/Intent/Dialect/GPU/Transforms/ValueMaterialization.h) | replay 必须给出原语义位置和已绑定 SSA frontier；生成位置由 builder 表达，不能用空 anchor 跳过读取证明 |
-| 改写后的 value/access/aggregate 关系闭合 | [Transforms/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
-| coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
-| predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
+| 静态与 specialization 后的候选条件 | [Transforms/Configuration/Resources.h](include/Intent/Dialect/GPU/Transforms/Configuration/Resources.h) | 从当前 IR 收集 typed requirements，静态筛选与 runtime 绑定求值使用同一条件；analysis 不隐藏改写 |
+| value projection、replay、validity 与显式常量 | [Transforms/Value/ValueMaterialization.h](include/Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h) | replay 必须给出原语义位置和已绑定 SSA frontier；生成位置由 builder 表达，不能用空 anchor 跳过读取证明 |
+| 改写后的 value/access/aggregate 关系闭合 | [Transforms/Value/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/Value/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
+| coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
+| predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Control/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
 
 `PhysicalProgramAnalysis` 的公开查询仍通过 [PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) 使用；维护查询算法时进入以下实现文件：
 
@@ -701,17 +765,17 @@ KIR 的验证入口直接属于 operation，按合同分布在
 SSA 快照，不沿其旧定义再次要求读取。没有 source selector 时检查整个未绑定 shaped
 graph；指定 source 时，独立且支配原位置的值可复用。能够复用原值不代表允许克隆它的读取。
 
-[ReplayMaterialization.cpp](lib/Dialect/GPU/Transforms/ReplayMaterialization.cpp) 集中执行按
+[ReplayMaterialization.cpp](lib/Dialect/GPU/Transforms/Value/ReplayMaterialization.cpp) 集中执行按
 source occurrence 或按 ranges 的重放，复用上述证明并检查替代值在实际 builder 插入点
 可用；不同轴投影保留各自规则。Contraction 的 `ContractionValues` 保留重算或保留快照的
-选择，不再另持一套克隆器。`createTraversalLoop`（[Traversal.h](include/Intent/Dialect/GPU/Transforms/Traversal.h)）
+选择，不再另持一套克隆器。`createTraversalLoop`（[Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)）
 先将循环接入当前 IR 再构造 body，供 contraction、region 与 scan 的位置分析使用。
 这个边界可对照本地 Triton `FuseNestedLoops.cpp:246–274` 中分开的节点资格、dominance
 和 hoist 集合；Intent 还需要证明逻辑 source 分块后的读取快照，不能仅以 pure 或只读 view 名称代替。
 
-Fold/scan 共用私有 [RegionSources.cpp](lib/Dialect/GPU/Transforms/RegionSources.cpp)：先保存
+Fold/scan 共用私有 [RegionSources.cpp](lib/Dialect/GPU/Transforms/Region/RegionSources.cpp)：先保存
 无法在新位置重新读取的 source，再从当前 IR 重算 source facts，最后形成片段和 tail。
-普通与多轴归约共用 [ReductionReads.cpp](lib/Dialect/GPU/Transforms/ReductionReads.cpp) 的相同
+普通与多轴归约共用 [ReductionReads.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionReads.cpp) 的相同
 准备/物化边界。保留片段按遍历坐标索引原 SSA 快照，资源地址上的基址偏移不能再用作快照 ordinal。
 
 资源查询的职责可对照本地 Triton `lib/Analysis/Alias.cpp:36–45`：真实 allocation
@@ -730,35 +794,37 @@ Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/ProgramGrid.cpp) 先读取
 `lowerExecutionGroups`，生成纯 `DelinearizeOp` 坐标计算并展开 body。
 正常编译与 shared IR 续编译使用同一入口；serializer 不保留或解释执行组。
 
-收缩计算的完整入口在 [RealizeContractionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeContractionBlocking.cpp)。同目录下 `ContractionSources` 负责合法的 source 规范化，`ContractionAnalysis` 负责轴与范围查询，`ContractionValues` 负责重算与保留快照的选择，`ContractionProjection` 负责结果关系，`ContractionTraversal` 与 `ContractionBlocking` 形成具体循环与 ownership。普通与 scaled contraction 共用能成立的判定和构造机制，各自的 dtype、scale 与 packing 条件留在相应实现。Provider 只通过 [Contraction.h](include/Intent/Dialect/GPU/Transforms/Contraction.h) 调用必要的形状规范化与查询，不接管 shared blocking。
+收缩计算的完整入口在 [RealizeContractionBlocking.cpp](lib/Dialect/GPU/Transforms/Contraction/RealizeContractionBlocking.cpp)。同目录下 `ContractionSources` 负责合法的 source 规范化，`ContractionAnalysis` 负责轴与范围查询，`ContractionValues` 负责重算与保留快照的选择，`ContractionProjection` 负责结果关系，`ContractionTraversal` 与 `ContractionBlocking` 形成具体循环与 ownership。普通与 scaled contraction 共用能成立的判定和构造机制，各自的 dtype、scale 与 packing 条件留在相应实现。Provider 只通过 [Contraction.h](include/Intent/Dialect/GPU/Transforms/Contraction/Contraction.h) 调用必要的形状规范化与查询，不接管 shared blocking。
 
-[ContractionTraversal](lib/Dialect/GPU/Transforms/ContractionTraversal.cpp) 保留完整 retained result 的原始 contraction：完整物理 extent 属于已有 tile 候选域且不超过所选 tile，reduction 也已具备原生执行条件时，直接使用原 shape、读快照和 accumulator，避免分片与拼回；其它情况保留分片与 padding 路径。这是 current IR 的完整分支，不由 serializer 根据运行时 shape 猜测。
+[ContractionTraversal](lib/Dialect/GPU/Transforms/Contraction/ContractionTraversal.cpp) 保留完整 retained result 的原始 contraction：完整物理 extent 属于已有 tile 候选域且不超过所选 tile，reduction 也已具备原生执行条件时，直接使用原 shape、读快照和 accumulator，避免分片与拼回；其它情况保留分片与 padding 路径。这是 current IR 的完整分支，不由 serializer 根据运行时 shape 猜测。
 
-普通归约的完整入口和策略次序在 [RealizeReductionBlocking.cpp](lib/Dialect/GPU/Transforms/RealizeReductionBlocking.cpp)。相邻私有模块分别承担具体机制：
+普通归约的完整入口和策略次序在 [RealizeReductionBlocking.cpp](lib/Dialect/GPU/Transforms/Reduction/RealizeReductionBlocking.cpp)。相邻私有模块分别承担具体机制：
 
 | 私有模块 | 修改入口与职责 |
 |---|---|
-| [ReductionAnalysis.cpp](lib/Dialect/GPU/Transforms/ReductionAnalysis.cpp) | source/root/extent 与 retained source 的只读资格查询 |
-| [ReductionParameters.cpp](lib/Dialect/GPU/Transforms/ReductionParameters.cpp) | reduction 参数选择与 free-axis 绑定 |
-| [ReductionValues.cpp](lib/Dialect/GPU/Transforms/ReductionValues.cpp) | identity、typed combine 克隆与 value schema 投影 |
-| [ReductionCoverage.cpp](lib/Dialect/GPU/Transforms/ReductionCoverage.cpp) | static padding、完整 coverage 与 tail neutralization |
-| [ReductionDecomposition.cpp](lib/Dialect/GPU/Transforms/ReductionDecomposition.cpp) | 多轴归约的分解和关系维护 |
-| [ReductionTraversal.cpp](lib/Dialect/GPU/Transforms/ReductionTraversal.cpp) | runtime chunk loop、nested hoist 与条件内归约 |
+| [ReductionAnalysis.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionAnalysis.cpp) | source/root/extent 与 retained source 的只读资格查询 |
+| [ReductionParameters.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionParameters.cpp) | reduction 参数选择与 free-axis 绑定 |
+| [ReductionValues.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionValues.cpp) | identity、typed combine 克隆与 value schema 投影 |
+| [ReductionCoverage.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionCoverage.cpp) | static padding、完整 coverage 与 tail neutralization |
+| [ReductionDecomposition.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionDecomposition.cpp) | 多轴归约的分解和关系维护 |
+| [ReductionTraversal.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionTraversal.cpp) | runtime chunk loop、nested hoist 与条件内归约 |
 
 这些机制由同一公开 driver 调用，不是新 pass；driver 保留策略选择和改写后的 worklist 刷新。`SourcePlan` 只是一次改写读取的当前 SSA 事实，不能成为独立持久计划。跨变换需要复用的范围证明、replay 和参数生命周期仍使用上表中的共同接口。
 
-Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise.h) 使用以下机制：
+Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/Pointwise/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise/Pointwise.h) 使用以下机制：
 
 | 私有模块 | 修改入口与职责 |
 |---|---|
-| [PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/PointwiseAnalysis.cpp) | 查询 source-axis、结构化范围用途、写入 effect 与现有 mapping 坐标；同一个 dimension 不自动代表同一个 Cartesian occurrence |
-| [PointwiseCoverage.cpp](lib/Dialect/GPU/Transforms/PointwiseCoverage.cpp) | 兑现 scan/reduction 的完整 coverage，形成固定或局部范围、tail validity，保留不能安全 replay 的 gather source，并完成值关系闭合 |
-| [PointwiseOwnership.cpp](lib/Dialect/GPU/Transforms/PointwiseOwnership.cpp) | 提升 workset，处理 axis occurrence 与 ownership 依赖，选择 ownership 并写入 program mapping |
-| [PointwiseTraversal.cpp](lib/Dialect/GPU/Transforms/PointwiseTraversal.cpp) | 重放合法 value graph，选择并形成写回/复用 traversal，兑现已确定 ownership 的 histogram |
+| [PointwiseAnalysis.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseAnalysis.cpp) | 查询 source-axis、结构化范围用途、写入 effect 与现有 mapping 坐标；同一个 dimension 不自动代表同一个 Cartesian occurrence |
+| [PointwiseCoverage.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseCoverage.cpp) | 兑现 scan/reduction 的完整 coverage，形成固定或局部范围、tail validity，保留不能安全 replay 的 gather source，并完成值关系闭合 |
+| [PointwiseWorksets.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseWorksets.cpp) | workset 提升的依赖、合法性、选择与 range 构造 |
+| [PointwiseLifting.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseLifting.cpp) | 消费已选执行轴，更新实际 SSA、structured operands 与控制边界；复用共同 schema 机制 |
+| [PointwiseOwnership.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseOwnership.cpp) | axis occurrence 与 ownership 依赖、ownership 选择及 program mapping |
+| [PointwiseTraversal.cpp](lib/Dialect/GPU/Transforms/Pointwise/PointwiseTraversal.cpp) | 重放合法 value graph，选择并形成写回/复用 traversal，兑现已确定 ownership 的 histogram |
 
 `PointwiseRewrite` 只保存一次完整变换期间的工作状态；driver 在相关改写后重新读取 current-IR facts，执行决定写入当前 IR，不跨两个入口保留第二份 plan。新增局部机制放入对应私有模块；需要多个 GPU 变换复用的只读关系才进入公开 Analysis。
 
-[SimplifyRangePredicates.cpp](lib/Dialect/GPU/Transforms/SimplifyRangePredicates.cpp) 是 `IndexPredicates` 的改写消费者：全体物理 lane 上已证明的比较可替换为布尔常量；只有条件蕴含时，写入 specialization guard 与原谓词的逻辑或，未满足 guard 时仍保留原判定。它不把未证明的 shape 关系变成输入要求，也不负责 provider 的 native-load 分支或 MMA 循环组织。
+[SimplifyRangePredicates.cpp](lib/Dialect/GPU/Transforms/Value/SimplifyRangePredicates.cpp) 是 `IndexPredicates` 的改写消费者：全体物理 lane 上已证明的比较可替换为布尔常量；只有条件蕴含时，写入 specialization guard 与原谓词的逻辑或，未满足 guard 时仍保留原判定。它不把未证明的 shape 关系变成输入要求，也不负责 provider 的 native-load 分支或 MMA 循环组织。
 
 新增一个 physical rewrite 时，先确定它读取的 current-IR facts，从上表选择查询或 materialization 接口；将 rewrite 和必要 relation closure 放进一个完整入口；在 family pipeline 中安排依赖位置与 postcondition 验证。新增只读查询应放 Analysis，只有本模块用的算法细节留在相邻私有实现，不扩大 Passes.h。CPU 或 DSA 的类似优化先复用它们自己的 analysis 和 storage/control 合同，只有与执行拓扑无关的规则才上提到公共 Analysis。
 
@@ -785,12 +851,12 @@ types 中的引用。标准 DCE/CSE 可以删除或合并读取，无需保活�
 | 需要修改的职责 | 入口 |
 |---|---|
 | 当前声明、完整绑定与阶段验证 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) 的只读 `ParameterSpace` |
-| 创建声明、按需读取、改域、替换与改名 | [Transforms/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) 的 `declareParameter`、`materializeParameter`、`updateParameter`、`replaceParameter`、`renameParameters` |
-| 校验并发布候选表 | [Transforms/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/PhysicalParameters.h) 的 `writeConfigurations` |
-| 当前图的分类、关联参数及完整结果机会 | [ConfigurationAnalysis.cpp](lib/Dialect/GPU/Transforms/ConfigurationAnalysis.cpp) |
-| 有限 profile 解码、family 选择与 role 投影 | [ConfigurationProfiles.cpp](lib/Dialect/GPU/Transforms/ConfigurationProfiles.cpp) |
-| 候选 extent 与资源约束 | [ConfigurationConstraints.cpp](lib/Dialect/GPU/Transforms/ConfigurationConstraints.cpp) |
-| 共同候选形成的完整入口 | [MaterializeConfigTuples.cpp](lib/Dialect/GPU/Transforms/MaterializeConfigTuples.cpp) |
+| 创建声明、按需读取、改域、替换与改名 | [Transforms/Configuration/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h) 的 `declareParameter`、`materializeParameter`、`updateParameter`、`replaceParameter`、`renameParameters` |
+| 校验并发布候选表 | [Transforms/Configuration/PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h) 的 `writeConfigurations` |
+| 当前图的分类、关联参数及完整结果机会 | [ConfigurationAnalysis.cpp](lib/Dialect/GPU/Transforms/Configuration/ConfigurationAnalysis.cpp) |
+| 有限 profile 解码、family 选择与 role 投影 | [ConfigurationProfiles.cpp](lib/Dialect/GPU/Transforms/Configuration/ConfigurationProfiles.cpp) |
+| 候选 extent 与资源约束 | [ConfigurationConstraints.cpp](lib/Dialect/GPU/Transforms/Configuration/ConfigurationConstraints.cpp) |
+| 共同候选形成的完整入口 | [MaterializeConfigTuples.cpp](lib/Dialect/GPU/Transforms/Configuration/MaterializeConfigTuples.cpp) |
 
 这些私有 policy facts 只在一次不变的 current program 上使用，不跨改写缓存，不拥有
 第二张执行表。修改 shared/deferred 声明使候选表失效；仅修改 provider 声明时，
@@ -810,7 +876,7 @@ Activation 只引用 provider 阶段的 `i1` 参数；未选择的形式不求�
 host metadata binding，不依赖某个比较 SSA 值仍然存活。
 
 新增条件时，先在所属 family/provider 从当前 typed facts 构造一次 requirement，
-再交给 [Resources](lib/Dialect/GPU/Transforms/Resources.cpp) 筛选和发布。
+再交给 [Resources](lib/Dialect/GPU/Transforms/Configuration/Resources.cpp) 筛选和发布。
 [Triton ConfigurationRequirements](lib/Target/Triton/Transforms/ConfigurationRequirements.cpp)
 从当前 range、fragment 和 descriptor 取得条件，包括真实 block shape、元素上限、
 连续字节与多 stage 对齐；descriptor 条件由当前 choice 参数激活。
@@ -910,6 +976,14 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 检查完整绑定；它们不重放依赖原始计算形状的候选筛选，也不重新选择实现。
 
 `inputRequirements` 是只读查询，候选期与后续供数变换都可以调用。`checkInputRequirement` / `checkInputRequirements` 共享 operand、panel、alignment 与显式 widening 的证明，实际物化时依据当前 IR 重查。跨阶段只传递正式 binding，不缓存另一份供数计划。输入已经满足实现要求、无需额外准备时可以返回空需求；空需求只表示不需要外围 preparation，不说明它一定更快。
+
+[ImplementationInputs.h](include/Intent/Dialect/CPU/Transforms/ImplementationInputs.h)
+公开函数级输入供应构造的三个入口：`prepare`、`prepareCaptured`、`prepareGroup`。
+CPU passes 与 Mojo 共用同一上下文的准备和复用状态；内部 prepared windows、guards
+及缓存结构由 `.cpp` 中的单一实现持有。仅供 CPU 内部使用的窗口分析留在
+[InputWindows.h](lib/Dialect/CPU/Transforms/InputWindows.h)。Mojo/Weft 共用的基础
+index、算术与 loop 构造放在 [LoopBuilders.h](include/Intent/Dialect/CPU/Transforms/LoopBuilders.h)，
+provider 通过公开 include 使用它们，不跨层包含 CPU 的私有源码路径。
 
 [ImplementationInputs.cpp](lib/Dialect/CPU/Transforms/ImplementationInputs.cpp) 的 group supply 将配置容量与当前 source 维度的已证明上界取小，只收缩未拆成 panel 的维度；panel 宽度、对齐、有效写入窗口及生命周期保持原合同。Mojo 的 group panel 预算检查使用同一上界查询。配置容量是分块上限，不能代替当前 IR 已有的更紧界；有效窗口宽度也不能代替实现要求的固定 panel pitch。Weft 当前不请求这类 group preparation，不因此宣称它使用了同一 packing 路径。
 
@@ -1263,7 +1337,7 @@ array、bounds 与 eligibility，[cuTile contract](python/intent/runtime/cutile/
 Triton/cuTile 的 `Transforms/Configurations.cpp` 负责各自的候选策略与资源合法性，使用共同的参数绑定分析。Triton 的 tensor/descriptor/collective 约束从当前 IR 一次收集后逐候选求值；cuTile 保留 launch 与 memory hints 的相关候选及 resident-capacity 绑定。新增设备约束时在对应模块处理，不复制参数解析器，也不把 Triton TTGIR 的布局、MMA 或 pipeline 再实现一遍。
 
 矩阵 primitive 需要的二维物理投影由现有
-[ContractionProjection.cpp](lib/Dialect/GPU/Transforms/ContractionProjection.cpp) 依据
+[ContractionProjection.cpp](lib/Dialect/GPU/Transforms/Contraction/ContractionProjection.cpp) 依据
 typed free/batch/reduction axes 形成，并恢复结果的原坐标映射。Triton 和 cuTile
 在各自准备边界共用 `normalizeMatrixContractShapes`；serializer 只输出
 已决定的 transpose/reshape。新增 provider 不应重新限制作者只能声明二维矩阵。

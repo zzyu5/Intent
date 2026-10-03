@@ -3,10 +3,10 @@ official_fmha,B4-QH32-KVH8-S4096-D128-fp16-causal,2.812640,2.562968,1.097415,pas
 block_scaled_gemm,M4096-N14336-K4096-fp8-block32,0.946456,1.062672,0.890638,pass,
 dense_gemm,M4096-N14336-K4096-fp16,2.081520,2.096800,0.992713,pass,
 moe_expert_projection,T4096-E8-top2-4096x14336-bf16,4.505312,6.210560,0.725428,pass,同算法；source 使用预计算 block ownership
-layer_norm,8192x4096-bf16,0.087728,0.265840,0.330003,pass,同算法；source 额外写 Mean/Rstd
+layer_norm,8192x4096-bf16,0.085776,0.264976,0.323712,pass,同算法；source 额外写 Mean/Rstd
 silu_and_mul,4096x28672-to14336-bf16,0.227104,0.245520,0.924992,pass,同算法；source 使用 FTZ 与近似除法
 attention_backward,B2-QH8-KVH2-S1024-D64-fp16-causal,0.132896,0.175920,0.755434,pass,同算法；中间精度和舍入不同
-dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.408112,1.283480,1.097105,pass,同算法；source 使用 FTZ 与近似除法
+dense_attention_forward,B2-QH32-KVH8-S4096-D128-bf16-causal,1.438848,1.283848,1.120731,pass,同算法；source 使用 FTZ 与近似除法
 grouped_flash_decode,B8-QH32-KVH8-S8192-D128-bf16,0.186368,0.188432,0.989046,pass,同算法；source 使用 FTZ 与近似除法
 swiglu,8192x14336-bf16,0.450368,0.464688,0.969184,pass,同算法；source 使用 FTZ 与近似除法
 splitk_attention_reduce,B8-H32-S8192-splits16-D128,0.005872,0.005936,0.989218,pass,
@@ -27,12 +27,12 @@ attention_sink_decode,B32-S8192-QH32-KVH8-D128-bf16,0.679008,2.081848,0.326156,p
 mhc_apply_residual,T2048-H4096-streams4-bf16,0.097504,0.108336,0.900015,pass,同算法；source 保留 bf16 中间累加
 gemma_prefill,B2-S4096-QH32-KVH8-D128-window1024-cap50-bf16,0.713408,0.595424,1.198151,pass,同算法；中间精度和舍入不同
 gemma_decode,B32-S8192-QH32-KVH8-D128-window1024-cap50-bf16,0.108528,0.698896,0.155285,pass,同算法；中间精度和舍入不同
-mhc_sinkhorn,T8192-streams4-fp32,0.008176,0.018432,0.443576,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
+mhc_sinkhorn,T8192-streams4-fp32,0.008192,0.018176,0.450704,pass,同算法；source 用 exp2(x * log2(e)) 实现 exp
 absorbed_mla_decode,B8-H64-S8192-C512-R64-fp16,0.185360,2.058936,0.090027,pass,同算法；source 使用近似除法并额外输出 LSE
 splitk_mla_decode,B8-H64-S8192-C512-R64-split512-fp16,0.114864,0.329792,0.348292,pass,同算法；source 使用 FTZ 与近似除法
 sparse_mla_prefill,S2048-SKV4096-H64-topk512-D128-R64-bf16,0.535184,2.464864,0.217125,pass,"compile_options={""numerics"":""relaxed_normalization"",""online_reduction"":true,""optimization_remarks"":true}. 同算法；source 使用 FTZ 与近似除法"
 sliding_window_attention,B2-S4096-QH32-KVH8-D128-window1024-fp16,0.662528,0.839920,0.788799,pass,同算法；source 的布局转换与辅助工作计入其调用时间
 rms_norm,8192x4096-bf16,0.087808,0.085840,1.022926,pass,同算法；source 额外写 Rstd
-recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.851680,0.801376,1.062772,pass,
+recurrent_gated_delta,B2-S2048-H8-K128-V128-bf16,0.852480,0.804864,1.059160,pass,
 chunk_gated_delta,B2-S2048-H8-K128-V128-C64-bf16,0.184720,1.561312,0.118311,pass,同算法；generated 使用 BF16 矩阵输入、FP32 累加与状态，source 使用 TF32 矩阵输入
 nvfp4_quantize,8192x4096-block16-bf16,0.057104,0.059008,0.967733,pass,同算法、group16；CUDA Graph 重放下的算子 GPU 执行延迟，不含编译、调优与输出分配
