@@ -1,3 +1,4 @@
+#include "PassSupport.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
@@ -309,4 +310,23 @@ LogicalResult realizeCollectiveGatherSupply(func::FuncOp function) {
   if (!gathers.empty()) realizeGroup(work, gathers, relations);
   return success();
 }
+} // namespace intent::dsa
+
+namespace intent::dsa {
+#define GEN_PASS_DEF_DSACOLLECTIVEGATHERSUPPLY
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+
+namespace {
+struct CollectiveGatherSupplyPass : impl::DSACollectiveGatherSupplyBase<CollectiveGatherSupplyPass> {
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyRealizedProgram(module)))
+      return signalPassFailure();
+    auto function = *module.getOps<func::FuncOp>().begin();
+    auto result = realizeCollectiveGatherSupply(function);
+    if (failed(detail::finishTransform(module, getArgument(), result)))
+      signalPassFailure();
+  }
+};
+} // namespace
 } // namespace intent::dsa

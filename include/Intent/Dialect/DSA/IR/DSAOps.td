@@ -1,6 +1,7 @@
 #ifndef INTENT_DIALECT_DSA_IR_DSAOPS_TD
 #define INTENT_DIALECT_DSA_IR_DSAOPS_TD
 include "Intent/Dialect/DSA/IR/DSAAttrs.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 class IntentDSA_Op<string name, list<Trait> traits = []>
     : Op<IntentDSA_Dialect, name, traits> { let hasVerifier = 1; }
@@ -191,6 +192,48 @@ def IntentDSA_ReduceOp : IntentDSA_Op<"reduce"> {
     Arg<AnyMemRef, "", [MemWrite]>:$scratch, Index:$count,
     AnyFloat:$identity, Intent_BinaryOperatorAttr:$kind,
     DefaultValuedAttr<I64Attr, "1">:$axis);
+}
+def IntentDSA_SliceReduceOp : IntentDSA_Op<"slice_reduce", [
+    AttrSizedOperandSegments, SingleBlock, IsolatedFromAbove,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Reduce local source members with a closed typed combine region";
+  let description = [{
+    Sources and outputs are complete contiguous local views retaining their
+    logical capacity axes. Counts concatenate the active extents of each source,
+    in source and then axis order. All sources share the selected member extents;
+    each field retains its own free-axis shape. Initials are scalar fills or
+    complete state views. The combine takes two component tuples followed by
+    explicit captures and yields one component tuple. Its borrowed inputs are
+    read-only; any writes are confined to helper-local scratch. Reduce permits
+    associative and commutative combination; empty membership returns initials.
+  }];
+  let arguments = (ins Variadic<AnyMemRef>:$sources,
+    Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
+    Variadic<AnyMemRef>:$outputs, Variadic<Index>:$counts,
+    DenseI64ArrayAttr:$axes);
+  let regions = (region AnyRegion:$combine);
+}
+def IntentDSA_ScanOp : IntentDSA_Op<"scan", [
+    AttrSizedOperandSegments, SingleBlock, IsolatedFromAbove,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Scan local source members and publish their final component state";
+  let description = [{
+    Uses the same source, active-count and closed combine schema as slice_reduce.
+    Outputs preserve every source capacity axis; finals remove the scan axis.
+    The combine preserves member order and may reassociate. Inclusive and reverse
+    are observable prefix semantics. Empty membership leaves outputs empty and
+    writes initials to finals. Helper shape values are ordinary explicit captures.
+  }];
+  let arguments = (ins Variadic<AnyMemRef>:$sources,
+    Variadic<AnyType>:$initials, Variadic<AnyType>:$captures,
+    Variadic<AnyMemRef>:$outputs, Variadic<Index>:$counts,
+    Variadic<AnyMemRef>:$finals, I64Attr:$axis, BoolAttr:$inclusive,
+    BoolAttr:$reverse);
+  let regions = (region AnyRegion:$combine);
+}
+def IntentDSA_CollectiveYieldOp : IntentDSA_Op<"collective_yield", [
+    Pure, Terminator, ReturnLike]> {
+  let arguments = (ins Variadic<AnyType>:$values);
 }
 def IntentDSA_PrepareMatrixOp : IntentDSA_Op<"prepare_matrix", [AttrSizedOperandSegments]> {
   let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$input,

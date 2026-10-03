@@ -4,6 +4,11 @@ add_mlir_library(MLIRIntentDSATransforms
   CollectiveGather.cpp
   IndexPrograms.cpp
   LocalValues.cpp
+  Collective/Passes.cpp
+  Collective/Realize.cpp
+  Collective/Storage.cpp
+  Collective/ScalarCombine.cpp
+  Collective/NativeReduction.cpp
 
   DEPENDS
   IntentDSAPassesIncGen

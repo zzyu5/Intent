@@ -199,7 +199,13 @@ FailureOr<SmallVector<Value>> Construction::makeSlots(TypeRange types, Location 
         auto shape = localShape(tensor, loc);
         if (failed(shape)) return failure();
         slots.push_back(allocateTensor(loc, tensor.getElementType(), *shape));
-      } else slots.push_back(allocate(loc, field.isIndex() || isa<LogicalIndexType>(field) ? b.getI64Type() : field, 1, 1));
+      } else {
+        Value slot = allocate(loc,
+            field.isIndex() || isa<LogicalIndexType>(field) ? b.getI64Type() : field,
+            1, 1);
+        localShapes[slot] = {};
+        slots.push_back(slot);
+      }
     }
   }
   return slots;

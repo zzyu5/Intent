@@ -13,6 +13,17 @@ class IntentDSAPass<string passArgument, string summaryText>
   ];
 }
 
+def DSARealizeCollectives : IntentDSAPass<"intent-dsa-realize-collectives",
+    "Realize current DSA reduction and scan combine regions"> {
+  let description = [{
+    Requires a verified DSA program with explicit local sources, initial states,
+    outputs, active counts and typed combine regions. Selects supported native
+    reductions or materializes scalar/whole-slice combine traversal and private
+    state snapshots. Leaves executable DSA, memref and structured control with
+    no ordinary collective regions, before supply and resource binding.
+  }];
+}
+
 def DSACollectiveGatherSupply : IntentDSAPass<
     "intent-dsa-collective-gather-supply",
     "Form collective row supply from current DSA address relations">;

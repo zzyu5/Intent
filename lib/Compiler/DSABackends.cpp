@@ -113,7 +113,7 @@ void DSABackend::buildShared(OpPassManager &manager, const Request &, StringRef)
 }
 
 LogicalResult DSABackend::verifySharedInput(ModuleOp module, const Request &request, StringRef) const {
-  if (failed(dsa::verifyProgram(module))) return failure();
+  if (failed(dsa::verifyRealizedProgram(module))) return failure();
   if (module->hasAttr("bangc.architecture"))
     return module.emitError("provider-specific BANG C input cannot be resumed as shared DSA IR");
   if (request.dsa.architecture != "mtp_372")

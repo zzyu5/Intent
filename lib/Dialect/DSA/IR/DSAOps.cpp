@@ -1,4 +1,5 @@
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
+#include "Intent/Dialect/DSA/IR/Views.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -649,16 +650,8 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
       }
     }
     if (auto view = dyn_cast<memref::ReinterpretCastOp>(op)) {
-      auto source = cast<MemRefType>(view.getSource().getType()), result = view.getType();
-      Value owner = view.getSource();
-      while (auto parent = owner.getDefiningOp<memref::ReinterpretCastOp>()) owner = parent.getSource();
-      if (!tile(view.getSource()) || !tile(view.getResult()) || !owner.getDefiningOp<memref::AllocaOp>() ||
-          source.getElementType() != result.getElementType() || source.getNumElements() != result.getNumElements() ||
-          !source.getLayout().isIdentity() || !result.getLayout().isIdentity() ||
-          !view.getOffsets().empty() || !view.getSizes().empty() || !view.getStrides().empty() ||
-          view.getStaticOffsets() != ArrayRef<int64_t>({0}) || view.getStaticSizes() != result.getShape() ||
-          view.getStaticStrides() != ArrayRef<int64_t>({result.getDimSize(1), 1})) {
-        op->emitError("DSA local views require a same-dtype contiguous reshape of one complete owned allocation");
+      if (!isCompleteLocalStorageView(view.getResult())) {
+        op->emitError("DSA local views require a same-dtype contiguous reshape of complete local storage or a borrowed collective input");
         return WalkResult::interrupt();
       }
     }
@@ -677,4 +670,15 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
     return WalkResult::advance();
   });
   return failure(walk.wasInterrupted());
+}
+
+LogicalResult intent::dsa::verifyRealizedProgram(ModuleOp module) {
+  if (failed(verifyProgram(module))) return failure();
+  WalkResult result = module.walk([&](Operation *operation) {
+    if (!isa<SliceReduceOp, ScanOp, CollectiveYieldOp>(operation))
+      return WalkResult::advance();
+    operation->emitOpError("ordinary collective must be realized before target lowering");
+    return WalkResult::interrupt();
+  });
+  return failure(result.wasInterrupted());
 }

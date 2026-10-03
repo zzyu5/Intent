@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 
 namespace intent::kir_to_dsa {
 
@@ -232,6 +233,71 @@ LogicalResult Construction::orderedControl(Operation *operation) {
   return success();
 }
 
+LogicalResult Construction::requireFullExtent(Value extent, int64_t dimension) {
+  // A bounded internal extent is discharged by the physical program. Only an
+  // actual public dimension can become a caller-visible tile obligation.
+  auto interval = dsa::integerInterval(extent, function);
+  if (interval) {
+    if (interval->second <= config.getTile()) return success();
+    if (interval->first > config.getTile())
+      return emitError(extent.getLoc(),
+          "DSA full row extent exceeds the selected tile capacity");
+  }
+  if (auto bound = upperDistance(extent, index(extent.getLoc(), 0));
+      bound && *bound <= config.getTile()) return success();
+
+  auto interface = getPublicInterface(function);
+  auto require = [&](int64_t identity) {
+    if (!llvm::is_contained(fullExtents, identity)) fullExtents.push_back(identity);
+    return success();
+  };
+  for (Attribute attribute : interface.getArguments()) {
+    auto view = dyn_cast<ViewType>(cast<PublicParameterAttr>(attribute).getType());
+    if (!view) continue;
+    auto tensor = publicViewTensor(view);
+    for (auto [axis, identity] : llvm::enumerate(publicViewDimensions(view).asArrayRef()))
+      if (identity == dimension && tensor.isDynamicDim(axis))
+        return require(identity);
+  }
+
+  Value current = extent;
+  while (true) {
+    if (auto cast = current.getDefiningOp<arith::IndexCastOp>(); cast &&
+        (cast.getIn().getType().isIndex() || cast.getIn().getType().isInteger(64)) &&
+        (cast.getType().isIndex() || cast.getType().isInteger(64))) {
+      current = cast.getIn();
+      continue;
+    }
+    if (auto maximum = current.getDefiningOp<arith::MaxSIOp>()) {
+      if (matchPattern(maximum.getLhs(), m_Zero())) {
+        current = maximum.getRhs();
+        continue;
+      }
+      if (matchPattern(maximum.getRhs(), m_Zero())) {
+        current = maximum.getLhs();
+        continue;
+      }
+    }
+    break;
+  }
+  // A view extent is nonnegative, so the domain's max(extent, 0) preserves
+  // that public size. Arithmetic combinations of different sizes do not.
+  if (auto query = current.getDefiningOp<memref::DimOp>()) {
+    auto argument = dyn_cast<BlockArgument>(query.getSource());
+    auto axis = query.getConstantIndex();
+    if (argument && argument.getOwner() == &function.front() && axis) {
+      auto view = getPublicView(interface, argument.getArgNumber());
+      if (view) {
+        int64_t identity = publicViewDimensions(view)[*axis];
+        if (identity > 0) return require(identity);
+      }
+    }
+  }
+  return emitError(extent.getLoc(),
+      "DSA full row requires a bounded extent or a public dimension; "
+      "specialize derived extents with compile-call shape bindings");
+}
+
 LogicalResult Construction::lowerBlock(Block &block) {
   bool rowCollective = false, rowsOnly = true;
   SmallVector<Value> tensors;
@@ -254,9 +320,9 @@ LogicalResult Construction::lowerBlock(Block &block) {
       if (dimension <= 0 || selectedAxis(value, 0)) continue;
       Value size = logicalExtent(value, 0, value.getLoc());
       if (!size) return emitError(value.getLoc(), "DSA full row has no logical extent");
+      if (failed(requireFullExtent(size, dimension))) return failure();
       axisBindings[dimension] = {size, index(value.getLoc(), 0), size, config.getTile()};
       bound.push_back(dimension);
-      if (!llvm::is_contained(fullExtents, dimension)) fullExtents.push_back(dimension);
     }
   return lowerStructuredBlock(block);
 }

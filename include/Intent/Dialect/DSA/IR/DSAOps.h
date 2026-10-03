@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "Intent/Dialect/DSA/IR/DSADialect.h.inc"
 #define GET_ATTRDEF_CLASSES
@@ -17,6 +18,9 @@ constexpr int64_t nramSpace = 1;
 constexpr int64_t matrixSpace = 2;
 constexpr int64_t sharedSpace = 3;
 mlir::Value storageRoot(mlir::Value value);
+// Collective formals denote borrowed values, not aliases of identity prototypes.
+bool isCollectiveBorrowedArgument(mlir::BlockArgument argument);
 mlir::LogicalResult verifyProgram(mlir::ModuleOp module);
+mlir::LogicalResult verifyRealizedProgram(mlir::ModuleOp module);
 }
 #endif

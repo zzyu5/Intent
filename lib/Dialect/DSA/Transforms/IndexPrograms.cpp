@@ -1,3 +1,4 @@
+#include "PassSupport.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -583,4 +584,29 @@ bool normalizeLinearIndices(func::FuncOp function) {
   });
   return changed;
 }
+} // namespace intent::dsa
+
+namespace intent::dsa {
+#define GEN_PASS_DEF_DSANORMALIZEINDICES
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+
+namespace {
+struct NormalizeIndicesPass : impl::DSANormalizeIndicesBase<NormalizeIndicesPass> {
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyRealizedProgram(module)))
+      return signalPassFailure();
+    auto function = *module.getOps<func::FuncOp>().begin();
+    LogicalResult result = success();
+    if (normalizeLinearIndices(function)) {
+      OpPassManager cleanup(ModuleOp::getOperationName());
+      cleanup.addPass(createCanonicalizerPass());
+      cleanup.addPass(createCSEPass());
+      result = runPipeline(cleanup, module);
+    }
+    if (failed(detail::finishTransform(module, getArgument(), result)))
+      signalPassFailure();
+  }
+};
+} // namespace
 } // namespace intent::dsa

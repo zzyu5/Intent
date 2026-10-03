@@ -57,6 +57,7 @@ private:
                        const std::function<LogicalResult(Value)> &body);
   LogicalResult orderedControl(Operation *operation);
   LogicalResult lowerBlock(Block &block);
+  LogicalResult requireFullExtent(Value extent, int64_t dimension);
   LogicalResult lowerOperations(Block &block);
   LogicalResult lowerOperation(Operation *operation);
 
@@ -120,12 +121,18 @@ private:
   FailureOr<SmallVector<Value>> helper(Block &block, ArrayRef<SmallVector<Value>> arguments,
                                         unsigned sourceCount = 0, int64_t sourceAxis = -1);
   SmallVector<SmallVector<Value>> splitFields(TypeRange types, ValueRange fields);
-  LogicalResult streamReduction(ReduceOp reduce, unsigned axis, int64_t dimension, const LocalShape &shape);
-  FailureOr<SmallVector<Value>> mappedCombine(Block &block, ArrayRef<SmallVector<Value>> arguments);
-  std::optional<LogicalResult> productReduction(ReduceOp reduce);
+  Value collectiveView(Location loc, Value buffer, const LocalShape &shape);
+  LogicalResult buildCollectiveHelper(Operation *operation, Block &source,
+      TypeRange stateTypes, ValueRange states, ValueRange captures);
+  LogicalResult emitSliceReduction(ReduceOp source, ValueRange inputs,
+      ValueRange initials, ValueRange captures, ValueRange outputs,
+      ArrayRef<int64_t> axes);
+  LogicalResult emitScan(ScanOp source, ValueRange inputs, ValueRange initials,
+      ValueRange captures, ValueRange outputs, ValueRange finals);
+  LogicalResult streamReduction(ReduceOp reduce, unsigned axis,
+      int64_t dimension, const LocalShape &shape);
+  std::optional<LogicalResult> stageProductReduction(ReduceOp reduce);
   LogicalResult reduceTensor(ReduceOp reduce);
-  LogicalResult advanceScan(ScanOp scan, ValueRange slots, ValueRange next,
-                             ValueRange elements, ArrayRef<SmallVector<Value>> captures);
   LogicalResult scanTensor(ScanOp scan);
   bool canStreamScan(ScanOp scan, Block &block);
   LogicalResult streamScan(ScanOp scan, Block &block);

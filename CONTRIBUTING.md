@@ -309,7 +309,7 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 | [Tensors.cpp](lib/Conversion/KIRToDSA/Tensors.cpp) | 局部 shape、storage、已选窗口的投影及逐元素操作 |
 | [Access.cpp](lib/Conversion/KIRToDSA/Access.cpp) | 消费公共 IndexRelation，形成当前窗口的地址、validity 和 load/store |
 | [Contractions.cpp](lib/Conversion/KIRToDSA/Contractions.cpp) | 消费公共 ContractionAxes，形成局部矩阵、K 遍历和独立 accumulator |
-| [Collectives.cpp](lib/Conversion/KIRToDSA/Collectives.cpp) | reduce/scan 的 helper、状态和结果映射；原生 primitive 的适用条件 |
+| [Collectives.cpp](lib/Conversion/KIRToDSA/Collectives.cpp)、[CollectiveConstruction.cpp](lib/Conversion/KIRToDSA/CollectiveConstruction.cpp) | 前者形成 reduce/scan 的 source staging 与局部窗口；后者把 sources、initials、captures、active extents 和完整 helper 写入当前 DSA collective |
 | [Regions.cpp](lib/Conversion/KIRToDSA/Regions.cpp) | region fold/scan 的 source 遍历、summary 和消费者投影 |
 | [Worksets.cpp](lib/Conversion/KIRToDSA/Worksets.cpp) | 输出域与 task 分配、def-use 切片传播、独立性证明和有序行分段 |
 
@@ -318,6 +318,48 @@ DSA 的 [MatrixSupply.cpp](lib/Dialect/DSA/Transforms/MatrixSupply.cpp) 消费�
 `valueSlices` 保存已证明的 value/axis 窗口，未决定的 K 轴不必提前拥有完整局部容量。
 真正物化张量时才要求完整 `LocalShape`。这些映射不交给后续 pass 保存或重放；
 construction 的输出必须是含实际循环、存储和访问的完整 DSA program。
+
+普通 collective 使用 `dsa.slice_reduce` 与 `dsa.scan` 保存完整 combine region。
+成员轴、实际有效长度、输入、初值、捕获和输出都是当前操作的属性或 SSA operands；
+helper 统一接收两组逐字段参数及显式 captures，通过 `dsa.collective_yield` 返回
+各字段结果。只读输入可以直接返回，局部 scratch 也可以产生结果；realization 先将
+全部结果写入独立 next 状态，再同时提交，保持多字段之间的数据依赖。
+
+Local allocation 继续使用原二维 NRAM 存储。Collective 的标准 `memref.reinterpret_cast`
+view 恢复逐轴 capacity，实际 active counts 另以 SSA 传递，不能把 padding capacity
+当成源 `.shape`。完整 view 不改变元素顺序、offset 或 owner；它与 allocation 的
+关系由公共 [Views.h](include/Intent/Dialect/DSA/IR/Views.h) 从当前 IR 查询，构造器与
+pass 共用该 builder 和完整存储证明。Whole-slice helper 的不同字段可以有各自的 rank 和保留
+形状；只有逐元素提升 scalar helper 时，才需要证明各字段共享同一个 free-axis 域。
+
+[DSA collective transforms](lib/Dialect/DSA/Transforms/Collective/) 消费这些操作，
+选择已有原生归约、可提升的 scalar combine 或完整 slice 实现；普通 reduce 保留
+多 member axes，scan 保留方向、inclusive/exclusive、逐 prefix 输出与 final state。
+构造器只形成实际 source staging 与 bounded collective，不再另行解释一套受限的
+product combine。后续 pass 不访问 KIR 或 construction 的 `localShapes`。
+
+新增 collective 优化从公共 [Collectives.h](include/Intent/Dialect/DSA/Transforms/Collective/Collectives.h)
+及该目录进入；语义与借用检查归 [IR/Collectives.cpp](lib/Dialect/DSA/IR/Collectives.cpp)。
+原低层 `dsa.reduce` 仍表示已经选定的本地原语，BANG C 继续处理其目标 workspace、
+同步和源码拼写。高层 helper 必须在共享 collective pass 中闭合，serializer 不解释
+combine 或补齐遍历。
+
+`intent-dsa-realize-collectives` 是可以单独调度的 MLIR pass。它接收完整的 collective
+IR，输出实际循环、局部存储和计算操作；后续供数、资源与 BANG C passes 使用
+`verifyRealizedProgram` 检查这个边界。IR 保存后重新读取仍足以完成 lowering，
+不依赖 construction 对象或额外的 stage 属性。
+
+公共入口的 full-extent 义务只引用真实参数维度。静态或 compile-call shape binding
+已证明的内部域在构造阶段兑现；不能把展平域的内部 identity 导出给调用方，或把
+一个乘积范围要求拆成较弱的逐因子条件。需要完整局部行而尚未证明容量的派生域，
+当前要求已有 shape binding 提供上界。
+
+职责对照：本地 Triton `include/triton/Dialect/Triton/IR/TritonOps.td:761–802`
+将 reduce/scan 的 combine 保存为 region；
+`lib/Conversion/TritonGPUToLLVM/ReduceScanCommon.h:26–105` 共享真实 region 的参数
+绑定、克隆与内联。Intent 的 DSA 也让 pass 消费完整 combine，但还需承载显式
+local-memory view、active counts 和 whole-slice 状态，因此保留借用验证与同步
+状态提交；不照搬 Triton 的同形标量参数限制或 GPU layout 实现。
 
 `localMatMul` 只处理当前 typed contraction。共享左操作数时，还需证明实际输出
 窗口一致、accumulator 独立、右操作数可重放，且中间没有冲突 effects。

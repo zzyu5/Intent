@@ -7,7 +7,7 @@ using namespace mlir;
 namespace intent::bangc {
 
 LogicalResult verifyProgram(ModuleOp module) {
-  if (failed(dsa::verifyProgram(module))) return failure();
+  if (failed(dsa::verifyRealizedProgram(module))) return failure();
   auto architecture = module->getAttrOfType<StringAttr>("bangc.architecture");
   if (!architecture || architecture.getValue() != "mtp_372")
     return module.emitError("BANG C program requires the selected mtp_372 implementation profile");

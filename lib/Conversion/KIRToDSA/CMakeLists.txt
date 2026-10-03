@@ -6,9 +6,11 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   Access.cpp
   Contractions.cpp
   Collectives.cpp
+  CollectiveConstruction.cpp
   Regions.cpp
   Worksets.cpp
 
   LINK_LIBS PUBLIC MLIRIntentAnalysis MLIRIntentScalarLowering MLIRIntentDialect MLIRIntentDSADialect
+    MLIRIntentDSAAnalysis
     MLIRArithDialect MLIRFuncDialect MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect
-    MLIRIR MLIRSupport)
+    MLIRIR MLIRSupport MLIRTransformUtils)

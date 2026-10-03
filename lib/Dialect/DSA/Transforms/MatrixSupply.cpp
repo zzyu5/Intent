@@ -1,3 +1,4 @@
+#include "PassSupport.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -540,4 +541,23 @@ LogicalResult realizeMatrixSupply(func::FuncOp function) {
   }
   return success();
 }
+} // namespace intent::dsa
+
+namespace intent::dsa {
+#define GEN_PASS_DEF_DSAMATRIXSUPPLY
+#include "Intent/Dialect/DSA/Transforms/Passes.h.inc"
+
+namespace {
+struct MatrixSupplyPass : impl::DSAMatrixSupplyBase<MatrixSupplyPass> {
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyRealizedProgram(module)))
+      return signalPassFailure();
+    auto function = *module.getOps<func::FuncOp>().begin();
+    auto result = realizeMatrixSupply(function);
+    if (failed(detail::finishTransform(module, getArgument(), result)))
+      signalPassFailure();
+  }
+};
+} // namespace
 } // namespace intent::dsa

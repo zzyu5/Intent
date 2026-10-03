@@ -17,7 +17,7 @@ namespace intent::bangc {
 
 namespace {
 LogicalResult checkProgram(ModuleOp module) {
-  if (failed(dsa::verifyProgram(module))) return failure();
+  if (failed(dsa::verifyRealizedProgram(module))) return failure();
   auto architecture = module->getAttrOfType<StringAttr>("bangc.architecture");
   if (!architecture || architecture.getValue() != "mtp_372")
     return module.emitError("BANG C transformations require the selected mtp_372 implementation profile");
@@ -33,7 +33,7 @@ OpPassManager cleanupPipeline() {
 
 LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result) {
   if (failed(result)) return module.emitError() << "BANG C transformation failed: " << name;
-  if (failed(dsa::verifyProgram(module))) return module.emitError() << "BANG C postcondition failed: " << name;
+  if (failed(dsa::verifyRealizedProgram(module))) return module.emitError() << "BANG C postcondition failed: " << name;
   return success();
 }
 
@@ -45,7 +45,7 @@ struct PrepareProgramPass : impl::BangCPrepareProgramBase<PrepareProgramPass> {
       module.emitError("BANG C requires an explicit mtp_372 implementation profile");
       return signalPassFailure();
     }
-    if (failed(dsa::verifyProgram(module))) return signalPassFailure();
+    if (failed(dsa::verifyRealizedProgram(module))) return signalPassFailure();
     module->setAttr("bangc.architecture", StringAttr::get(module.getContext(), architecture.getValue()));
   }
 };
