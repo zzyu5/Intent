@@ -938,7 +938,14 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
         range.getLoc(), predicateType(fragment), blocked.getResult(),
         endFragment, ComparePredicate::Lt);
     validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
-    Value valid = validComparison.getResult();
+    Value lower = builder.create<BroadcastOp>(
+        range.getLoc(), fragment, range.getLogicalStart());
+    Value active = builder.create<CompareOp>(
+        range.getLoc(), predicateType(fragment), blocked.getResult(), lower,
+        ComparePredicate::Ge);
+    Value valid = builder.create<BinaryOp>(
+        range.getLoc(), predicateType(fragment), active, validComparison,
+        BinaryOperator::LogicalAnd);
     range.getResult().replaceAllUsesWith(blocked.getResult());
     fixedRangePredicates[blocked.getResult()] = valid;
     range.erase();

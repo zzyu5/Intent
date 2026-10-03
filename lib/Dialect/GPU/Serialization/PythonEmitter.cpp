@@ -28,7 +28,7 @@ void PythonEmitter::addCommonOperations(Emitters &emitters) {
   });
   emitters.add<PhysicalExprOp>(valid, [](PhysicalExprOp op, PythonEmitter &e) {
     e.assign(op.getResult(), e.expressionString(op.getExpression()),
-             e.isConstexprExpression(op.getExpression())); return success();
+             isConstexprPhysicalExpression(op.getExpression())); return success();
   });
   emitters.add<ProgramIdOp>(valid, [](ProgramIdOp op, PythonEmitter &e) {
     e.assign(op.getResult(), e.programId(op)); return success();
@@ -38,7 +38,7 @@ void PythonEmitter::addCommonOperations(Emitters &emitters) {
   });
   emitters.add<DimOp>(valid, [](DimOp op, PythonEmitter &e) {
     auto extent = cast<PhysicalExprAttr>(op.getView().getType().getLayout().getExtents()[op.getAxis()]);
-    e.assign(op.getResult(), e.expressionString(extent), e.isConstexprExpression(extent));
+    e.assign(op.getResult(), e.expressionString(extent), isConstexprPhysicalExpression(extent));
     return success();
   });
   emitters.add<RangeOp>(valid, [](RangeOp op, PythonEmitter &e) {
@@ -272,12 +272,6 @@ void PythonEmitter::assignResults(ResultRange results, StringRef expression) {
   std::string lhs;
   for (auto [index, name] : llvm::enumerate(names)) { if (index) lhs += ", "; lhs += name; }
   line(lhs + " = " + expression.str());
-}
-bool PythonEmitter::isConstexprExpression(PhysicalExprAttr expression) const {
-  if (expression.getKind() == PhysicalExprKind::ScalarABI) return false;
-  return llvm::all_of(expression.getOperands(), [&](Attribute operand) {
-    return isConstexprExpression(cast<PhysicalExprAttr>(operand));
-  });
 }
 std::string PythonEmitter::controlValueString(Value value) { return valueString(value); }
 std::string PythonEmitter::loopInitialValue(Value value) { return controlValueString(value); }

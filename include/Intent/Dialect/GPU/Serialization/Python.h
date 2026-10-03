@@ -41,14 +41,19 @@ struct PythonScalarSyntax {
 std::string pythonScalarType(mlir::Type type, const PythonScalarSyntax &syntax);
 
 struct PythonExpressionSyntax {
-  // Empty ceilDivide/select names request their ordinary Python expression.
-  llvm::StringRef ceilDivide;
+  // Runtime division follows the provider's integer semantics. Constant
+  // expressions use Python's mathematical floor/ceil without fixed-width sums.
+  std::string (*integerDivision)(PhysicalExprKind, llvm::StringRef,
+                                 llvm::StringRef);
   llvm::StringRef minimum;
   llvm::StringRef maximum;
+  // An empty select name requests an ordinary Python conditional expression.
   llvm::StringRef select;
   llvm::StringRef nextPowerOfTwo;
   bool clampNextPowerOfTwo;
 };
+
+bool isConstexprPhysicalExpression(PhysicalExprAttr expression);
 
 std::string pythonExpression(
     PhysicalExprAttr expression, const PythonExpressionSyntax &syntax,

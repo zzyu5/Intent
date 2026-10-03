@@ -45,7 +45,7 @@ public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
       : gpu::PythonEmitter(kernel, output,
             {"ct.", "bool_", "float64", "float8_e4m3fn", "float8_e5m2"},
-            {"ct.cdiv", "min", "max", "", "_intent_next_power_of_2", false},
+            {integerDivision, "min", "max", "", "_intent_next_power_of_2", false},
             "") {}
 
   LogicalResult emit(std::string &metadata) {

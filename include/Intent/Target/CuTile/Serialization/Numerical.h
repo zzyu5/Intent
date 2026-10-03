@@ -10,6 +10,9 @@ inline constexpr llvm::StringLiteral libraryMathImport =
 
 void addNumericalOperations(gpu::PythonEmitter::Emitters &emitters);
 
+std::string integerDivision(gpu::PhysicalExprKind kind, llvm::StringRef lhs,
+                            llvm::StringRef rhs);
+
 // Internal source constructions use the same cast/selection spelling as the
 // registered numeric operations; they do not select a different computation.
 std::string numericalCast(gpu::PythonEmitter &emitter, mlir::Value value,

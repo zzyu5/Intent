@@ -504,16 +504,17 @@ LogicalResult PointwiseRewrite::materializeRanges() {
         range.getLoc(), predicateType(blockedType), blocked, endFragment,
         ComparePredicate::Lt);
     validComparison->setAttr(physicalTailAttr, builder.getUnitAttr());
-    Value valid = validComparison.getResult();
-    if (parentAnchorOffsets.contains(range.getOperation())) {
-      Value lower = builder.create<BroadcastOp>(
-          range.getLoc(), blockedType, range.getLogicalStart());
-      Value active = builder.create<CompareOp>(
-          range.getLoc(), predicateType(blockedType), blocked, lower,
-          ComparePredicate::Ge);
-      valid = builder.create<BinaryOp>(range.getLoc(), predicateType(blockedType),
-                                       active, valid, BinaryOperator::LogicalAnd);
-    }
+    // Changing the origin/capacity invalidates sign facts about the old range.
+    // Preserve both logical bounds; range simplification can discharge either
+    // comparison only after proving the newly materialized coordinates.
+    Value lower = builder.create<BroadcastOp>(
+        range.getLoc(), blockedType, range.getLogicalStart());
+    Value active = builder.create<CompareOp>(
+        range.getLoc(), predicateType(blockedType), blocked, lower,
+        ComparePredicate::Ge);
+    Value valid = builder.create<BinaryOp>(
+        range.getLoc(), predicateType(blockedType), active, validComparison,
+        BinaryOperator::LogicalAnd);
     range.getResult().replaceAllUsesWith(blocked);
     rangePredicates[blocked] = valid;
     range.erase();

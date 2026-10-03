@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <type_traits>
 
 using namespace mlir;
@@ -47,6 +48,28 @@ Translation library(std::string expression) {
   return {std::move(expression),
           {"from triton.language.extra import libdevice"}};
 }
+
+struct SignedDivision {
+  explicit SignedDivision(StringRef lhs, StringRef rhs)
+      : quotient("(" + lhs.str() + " // " + rhs.str() + ")"),
+        remainder("(" + lhs.str() + " % " + rhs.str() + ")"),
+        nonzero("(" + remainder + " != 0)"),
+        adjustment("(" + nonzero + " & ((" + remainder + " < 0) != (" +
+                   rhs.str() + " < 0)))") {}
+
+  // Triton's runtime // truncates; Python constexpr already floors and has a
+  // divisor-sign remainder, making the same correction zero.
+  std::string floor() const { return "(" + quotient + " - " + adjustment + ")"; }
+  std::string ceil() const { return "(" + floor() + " + " + nonzero + ")"; }
+  std::string modulo(StringRef rhs) const {
+    return "(" + remainder + " + " + adjustment + " * " + rhs.str() + ")";
+  }
+
+  std::string quotient;
+  std::string remainder;
+  std::string nonzero;
+  std::string adjustment;
+};
 
 FailureOr<Translation> translate(arith::ConstantOp operation,
                                 ArrayRef<std::string>, bool) {
@@ -140,13 +163,8 @@ FailureOr<Translation> translate(gpu::BinaryOp operation,
     bool remainder = operation.getOperatorKind() == BinaryOperator::Remainder;
     if (integer && integer.isUnsigned())
       return direct(infix(remainder ? "%" : "//"));
-    std::string rem = infix("%");
-    // Runtime Triton division truncates; constexpr Python division already has
-    // the divisor-sign remainder and therefore makes this correction zero.
-    std::string adjust = "((" + rem + " != 0) & ((" + rem +
-                         " < 0) != (" + rhs + " < 0)))";
-    return direct(remainder ? "(" + rem + " + " + adjust + " * " + rhs + ")"
-                            : "(" + infix("//") + " - " + adjust + ")");
+    SignedDivision division(lhs, rhs);
+    return direct(remainder ? division.modulo(rhs) : division.floor());
   }
   case BinaryOperator::Power:
     return libraryMath(operation, "pow", operands);
@@ -342,6 +360,16 @@ template <typename Op> void addNumerical(gpu::PythonEmitter::Emitters &emitters)
 }
 
 } // namespace
+
+std::string integerDivision(gpu::PhysicalExprKind kind, StringRef lhs,
+                            StringRef rhs) {
+  SignedDivision division(lhs, rhs);
+  switch (kind) {
+  case gpu::PhysicalExprKind::FloorDiv: return division.floor();
+  case gpu::PhysicalExprKind::CeilDiv: return division.ceil();
+  default: llvm_unreachable("expected a physical integer division");
+  }
+}
 
 FailureOr<std::string> numericalCast(Operation *diagnostic, Type source,
                                     Type target, StringRef value, bool bitcast) {

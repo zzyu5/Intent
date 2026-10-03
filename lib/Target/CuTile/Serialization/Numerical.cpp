@@ -1,6 +1,7 @@
 #include "Intent/Target/CuTile/Serialization/Numerical.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
 
@@ -229,6 +230,17 @@ template <typename Op> void addNumericalOperation(Emitter::Emitters &emitters) {
 }
 
 } // namespace
+
+std::string integerDivision(gpu::PhysicalExprKind kind, StringRef lhs,
+                            StringRef rhs) {
+  switch (kind) {
+  case gpu::PhysicalExprKind::FloorDiv:
+    return "ct.floordiv(" + lhs.str() + ", " + rhs.str() + ")";
+  case gpu::PhysicalExprKind::CeilDiv:
+    return "ct.cdiv(" + lhs.str() + ", " + rhs.str() + ")";
+  default: llvm_unreachable("expected a physical integer division");
+  }
+}
 
 void addNumericalOperations(Emitter::Emitters &emitters) {
   addNumericalOperation<gpu::BinaryOp>(emitters);

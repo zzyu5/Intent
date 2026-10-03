@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "ContiguousAccesses.h"
+#include "Intent/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -65,10 +66,18 @@ std::optional<SmallVector<int64_t>> rowMajorStrides(MemRefType type) {
 class Coordinates {
 public:
   Coordinates(MLIRContext *context, ArrayRef<int64_t> sizes)
-      : context(context), sizes(sizes.begin(), sizes.end()) {}
+      : context(context), sizes(sizes.begin(), sizes.end()),
+        ranges(IntegerRangePolicy{
+            {}, [this](Value value, IntegerRangeAnalysis &)
+                    -> std::optional<ConstantIntRanges> {
+              auto bound = memberAxes.find(value);
+              if (bound == memberAxes.end()) return std::nullopt;
+              return ConstantIntRanges::fromSigned(
+                  APInt(64, 0), APInt(64, this->sizes[bound->second] - 1, true));
+            }}) {}
 
   void bind(Value value, unsigned axis) {
-    values[value] = BoundedCoordinate{getAffineDimExpr(axis, context), 0, sizes[axis] - 1};
+    memberAxes[value] = axis;
   }
 
   std::optional<BoundedCoordinate> get(Value value) {
@@ -113,6 +122,14 @@ public:
   }
 
 private:
+  std::optional<BoundedCoordinate> withBounds(AffineExpr expression, Value value) {
+    auto bounds = ranges.range(value);
+    if (!bounds || !bounds->smin().isSignedIntN(64) ||
+        !bounds->smax().isSignedIntN(64)) return std::nullopt;
+    return BoundedCoordinate{expression, bounds->smin().getSExtValue(),
+                             bounds->smax().getSExtValue()};
+  }
+
   std::optional<BoundedCoordinate> materializedBounds(AffineExpr expression) {
     if (auto constant = dyn_cast<AffineConstantExpr>(expression))
       return BoundedCoordinate{expression, constant.getValue(), constant.getValue()};
@@ -140,39 +157,42 @@ private:
   }
 
   std::optional<BoundedCoordinate> compute(Value value) {
+    if (auto member = memberAxes.find(value); member != memberAxes.end())
+      return withBounds(getAffineDimExpr(member->second, context), value);
     if (auto constant = getConstantIntValue(value))
       return BoundedCoordinate{getAffineConstantExpr(*constant, context), *constant, *constant};
-    if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) return get(cast.getIn());
+    if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) {
+      auto input = get(cast.getIn());
+      return input ? withBounds(input->expression, value) : std::nullopt;
+    }
     if (auto argument = dyn_cast<BlockArgument>(value)) {
-      Value lower, upper, step;
+      bool induction = false;
       if (auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
           loop && argument == loop.getInductionVar()) {
-        lower = loop.getLowerBound(); upper = loop.getUpperBound(); step = loop.getStep();
+        induction = true;
       } else if (auto parallel = dyn_cast<scf::ParallelOp>(argument.getOwner()->getParentOp())) {
-        auto position = llvm::find(parallel.getInductionVars(), value);
-        if (position == parallel.getInductionVars().end()) return std::nullopt;
-        unsigned axis = position - parallel.getInductionVars().begin();
-        lower = parallel.getLowerBound()[axis]; upper = parallel.getUpperBound()[axis];
-        step = parallel.getStep()[axis];
-      } else return std::nullopt;
-      auto first = getConstantIntValue(lower), end = getConstantIntValue(upper), increment = getConstantIntValue(step);
-      if (!first || !end || !increment || *increment <= 0 || *end <= *first) return std::nullopt;
+        induction = llvm::is_contained(parallel.getInductionVars(), value);
+      }
+      if (!induction) return std::nullopt;
       auto expression = getAffineSymbolExpr(symbols.size(), context);
       symbols.push_back(value);
-      return BoundedCoordinate{expression, *first, *end - 1};
+      return withBounds(expression, value);
     }
     Operation *operation = value.getDefiningOp();
     if (!operation || operation->getNumOperands() != 2) return std::nullopt;
     Value lhs = operation->getOperand(0), rhs = operation->getOperand(1);
     if (isa<arith::AddIOp, arith::SubIOp>(operation)) {
       auto left = get(lhs), right = get(rhs);
-      return left && right ? add(*left, *right, isa<arith::SubIOp>(operation)) : std::nullopt;
+      auto checked = left && right
+          ? add(*left, *right, isa<arith::SubIOp>(operation)) : std::nullopt;
+      return checked ? withBounds(checked->expression, value) : std::nullopt;
     }
     if (isa<arith::MulIOp>(operation)) {
       auto factor = getConstantIntValue(rhs);
       if (!factor) { factor = getConstantIntValue(lhs); std::swap(lhs, rhs); }
       auto input = factor ? get(lhs) : std::nullopt;
-      return input ? multiply(*input, *factor) : std::nullopt;
+      auto checked = input ? multiply(*input, *factor) : std::nullopt;
+      return checked ? withBounds(checked->expression, value) : std::nullopt;
     }
     if (!isa<arith::FloorDivSIOp, arith::DivSIOp, arith::RemSIOp>(operation)) return std::nullopt;
     auto divisor = getConstantIntValue(rhs);
@@ -180,15 +200,16 @@ private:
     if (!divisor || *divisor <= 0 || !input) return std::nullopt;
     if (!isa<arith::FloorDivSIOp>(operation) && input->minimum < 0) return std::nullopt;
     if (isa<arith::RemSIOp>(operation))
-      return BoundedCoordinate{input->expression % *divisor, 0, std::min(input->maximum, *divisor - 1)};
-    return BoundedCoordinate{input->expression.floorDiv(*divisor),
-                             floorDivide(input->minimum, *divisor), floorDivide(input->maximum, *divisor)};
+      return withBounds(input->expression % *divisor, value);
+    return withBounds(input->expression.floorDiv(*divisor), value);
   }
 
   MLIRContext *context;
   SmallVector<int64_t> sizes;
   SmallVector<Value> symbols;
+  llvm::DenseMap<Value, unsigned> memberAxes;
   llvm::DenseMap<Value, std::optional<BoundedCoordinate>> values;
+  IntegerRangeAnalysis ranges;
 };
 
 Value materialize(AffineExpr expression, ArrayRef<Value> symbols, OpBuilder &builder, Location loc) {

@@ -33,6 +33,10 @@ struct ControlFlowEdges {
   bool complete = false;
 };
 
+// Construction can query existing values before filling sibling regions.
+// Native region interfaces may inspect terminators even for an entry-edge query.
+bool hasCompleteControlFlowRegions(mlir::Operation *operation);
+
 // Current-IR queries only. Results borrow OpOperand slots and are invalidated
 // by operand/region mutation. A known condition/non-forwarded operand has an
 // empty, complete outgoing relation; an unsupported owner is incomplete.

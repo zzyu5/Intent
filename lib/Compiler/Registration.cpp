@@ -11,6 +11,7 @@
 #include "Intent/Dialect/CPU/Transforms/Storage/Bufferization.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
+#include "Intent/Dialect/GPU/IR/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Transforms/Passes.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
@@ -47,6 +48,7 @@ void registerDialects(DialectRegistry &registry) {
   func::registerInlinerExtension(registry);
   cpu::registerExtentRelations(registry);
   registerBufferStorageInterfaces(registry);
+  gpu::registerIntegerRangeInterfaces(registry);
   cpu::registerValueBufferizationInterfaces(registry);
   registry.insert<IntentDialect, gpu::IntentGPUDialect, cpu::IntentCPUDialect,
       dsa::IntentDSADialect>();

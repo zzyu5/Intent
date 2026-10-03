@@ -5,7 +5,7 @@
 
 namespace intent::gpu::detail {
 
-std::optional<int64_t> integerConstant(mlir::Value value, unsigned depth = 0);
+std::optional<int64_t> integerConstant(mlir::Value value);
 mlir::Value stripBroadcast(mlir::Value value);
 mlir::Value stripScalarIdentity(mlir::Value value);
 bool sameScalarExpression(mlir::Value lhs, mlir::Value rhs, unsigned depth = 0);

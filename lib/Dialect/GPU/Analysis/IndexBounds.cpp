@@ -1,6 +1,8 @@
 #include "IndexBounds.h"
 #include "PhysicalProgramDetail.h"
 #include "ScalarExpressions.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -20,53 +22,6 @@ namespace {
 bool valueKnownPositive(Value value, unsigned depth);
 
 bool valueKnownNonNegative(Value value, unsigned depth);
-
-enum class IndexSign { Unknown, NonNegative, Positive };
-
-IndexSign physicalIndexSign(PhysicalExprAttr expression, func::FuncOp kernel) {
-  auto kind = expression.getKind();
-  if (kind == PhysicalExprKind::Constant)
-    return expression.getValue() > 0 ? IndexSign::Positive
-         : expression.getValue() == 0 ? IndexSign::NonNegative : IndexSign::Unknown;
-  if (kind == PhysicalExprKind::Dimension)
-    return IndexSign::NonNegative;
-  if (kind == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, expression.getParameterReference().getName());
-    if (failed(parameter))
-      return IndexSign::Unknown;
-    auto candidates = (*parameter).getCandidates().asArrayRef();
-    if (candidates.empty())
-      return IndexSign::Unknown;
-    if (llvm::all_of(candidates, [](int64_t value) { return value > 0; }))
-      return IndexSign::Positive;
-    return llvm::all_of(candidates, [](int64_t value) { return value >= 0; })
-               ? IndexSign::NonNegative : IndexSign::Unknown;
-  }
-  if (kind == PhysicalExprKind::Select && expression.getOperands().size() == 3)
-    return std::min(
-        physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel),
-        physicalIndexSign(cast<PhysicalExprAttr>(expression.getOperands()[2]), kernel));
-  if (kind == PhysicalExprKind::NextPowerOfTwo ||
-      kind == PhysicalExprKind::Multiply)
-    return positiveExtentBounds(kernel, expression) ? IndexSign::Positive
-                                                    : IndexSign::Unknown;
-  if (expression.getOperands().size() != 2)
-    return IndexSign::Unknown;
-  IndexSign lhs = physicalIndexSign(
-      cast<PhysicalExprAttr>(expression.getOperands()[0]), kernel);
-  IndexSign rhs = physicalIndexSign(
-      cast<PhysicalExprAttr>(expression.getOperands()[1]), kernel);
-  if (kind == PhysicalExprKind::Maximum)
-    return std::max(lhs, rhs);
-  if (kind == PhysicalExprKind::Minimum)
-    return std::min(lhs, rhs);
-  if ((kind == PhysicalExprKind::CeilDiv || kind == PhysicalExprKind::FloorDiv) &&
-      lhs != IndexSign::Unknown && rhs == IndexSign::Positive)
-    return kind == PhysicalExprKind::CeilDiv ? lhs : IndexSign::NonNegative;
-  // Unknown arithmetic remains unknown; in particular this does not assume
-  // that a product or sum of dynamic index values cannot overflow.
-  return IndexSign::Unknown;
-}
 
 bool valueBelowDelinearizeExtent(Value value, Value extent, unsigned depth) {
   if (!value || depth >= 32)
@@ -98,33 +53,20 @@ bool valueKnownPositive(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIntegerIndexCasts(value);
-  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
-    return physicalIndexSign(physical.getExpression(),
-                             physical->getParentOfType<func::FuncOp>()) ==
-           IndexSign::Positive;
-  if (std::optional<int64_t> constant = integerConstant(value))
-    return *constant > 0;
-  if (auto parameter = queryParameter(value))
-    return llvm::all_of(
-        parameter.getCandidates().asArrayRef(),
-        [](int64_t candidate) { return candidate > 0; });
-  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<RangeOp>();
-    return range && bound.getBound() == 2 &&
-           valueKnownPositive(range.getStep(), depth + 1);
-  }
+  IntegerRangeAnalysis ranges(integerRangePolicy());
+  if (ranges.isPositive(value)) return true;
   auto binary = value.getDefiningOp<BinaryOp>();
   if (!binary)
     return false;
   if (binary.getOperatorKind() == BinaryOperator::Subtract)
-    return valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1);
+    return ranges.isNonNegative(binary.getLhs()) &&
+           ranges.isNonNegative(binary.getRhs()) &&
+           valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1);
   if (binary.getOperatorKind() == BinaryOperator::Maximum &&
       value.getType().isIndex())
     return valueKnownPositive(binary.getLhs(), depth + 1) ||
            valueKnownPositive(binary.getRhs(), depth + 1);
-  if (binary.getOperatorKind() == BinaryOperator::Multiply ||
-      binary.getOperatorKind() == BinaryOperator::Add ||
-      binary.getOperatorKind() == BinaryOperator::Minimum ||
+  if (binary.getOperatorKind() == BinaryOperator::Minimum ||
       binary.getOperatorKind() == BinaryOperator::MinimumNum)
     return valueKnownPositive(binary.getLhs(), depth + 1) &&
            valueKnownPositive(binary.getRhs(), depth + 1);
@@ -135,45 +77,19 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   if (!value || depth >= 32)
     return false;
   value = stripIntegerIndexCasts(value);
+  IntegerRangeAnalysis ranges(integerRangePolicy());
+  if (ranges.isNonNegative(value)) return true;
   if (auto reshape = value.getDefiningOp<ReshapeOp>())
     return valueKnownNonNegative(reshape.getValue(), depth + 1);
   if (auto transpose = value.getDefiningOp<TransposeOp>())
     return valueKnownNonNegative(transpose.getValue(), depth + 1);
-  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
-    return physicalIndexSign(physical.getExpression(),
-                             physical->getParentOfType<func::FuncOp>()) !=
-           IndexSign::Unknown;
-  if (std::optional<int64_t> constant = integerConstant(value))
-    return *constant >= 0;
-  if (value.getDefiningOp<ProgramIdOp>())
-    return true;
-  if (auto parameter = queryParameter(value))
-    return llvm::all_of(
-        parameter.getCandidates().asArrayRef(),
-        [](int64_t candidate) { return candidate >= 0; });
   if (auto coordinate = queryDecodedCoordinate(value))
     return valueKnownNonNegative(coordinate->linear, depth + 1) &&
            llvm::all_of(coordinate->extents, [&](Value extent) {
              return valueKnownNonNegative(extent, depth + 1);
            });
-  if (value.getDefiningOp<DimOp>())
-    return true;
-  if (auto argument = dyn_cast<BlockArgument>(value)) {
-    if (auto binding = getArgumentBinding(argument);
-        binding && binding.getKind() == ArgumentKind::Dimension)
-      return true;
-    auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
-    if (loop && argument == loop.getInductionVar()) {
-      return valueKnownPositive(loop.getStep(), depth + 1) &&
-             valueKnownNonNegative(loop.getLowerBound(), depth + 1);
-    }
-  }
   if (auto coordinate = value.getDefiningOp<WorksetCoordinateOp>())
     return valueKnownNonNegative(coordinate.getCoordinate(), depth + 1);
-  if (auto range = value.getDefiningOp<MakeRangeOp>()) {
-    return valueKnownPositive(range.getStep(), depth + 1) &&
-           valueKnownNonNegative(range.getStart(), depth + 1);
-  }
   if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
     auto range = bound.getRange().getDefiningOp<RangeOp>();
     if (!range)
@@ -193,8 +109,6 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   bool lhs = valueKnownNonNegative(binary.getLhs(), depth + 1);
   bool rhs = valueKnownNonNegative(binary.getRhs(), depth + 1);
   switch (binary.getOperatorKind()) {
-  case BinaryOperator::Add:
-  case BinaryOperator::Multiply:
   case BinaryOperator::Minimum:
   case BinaryOperator::MinimumNum:
     return lhs && rhs;
@@ -202,7 +116,7 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
   case BinaryOperator::MaximumNum:
     return lhs || rhs;
   case BinaryOperator::Subtract: {
-    if (valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1))
+    if (lhs && rhs && valueBelowDelinearizeExtent(binary.getRhs(), binary.getLhs(), depth + 1))
       return true;
     if (lhs && rhs) {
       std::function<bool(Value, unsigned)> orderedByCondition =
@@ -229,18 +143,7 @@ bool valueKnownNonNegative(Value value, unsigned depth = 0) {
               orderedByCondition(conditional.getCondition(), 32 - depth))
             return true;
     }
-    std::optional<int64_t> subtrahend = integerConstant(binary.getRhs());
-    if (!subtrahend)
-      return false;
-    if (*subtrahend <= 0)
-      return lhs;
-    Value minuend = stripIntegerIndexCasts(binary.getLhs());
-    auto parameter = queryParameter(minuend);
-    return parameter &&
-           llvm::all_of(parameter.getCandidates().asArrayRef(),
-                        [&](int64_t candidate) {
-                          return candidate >= *subtrahend;
-                        });
+    return false;
   }
   case BinaryOperator::FloorDivide: {
     return lhs && valueKnownPositive(binary.getRhs(), depth + 1);
@@ -316,7 +219,8 @@ Value stripIntegerIndexCasts(Value value) {
     Type source = element(cast.getValue().getType());
     Type result = element(cast.getResult().getType());
     if (!isa<IntegerType, IndexType>(source) ||
-        !isa<IntegerType, IndexType>(result))
+        !isa<IntegerType, IndexType>(result) ||
+        !gpu::isValuePreservingIntegerCast(cast.getValue(), result))
       break;
     value = stripBroadcast(cast.getValue());
   }
@@ -331,119 +235,9 @@ bool coordinateKnownNonNegative(Value coordinate) {
 
 std::optional<std::pair<int64_t, int64_t>>
 nonNegativeExtentBounds(func::FuncOp kernel, PhysicalExprAttr extent) {
-  if (!extent)
-    return std::nullopt;
-  auto kind = extent.getKind();
-  if (auto constant = constantPhysicalExpression(extent)) {
-    if (*constant < 0)
-      return std::nullopt;
-    return std::pair{*constant, *constant};
-  }
-  if (kind == PhysicalExprKind::Parameter) {
-    FailureOr<ParameterAttr> parameter =
-        queryParameterBySymbol(kernel, extent.getParameterReference().getName());
-    if (failed(parameter))
-      return std::nullopt;
-    // Provider configuration formation may rebind resident capacity. Its
-    // positive sign is stable, but placeholder candidates and shared tuples
-    // cannot prove a numeric upper bound or absence of index overflow.
-    if (parameter->getRole() ==
-        ParameterRole::ResidentWorkers)
-      return std::nullopt;
-    auto candidates = parameter->getCandidates().asArrayRef();
-    if (candidates.empty() ||
-        llvm::any_of(candidates, [](int64_t value) { return value <= 0; }))
-      return std::nullopt;
-    if (auto configurations =
-            kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
-        configurations && !configurations.getRows().empty()) {
-      int64_t minimum = std::numeric_limits<int64_t>::max();
-      int64_t maximum = 0;
-      bool bound = true;
-      for (Attribute attribute : configurations.getRows()) {
-        auto tuple = dyn_cast<DictionaryAttr>(attribute);
-        auto selected = tuple ? tuple.getAs<IntegerAttr>(extent.getParameterReference().getName())
-                              : IntegerAttr();
-        if (!selected || selected.getInt() <= 0 ||
-            !llvm::is_contained(candidates, selected.getInt())) {
-          bound = false;
-          break;
-        }
-        minimum = std::min(minimum, selected.getInt());
-        maximum = std::max(maximum, selected.getInt());
-      }
-      if (bound)
-        return std::pair{minimum, maximum};
-    }
-    return std::pair{*llvm::min_element(candidates),
-                     *llvm::max_element(candidates)};
-  }
-  if (kind == PhysicalExprKind::NextPowerOfTwo &&
-      extent.getOperands().size() == 1) {
-    auto bounds = nonNegativeExtentBounds(
-        kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
-    if (!bounds || bounds->second > (int64_t{1} << 62))
-      return std::nullopt;
-    return std::pair{static_cast<int64_t>(llvm::PowerOf2Ceil(
-                         std::max<int64_t>(1, bounds->first))),
-                     static_cast<int64_t>(llvm::PowerOf2Ceil(
-                         std::max<int64_t>(1, bounds->second)))};
-  }
-  if (extent.getOperands().size() != 2)
-    return std::nullopt;
-  auto lhs = nonNegativeExtentBounds(
-      kernel, cast<PhysicalExprAttr>(extent.getOperands()[0]));
-  auto rhs = nonNegativeExtentBounds(
-      kernel, cast<PhysicalExprAttr>(extent.getOperands()[1]));
-  if (kind == PhysicalExprKind::Minimum) {
-    if (lhs && rhs)
-      return std::pair{std::min(lhs->first, rhs->first),
-                       std::min(lhs->second, rhs->second)};
-    for (unsigned known : {0u, 1u}) {
-      auto bound = known == 0 ? lhs : rhs;
-      auto other = cast<PhysicalExprAttr>(extent.getOperands()[1 - known]);
-      if (bound && physicalIndexSign(other, kernel) == IndexSign::Positive)
-        return std::pair{std::min<int64_t>(1, bound->first), bound->second};
-    }
-    return std::nullopt;
-  }
-  if (!lhs || !rhs)
-    return std::nullopt;
-  __int128 minimum, maximum;
-  switch (kind) {
-  case PhysicalExprKind::Add:
-    minimum = static_cast<__int128>(lhs->first) + rhs->first;
-    maximum = static_cast<__int128>(lhs->second) + rhs->second;
-    break;
-  case PhysicalExprKind::Subtract:
-    minimum = static_cast<__int128>(lhs->first) - rhs->second;
-    maximum = static_cast<__int128>(lhs->second) - rhs->first;
-    break;
-  case PhysicalExprKind::Multiply:
-    minimum = static_cast<__int128>(lhs->first) * rhs->first;
-    maximum = static_cast<__int128>(lhs->second) * rhs->second;
-    break;
-  case PhysicalExprKind::Maximum:
-    minimum = std::max(lhs->first, rhs->first);
-    maximum = std::max(lhs->second, rhs->second);
-    break;
-  case PhysicalExprKind::FloorDiv:
-  case PhysicalExprKind::CeilDiv: {
-    if (rhs->first <= 0)
-      return std::nullopt;
-    bool ceil = kind == PhysicalExprKind::CeilDiv;
-    minimum = (static_cast<__int128>(lhs->first) +
-               (ceil ? rhs->second - 1 : 0)) / rhs->second;
-    maximum = (static_cast<__int128>(lhs->second) +
-               (ceil ? rhs->first - 1 : 0)) / rhs->first;
-    break;
-  }
-  default:
-    return std::nullopt;
-  }
-  if (minimum < 0 || maximum > std::numeric_limits<int64_t>::max())
-    return std::nullopt;
-  return std::pair{static_cast<int64_t>(minimum), static_cast<int64_t>(maximum)};
+  auto bounds = queryPhysicalExpressionRange(extent, kernel);
+  if (!bounds || bounds->smin().isNegative()) return std::nullopt;
+  return std::pair{bounds->smin().getSExtValue(), bounds->smax().getSExtValue()};
 }
 
 std::optional<std::pair<int64_t, int64_t>>
@@ -471,6 +265,15 @@ IndexBounds queryIndexBounds(Value value) {
       return PhysicalExprAttr::get(
           context, kind, constant,
           StringAttr::get(context, ""), ArrayAttr::get(context, operands));
+    };
+    auto numericBounds = [&]() -> Bounds {
+      auto range = queryIntegerRange(current);
+      if (!range || range->smin().isNegative()) return {};
+      int64_t maximum = range->smax().getSExtValue();
+      // The index type's limit is not a selected resource capacity.
+      PhysicalExprAttr upper = maximum == std::numeric_limits<int64_t>::max()
+          ? PhysicalExprAttr() : expression(PhysicalExprKind::Constant, maximum);
+      return {true, upper, range->smin().getSExtValue()};
     };
     if (auto coordinate = current.getDefiningOp<WorksetCoordinateOp>())
       return bound(coordinate.getCoordinate(), depth + 1);
@@ -593,7 +396,7 @@ IndexBounds queryIndexBounds(Value value) {
     }
     auto binary = current.getDefiningOp<BinaryOp>();
     if (!binary)
-      return {};
+      return numericBounds();
     Bounds lhs = bound(binary.getLhs(), depth + 1);
     Bounds rhs = bound(binary.getRhs(), depth + 1);
     std::optional<int64_t> lhsConstant = constantUpper(lhs);
@@ -699,17 +502,10 @@ IndexBounds queryIndexBounds(Value value) {
         }
       }
     }
-    if (lhsConstant && rhsConstant) {
-      constexpr int64_t maximum = std::numeric_limits<int64_t>::max();
-      if (binary.getOperatorKind() == BinaryOperator::Add &&
-          *lhsConstant <= maximum - *rhsConstant)
-        return {true, expression(PhysicalExprKind::Constant,
-                                 *lhsConstant + *rhsConstant), lhs.lower + rhs.lower};
-      if (binary.getOperatorKind() == BinaryOperator::Multiply &&
-          (*rhsConstant == 0 || *lhsConstant <= maximum / *rhsConstant))
-        return {true, expression(PhysicalExprKind::Constant,
-                *lhsConstant * *rhsConstant), lhs.lower * rhs.lower};
-    }
+    if (lhsConstant && rhsConstant &&
+        (binary.getOperatorKind() == BinaryOperator::Add ||
+         binary.getOperatorKind() == BinaryOperator::Multiply))
+      return numericBounds();
     if (binary.getOperatorKind() == BinaryOperator::Add &&
         lhs.nonNegative && rhs.nonNegative && lhs.upper && rhs.upper) {
       PhysicalExprAttr upper = expression(
@@ -772,7 +568,7 @@ IndexBounds queryIndexBounds(Value value) {
         }
       }
     }
-    return {};
+    return numericBounds();
   };
   return bound(value, 0);
 }
@@ -780,7 +576,8 @@ IndexBounds queryIndexBounds(Value value) {
 } // namespace detail
 
 bool isKnownPositiveExtent(PhysicalExprAttr extent, func::FuncOp kernel) {
-  return physicalIndexSign(extent, kernel) == IndexSign::Positive;
+  auto range = queryPhysicalExpressionRange(extent, kernel);
+  return range && range->smin().isStrictlyPositive();
 }
 
 std::optional<std::pair<int64_t, int64_t>>

@@ -2,6 +2,8 @@ add_mlir_library(MLIRIntentGPUAnalysis
   PhysicalProgram.cpp
   ScalarExpressions.cpp
   IndexBounds.cpp
+  IntegerRanges.cpp
+  PhysicalExpressionBounds.cpp
   CoordinateRanges.cpp
   RangeProvenance.cpp
   AxisRealization.cpp

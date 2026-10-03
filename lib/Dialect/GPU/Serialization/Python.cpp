@@ -56,6 +56,14 @@ std::string pythonScalarType(Type type, const PythonScalarSyntax &syntax) {
   return spelling.empty() ? std::string() : (syntax.prefix + spelling).str();
 }
 
+bool isConstexprPhysicalExpression(PhysicalExprAttr expression) {
+  if (expression.getKind() == PhysicalExprKind::ScalarABI)
+    return false;
+  return llvm::all_of(expression.getOperands(), [](Attribute operand) {
+    return isConstexprPhysicalExpression(cast<PhysicalExprAttr>(operand));
+  });
+}
+
 std::string pythonExpression(
     PhysicalExprAttr expression, const PythonExpressionSyntax &syntax,
     llvm::function_ref<std::string(PhysicalExprAttr)> symbol) {
@@ -85,10 +93,13 @@ std::string pythonExpression(
   case PhysicalExprKind::Add: return infix("+");
   case PhysicalExprKind::Subtract: return infix("-");
   case PhysicalExprKind::Multiply: return infix("*");
-  case PhysicalExprKind::FloorDiv: return infix("//");
+  case PhysicalExprKind::FloorDiv:
   case PhysicalExprKind::CeilDiv:
-    if (!syntax.ceilDivide.empty()) return call(syntax.ceilDivide);
-    return "((" + operands[0] + " + " + operands[1] + " - 1) // " + operands[1] + ")";
+    if (!isConstexprPhysicalExpression(expression))
+      return syntax.integerDivision(kind, operands[0], operands[1]);
+    if (kind == PhysicalExprKind::FloorDiv)
+      return infix("//");
+    return "(-(-(" + operands[0] + ") // (" + operands[1] + ")))";
   case PhysicalExprKind::Minimum: return call(syntax.minimum);
   case PhysicalExprKind::Maximum: return call(syntax.maximum);
   case PhysicalExprKind::Select:

@@ -1,9 +1,11 @@
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/MathExtras.h"
+#include "IndexBounds.h"
 
 using namespace mlir;
 
@@ -81,49 +83,19 @@ bool IndexRelations::same(Value lhs, Value rhs) const {
 }
 
 bool IndexRelations::nonnegative(Value value) const {
-  return nonnegative(value, 0);
-}
-
-bool IndexRelations::nonnegative(Value value, unsigned depth) const {
-  if (!value || !value.getType().isIndex() || depth >= 32)
+  if (!value || !value.getType().isIndex())
     return false;
-  if (auto literal = constant(value))
-    return *literal >= 0;
-  if (queryNonNegativeIndexUpperBound(value))
+  if (auto range = queryIntegerRange(value); range && range->smin().isNonNegative())
     return true;
-  if (value.getDefiningOp<ProgramIdOp>())
-    return true;
-  if (auto coordinate = value.getDefiningOp<WorksetCoordinateOp>())
-    return nonnegative(coordinate.getCoordinate(), depth + 1);
-  if (auto physical = value.getDefiningOp<PhysicalExprOp>())
-    return isKnownPositiveExtent(physical.getExpression(),
-                                  physical->getParentOfType<func::FuncOp>());
-  if (auto binary = value.getDefiningOp<BinaryOp>()) {
-    if (binary.getOperatorKind() == BinaryOperator::Maximum)
-      return nonnegative(binary.getLhs(), depth + 1) ||
-             nonnegative(binary.getRhs(), depth + 1);
-    if (binary.getOperatorKind() == BinaryOperator::Minimum)
-      return nonnegative(binary.getLhs(), depth + 1) &&
-             nonnegative(binary.getRhs(), depth + 1);
-    if (binary.getOperatorKind() == BinaryOperator::FloorDivide ||
-        binary.getOperatorKind() == BinaryOperator::Remainder)
-      return nonnegative(binary.getLhs(), depth + 1) && positive(binary.getRhs());
-  }
-  return false;
+  // Coordinate/control relations can prove facts that independent value
+  // intervals cannot: e.g. extent - coordinate within its decoded domain.
+  return detail::coordinateKnownNonNegative(value);
 }
 
 bool IndexRelations::positive(Value value) const {
-  if (auto literal = constant(value))
-    return *literal > 0;
-  if (auto parameter = queryParameter(value)) {
-    // Coverage capacity is selected from these candidates at launch. Their
-    // common sign/alignment properties apply, but they are not the logical
-    // extent and do not make a coverage parameter a compile-time singleton.
-    auto candidates = parameter.getCandidates().asArrayRef();
-    return !candidates.empty() && llvm::all_of(candidates, [](int64_t candidate) {
-      return candidate > 0;
-    });
-  }
+  if (!value || !value.getType().isIndex()) return false;
+  if (auto range = queryIntegerRange(value); range && range->smin().isStrictlyPositive())
+    return true;
   auto expression = queryLaunchExpression(value);
   auto owner = value.getDefiningOp();
   auto kernel = owner ? owner->getParentOfType<func::FuncOp>() : func::FuncOp();
@@ -145,6 +117,9 @@ bool IndexRelations::atMost(Value lhs, Value rhs, unsigned depth) const {
     return *left <= *right;
   if (left && *left == 0 && nonnegative(rhs))
     return true;
+  auto leftRange = queryIntegerRange(lhs), rightRange = queryIntegerRange(rhs);
+  if (leftRange && rightRange && leftRange->smax().sle(rightRange->smin()))
+    return true;
   auto compare = [&](Value a, Value b) { return atMost(a, b, depth + 1); };
   if (auto binary = lhs.getDefiningOp<BinaryOp>()) {
     if (binary.getOperatorKind() == BinaryOperator::Minimum)
@@ -153,6 +128,7 @@ bool IndexRelations::atMost(Value lhs, Value rhs, unsigned depth) const {
       return compare(binary.getLhs(), rhs) && compare(binary.getRhs(), rhs);
     if (binary.getOperatorKind() == BinaryOperator::Subtract &&
         nonnegative(binary.getLhs()) && nonnegative(binary.getRhs()))
+      // The difference of two nonnegative signed values fits the signed type.
       return compare(binary.getLhs(), rhs);
     if (binary.getOperatorKind() == BinaryOperator::Multiply)
       for (auto [quotient, factor] :
@@ -170,6 +146,10 @@ bool IndexRelations::atMost(Value lhs, Value rhs, unsigned depth) const {
       return compare(lhs, binary.getLhs()) || compare(lhs, binary.getRhs());
     if (binary.getOperatorKind() == BinaryOperator::Minimum)
       return compare(lhs, binary.getLhs()) && compare(lhs, binary.getRhs());
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        integerOperationDoesNotWrap(binary.getResult()))
+      return (nonnegative(binary.getRhs()) && compare(lhs, binary.getLhs())) ||
+             (nonnegative(binary.getLhs()) && compare(lhs, binary.getRhs()));
   }
   return false;
 }

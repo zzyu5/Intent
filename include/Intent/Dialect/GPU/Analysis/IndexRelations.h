@@ -36,7 +36,6 @@ public:
   mlir::Value alignedBound(mlir::Value value, mlir::Value step) const;
 
 private:
-  bool nonnegative(mlir::Value value, unsigned depth) const;
   bool atMost(mlir::Value lhs, mlir::Value rhs, unsigned depth) const;
 };
 

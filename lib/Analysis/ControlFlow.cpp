@@ -1,4 +1,5 @@
 #include "Intent/Analysis/ControlFlow.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -76,6 +77,8 @@ void appendTerminatorEdges(ControlFlowEdges &result, Operation *terminator,
 ControlFlowEdges regionEdges(RegionBranchOpInterface owner, Value selectedTarget,
                              OpOperand *selectedOperand) {
   ControlFlowEdges result{{}, true};
+  if (!hasCompleteControlFlowRegions(owner))
+    return {};
   if (!selectedOperand || selectedOperand->getOwner() == owner.getOperation()) {
     SmallVector<RegionSuccessor> successors;
     owner.getSuccessorRegions(RegionBranchPoint::parent(), successors);
@@ -138,6 +141,24 @@ void appendBranchEdges(ControlFlowEdges &result, BranchOpInterface branch,
 }
 
 } // namespace
+
+bool hasCompleteControlFlowRegions(Operation *operation) {
+  if (!operation) return false;
+  for (Region &region : operation->getRegions()) {
+    if (region.empty()) {
+      // A result-free scf.if has a legitimately absent else region. Required
+      // loop/helper regions cannot be treated as an empty, known control path.
+      auto branch = dyn_cast<scf::IfOp>(operation);
+      if (branch && !branch.getNumResults() && &region == &branch.getElseRegion())
+        continue;
+      return false;
+    }
+    for (Block &block : region)
+      if (block.empty() || !block.back().hasTrait<OpTrait::IsTerminator>())
+        return false;
+  }
+  return true;
+}
 
 ControlFlowEdges queryControlFlowIncoming(Value target) {
   if (auto argument = dyn_cast<BlockArgument>(target)) {

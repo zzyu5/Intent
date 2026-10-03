@@ -1,12 +1,11 @@
 #include "Intent/Dialect/GPU/Analysis/IndexPredicates.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "llvm/ADT/DenseMap.h"
-#include <limits>
 
 using namespace mlir;
 
@@ -52,88 +51,6 @@ Value completeTileLimit(MakeRangeOp range, IndexRelations &relations) {
   return {};
 }
 
-// A bound valid inside an executing loop need not be safe to evaluate during
-// specialization of an empty loop. Check the entire shape expression, not just
-// its leaves, before materializing it as an additional constexpr predicate.
-class ShapeExpressionBounds {
-  using Interval = std::pair<int64_t, int64_t>;
-public:
-  explicit ShapeExpressionBounds(func::FuncOp kernel) : kernel(kernel) {}
-  bool safe(PhysicalExprAttr expression) { return bool(bounds(expression)); }
-private:
-  std::optional<Interval> bounds(PhysicalExprAttr expression) {
-    if (auto found = known.find(expression); found != known.end())
-      return found->second;
-    auto result = infer(expression);
-    known[expression] = result;
-    return result;
-  }
-  std::optional<Interval> infer(PhysicalExprAttr expression) {
-    auto kind = expression.getKind();
-    if (kind == PhysicalExprKind::Constant)
-      return Interval{expression.getValue(), expression.getValue()};
-    if (kind == PhysicalExprKind::Dimension)
-      return Interval{0, std::numeric_limits<int64_t>::max()};
-    if (kind == PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, expression.getParameterReference().getName());
-      if (failed(parameter)) return std::nullopt;
-      if (parameter->isDeferred() ||
-          parameter->getCategory() ==
-              ParameterCategory::Coverage)
-        return Interval{0, std::numeric_limits<int64_t>::max()};
-      auto domain = parameter->getCandidates().asArrayRef();
-      if (domain.empty()) return std::nullopt;
-      return Interval{*llvm::min_element(domain), *llvm::max_element(domain)};
-    }
-    if (kind == PhysicalExprKind::ScalarABI)
-      return std::nullopt;
-    SmallVector<Interval> operands;
-    for (Attribute operand : expression.getOperands()) {
-      auto value = bounds(cast<PhysicalExprAttr>(operand));
-      if (!value) return std::nullopt;
-      operands.push_back(*value);
-    }
-    if (kind == PhysicalExprKind::Select && operands.size() == 3)
-      return Interval{std::min(operands[1].first, operands[2].first),
-                      std::max(operands[1].second, operands[2].second)};
-    if (operands.size() != 2 &&
-        !(kind == PhysicalExprKind::NextPowerOfTwo && operands.size() == 1))
-      return std::nullopt;
-    if ((kind == PhysicalExprKind::FloorDiv || kind == PhysicalExprKind::CeilDiv) &&
-        operands[1].first <= 0)
-      return std::nullopt;
-    if (kind != PhysicalExprKind::Add && kind != PhysicalExprKind::Subtract &&
-        kind != PhysicalExprKind::Multiply && kind != PhysicalExprKind::Minimum &&
-        kind != PhysicalExprKind::Maximum && kind != PhysicalExprKind::FloorDiv &&
-        kind != PhysicalExprKind::CeilDiv && kind != PhysicalExprKind::NextPowerOfTwo)
-      return std::nullopt;
-    auto context = expression.getContext();
-    auto constant = [&](int64_t value) {
-      return PhysicalExprAttr::get(context,
-          PhysicalExprKind::Constant, value,
-          StringAttr::get(context, ""), ArrayAttr::get(context, {}));
-    };
-    Interval result{std::numeric_limits<int64_t>::max(),
-                    std::numeric_limits<int64_t>::min()};
-    for (int64_t lhs : {operands[0].first, operands[0].second}) {
-      auto rhsBounds = operands.size() == 2 ? operands[1] : Interval{0, 0};
-      for (int64_t rhs : {rhsBounds.first, rhsBounds.second}) {
-        SmallVector<Attribute> values{constant(lhs)};
-        if (operands.size() == 2) values.push_back(constant(rhs));
-        auto point = PhysicalExprAttr::get(context, expression.getKind(), 0,
-            StringAttr::get(context, ""), ArrayAttr::get(context, values));
-        auto value = constantPhysicalExpression(point);
-        if (!value) return std::nullopt;
-        result.first = std::min(result.first, *value);
-        result.second = std::max(result.second, *value);
-      }
-    }
-    return result;
-  }
-  func::FuncOp kernel;
-  DenseMap<PhysicalExprAttr, std::optional<Interval>> known;
-};
-
 } // namespace
 
 Value queryCompleteTileLimit(MakeRangeOp range) {
@@ -178,8 +95,11 @@ std::optional<IndexComparisonBound> queryIndexComparisonBound(CompareOp comparis
   auto limit = queryLaunchExpression(comparison.getRhs());
   if (!upper || !limit || !isShapeBound(upper) || !isShapeBound(limit))
     return std::nullopt;
-  ShapeExpressionBounds bounds(comparison->getParentOfType<func::FuncOp>());
-  if (!bounds.safe(upper) || !bounds.safe(limit))
+  // A loop-local bound is not automatically safe to evaluate in the host's
+  // specialization of an empty loop. Prove the entire checked expression.
+  auto kernel = comparison->getParentOfType<func::FuncOp>();
+  if (!queryPhysicalExpressionRange(upper, kernel) ||
+      !queryPhysicalExpressionRange(limit, kernel))
     return std::nullopt;
   for (Operation *user : comparison.getResult().getUsers()) {
     auto logicalOr = dyn_cast<BinaryOp>(user);

@@ -548,14 +548,6 @@ FailureOr<Value> ScalarRegionLowering::materializeAccessValidity(
     Value index = coordinate;
     Value upper = *extent;
     Value zero = builder.create<arith::ConstantIndexOp>(operation->getLoc(), 0);
-    bool nonNegative = false;
-    if (std::optional<int64_t> constant = integerConstant(coordinate))
-      nonNegative = *constant >= 0;
-    if (auto range = coordinate.getDefiningOp<gpu::MakeRangeOp>()) {
-      std::optional<int64_t> start = integerConstant(range.getStart());
-      std::optional<int64_t> step = integerConstant(range.getStep());
-      nonNegative = start && step && *start >= 0 && *step > 0;
-    }
     FailureOr<Value> logicalIndex =
         asLogicalIndex(operation->getLoc(), index);
     if (failed(logicalIndex))
@@ -577,15 +569,15 @@ FailureOr<Value> ScalarRegionLowering::materializeAccessValidity(
     Value upperBound = createCompare(
         builder, operation->getLoc(), axisPredicateType, index, upper,
         ComparePredicate::Lt);
-    Value axisValid = upperBound;
-    if (!nonNegative) {
-      Value lowerBound = createCompare(
-          builder, operation->getLoc(), axisPredicateType, index, zero,
-          ComparePredicate::Ge);
-      axisValid = createBinary(builder, operation->getLoc(), axisPredicateType,
-                               lowerBound, upperBound,
-                               BinaryOperator::LogicalAnd);
-    }
+    // Construction preserves the complete access domain. Physical rewrites
+    // still change these coordinates; only later range simplification may
+    // discharge a bound using facts about the final coordinate expression.
+    Value lowerBound = createCompare(
+        builder, operation->getLoc(), axisPredicateType, index, zero,
+        ComparePredicate::Ge);
+    Value axisValid = createBinary(builder, operation->getLoc(), axisPredicateType,
+                                   lowerBound, upperBound,
+                                   BinaryOperator::LogicalAnd);
     if (payloadFragment) {
       auto axis = coordinateAxes[coordinateIndex];
       FailureOr<Value> projected = axis

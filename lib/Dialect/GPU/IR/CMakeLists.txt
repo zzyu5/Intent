@@ -2,6 +2,7 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
   GPUDialect.cpp
   ProgramInterface.cpp
   PhysicalExpressions.cpp
+  IntegerRanges.cpp
   TypeVerification.cpp
   GPUOps.cpp
   Operations/Program.cpp
@@ -21,6 +22,8 @@ add_mlir_dialect_library(MLIRIntentGPUDialect
 
   LINK_LIBS PUBLIC
   MLIRIntentDialect
+  MLIRIntentAnalysis
+  MLIRInferIntRangeInterface
   MLIRIntentStructuredOpInterface
   MLIRInferTypeOpInterface
   MLIRFuncDialect

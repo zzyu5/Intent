@@ -1,5 +1,5 @@
 #include "Intent/Dialect/CPU/Analysis/RegionPredicates.h"
-#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
+#include "Intent/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Analysis/UniformValues.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -24,19 +24,6 @@ std::optional<SmallVector<Value>> fullAliases(Value value) {
       })) return std::nullopt;
   return aliases.values;
 }
-bool nonnegative(Value value) {
-  if (auto constant = getConstantIntValue(value)) return *constant >= 0;
-  if (value.getDefiningOp<memref::DimOp>()) return true;
-  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
-    return (cast.getIn().getType().isIndex() || cast.getIn().getType().isInteger(64)) &&
-        (cast.getType().isIndex() || cast.getType().isInteger(64)) && nonnegative(cast.getIn());
-  if (auto minimum = value.getDefiningOp<arith::MinSIOp>()) return nonnegative(minimum.getLhs()) && nonnegative(minimum.getRhs());
-  if (auto maximum = value.getDefiningOp<arith::MaxSIOp>()) return nonnegative(maximum.getLhs()) || nonnegative(maximum.getRhs());
-  auto argument = dyn_cast<BlockArgument>(value);
-  auto loop = argument ? dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp()) : scf::ForOp();
-  return loop && argument == loop.getInductionVar() &&
-      getConstantIntValue(loop.getStep()).value_or(0) > 0 && nonnegative(loop.getLowerBound());
-}
 
 Value stripIndexWidthCasts(Value value) {
   auto indexWidth = [](Type type) { return type.isIndex() || type.isInteger(64); };
@@ -51,80 +38,15 @@ using SignedBounds = std::pair<llvm::APInt, llvm::APInt>;
 
 llvm::APInt wideInteger(int64_t value) { return llvm::APInt(65, value, true); }
 
-std::optional<SignedBounds> signedBounds(Value value);
-
-std::optional<SignedBounds> extentBounds(Value memory, unsigned axis) {
-  if (auto cast = memory.getDefiningOp<memref::CastOp>()) return extentBounds(cast.getSource(), axis);
-  auto type = cast<MemRefType>(memory.getType());
-  if (!type.isDynamicDim(axis))
-    return SignedBounds{wideInteger(type.getDimSize(axis)), wideInteger(type.getDimSize(axis))};
-  if (auto allocation = memory.getDefiningOp<memref::AllocOp>())
-    return signedBounds(allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)]);
-  if (auto view = memory.getDefiningOp<memref::SubViewOp>()) {
-    auto dropped = view.getDroppedDims();
-    unsigned resultAxis = 0;
-    for (auto [sourceAxis, size] : llvm::enumerate(view.getMixedSizes())) {
-      if (dropped.test(sourceAxis)) continue;
-      if (resultAxis++ != axis) continue;
-      if (auto constant = getConstantIntValue(size))
-        return SignedBounds{wideInteger(*constant), wideInteger(*constant)};
-      auto bounds = signedBounds(cast<Value>(size));
-      if (bounds) bounds->first = llvm::APIntOps::smax(bounds->first, wideInteger(0));
-      return bounds;
-    }
-  }
-  return SignedBounds{wideInteger(0), llvm::APInt::getSignedMaxValue(64).sext(65)};
+std::optional<SignedBounds>
+coordinateBounds(std::optional<ConstantIntRanges> range) {
+  if (!range || range->smin().getBitWidth() > 64) return std::nullopt;
+  return SignedBounds{range->smin().sext(65), range->smax().sext(65)};
 }
 
-std::optional<SignedBounds> signedBounds(Value value) {
-  value = stripIndexWidthCasts(value);
-  if (auto constant = getConstantIntValue(value))
-    return SignedBounds{wideInteger(*constant), wideInteger(*constant)};
-  if (auto dimension = value.getDefiningOp<memref::DimOp>())
-    if (auto axis = dimension.getConstantIndex()) return extentBounds(dimension.getSource(), *axis);
-  auto operation = value.getDefiningOp();
-  if ((value.getType().isIndex() || value.getType().isInteger(64)) &&
-      isa_and_nonnull<arith::AddIOp, arith::SubIOp, arith::MinSIOp, arith::MaxSIOp>(operation)) {
-    auto left = signedBounds(operation->getOperand(0)), right = signedBounds(operation->getOperand(1));
-    if (!left || !right) return std::nullopt;
-    SignedBounds result = *left;
-    if (isa<arith::AddIOp>(operation)) result = {left->first + right->first, left->second + right->second};
-    else if (isa<arith::SubIOp>(operation)) result = {left->first - right->second, left->second - right->first};
-    else if (isa<arith::MinSIOp>(operation))
-      result = {llvm::APIntOps::smin(left->first, right->first), llvm::APIntOps::smin(left->second, right->second)};
-    else result = {llvm::APIntOps::smax(left->first, right->first), llvm::APIntOps::smax(left->second, right->second)};
-    if (result.first.slt(llvm::APInt::getSignedMinValue(64).sext(65)) ||
-        result.second.sgt(llvm::APInt::getSignedMaxValue(64).sext(65))) return std::nullopt;
-    return result;
-  }
-  if (auto argument = dyn_cast<BlockArgument>(value))
-    if (auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-        loop && argument == loop.getInductionVar() && getConstantIntValue(loop.getStep()).value_or(0) > 0) {
-      auto lower = signedBounds(loop.getLowerBound()), upper = signedBounds(loop.getUpperBound());
-      if (lower && upper) return SignedBounds{lower->first, upper->second};
-    }
-  Value input;
-  bool unsignedExtension = false;
-  if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) input = cast.getIn();
-  else if (auto cast = value.getDefiningOp<arith::IndexCastUIOp>()) {
-    input = cast.getIn();
-    unsignedExtension = true;
-  } else if (auto extension = value.getDefiningOp<arith::ExtSIOp>()) input = extension.getIn();
-  else if (auto extension = value.getDefiningOp<arith::ExtUIOp>()) {
-    input = extension.getIn();
-    unsignedExtension = true;
-  }
-  auto integer = input ? dyn_cast<IntegerType>(input.getType()) : IntegerType();
-  if (!integer || integer.getWidth() >= 64) return std::nullopt;
-  unsigned width = integer.getWidth();
-  if (unsignedExtension)
-    return SignedBounds{wideInteger(0), llvm::APInt::getMaxValue(width).zext(65)};
-  return SignedBounds{llvm::APInt::getSignedMinValue(width).sext(65),
-                      llvm::APInt::getSignedMaxValue(width).sext(65)};
-}
-
-bool shiftedSequenceDoesNotWrap(memref::AllocOp allocation, Value origin) {
-  auto begin = signedBounds(origin);
+bool shiftedSequenceDoesNotWrap(memref::AllocOp allocation, Value origin,
+                                 IntegerRangeAnalysis &ranges) {
+  auto begin = coordinateBounds(ranges.range(origin));
   if (!begin) return false;
   auto minimum = llvm::APInt::getSignedMinValue(64).sext(65);
   auto maximum = llvm::APInt::getSignedMaxValue(64).sext(65);
@@ -141,7 +63,7 @@ bool shiftedSequenceDoesNotWrap(memref::AllocOp allocation, Value origin) {
   auto subtraction = difference ? difference.getDefiningOp<arith::SubIOp>() : arith::SubIOp();
   if (!subtraction || stripIndexWidthCasts(subtraction.getRhs()) != stripIndexWidthCasts(origin))
     return false;
-  auto end = signedBounds(subtraction.getLhs());
+  auto end = coordinateBounds(ranges.range(subtraction.getLhs()));
   if (!end) return false;
   // A non-wrapping max(end - begin, 0) keeps every populated coordinate
   // between its signed endpoints, even when the common origin is negative.
@@ -380,6 +302,7 @@ bool summaryIsIdentityWhenFalse(RegionOpInterface program, ValueRange predicates
 }
 
 std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at) {
+  IntegerRangeAnalysis ranges;
   CoordinateSequence result{{}, true, true, {}};
   Value selectedMemory = memory;
   while (true) {
@@ -391,7 +314,7 @@ std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at
       result.offsets.push_back(offset);
       result.startsAtOrigin &= getConstantIntValue(offset) == 0;
       result.nonnegativeOffsets &= isa<Attribute>(offset) ? cast<IntegerAttr>(cast<Attribute>(offset)).getInt() >= 0
-                                                          : nonnegative(cast<Value>(offset));
+                                                          : ranges.isNonNegative(cast<Value>(offset));
       memory = view.getSource();
       continue;
     }
@@ -444,16 +367,16 @@ std::optional<CoordinateSequence> coordinateSequence(Value memory, Operation *at
       result.origin = left;
     } else return std::nullopt;
     if (!dominance.properlyDominates(result.origin, writer) ||
-        !shiftedSequenceDoesNotWrap(allocation, result.origin)) return std::nullopt;
+        !shiftedSequenceDoesNotWrap(allocation, result.origin, ranges)) return std::nullopt;
     // Range construction also adds view offsets and an exclusive endpoint.
     // Prove those relative index operations fit before removing the origin.
-    auto extent = extentBounds(selectedMemory, 0);
+    auto extent = coordinateBounds(ranges.dimension(selectedMemory, 0));
     if (!extent || extent->first.isNegative()) return std::nullopt;
     llvm::APInt upper = extent->second;
     for (OpFoldResult offset : result.offsets) {
       auto constant = getConstantIntValue(offset);
       auto bounds = constant ? std::optional<SignedBounds>({wideInteger(*constant), wideInteger(*constant)})
-                             : signedBounds(cast<Value>(offset));
+                             : coordinateBounds(ranges.range(cast<Value>(offset)));
       if (!bounds || bounds->first.isNegative()) return std::nullopt;
       upper += bounds->second;
       if (upper.sgt(llvm::APInt::getSignedMaxValue(64).sext(65))) return std::nullopt;

@@ -338,9 +338,7 @@ LogicalResult constructGPUProgram(
   }
   Value pid = builder.create<gpu::ProgramIdOp>(function.getLoc(),
                                                builder.getIndexType(), 0);
-  Value zero = builder.create<arith::ConstantIndexOp>(function.getLoc(), 0);
   Value one = builder.create<arith::ConstantIndexOp>(function.getLoc(), 1);
-  Value runtimeOffset = zero;
   PhysicalExprAttr launchOffset =
       expression(context, PhysicalExprKind::Constant, 0);
   ScalarRegionLowering rootLowering(builder, values, sourceArguments,
@@ -374,41 +372,26 @@ LogicalResult constructGPUProgram(
     SmallVector<Value> runtimeExtents;
     SmallVector<Value> starts;
     SmallVector<Value> steps;
-    Value runtimeLength = one;
     for (const IterationAxis &axis : workset.axes) {
-      Location location = axis.source.getLoc();
       FailureOr<Value> start = rootLowering.lowerIndexValue(axis.start);
-      FailureOr<Value> stop = rootLowering.lowerIndexValue(axis.stop);
       FailureOr<Value> step =
           axis.step
               ? rootLowering.lowerIndexValue(axis.step)
               : FailureOr<Value>(one);
-      if (failed(start) || failed(stop) || failed(step))
+      if (failed(start) || failed(step))
         return axis.source.getDefiningOp()->emitOpError(
             "parallel workset runtime bounds are unavailable");
-      Value distance = createBinary(builder, location,
-                                    builder.getIndexType(), *stop, *start,
-                                    BinaryOperator::Subtract);
-      Value adjusted = createBinary(
-          builder, location, builder.getIndexType(), distance,
-          createBinary(builder, location, builder.getIndexType(), *step,
-                       one, BinaryOperator::Subtract),
-          BinaryOperator::Add);
-      Value extent = createBinary(builder, location,
-                                  builder.getIndexType(), adjusted, *step,
-                                  BinaryOperator::FloorDivide);
-      runtimeExtents.push_back(extent);
       starts.push_back(*start);
       steps.push_back(*step);
-      runtimeLength = createBinary(builder, location,
-                                   builder.getIndexType(), runtimeLength, extent,
-                                   BinaryOperator::Multiply);
     }
-    if (workset.singleton)
-      runtimeExtents.push_back(one);
-    Value segmentEnd = createBinary(builder, function.getLoc(),
-                                    builder.getIndexType(), runtimeOffset,
-                                    runtimeLength, BinaryOperator::Add);
+    for (auto [axis, extent] : llvm::enumerate(workset.launchExtents)) {
+      Location location = workset.singleton ? function.getLoc()
+                                            : workset.axes[axis].source.getLoc();
+      runtimeExtents.push_back(builder.create<gpu::PhysicalExprOp>(
+          location, builder.getIndexType(), extent));
+    }
+    PhysicalExprAttr launchEnd = binaryExpression(
+        context, PhysicalExprKind::Add, launchOffset, workset.launchLength);
     auto lowerGroup = [&](OpBuilder &nested, Value linear) -> LogicalResult {
       SmallVector<Attribute> launchExtents(workset.launchExtents.begin(),
                                            workset.launchExtents.end());
@@ -445,11 +428,13 @@ LogicalResult constructGPUProgram(
     };
     if (worksets.size() == 1) {
       if (failed(lowerGroup(builder, pid))) return failure();
-      runtimeOffset = segmentEnd;
-      launchOffset = binaryExpression(context, PhysicalExprKind::Add,
-                                      launchOffset, workset.launchLength);
+      launchOffset = launchEnd;
       continue;
     }
+    Value runtimeOffset = builder.create<gpu::PhysicalExprOp>(
+        function.getLoc(), builder.getIndexType(), launchOffset);
+    Value segmentEnd = builder.create<gpu::PhysicalExprOp>(
+        function.getLoc(), builder.getIndexType(), launchEnd);
     Value afterOffset = createCompare(builder, function.getLoc(),
                                       builder.getI1Type(), pid, runtimeOffset,
                                       ComparePredicate::Ge);
@@ -471,9 +456,7 @@ LogicalResult constructGPUProgram(
           }
           nested.create<scf::YieldOp>(location);
         });
-    runtimeOffset = segmentEnd;
-    launchOffset = binaryExpression(context, PhysicalExprKind::Add, launchOffset,
-                                    workset.launchLength);
+    launchOffset = launchEnd;
   }
   if (dispatchLoweringFailed)
     return failure();

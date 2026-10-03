@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentAnalysis
   ControlFlow.cpp
   UniformValues.cpp
   IntegerRelations.cpp
+  IntegerRanges.cpp
   RegionSemantics.cpp
   OnlineSummary.cpp
   ProductSchema.cpp
@@ -20,6 +21,12 @@ add_mlir_library(MLIRIntentAnalysis
   MLIRViewLikeInterface
   MLIRArithDialect
   MLIRMathDialect
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRInferIntRangeInterface
+  MLIRInferIntRangeCommon
+  MLIRLoopLikeInterface
+  MLIRValueBoundsOpInterface
   MLIRControlFlowInterfaces
   MLIRIR
   MLIRIntentDialect

@@ -741,6 +741,10 @@ KIR 的验证入口直接属于 operation，按合同分布在
 
 该核心只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
 
+需要整数值范围时，复用 [IntegerRangeAnalysis](include/Intent/Analysis/IntegerRanges.h)：它按实际位宽消费 MLIR `ConstantIntRanges` / `InferIntRangeInterface`，并查询标准控制流和 shaped-value dimensions。CPU、DSA、GPU 适配层只补自己的参数、执行域与类型事实；未知整数保留完整位宽范围，IR 改写后重建查询。`provesSignedNoWrap` 与 `isValuePreservingIntegerCast` 分别证明有符号数学运算不回绕、cast 保持数值，不能以结果非负或两个整数类型代替这些条件，也不向 IR 添加 `nsw/nuw` 假设。
+
+职责对照：本地 Triton `lib/Dialect/Triton/IR/Utility.cpp:55–84` 按比较的 signedness 和 operand bitwidth 建立范围；LLVM 20 `mlir/lib/Dialect/Arith/IR/InferIntRangeInterfaceImpls.cpp:67–90,223–252` 将算术及扩宽/截断交给共用的整数范围原语。Intent 复用这些位宽语义，额外固定自己的 logical index 为 64 位。
+
 公开的 transformation 入口必须完成自身改写所需的 relation closure，使调用方得到满足 postcondition 的 current program。中间 repair helper 不因可以被调用就成为独立 pass；pipeline 负责次序，不应成为调用者必须记忆的隐式修复配方。
 
 例如，[Region/Realization.h](include/Intent/Dialect/GPU/Transforms/Region/Realization.h) 的 fold/scan 两个入口在完成 region 改写后，自身调用 [closeValueRelations](lib/Dialect/GPU/Transforms/Value/Relations/Worklist.cpp)，通过工作队列闭合受影响的 value/access/aggregate 关系。这两个 region 阶段在 [GPU pipeline](lib/Dialect/GPU/Transforms/Passes.cpp) 中只调度完整入口，随后验证 postcondition。调用者不需要再附加一串 repair 调用；这也不要求 CPU 使用相同的关系维护方式。
@@ -819,6 +823,8 @@ GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`
 | 已选执行域的类型提升、轴重映射和克隆 | [Transforms/Value/ExecutionSchema.h](include/Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h) | 实际 `oldToNew`/`executionToNew` 映射与 `cloneWithSchema`；不选择执行轴，不接管 effects 或控制策略 |
 | 普通值运算的 operand/result 轴关系与形状传递 | [IR/FragmentOpInterface.h](include/Intent/Dialect/GPU/IR/FragmentOpInterface.h) | 按操作数位置查询；改写前取得关系，传递 extents，数值与重放资格由调用方证明 |
 | 物理整数表达式求值 | [Analysis/UniformValues.h](include/Intent/Dialect/GPU/Analysis/UniformValues.h) | `evaluatePhysicalExpression` 接受 symbolic-leaf binding；算术和溢出检查共用一份实现 |
+| scalar/fragment 整数值范围与数值保持 cast | [Analysis/IntegerRanges.h](include/Intent/Dialect/GPU/Analysis/IntegerRanges.h) | `queryIntegerRange` 给共同分析绑定 fragment element type、参数和坐标事实；设备算术保持定宽回绕语义 |
+| host/resource 表达式的 checked 范围 | [Analysis/PhysicalExpressionBounds.h](include/Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h) | `queryPhysicalExpressionRange` 验证当前参数域上每个中间运算均可用有符号 64 位表示；可能溢出时返回未知，不把设备模运算结果用于 launch/resource 证明 |
 | range/loop 中的整数比较与完整 tile 界限 | [Analysis/IndexPredicates.h](include/Intent/Dialect/GPU/Analysis/IndexPredicates.h) | `proveRangeComparison`、`queryCompleteTileLimit` 与 `queryIndexComparisonBound` 只读当前范围；区分已证明的真值、条件蕴含和未知 |
 | 常量、大小关系与访问对齐 | [Analysis/IndexRelations.h](include/Intent/Dialect/GPU/Analysis/IndexRelations.h) | `IndexRelations` 共用于范围谓词、Triton descriptor 与 cuTile tile access；按 typed index 与回绕合同证明，不创建 guard 或选择原生 form |
 | 参数声明与完整候选绑定检查 | [Analysis/PhysicalParameters.h](include/Intent/Dialect/GPU/Analysis/PhysicalParameters.h) | `ParameterSpace::read` 读取 kernel 声明；不依赖 SSA 读取是否存在；改变声明后重读 |
@@ -828,6 +834,10 @@ GPU Transforms 的实现按 `Access`、`Contraction`、`Pointwise`、`Reduction`
 | 改写后的 value/access/aggregate 关系闭合 | [Transforms/Value/ValueRelations.h](include/Intent/Dialect/GPU/Transforms/Value/ValueRelations.h) | 在完整 transformation 内调用，随后验证，不能让 serializer 补修 |
 | coverage traversal、参数生命周期 | [Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)、[PhysicalParameters.h](include/Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h) | 分别改变当前 ranges/access 与参数引用；参数替换同时覆盖 SSA、types 和 attributes |
 | predication、workspace 与 retained slice | [Predication.h](include/Intent/Dialect/GPU/Transforms/Control/Predication.h)、[Storage.h](include/Intent/Dialect/GPU/Transforms/Storage/Storage.h) | 保持 effects、allocation ownership 与 lifetime；不由 provider 字符串猜测 |
+
+GPU 算术、cast、select 与纯 shape projection 的范围传递由 [IR/IntegerRanges.cpp](lib/Dialect/GPU/IR/IntegerRanges.cpp) 注册标准 `InferIntRangeInterface` external models，再调用共同的 `inferInteger*` 原语。新增运算在所属 operation 的接口模型中接线；[Analysis/IntegerRanges.cpp](lib/Dialect/GPU/Analysis/IntegerRanges.cpp) 只提供 GPU 固有事实，`IndexBounds` 保留坐标和控制关系证明，不再维护另一份算术范围计算。
+
+访问构造保留完整的资源上下界；分块改变 range 的起点或容量后重新保留逻辑上下界，再由范围简化消除可证明的比较。不能把原 range 的非负结论沿用到新的坐标。Launch-visible 的 workset 分派和 pointwise tile 数通过 `PhysicalExprOp` 读取同一份 typed launch expression，不再单独构造另一套可能回绕的 SSA 除法与前缀长度计算。
 
 `PhysicalProgramAnalysis` 的公开查询仍通过 [PhysicalProgram.h](include/Intent/Dialect/GPU/Analysis/PhysicalProgram.h) 使用；维护查询算法时进入以下实现文件：
 
@@ -1483,6 +1493,10 @@ Triton 的 contract form、loop unroll 等真实执行属性仍保存在 IR，�
 `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/ElementwiseOpToLLVM.cpp:245–246`
 使用饱和 E5M2 指令，Intent 的普通 E5M2 转换则按 RN-even 溢出到无穷，因此目标转换
 显式补齐结果编码，不能直接继承 SDK 默认。普通 cast 与 bitcast 保持独立。
+
+物理表达式的动态整数除法也由该 provider 的 `integerDivision` 拼写：Triton 与普通数值操作共用商/余数修正，cuTile 直接使用原生 floor/ceil division；constexpr 子表达式按 Python 数学除法计算。不能把 Triton 的截零 `//` 当作数学 floor，或用可能中间溢出的 `n + d - 1` 替代 ceil。本地 Triton `python/triton/language/semantic.py:312–322` 与 `standard.py:34–43` 展示了这两个需要区分的合同。
+
+原生坐标构造也须兑现 IR 位宽：Triton 的 `program_id` 和 `arange` 默认产生 i32（本地 `semantic.py:39–42,578–594`），serializer 在后续乘加之前转为当前 IR 的 index/element type；cuTile 的 block id 转换与 arange dtype 同样显式表达该类型。不能用 SDK 对小整数的默认推导代替 Intent 的 index64 合同。
 
 Triton descriptor 的 offsets 在 pass 中显式形成 `i32` SSA，serializer 只拼写已决定的
 操作数；shape、stride 和 block shape 通过当前 view layout 与 launch-expression 查询取得。

@@ -43,7 +43,6 @@ public:
   void assign(mlir::Value value, llvm::StringRef expression,
               bool compileTime = false);
   void assignResults(mlir::ResultRange results, llvm::StringRef expression);
-  bool isConstexprExpression(PhysicalExprAttr expression) const;
   bool isConstexprValue(mlir::Value value) const { return constexprValues.contains(value); }
   void bindConstexpr(mlir::Value value, llvm::StringRef expression) {
     bind(value, expression);

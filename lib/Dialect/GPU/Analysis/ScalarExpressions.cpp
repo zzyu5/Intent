@@ -1,5 +1,6 @@
 #include "ScalarExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -7,7 +8,6 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <functional>
-#include <limits>
 
 using namespace mlir;
 
@@ -16,68 +16,22 @@ using namespace detail;
 
 namespace detail {
 
-std::optional<int64_t> integerConstant(Value value, unsigned depth) {
-  if (!value || depth >= 32)
-    return std::nullopt;
-  if (auto constant = value.getDefiningOp<arith::ConstantOp>())
-    if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
-      return integer.getInt();
-  if (auto broadcast = value.getDefiningOp<BroadcastOp>())
-    return integerConstant(broadcast.getValue(), depth + 1);
-  if (auto splat = value.getDefiningOp<SplatOp>())
-    return integerConstant(splat.getValue(), depth + 1);
-  if (auto cast = value.getDefiningOp<CastOp>()) {
-    if (cast.getValue().getType() == cast.getResult().getType())
-      return integerConstant(cast.getValue(), depth + 1);
-    if (!cast.getResult().getType().isIndex() ||
-        !isa<IntegerType, IndexType>(cast.getValue().getType()))
-      return std::nullopt;
-    auto constant = dyn_cast_or_null<IntegerAttr>(
+std::optional<int64_t> integerConstant(Value value) {
+  if (!value) return std::nullopt;
+  auto range = queryIntegerRange(value);
+  auto constant = range ? range->getConstantValue() : std::nullopt;
+  if (!constant) {
+    auto folded = dyn_cast_or_null<IntegerAttr>(
         UniformValueAnalysis(describeUniformValue).evaluate(value));
-    return constant && constant.getType().isIndex()
-               ? std::optional<int64_t>(constant.getInt())
-               : std::nullopt;
+    if (folded) constant = folded.getValue();
   }
-  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<RangeOp>();
-    if (!range)
-      return std::nullopt;
-    if (bound.getBound() == 0)
-      return integerConstant(range.getStart(), depth + 1);
-    if (bound.getBound() == 1)
-      return integerConstant(range.getStop(), depth + 1);
-    return integerConstant(range.getStep(), depth + 1);
+  if (!constant || constant->getBitWidth() > 64) return std::nullopt;
+  auto integer = dyn_cast<IntegerType>(uniformElementType(value.getType()));
+  if (integer && (integer.isUnsigned() || integer.getWidth() == 1)) {
+    if (constant->getActiveBits() > 63) return std::nullopt;
+    return constant->getZExtValue();
   }
-  auto binary = value.getDefiningOp<BinaryOp>();
-  if (!binary)
-    return std::nullopt;
-  std::optional<int64_t> lhs = integerConstant(binary.getLhs(), depth + 1);
-  std::optional<int64_t> rhs = integerConstant(binary.getRhs(), depth + 1);
-  if (!lhs || !rhs)
-    return std::nullopt;
-  __int128 evaluated;
-  switch (binary.getOperatorKind()) {
-  case BinaryOperator::Add:
-    evaluated = static_cast<__int128>(*lhs) + *rhs;
-    break;
-  case BinaryOperator::Subtract:
-    evaluated = static_cast<__int128>(*lhs) - *rhs;
-    break;
-  case BinaryOperator::Multiply:
-    evaluated = static_cast<__int128>(*lhs) * *rhs;
-    break;
-  case BinaryOperator::FloorDivide:
-    if (*rhs != 1)
-      return std::nullopt;
-    evaluated = *lhs;
-    break;
-  default:
-    return std::nullopt;
-  }
-  if (evaluated < std::numeric_limits<int64_t>::min() ||
-      evaluated > std::numeric_limits<int64_t>::max())
-    return std::nullopt;
-  return static_cast<int64_t>(evaluated);
+  return constant->getSExtValue();
 }
 
 Value stripBroadcast(Value value) {
@@ -211,15 +165,7 @@ bool sameScalarExpression(Value lhs, Value rhs, unsigned depth) {
 }
 
 bool isUnitStepValue(Value value) {
-  if (std::optional<int64_t> constant = integerConstant(value))
-    return *constant == 1;
-  if (auto cast = value.getDefiningOp<CastOp>())
-    return isUnitStepValue(cast.getValue());
-  if (auto bound = value.getDefiningOp<RangeBoundOp>()) {
-    auto range = bound.getRange().getDefiningOp<RangeOp>();
-    return range && bound.getBound() == 2 && isUnitStepValue(range.getStep());
-  }
-  return false;
+  return integerConstant(value) == 1;
 }
 
 PhysicalExprAttr resourceExtentExpression(Value resource, unsigned axis) {
@@ -448,11 +394,8 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
     }
     if (auto cast = current.getDefiningOp<CastOp>()) {
       Type source = cast.getValue().getType();
-      auto integer = dyn_cast<IntegerType>(source);
-      bool preservesInteger = current.getType().isIndex() && integer &&
-          (integer.getWidth() < 64 ||
-           (integer.getWidth() == 64 && !integer.isUnsigned()));
-      return source == current.getType() || preservesInteger
+      return source == current.getType() ||
+                     gpu::isValuePreservingIntegerCast(cast.getValue(), current.getType())
                  ? query(cast.getValue(), depth + 1)
                  : PhysicalExprAttr();
     }
@@ -486,6 +429,11 @@ PhysicalExprAttr queryLaunchExpression(Value value) {
     }
     auto binary = current.getDefiningOp<BinaryOp>();
     if (!binary || !current.getType().isIndex())
+      return {};
+    if ((binary.getOperatorKind() == BinaryOperator::Add ||
+         binary.getOperatorKind() == BinaryOperator::Subtract ||
+         binary.getOperatorKind() == BinaryOperator::Multiply) &&
+        !integerOperationDoesNotWrap(current))
       return {};
     PhysicalExprAttr lhs = query(binary.getLhs(), depth + 1);
     PhysicalExprAttr rhs = query(binary.getRhs(), depth + 1);

@@ -1506,17 +1506,6 @@ LogicalResult PointwiseRewrite::mapOwnership() {
       return failure();
     }
     logicalDimensions[axisKey] = dimension;
-    Value one = mappingBuilder.create<arith::ConstantIndexOp>(mapping.getLoc(), 1);
-    Value adjusted = mappingBuilder.create<BinaryOp>(
-        mapping.getLoc(), mappingBuilder.getIndexType(), dimension,
-        mappingBuilder.create<BinaryOp>(mapping.getLoc(),
-                                        mappingBuilder.getIndexType(),
-                                        materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), one,
-                                        BinaryOperator::Subtract),
-        BinaryOperator::Add);
-    Value tiles = mappingBuilder.create<BinaryOp>(
-        mapping.getLoc(), mappingBuilder.getIndexType(), adjusted,
-        materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), BinaryOperator::FloorDivide);
     PhysicalExprAttr logical;
     if (worksetPosition) {
       logical = cast<PhysicalExprAttr>(
@@ -1544,6 +1533,8 @@ LogicalResult PointwiseRewrite::mapOwnership() {
         parameter.getName().getValue());
     PhysicalExprAttr launch = binaryExpression(
         module.getContext(), PhysicalExprKind::CeilDiv, logical, tile);
+    Value tiles = mappingBuilder.create<PhysicalExprOp>(
+        mapping.getLoc(), mappingBuilder.getIndexType(), launch);
     auto mapped = mappedAxes.find(axisKey);
     if (mapped != mappedAxes.end() || reusableUnitAxis) {
       unsigned axis = mapped != mappedAxes.end() ? mapped->second

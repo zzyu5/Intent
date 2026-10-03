@@ -37,7 +37,7 @@ public:
   Serializer(func::FuncOp kernel, raw_ostream &output)
       : gpu::PythonEmitter(kernel, output,
             {"tl.", "int1", "float64", "float8e4nv", "float8e5"},
-            {"", "min", "max", "", "triton.next_power_of_2", true},
+            {integerDivision, "min", "max", "", "triton.next_power_of_2", true},
             ": tl.constexpr") {}
 
   LogicalResult emit(std::string &metadata) {
@@ -102,12 +102,15 @@ private:
   }
 
   std::string programId(gpu::ProgramIdOp op) override {
-    return "tl.program_id(" + std::to_string(op.getAxis()) + ")";
+    return "tl.program_id(" + std::to_string(op.getAxis()) + ").to(" +
+        pythonType(op.getResult().getType()) + ")";
   }
   std::string makeRange(gpu::MakeRangeOp op) override {
     auto type = cast<gpu::FragmentType>(op.getResult().getType());
     return "(" + valueString(op.getStart()) + " + tl.arange(0, " +
-        expressionString(cast<gpu::PhysicalExprAttr>(type.getShape()[0])) + ") * " + valueString(op.getStep()) + ")";
+        expressionString(cast<gpu::PhysicalExprAttr>(type.getShape()[0])) +
+        ").to(" + pythonType(type.getElementType()) + ") * " +
+        valueString(op.getStep()) + ")";
   }
   std::string splat(gpu::SplatOp op) override {
     if (emittingHelper) return valueString(op.getValue());
