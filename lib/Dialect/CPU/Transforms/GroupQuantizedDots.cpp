@@ -63,7 +63,8 @@ LogicalResult group(scf::ParallelOp parallel, const ImplementationRegistry &impl
   if (!rowProjection(lhs, row, 3) || !rowProjection(output, row, 1)) return success();
   auto function = parallel->getParentOfType<func::FuncOp>();
   DominanceInfo dominance(function);
-  for (Value source : ValueRange{lhs.getSource(), dot.getRhs(), output.getSource()})
+  const Value sources[] = {lhs.getSource(), dot.getRhs(), output.getSource()};
+  for (Value source : sources)
     if (!dominance.dominates(source, parallel)) return success();
   StorageAnalysis analysis(function);
   auto interface = function->getAttrOfType<EntryRequirementsAttr>(entryRequirementsAttr);
