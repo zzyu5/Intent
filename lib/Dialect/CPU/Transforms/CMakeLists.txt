@@ -55,6 +55,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Structure/Passes.cpp
 
   Task/BlockStructuredComputations.cpp
+  Task/AtomicTaskOwnership.cpp
   Task/GroupWorksetComputations.cpp
   Task/PartitionTasks.cpp
   Task/Passes.cpp
