@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "ContiguousAccesses.h"
+#include "ProducerReuse.h"
 #include "Intent/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -12,6 +13,8 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -65,8 +68,10 @@ std::optional<SmallVector<int64_t>> rowMajorStrides(MemRefType type) {
 // No candidate extent or two unknown strides establish a numerical bound.
 class Coordinates {
 public:
-  Coordinates(MLIRContext *context, ArrayRef<int64_t> sizes)
+  Coordinates(MLIRContext *context, ArrayRef<int64_t> sizes,
+              StorageAnalysis &storage)
       : context(context), sizes(sizes.begin(), sizes.end()),
+        storage(storage),
         ranges(IntegerRangePolicy{
             {}, [this](Value value, IntegerRangeAnalysis &)
                     -> std::optional<ConstantIntRanges> {
@@ -80,16 +85,26 @@ public:
     memberAxes[value] = axis;
   }
 
+  void bind(linalg::GenericOp operation) {
+    SmallVector<BoundedCoordinate> coordinates;
+    for (auto [axis, size] : llvm::enumerate(sizes))
+      coordinates.push_back({getAffineDimExpr(axis, context), 0, size - 1});
+    iterationCoordinates[operation] = std::move(coordinates);
+  }
+
   std::optional<BoundedCoordinate> get(Value value) {
     if (!value.getType().isIndex() && !value.getType().isSignlessInteger(64)) return std::nullopt;
-    auto found = values.find(value);
-    if (found != values.end()) return found->second;
-    auto result = compute(value);
-    values[value] = result;
-    return result;
+    if (!active.insert(value).second) return std::nullopt;
+    auto leave = llvm::make_scope_exit([&] { active.erase(value); });
+    // The same producer SSA may be queried at different consumer coordinates.
+    // Only immutable external symbols are cached across those substitutions.
+    return compute(value);
   }
 
   ArrayRef<Value> getSymbols() const { return symbols; }
+  bool resolvedRead(Operation *operation) const {
+    return resolvedReads.contains(operation);
+  }
 
   std::optional<AffineExpr> displacement(Value memory, ValueRange indices,
                                         ArrayRef<int64_t> destinationStrides) {
@@ -134,7 +149,7 @@ private:
     if (auto constant = dyn_cast<AffineConstantExpr>(expression))
       return BoundedCoordinate{expression, constant.getValue(), constant.getValue()};
     if (auto symbol = dyn_cast<AffineSymbolExpr>(expression))
-      return values.lookup(symbols[symbol.getPosition()]);
+      return symbolBounds[symbol.getPosition()];
     auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
     if (!binary) return std::nullopt;
     auto lhs = materializedBounds(binary.getLHS()), rhs = materializedBounds(binary.getRHS());
@@ -156,6 +171,122 @@ private:
     return BoundedCoordinate{expression, 0, divisor.getValue() - 1};
   }
 
+  std::optional<BoundedCoordinate> project(
+      AffineExpr expression, ArrayRef<BoundedCoordinate> coordinates) {
+    if (auto dimension = dyn_cast<AffineDimExpr>(expression))
+      return coordinates[dimension.getPosition()];
+    if (auto constant = dyn_cast<AffineConstantExpr>(expression))
+      return BoundedCoordinate{expression, constant.getValue(), constant.getValue()};
+    auto binary = dyn_cast<AffineBinaryOpExpr>(expression);
+    if (!binary) return std::nullopt;
+    auto lhs = project(binary.getLHS(), coordinates);
+    auto rhs = project(binary.getRHS(), coordinates);
+    if (!lhs || !rhs) return std::nullopt;
+    if (expression.getKind() == AffineExprKind::Add) return add(*lhs, *rhs);
+    if (expression.getKind() == AffineExprKind::Mul) {
+      if (lhs->minimum == lhs->maximum) return multiply(*rhs, lhs->minimum);
+      if (rhs->minimum == rhs->maximum) return multiply(*lhs, rhs->minimum);
+    }
+    return std::nullopt;
+  }
+
+  bool pointwiseInput(Value memory, Operation *point) {
+    auto generic = dyn_cast<linalg::GenericOp>(point);
+    if (!generic || generic.getNumResults() || generic.getNumReductionLoops())
+      return false;
+    auto maps = generic.getIndexingMapsArray();
+    AffineMap outputMap;
+    for (auto [number, output] : llvm::enumerate(generic.getOutputs())) {
+      if (output != memory) continue;
+      if (outputMap) return false;
+      outputMap = maps[generic.getInputs().size() + number];
+    }
+    if (!outputMap || failed(fullOutputProjection(memory, outputMap))) return false;
+    bool reads = false;
+    for (auto [number, input] : llvm::enumerate(generic.getInputs())) {
+      if (input != memory) continue;
+      if (maps[number] != outputMap) return false;
+      reads = true;
+    }
+    // An in-place element formal observes its old element before that same
+    // iteration writes it. Explicit reads or a different map need a separate
+    // cross-iteration dependence proof and cannot use the preceding definition.
+    return reads && llvm::all_of(generic.getRegion().front().without_terminator(),
+        [](Operation &operation) {
+          return !operation.getNumRegions() && isMemoryEffectFree(&operation);
+        });
+  }
+
+  std::optional<BoundedCoordinate> read(
+      Value memory, ArrayRef<BoundedCoordinate> coordinates, Operation *point) {
+    auto allocation = memory.getDefiningOp<memref::AllocOp>();
+    if (!allocation) return std::nullopt;
+    auto lifetime = storage.lifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete ||
+        lifetime->aliases.values.size() != 1 || !lifetime->contains(point))
+      return std::nullopt;
+    Operation *consumer = allocation->getBlock()->findAncestorOpInBlock(*point);
+    if (!consumer) return std::nullopt;
+    Operation *writer = nullptr;
+    for (Operation *user : lifetime->aliases.users) {
+      if (user == lifetime->end || isa<memref::DimOp>(user)) continue;
+      auto effects = storage.effects(user);
+      if (!effects.complete || effects.ordered) return std::nullopt;
+      for (const StorageEffect &entry : effects.entries) {
+        if (isa<MemoryEffects::Read>(entry.effect.getEffect())) continue;
+        Value target = entry.effect.getValue();
+        if (target && storage.disjoint(target, memory)) continue;
+        if (!isa<MemoryEffects::Write>(entry.effect.getEffect()))
+          return std::nullopt;
+        Operation *owner = allocation->getBlock()->findAncestorOpInBlock(*user);
+        if (!owner) return std::nullopt;
+        // A later write does not change this observation. A write in the
+        // observing scope may change elements between its iterations.
+        if (owner == consumer) {
+          if (owner == point && pointwiseInput(memory, point)) continue;
+          return std::nullopt;
+        }
+        if (consumer->isBeforeInBlock(owner)) continue;
+        if (owner != user) return std::nullopt;
+        if (!writer || writer->isBeforeInBlock(owner)) writer = owner;
+      }
+    }
+    if (!writer) return std::nullopt;
+    if (auto fill = dyn_cast<linalg::FillOp>(writer)) {
+      if (fill.getNumResults() || fill.getOutputs().size() != 1 ||
+          fill.getOutputs().front() != memory) return std::nullopt;
+      return get(fill.getInputs().front());
+    }
+    auto producer = dyn_cast<linalg::GenericOp>(writer);
+    if (!producer || producer.getNumResults() || producer.getNumReductionLoops() ||
+        llvm::count(producer.getOutputs(), memory) != 1)
+      return std::nullopt;
+    auto output = llvm::find(producer.getOutputs(), memory);
+    if (output == producer.getOutputs().end()) return std::nullopt;
+    unsigned number = std::distance(producer.getOutputs().begin(), output);
+    auto maps = producer.getIndexingMapsArray();
+    auto inverse = fullOutputProjection(memory, maps[producer.getInputs().size() + number]);
+    if (failed(inverse)) return std::nullopt;
+    Block &body = producer.getRegion().front();
+    if (!body.getArgument(producer.getInputs().size() + number).use_empty())
+      return std::nullopt;
+    auto payload = analyzeProducerResult(producer, storage, number);
+    if (failed(payload)) return std::nullopt;
+    // This is an observation of the stored result, not motion of the producer's
+    // reads. Each input is interpreted at its original producer, before later
+    // overwrites; only the resulting pure coordinate expression is retained.
+    SmallVector<BoundedCoordinate> members;
+    for (AffineExpr expression : inverse->getResults()) {
+      auto member = project(expression, coordinates);
+      if (!member) return std::nullopt;
+      members.push_back(*member);
+    }
+    if (iterationCoordinates.contains(producer)) return std::nullopt;
+    iterationCoordinates[producer] = std::move(members);
+    auto leave = llvm::make_scope_exit([&] { iterationCoordinates.erase(producer); });
+    return get(body.getTerminator()->getOperand(number));
+  }
+
   std::optional<BoundedCoordinate> compute(Value value) {
     if (auto member = memberAxes.find(value); member != memberAxes.end())
       return withBounds(getAffineDimExpr(member->second, context), value);
@@ -163,9 +294,42 @@ private:
       return BoundedCoordinate{getAffineConstantExpr(*constant, context), *constant, *constant};
     if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) {
       auto input = get(cast.getIn());
-      return input ? withBounds(input->expression, value) : std::nullopt;
+      return input;
+    }
+    if (auto index = value.getDefiningOp<linalg::IndexOp>()) {
+      auto found = iterationCoordinates.find(index->getParentOp());
+      if (found != iterationCoordinates.end()) return found->second[index.getDim()];
+      return std::nullopt;
+    }
+    if (auto load = value.getDefiningOp<memref::LoadOp>()) {
+      SmallVector<BoundedCoordinate> coordinates;
+      for (Value index : load.getIndices()) {
+        auto coordinate = get(index);
+        if (!coordinate) return std::nullopt;
+        coordinates.push_back(*coordinate);
+      }
+      auto result = read(load.getMemref(), coordinates, load);
+      if (result) resolvedReads.insert(load);
+      return result;
     }
     if (auto argument = dyn_cast<BlockArgument>(value)) {
+      if (auto generic = dyn_cast<linalg::GenericOp>(argument.getOwner()->getParentOp())) {
+        auto found = iterationCoordinates.find(generic);
+        unsigned number = argument.getArgNumber();
+        if (found == iterationCoordinates.end() || number >= generic.getInputs().size())
+          return std::nullopt;
+        Value input = generic.getInputs()[number];
+        if (!isa<MemRefType>(input.getType())) return get(input);
+        AffineMap map = generic.getIndexingMapsArray()[number];
+        if (map.getNumSymbols()) return std::nullopt;
+        SmallVector<BoundedCoordinate> coordinates;
+        for (AffineExpr expression : map.getResults()) {
+          auto coordinate = project(expression, found->second);
+          if (!coordinate) return std::nullopt;
+          coordinates.push_back(*coordinate);
+        }
+        return read(input, coordinates, generic);
+      }
       bool induction = false;
       if (auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
           loop && argument == loop.getInductionVar()) {
@@ -174,9 +338,13 @@ private:
         induction = llvm::is_contained(parallel.getInductionVars(), value);
       }
       if (!induction) return std::nullopt;
-      auto expression = getAffineSymbolExpr(symbols.size(), context);
+      auto found = llvm::find(symbols, value);
+      if (found != symbols.end()) return symbolBounds[std::distance(symbols.begin(), found)];
+      auto result = withBounds(getAffineSymbolExpr(symbols.size(), context), value);
+      if (!result) return std::nullopt;
       symbols.push_back(value);
-      return withBounds(expression, value);
+      symbolBounds.push_back(*result);
+      return result;
     }
     Operation *operation = value.getDefiningOp();
     if (!operation || operation->getNumOperands() != 2) return std::nullopt;
@@ -185,30 +353,37 @@ private:
       auto left = get(lhs), right = get(rhs);
       auto checked = left && right
           ? add(*left, *right, isa<arith::SubIOp>(operation)) : std::nullopt;
-      return checked ? withBounds(checked->expression, value) : std::nullopt;
+      return checked;
     }
     if (isa<arith::MulIOp>(operation)) {
-      auto factor = getConstantIntValue(rhs);
-      if (!factor) { factor = getConstantIntValue(lhs); std::swap(lhs, rhs); }
-      auto input = factor ? get(lhs) : std::nullopt;
-      auto checked = input ? multiply(*input, *factor) : std::nullopt;
-      return checked ? withBounds(checked->expression, value) : std::nullopt;
+      auto left = get(lhs), right = get(rhs);
+      if (!left || !right) return std::nullopt;
+      if (left->minimum == left->maximum) return multiply(*right, left->minimum);
+      if (right->minimum == right->maximum) return multiply(*left, right->minimum);
+      return std::nullopt;
     }
     if (!isa<arith::FloorDivSIOp, arith::DivSIOp, arith::RemSIOp>(operation)) return std::nullopt;
-    auto divisor = getConstantIntValue(rhs);
-    auto input = get(lhs);
-    if (!divisor || *divisor <= 0 || !input) return std::nullopt;
+    auto divisor = get(rhs), input = get(lhs);
+    if (!divisor || divisor->minimum != divisor->maximum ||
+        divisor->minimum <= 0 || !input) return std::nullopt;
+    int64_t factor = divisor->minimum;
     if (!isa<arith::FloorDivSIOp>(operation) && input->minimum < 0) return std::nullopt;
     if (isa<arith::RemSIOp>(operation))
-      return withBounds(input->expression % *divisor, value);
-    return withBounds(input->expression.floorDiv(*divisor), value);
+      return BoundedCoordinate{input->expression % factor, 0, factor - 1};
+    return BoundedCoordinate{input->expression.floorDiv(factor),
+                             floorDivide(input->minimum, factor),
+                             floorDivide(input->maximum, factor)};
   }
 
   MLIRContext *context;
   SmallVector<int64_t> sizes;
   SmallVector<Value> symbols;
+  SmallVector<BoundedCoordinate> symbolBounds;
   llvm::DenseMap<Value, unsigned> memberAxes;
-  llvm::DenseMap<Value, std::optional<BoundedCoordinate>> values;
+  llvm::DenseSet<Value> active;
+  llvm::DenseSet<Operation *> resolvedReads;
+  llvm::DenseMap<Operation *, SmallVector<BoundedCoordinate>> iterationCoordinates;
+  StorageAnalysis &storage;
   IntegerRangeAnalysis ranges;
 };
 
@@ -250,7 +425,7 @@ Value contiguousView(Value source, MemRefType shape, ArrayRef<int64_t> strides,
 }
 
 bool foldRead(linalg::GenericOp producer, func::FuncOp function) {
-  if (producer.getNumResults() || !producer.getInputs().empty() || producer.getOutputs().size() != 1 ||
+  if (producer.getNumResults() || producer.getOutputs().size() != 1 ||
       producer.getNumReductionLoops() || !producer.getIndexingMapsArray().back().isIdentity()) return false;
   auto allocation = producer.getOutputs()[0].getDefiningOp<memref::AllocOp>();
   if (!allocation || allocation->getBlock() != producer->getBlock()) return false;
@@ -262,16 +437,17 @@ bool foldRead(linalg::GenericOp producer, func::FuncOp function) {
   if (!body.getArguments().back().use_empty()) return false;
   auto read = body.getTerminator()->getOperand(0).getDefiningOp<memref::LoadOp>();
   if (!read || read->getBlock() != &body) return false;
-  Coordinates coordinates(function.getContext(), allocation.getType().getShape());
-  for (Operation &operation : body.without_terminator()) {
-    if (auto index = dyn_cast<linalg::IndexOp>(operation)) coordinates.bind(index.getResult(), index.getDim());
-    else if (&operation != read && (!isMemoryEffectFree(&operation) || operation.getNumRegions())) return false;
-  }
+  if (failed(analyzeLinalgProducer(producer, storage))) return false;
+  Coordinates coordinates(function.getContext(), allocation.getType().getShape(), storage);
+  coordinates.bind(producer);
   auto sourceType = read.getMemRefType();
   if (sourceType.getElementType() != allocation.getType().getElementType() ||
       sourceType.getMemorySpace() != allocation.getType().getMemorySpace()) return false;
   auto displacement = coordinates.displacement(read.getMemref(), read.getIndices(), *strides);
   if (!displacement) return false;
+  for (Operation &operation : body.without_terminator())
+    if (&operation != read && !coordinates.resolvedRead(&operation) &&
+        (!isMemoryEffectFree(&operation) || operation.getNumRegions())) return false;
   DominanceInfo dominance(function);
   if (!dominance.dominates(read.getMemref(), allocation) ||
       llvm::any_of(coordinates.getSymbols(), [&](Value symbol) { return !dominance.dominates(symbol, allocation); })) return false;
@@ -317,15 +493,18 @@ bool composeWrite(memref::StoreOp store, func::FuncOp function) {
   }
   std::reverse(loops.begin(), loops.end());
   if (loops.size() != strides->size()) return false;
-  Coordinates coordinates(function.getContext(), allocation.getType().getShape());
+  Coordinates coordinates(function.getContext(), allocation.getType().getShape(), storage);
   for (auto [axis, loop] : llvm::enumerate(loops)) {
     if (getConstantIntValue(loop.getUpperBound()) != allocation.getType().getDimSize(axis) ||
         read.getIndices()[axis] != loop.getInductionVar()) return false;
     coordinates.bind(loop.getInductionVar(), axis);
   }
+  auto displacement = coordinates.displacement(store.getMemref(), store.getIndices(), *strides);
+  if (!displacement) return false;
   bool valid = true;
   root->walk([&](Operation *operation) {
-    if (operation == read || operation == store || isa<scf::ForOp, scf::YieldOp>(operation)) return;
+    if (operation == read || operation == store || coordinates.resolvedRead(operation) ||
+        isa<scf::ForOp, scf::YieldOp>(operation)) return;
     if (operation->getNumRegions() || !isMemoryEffectFree(operation)) valid = false;
   });
   auto destination = store.getMemRefType();
@@ -334,8 +513,6 @@ bool composeWrite(memref::StoreOp store, func::FuncOp function) {
   // memref.copy itself must preserve the scalar traversal before the separate
   // output-forwarding transform considers it. Overlapping ranges stay as loops.
   if (!storage.disjoint(allocation, store.getMemref())) return false;
-  auto displacement = coordinates.displacement(store.getMemref(), store.getIndices(), *strides);
-  if (!displacement) return false;
   DominanceInfo dominance(function);
   if (!dominance.dominates(store.getMemref(), allocation) ||
       llvm::any_of(coordinates.getSymbols(), [&](Value symbol) { return !dominance.dominates(symbol, allocation); })) return false;
