@@ -9,6 +9,7 @@ namespace intent::cpu {
 #define GEN_PASS_DEF_CPUBUFFERIZEVALUES
 #define GEN_PASS_DEF_CPUREUSEPRIVATESTORAGE
 #define GEN_PASS_DEF_CPUREUSESCRATCHSTORAGE
+#define GEN_PASS_DEF_CPUOPTIMIZEMEMORYACCESSES
 #include "Intent/Dialect/CPU/Transforms/Passes.h.inc"
 
 namespace {
@@ -47,6 +48,17 @@ public:
             [](func::FuncOp function) {
               return reuseScratchStorage(function, ScratchRepresentation::PreserveDescriptors);
             })))
+      signalPassFailure();
+  }
+};
+
+class OptimizeMemoryAccessesPass
+    : public impl::CPUOptimizeMemoryAccessesBase<OptimizeMemoryAccessesPass> {
+public:
+  using CPUOptimizeMemoryAccessesBase::CPUOptimizeMemoryAccessesBase;
+  void runOnOperation() final {
+    if (failed(detail::transformFunctions(getOperation(), getArgument(),
+                                          optimizeMemoryAccesses)))
       signalPassFailure();
   }
 };

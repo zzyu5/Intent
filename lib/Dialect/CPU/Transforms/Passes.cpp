@@ -78,6 +78,7 @@ void buildCPUPipeline(OpPassManager &manager,
   tasks.provider = options.provider;
   manager.addPass(createCPUPartitionTasks(tasks));
   manager.addPass(createCPUReuseScratchStorage());
+  manager.addPass(createCPUOptimizeMemoryAccesses());
   addNormalization(manager);
   manager.addPass(createCPUIsolateTasks());
 }

@@ -71,6 +71,7 @@ void registerWeftPasses() {
 void buildWeftPipeline(OpPassManager &manager) {
   manager.addPass(createWeftPrepareTaskViews());
   manager.addPass(cpu::createCPUReuseScratchStorage());
+  manager.addPass(cpu::createCPUOptimizeMemoryAccesses());
   manager.addPass(createWeftConvertProgram());
   manager.addPass(createWeftVerifyProgram());
 }

@@ -23,8 +23,6 @@ struct TraversalAccess {
   mlir::AffineMap indexingMap;
 };
 
-bool sameTraversalValue(mlir::Value first, mlir::Value second,
-                        const mlir::IRMapping &mapping);
 bool sameTraversalAddress(const TraversalAccess &first,
                           const TraversalAccess &second,
                           const mlir::IRMapping &mapping);
@@ -34,7 +32,6 @@ bool separatesIterations(const TraversalAccess &access,
                          const Traversal &traversal,
                          mlir::DominanceInfo &dominance);
 bool containedSubview(mlir::memref::SubViewOp view);
-bool reuseTraversalReads(mlir::func::FuncOp function);
 
 } // namespace intent::cpu::detail
 #endif

@@ -284,7 +284,8 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
   if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
   if (failed(expandAtomicUpdates(module))) return failure();
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-    if (failed(cpu::reuseScratchStorage(
+    if (failed(cpu::optimizeMemoryAccesses(function)) ||
+        failed(cpu::reuseScratchStorage(
             function, cpu::ScratchRepresentation::LinearCapacity))) return failure();
     promotePrivateScratch(function, capabilities.getPrivateBytes());
   }

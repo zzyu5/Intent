@@ -1,41 +1,24 @@
 #include "TraversalFusion.h"
+#include "../Storage/MemoryAccess.h"
 #include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
-#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
 namespace intent::cpu::detail {
 
-bool sameTraversalValue(Value first, Value second, const IRMapping &mapping) {
-  if (mapping.lookupOrDefault(first) == second) return true;
-  auto lhs = getConstantIntValue(first), rhs = getConstantIntValue(second);
-  if (lhs && rhs) return first.getType() == second.getType() && *lhs == *rhs;
-  auto firstResult = dyn_cast<OpResult>(first), secondResult = dyn_cast<OpResult>(second);
-  if (!firstResult || !secondResult || firstResult.getResultNumber() != secondResult.getResultNumber())
-    return false;
-  Operation *a = firstResult.getOwner(), *b = secondResult.getOwner();
-  if (a->getNumRegions() || b->getNumRegions() ||
-      !isMemoryEffectFree(a) || !isMemoryEffectFree(b)) return false;
-  return OperationEquivalence::isEquivalentTo(a, b,
-      [&](Value left, Value right) { return success(sameTraversalValue(left, right, mapping)); },
-      [](Value, Value) {}, OperationEquivalence::IgnoreLocations);
-}
-
 bool sameTraversalAddress(const TraversalAccess &first, const TraversalAccess &second,
                           const IRMapping &mapping) {
   if (first.indexed != second.indexed || first.indices.size() != second.indices.size() ||
-      !sameTraversalValue(first.memory, second.memory, mapping)) return false;
+      !sameMemoryValue(first.memory, second.memory, mapping)) return false;
   if (!first.indexed && (!first.indexingMap || !second.indexingMap ||
                          first.indexingMap != second.indexingMap)) return false;
   return llvm::all_of(llvm::zip(first.indices, second.indices), [&](auto pair) {
-    return sameTraversalValue(std::get<0>(pair), std::get<1>(pair), mapping);
+    return sameMemoryValue(std::get<0>(pair), std::get<1>(pair), mapping);
   });
 }
 
@@ -136,73 +119,6 @@ bool separatesIterations(const TraversalAccess &access, const Traversal &travers
     }
     memory = view.getSource();
   }
-  return false;
-}
-
-namespace {
-
-struct AvailableRead {
-  TraversalAccess access;
-  Value value;
-};
-
-// A block keeps only definitely executed values. Branch-local values are never
-// published to the parent scope, and an aliasing write invalidates cached reads.
-bool forwardOne(Block &block, SmallVector<AvailableRead> available,
-                StorageAnalysis &storage) {
-  IRMapping identity;
-  for (Operation &operation : block) {
-    if (auto load = dyn_cast<memref::LoadOp>(operation)) {
-      TraversalAccess access{load, load.getMemref(), llvm::to_vector(load.getIndices()), true, false};
-      auto found = llvm::find_if(llvm::reverse(available), [&](const AvailableRead &previous) {
-        return previous.value.getType() == load.getType() &&
-               sameTraversalAddress(previous.access, access, identity);
-      });
-      if (found != llvm::reverse(available).end()) {
-        load.getResult().replaceAllUsesWith(found->value);
-        load.erase();
-        return true;
-      }
-      available.push_back({std::move(access), load.getResult()});
-      continue;
-    }
-    auto effects = storage.effects(&operation);
-    if (!effects.complete || effects.ordered) {
-      available.clear();
-      continue;
-    }
-    for (Region &region : operation.getRegions()) {
-      for (Block &nested : region) {
-        SmallVector<AvailableRead> inherited;
-        // For loops, a write in a previous iteration can invalidate the incoming
-        // value. Branches execute at most once and retain their enclosing guard.
-        if (isa<scf::IfOp>(operation)) inherited = available;
-        else
-          for (const auto &entry : available)
-            if (storage.preserves(&operation, entry.access.memory)) inherited.push_back(entry);
-        if (forwardOne(nested, std::move(inherited), storage)) return true;
-      }
-    }
-    for (const StorageEffect &entry : effects.entries) {
-      if (!isa<MemoryEffects::Write, MemoryEffects::Free>(entry.effect.getEffect())) continue;
-      Value memory = entry.effect.getValue();
-      llvm::erase_if(available, [&](const AvailableRead &previous) {
-        return !memory || !storage.disjoint(memory, previous.access.memory);
-      });
-    }
-    if (auto store = dyn_cast<memref::StoreOp>(operation))
-      available.push_back({{store, store.getMemref(), llvm::to_vector(store.getIndices()), true, true},
-                           store.getValue()});
-  }
-  return false;
-}
-
-} // namespace
-
-bool reuseTraversalReads(func::FuncOp function) {
-  StorageAnalysis storage(function);
-  for (Block &block : function.getBody())
-    if (forwardOne(block, {}, storage)) return true;
   return false;
 }
 

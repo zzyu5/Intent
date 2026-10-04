@@ -32,6 +32,10 @@ add_mlir_library(MLIRIntentCPUTransforms
   Storage/Bufferization.cpp
   Storage/CollectiveBufferization.cpp
   Storage/FuseIntermediateBuffers.cpp
+  Storage/InvariantMemory.cpp
+  Storage/MemoryAccess.cpp
+  Storage/MemoryOptimization.cpp
+  Storage/MemoryValues.cpp
   Storage/Passes.cpp
   Storage/ReusePrivateStorage.cpp
   Storage/ScratchCapacity.cpp

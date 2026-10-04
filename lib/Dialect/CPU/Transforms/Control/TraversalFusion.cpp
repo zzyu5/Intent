@@ -187,9 +187,7 @@ LogicalResult fuseSharedTraversals(func::FuncOp function) {
   do {
     if (failed(foldPrivateAccessAliases(function))) return failure();
     changed = fuseOne(function);
-    bool forwarded = false;
-    while (detail::reuseTraversalReads(function)) forwarded = true;
-    changed |= forwarded;
+    changed |= reuseMemoryValues(function);
     if (changed) {
       IRRewriter rewriter(function.getContext());
       DominanceInfo dominance(function);

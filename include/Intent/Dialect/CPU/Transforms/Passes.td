@@ -158,6 +158,17 @@ def CPUReuseScratchStorage : CPUTransform<"intent-cpu-reuse-scratch-storage",
   }];
 }
 
+def CPUOptimizeMemoryAccesses : CPUTransform<"intent-cpu-optimize-memory-accesses",
+    "Reuse available memory values and place invariant CPU reads"> {
+  let description = [{
+    Requires and preserves the CPU Buffers contract. Forwards exact scalar and
+    vector memory values, removes overwritten stores, and places stable reads
+    outside serial loops while retaining conditional and zero-trip execution.
+    Uses current descriptors, aliases and effects without changing task owners,
+    public ABI or implementation selection.
+  }];
+}
+
 def CPUPrepareInputs : CPUTransform<"intent-cpu-prepare-inputs",
     "Share prepared input representations required by selected implementations"> {
   let description = [{
