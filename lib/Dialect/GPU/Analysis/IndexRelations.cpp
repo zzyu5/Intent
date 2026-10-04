@@ -313,6 +313,15 @@ bool IndexRelations::multipleOf(Value value, Value divisor) const {
     return false;
   if (same(value, divisor) || constant(value) == 0)
     return true;
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    auto loop = dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
+    // Keep the correlation between an induction variable and its actual step.
+    // Enumerating each step candidate independently loses this identity.
+    if (loop && argument == loop.getInductionVar() &&
+        loop.getStep() == divisor && constant(loop.getLowerBound()) == 0 &&
+        powerOfTwo(divisor))
+      return true;
+  }
   if (auto literal = constant(divisor))
     return multipleOf(value, *literal);
   auto parameter = queryParameter(divisor);

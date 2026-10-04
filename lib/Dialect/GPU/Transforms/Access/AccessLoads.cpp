@@ -1,11 +1,16 @@
 #include "AccessComposition.h"
 #include "../Value/ScopePlacement.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
@@ -173,7 +178,115 @@ FailureOr<bool> composeSelectLoad(SelectOp select) {
   return true;
 }
 
-FailureOr<bool> composeLoadGather(GatherOp gather) {
+namespace {
+
+bool hasFullSnapshotConsumer(Value value, Operation *anchor) {
+  auto kernel = anchor->getParentOfType<func::FuncOp>();
+  DominanceInfo dominance(kernel);
+  SmallVector<Value> pending{value};
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!visited.insert(current).second) continue;
+    for (Operation *user : current.getUsers()) {
+      if (user == anchor || anchor->isAncestor(user)) continue;
+      if (auto gather = dyn_cast<GatherOp>(user);
+          gather && gather.getSource() == current) continue;
+      if (isa<FragmentOpInterface>(user) && !user->getNumRegions()) {
+        // These values can disappear when all their consumers take sub-tiles.
+        llvm::append_range(pending, user->getResults());
+        continue;
+      }
+      if (llvm::any_of(user->getResultTypes(), [](Type type) {
+            return isa<FragmentType>(type);
+          }) && dominance.properlyDominates(user, anchor)) return true;
+    }
+  }
+  return false;
+}
+
+bool isAlignedSnapshotSlice(GatherOp gather) {
+  auto load = gather.getSource().getDefiningOp<LoadOp>();
+  auto source = dyn_cast<FragmentType>(gather.getSource().getType());
+  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
+  if (!load || !source || !result || source.getShape().empty() ||
+      source.getShape().size() != result.getShape().size() ||
+      source.getElementType() != result.getElementType() ||
+      source.getValidity() != result.getValidity() || source.getOwner() != result.getOwner() ||
+      gather.getCoordinates().size() != 1 || gather.getSourceAxes().size() != 1 ||
+      gather.getSourceAxes().front() != static_cast<int64_t>(source.getShape().size() - 1) ||
+      !hasFullSnapshotConsumer(load.getResult(), gather) || !canReplayReadAt(load, gather))
+    return false;
+  auto kernel = gather->getParentOfType<func::FuncOp>();
+  PhysicalProgramAnalysis analysis(kernel);
+  for (unsigned position = 0; position < source.getShape().size(); ++position) {
+    auto realization = analysis.axisRealization(load.getResult(), position);
+    if (!realization.isExact() || !realization.physicalized ||
+        realization.constructionScalarSeed) return false;
+  }
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities) return false;
+  auto footprint = minimumFragmentRegisterFootprint(
+      kernel, load.getResult(), capabilities.getRegistersPerUnit(),
+      FragmentFootprintScope::PhysicalShape);
+  // As in replay retention, this is an opportunity for a fitting candidate;
+  // the ordinary resource checks still own each final configuration's legality.
+  if (!footprint || *footprint >= capabilities.getRegistersPerUnit()) return false;
+  unsigned axis = source.getShape().size() - 1;
+  for (unsigned other = 0; other < axis; ++other)
+    if (source.getShape()[other] != result.getShape()[other] ||
+        source.getAxisMaps()[other] != result.getAxisMaps()[other]) return false;
+  Value coordinate = gather.getCoordinates().front();
+  auto coordinateType = dyn_cast<FragmentType>(coordinate.getType());
+  auto projection = queryAccessCoordinateAxes(cast<AccessOpInterface>(gather.getOperation()), 0);
+  if (!coordinateType || coordinateType.getShape().size() != 1 ||
+      !projection.isExact() || projection.targetToSource.size() != result.getShape().size())
+    return false;
+  for (auto [position, mapped] : llvm::enumerate(projection.targetToSource))
+    if (mapped != (position == axis ? std::optional<unsigned>(0) : std::nullopt)) return false;
+  while (auto reshape = coordinate.getDefiningOp<ReshapeOp>()) {
+    auto relations = queryFragmentOperandRelations(reshape);
+    auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
+    if (!input || input.getShape().size() != 1 || failed(relations) ||
+        !relations->front().preservesNonUnitAxes()) return false;
+    coordinate = reshape.getValue();
+  }
+  if (auto subtract = coordinate.getDefiningOp<BinaryOp>()) {
+    if (subtract.getOperatorKind() != BinaryOperator::Subtract) return false;
+    auto zero = dyn_cast_or_null<IntegerAttr>(
+        UniformValueAnalysis(describeUniformValue).evaluate(subtract.getRhs()));
+    if (!zero || !zero.getValue().isZero()) return false;
+    coordinate = subtract.getLhs();
+  }
+  auto range = coordinate.getDefiningOp<MakeRangeOp>();
+  return range && isUnitStepRange(range) &&
+      range.getResult().getType().getShape()[0] == result.getShape()[axis] &&
+      IndexRelations().multipleOf(range.getStart(), range.getExtent());
+}
+
+std::optional<bool> snapshotSliceFits(GatherOp gather) {
+  auto kernel = gather->getParentOfType<func::FuncOp>();
+  auto source = cast<FragmentType>(gather.getSource().getType());
+  auto result = cast<FragmentType>(gather.getResult().getType());
+  unsigned axis = source.getShape().size() - 1;
+  auto width = cast<PhysicalExprAttr>(result.getShape()[axis]);
+  auto capacity = cast<PhysicalExprAttr>(source.getShape()[axis]);
+  if (configurationExpressionAtMost(kernel, width, capacity)) return true;
+  if (configurationExpressionLessThan(kernel, capacity, width)) return false;
+  for (Operation *child = gather, *parent = child->getParentOp(); parent;
+       child = parent, parent = parent->getParentOp()) {
+    auto branch = dyn_cast<scf::IfOp>(parent);
+    if (!branch) continue;
+    auto comparison = branch.getCondition().getDefiningOp<CompareOp>();
+    if (comparison && comparison.getPredicate() == ComparePredicate::Le &&
+        queryLaunchExpression(comparison.getLhs()) == width &&
+        queryLaunchExpression(comparison.getRhs()) == capacity)
+      return child->getParentRegion() == &branch.getThenRegion();
+  }
+  return std::nullopt;
+}
+
+FailureOr<bool> composeLoadGatherImpl(GatherOp gather) {
   auto sourceType = dyn_cast<FragmentType>(gather.getSource().getType());
   Value loaded = gather.getSource();
   while (auto transpose = loaded.getDefiningOp<TransposeOp>()) {
@@ -494,6 +607,48 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
   gather.erase();
   if (sourceLoad->getBlock() && sourceLoad.getResult().use_empty())
     sourceLoad.erase();
+  return true;
+}
+
+} // namespace
+
+FailureOr<bool> composeLoadGather(GatherOp gather) {
+  if (!isAlignedSnapshotSlice(gather)) return composeLoadGatherImpl(gather);
+  auto fits = snapshotSliceFits(gather);
+  if (fits) return *fits ? FailureOr<bool>(false) : composeLoadGatherImpl(gather);
+
+  // The complete source is already required by another computation. Preserve
+  // that snapshot for aligned shrinking sub-tiles, without changing the load's
+  // mask/fill or extending its coverage. Coverage and tile parameters are bound
+  // at invocation; the alternative remains the original access composition.
+  OpBuilder builder(gather);
+  Location location = gather.getLoc();
+  auto source = cast<FragmentType>(gather.getSource().getType());
+  auto result = cast<FragmentType>(gather.getResult().getType());
+  unsigned axis = source.getShape().size() - 1;
+  auto width = builder.create<PhysicalExprOp>(location, builder.getIndexType(),
+      cast<PhysicalExprAttr>(result.getShape()[axis]));
+  auto capacity = builder.create<PhysicalExprOp>(location, builder.getIndexType(),
+      cast<PhysicalExprAttr>(source.getShape()[axis]));
+  auto condition = builder.create<CompareOp>(location, builder.getI1Type(), width,
+                                            capacity, ComparePredicate::Le);
+  auto choice = builder.create<scf::IfOp>(location, TypeRange{result}, condition, true);
+  OpBuilder retained = choice.getThenBodyBuilder();
+  auto selected = cast<GatherOp>(retained.clone(*gather.getOperation()));
+  retained.create<scf::YieldOp>(location, selected.getResult());
+  OpBuilder composed = choice.getElseBodyBuilder();
+  auto original = cast<GatherOp>(composed.clone(*gather.getOperation()));
+  composed.create<scf::YieldOp>(location, original.getResult());
+  auto changed = composeLoadGatherImpl(original);
+  if (failed(changed) || !*changed) {
+    choice.erase();
+    condition.erase();
+    capacity.erase();
+    width.erase();
+    return failed(changed) ? FailureOr<bool>(failure()) : composeLoadGatherImpl(gather);
+  }
+  gather.getResult().replaceAllUsesWith(choice.getResult(0));
+  gather.erase();
   return true;
 }
 
