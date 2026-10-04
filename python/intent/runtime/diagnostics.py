@@ -1,9 +1,9 @@
 """Observations from an existing provider invocation, never compilation policy."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from threading import Lock
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from .interface import PublicInterface, ViewParameter
 from .invocation import ViewFacts
@@ -137,25 +137,77 @@ class NativeObservation:
     caches: tuple[CacheObservation, ...] = ()
 
 
+class _ObservationSource:
+    """Materialize immutable invocation facts without revisiting execution."""
+
+    __slots__ = ("_factory", "_value")
+
+    def __init__(self, factory: Callable[[], NativeObservation]):
+        self._factory = factory
+        self._value: NativeObservation | None = None
+
+    def resolve(self) -> NativeObservation:
+        factory = self._factory
+        if factory is not None:
+            value = factory()
+            self._value = value
+            self._factory = None
+        return cast(NativeObservation, self._value)
+
+
+@dataclass(slots=True)
+class _DeferredObservation:
+    _source: _ObservationSource
+    stage: str
+    _replayed: bool = False
+    _value: NativeObservation | None = field(default=None, init=False)
+
+    def executed(self, stage: str, replayed: bool) -> _DeferredObservation:
+        # Repeated launch/benchmark transitions share one immutable source,
+        # rather than building a chain of pending snapshots.
+        return _DeferredObservation(self._source, stage, self._replayed or replayed)
+
+    def resolve(self) -> NativeObservation:
+        if self._value is None:
+            source = self._source.resolve()
+            caches = source.caches
+            if self._replayed:
+                caches = (*caches, _prepared_replay_observation())
+            self._value = replace(source, stage=self.stage, caches=caches)
+        return self._value
+
+
+def _prepared_replay_observation() -> CacheObservation:
+    return CacheObservation("prepared_call", "prepared_call", True, "Stored prepared invocation",
+                            "dispatch", "The selected invocation was reused; SDK cache behavior is separate")
+
+
+def resolve_observation(observed: NativeObservation | _DeferredObservation | None) -> NativeObservation | None:
+    return observed.resolve() if isinstance(observed, _DeferredObservation) else observed
+
+
 class ObservedCall:
     """Share a prepared call's latest snapshot with its owning runtime."""
 
-    _observation: NativeObservation | None = None
-    _replay_observation: NativeObservation | None = None
+    _observation: NativeObservation | _DeferredObservation | None = None
+    _replay_observation: NativeObservation | _DeferredObservation | None = None
     _executed = False
 
     @property
     def observation(self) -> NativeObservation | None:
         """Read the latest native snapshot without choosing, compiling or launching."""
-        return self._observation
+        return resolve_observation(self._observation)
 
-    def _record_observation(self, observed: NativeObservation | None) -> None:
+    def _record_observation(self, observed: NativeObservation | _DeferredObservation | None) -> None:
         self._observation = observed
         self.program._observation = observed
 
+    def _defer_observation(self, factory: Callable[[], NativeObservation], *, stage: str) -> None:
+        self._record_observation(_DeferredObservation(_ObservationSource(factory), stage))
+
     def _record_execution(self, stage: str, observed: NativeObservation | None = None,
                           *, replay: bool | None = None) -> None:
-        current = observed if observed is not None else self.observation
+        current = observed if observed is not None else self._observation
         reused = self._executed if replay is None else replay
         self._executed = True
         if not reused:
@@ -163,16 +215,21 @@ class ObservedCall:
         if current is None:
             self._record_observation(None)
             return
+
+        def dispatched(base, *, reused):
+            if isinstance(base, _DeferredObservation):
+                return base.executed(stage, reused)
+            caches = (*base.caches, _prepared_replay_observation()) if reused else base.caches
+            return replace(base, stage=stage, caches=caches)
+
         if reused:
             if self._replay_observation is None:
-                self._replay_observation = replace(current, stage=stage, caches=(*current.caches,
-                    CacheObservation("prepared_call", "prepared_call", True, "Stored prepared invocation",
-                                     "dispatch", "The selected invocation was reused; SDK cache behavior is separate")))
+                self._replay_observation = dispatched(current, reused=True)
             elif self._replay_observation.stage != stage:
-                self._replay_observation = replace(self._replay_observation, stage=stage)
+                self._replay_observation = dispatched(self._replay_observation, reused=False)
             current = self._replay_observation
         elif current.stage != stage:
-            current = replace(current, stage=stage)
+            current = dispatched(current, reused=False)
         self._record_observation(current)
 
 

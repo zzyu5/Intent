@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..artifact import ParameterRole, TuningConfiguration, TuningParameter
 from ..diagnostics import ConfigurationAssessment, RequirementEvaluation, bindings
@@ -17,6 +17,12 @@ class ConfigurationRequirement:
     limit: Expression | None
     activation: str | None
     message: str
+    _reference_keys: tuple[int | str, ...] = field(init=False, repr=False, compare=False)
+    _last_evaluation: tuple[tuple[int, ...], RequirementEvaluation] | None = field(
+        init=False, default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "_reference_keys", tuple(self.references))
 
     @classmethod
     def read(cls, entry: dict) -> ConfigurationRequirement:
@@ -51,6 +57,27 @@ class ConfigurationRequirement:
         return references if self.activation is None else references | {self.activation}
 
     def assess(self, values: Mapping[int | str, object]) -> RequirementEvaluation:
+        # Requirements are pure functions of these scalar facts. Keep only the
+        # most recent evaluation: tuning repeatedly launches one candidate, but
+        # another invocation may have different dimensions, aliases or coverage.
+        active = values.get(self.activation) if self.activation is not None else None
+        if type(active) is int and active == 0:
+            key = (0,)
+        else:
+            facts = tuple(values.get(name) for name in self._reference_keys)
+            if any(type(value) is not int for value in facts):
+                return self._assess(values)
+            key = (1, *facts)
+        previous = self._last_evaluation
+        if previous is not None and previous[0] == key:
+            return previous[1]
+        evaluation = self._assess(values)
+        # Publish key and result together; interleaved callers must never pair
+        # one invocation's facts with another invocation's evaluation.
+        object.__setattr__(self, "_last_evaluation", (key, evaluation))
+        return evaluation
+
+    def _assess(self, values: Mapping[int | str, object]) -> RequirementEvaluation:
         def result(status, usage=None, limit=None, detail=""):
             return RequirementEvaluation(self.kind, self.metric, self.predicate,
                                          self.message, status, usage, limit, detail)

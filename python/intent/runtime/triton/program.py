@@ -100,6 +100,7 @@ class TritonProgram:
         self._config_rows = {id(config): row for config, row in
                              zip(configs, self.configurations.rows, strict=True)}
         kernel = namespace[facts.kernel]
+        self._native_signature = kernel.signature
         # Native JIT invocation also covers the autotuner's one-config and
         # cached-winner paths, which do not call early_config_prune.
         kernel.add_pre_run_hook(self._validate_native_configuration)
@@ -130,18 +131,19 @@ class TritonProgram:
 
     def _descriptor_hook(self, entry):
         def bind(arguments):
-            from triton.tools.tensor_descriptor import TensorDescriptor
-
-            choice = self.facts.descriptor_choice
-            values = self._context(arguments)
-            if not arguments[choice.config]:
-                return values[entry.base]
-            return TensorDescriptor(values[entry.base],
-                                    shape=list(evaluate_shape(entry.shape, values)),
-                                    strides=list(evaluate_shape(entry.strides, values)),
-                                    block_shape=list(evaluate_shape(entry.block_shape, values)),
-                                    padding=entry.padding)
+            return self._descriptor(entry, self._context(arguments))
         return bind
+
+    def _descriptor(self, entry, values):
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        if not values[self.facts.descriptor_choice.config]:
+            return values[entry.base]
+        return TensorDescriptor(values[entry.base],
+                                shape=list(evaluate_shape(entry.shape, values)),
+                                strides=list(evaluate_shape(entry.strides, values)),
+                                block_shape=list(evaluate_shape(entry.block_shape, values)),
+                                padding=entry.padding)
 
     @staticmethod
     def _eligible(entry, values) -> bool:
@@ -196,6 +198,27 @@ class TritonProgram:
         arguments = tuple(self.interface.native_value(name, values) for name in self.facts.kernel_arguments)
         coverage = {name: values[name] for name in self.configurations.coverage_names}
         return values, arguments, coverage
+
+    def _bound_launch(self, compiled, arguments, coverage, configuration, grid):
+        named = dict(zip(self.facts.kernel_arguments, arguments, strict=True))
+        named.update(coverage)
+        named.update(configuration.all_kwargs())
+        if self.descriptors:
+            context = self._context(named)
+            for entry in self.descriptors:
+                named[entry.name] = self._descriptor(entry, context)
+        bound = self._native_signature.bind(**{
+            name: named[name] for name in self._native_signature.parameters if name in named
+        })
+        bound.apply_defaults()
+        native_arguments = tuple(bound.arguments.values())
+        selected_grid = tuple(grid(bound.arguments))
+        native_launch = compiled[selected_grid + (1,) * (3 - len(selected_grid))]
+
+        def execute():
+            native_launch(*native_arguments)
+
+        return execute
 
     def compile(self, invocation):
         import triton
@@ -303,7 +326,8 @@ class TritonProgram:
         compiled = invoke()
         # The native pre-run hook has checked this complete binding before
         # execution, including winners reconstructed by Triton's disk cache.
-        config = self._trial_configuration(self.kernel.best_config.all_kwargs())
+        selected = self.kernel.best_config
+        config = self._trial_configuration(selected.all_kwargs())
         history = recorder.snapshot()
         if history:
             # Triton's autotuner returns the median in milliseconds at index 0
@@ -323,7 +347,36 @@ class TritonProgram:
                                       CacheObservation("native_compilation", "sdk", None, "Triton JIT",
                                                        "native_dispatch",
                                                        "The returned compiled kernel does not identify a native compilation cache hit")))
-        return LaunchResult(invoke, compiled, details)
+        # A prepared invocation retains its arguments and metadata. Bind the
+        # selected SDK kernel once; fresh invocations still pass through tuning
+        # and the native hook, including single-config and cached-winner paths.
+        try:
+            native_launch = self._bound_launch(
+                compiled, arguments, coverage, selected, grid)
+        except Exception as error:
+            raise CompilationStageError("provider_invocation", str(error),
+                observation=replace(details, stage="failed")) from error
+
+        def execute_bound():
+            if self.facts.allocator:
+                triton.set_allocator(_descriptor_allocator)
+            native_launch()
+
+        def replay():
+            try:
+                if self.facts.allocator:
+                    copy_context().run(execute_bound)
+                else:
+                    execute_bound()
+            except CompilationStageError as error:
+                if error.observation is None:
+                    error.observation = replace(details, stage="failed")
+                raise
+            except Exception as error:
+                raise CompilationStageError("provider_invocation", str(error),
+                    observation=replace(details, stage="failed")) from error
+
+        return LaunchResult(replay, compiled, details)
 
     def tuning_configurations(self, invocation):
         return self.configurations.enumerate(invocation.values,

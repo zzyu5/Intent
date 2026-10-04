@@ -9,7 +9,7 @@ from ..language.dtypes import DType, dtype
 from .interface import AliasCheck, PublicInterface, ScalarParameter, ViewParameter
 from .invocation import ViewFacts, build_invocation_binders
 from .native_requirements import NativeRequirements
-from .diagnostics import ConfigurationAssessment, NativeObservation, invocation_arguments
+from .diagnostics import ConfigurationAssessment, NativeObservation, invocation_arguments, resolve_observation
 
 
 _CARRIERS = {"ptr": ctypes.c_void_p, "bool": ctypes.c_bool,
@@ -223,7 +223,7 @@ class NativePreparedRuntime:
     @property
     def observation(self) -> NativeObservation | None:
         """Latest native call snapshot; reading does not choose or execute a candidate."""
-        return self._observation
+        return resolve_observation(self._observation)
 
     def describe_arguments(self, bound: BoundArguments, device: str):
         return invocation_arguments(self.interface, bound.arguments, bound.views, device)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import os
 import statistics
 from threading import RLock
@@ -14,8 +14,10 @@ from ..interface import ViewParameter
 from ..invocation import ViewFacts, build_invocation_binders, invocation_result
 from ..native import NativeABI, NativePreparedRuntime
 from ..native_artifact import load_native_library
+from ..torch import torch_dtype
 from ..torch_views import allocate_output, check_abstract_relation, observe_view
-from ..diagnostics import CacheObservation, CandidateObservation, ObservedCall, bindings, observation
+from ..diagnostics import (CacheObservation, CandidateObservation, ObservedCall,
+                           bindings, invocation_arguments, observation)
 from intent.compiler.toolchain import CompilationStageError
 
 
@@ -62,8 +64,17 @@ class NativeCall(ObservedCall):
     native_arguments: tuple[object, ...]
     outputs: tuple[torch.Tensor, ...]
     key: tuple[object, ...]
-    description: tuple
+    _description_arguments: tuple
+    _description_views: tuple
     winner: int | None = None
+    _description: tuple | None = field(default=None, init=False, repr=False)
+
+    @property
+    def description(self) -> tuple:
+        if self._description is None:
+            self._description = invocation_arguments(
+                self.program.interface, self._description_arguments, self._description_views, "cpu")
+        return self._description
 
     def _native_failure(self, error: CompilationStageError) -> None:
         configuration = next((description for candidate, description in zip(
@@ -125,11 +136,26 @@ class NativeCall(ObservedCall):
                                                   elapsed_ms=elapsed)
                              for configuration, elapsed in zip(self.program.configuration_descriptions, timings, strict=True))
         self.winner = self.program.winners[self.key]
-        self._record_observation(observation("mojo", self.program.target, self.description,
-            self.program.configuration_descriptions[self.winner], (), observed, stage="selected",
-            history_unavailable="The process-local winner was reused; no candidates were retried" if reused else None,
-            caches=(*self.program.compilation_cache,
-                    CacheObservation("tuning", "process", reused, "Mojo NativeProgram.winners", "selection"))))
+        if reused:
+            interface, target = self.program.interface, self.program.target
+            arguments, views = self._description_arguments, self._description_views
+            configuration = self.program.configuration_descriptions[self.winner]
+            caches = self.program.compilation_cache
+
+            def selected_observation():
+                return observation("mojo", target,
+                    invocation_arguments(interface, arguments, views, "cpu"), configuration, (), (),
+                    stage="selected",
+                    history_unavailable="The process-local winner was reused; no candidates were retried",
+                    caches=(*caches, CacheObservation(
+                        "tuning", "process", True, "Mojo NativeProgram.winners", "selection")))
+
+            self._defer_observation(selected_observation, stage="selected")
+        else:
+            self._record_observation(observation("mojo", self.program.target, self.description,
+                self.program.configuration_descriptions[self.winner], (), observed, stage="selected",
+                caches=(*self.program.compilation_cache,
+                        CacheObservation("tuning", "process", False, "Mojo NativeProgram.winners", "selection"))))
         return self.winner
 
     def launch(self) -> None:
@@ -166,6 +192,9 @@ class NativeProgram(NativePreparedRuntime):
         self.functions = ()
         self.measurements = ()
         self.interface = abi.interface
+        self._device = torch.device("cpu")
+        self._view_dtypes = {parameter.position: torch_dtype(parameter.dtype)
+                             for parameter in self.interface.views}
         self.target = bindings({"family": "cpu", **{name: value for name, value in asdict(target.compilation).items()
                                                   if name != "provider"}})
         self.candidates = facts.candidates
@@ -207,6 +236,9 @@ class NativeProgram(NativePreparedRuntime):
             return self.compilation
 
     def ensure_loaded(self) -> None:
+        self._check_open()
+        if self._loaded_libraries:
+            return
         with self._lock:
             compilation = self.compile()
             if self._loaded_libraries:
@@ -251,30 +283,39 @@ class NativeProgram(NativePreparedRuntime):
             self.measurements = ()
 
     def _view(self, parameter: ViewParameter, tensor) -> ViewFacts:
-        facts = observe_view(parameter, tensor, device=torch.device("cpu"))
-        if tensor.numel() == 0:
+        facts = observe_view(parameter, tensor, device=self._device,
+                             expected_dtype=self._view_dtypes[parameter.position])
+        if 0 in facts.shape:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         return facts
 
     def _allocate_output(self, parameter: ViewParameter, shape: tuple[int, ...]) -> tuple[torch.Tensor, ViewFacts]:
-        tensor, facts = allocate_output(parameter, shape, device=torch.device("cpu"))
-        if tensor.numel() == 0:
+        tensor, facts = allocate_output(parameter, shape, device=self._device,
+                                        expected_dtype=self._view_dtypes[parameter.position])
+        if 0 in facts.shape:
             raise NotImplementedError("Mojo CPU empty-storage pointer ABI is not implemented")
         return tensor, facts
 
     def prepare(self, arguments: tuple[object, ...], *, explicit_outputs: bool = False) -> NativeCall:
         self._check_open()
         bound = self._binders[bool(explicit_outputs)](self, arguments)
+        # Invocation diagnostics need scalar values and already observed view
+        # facts, not tensor owners. A deferred program snapshot must not retain
+        # the invocation's potentially large input/output allocations.
+        description_arguments = tuple(value if facts is None else None
+                                      for value, facts in zip(bound.arguments, bound.views, strict=True))
         return NativeCall(self, bound.arguments, bound.native_arguments, bound.outputs, bound.key,
-                          self.describe_arguments(bound, "cpu"))
+                          description_arguments, bound.views)
 
     @staticmethod
     def _abstract_view(owner, parameter: ViewParameter, value) -> ViewFacts:
-        return observe_view(parameter, value, device=torch.device("cpu"), abstract=True)
+        return observe_view(parameter, value, device=owner._device, abstract=True,
+                            expected_dtype=owner._view_dtypes[parameter.position])
 
     @staticmethod
     def _abstract_output(owner, parameter: ViewParameter, shape: tuple):
-        return allocate_output(parameter, shape, device=torch.device("cpu"), abstract=True)
+        return allocate_output(parameter, shape, device=owner._device, abstract=True,
+                               expected_dtype=owner._view_dtypes[parameter.position])
 
     def infer_outputs(self, arguments: tuple):
         return self._infer(self, arguments).result()

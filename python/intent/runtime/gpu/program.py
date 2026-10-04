@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..artifact import CompiledArtifact
-from ..diagnostics import ConfigurationAssessment, NativeObservation, ObservedCall
+from ..diagnostics import ConfigurationAssessment, NativeObservation, ObservedCall, resolve_observation
 from intent.compiler.toolchain import CompilationStageError
 from ..source import load_python_source
 from .interface import BoundInvocation, GPUInterface
@@ -103,7 +103,7 @@ class GPUProgram:
 
     @property
     def observation(self) -> NativeObservation | None:
-        return self._observation
+        return resolve_observation(self._observation)
 
     def prepare(self, *arguments, outputs: tuple | None = None,
                 explicit_outputs: bool = False) -> PreparedCall:
