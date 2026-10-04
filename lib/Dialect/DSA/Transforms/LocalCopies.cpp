@@ -1,4 +1,4 @@
-#include "StoragePatterns.h"
+#include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/DSA/IR/MemoryEffects.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"

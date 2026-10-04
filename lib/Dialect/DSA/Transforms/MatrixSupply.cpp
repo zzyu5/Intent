@@ -1,5 +1,5 @@
 #include "PassSupport.h"
-#include "StoragePatterns.h"
+#include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
 #include "MatrixSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"

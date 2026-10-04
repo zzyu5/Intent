@@ -599,6 +599,8 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (bindBroadcastOperands(function) && failed(cleanup())) return failure();
   if (realizeRowBroadcasts(function, config) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();
+  while (propagateLocalTransposeSupply(function, config))
+    if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
   if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();

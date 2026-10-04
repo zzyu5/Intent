@@ -33,6 +33,7 @@ bool supportedScalarBinary(BinaryOperator kind);
 bool specializeZeroMatrixTiles(func::FuncOp function);
 bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool bindBroadcastOperands(func::FuncOp function);
+bool propagateLocalTransposeSupply(func::FuncOp function, dsa::ConfigurationAttr config);
 bool realizeAffineRanges(func::FuncOp function, dsa::ConfigurationAttr config);
 bool realizeFullWidthMasks(func::FuncOp function, dsa::ConfigurationAttr config);
 bool vectorizeIndexLoops(func::FuncOp function, dsa::ConfigurationAttr config);

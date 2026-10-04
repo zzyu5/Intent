@@ -1,7 +1,7 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
-#include "StoragePatterns.h"
+#include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"

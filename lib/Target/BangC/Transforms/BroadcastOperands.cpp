@@ -1,71 +1,10 @@
 #include "PassDetail.h"
-#include "Intent/Analysis/IntegerRanges.h"
-#include "mlir/IR/AffineExpr.h"
+#include "LocalSupplyRelations.h"
 
 using namespace mlir;
 
 namespace intent::bangc {
 namespace {
-
-// Normalize only defined signed index arithmetic. Standard affine expressions
-// retain correlations after a min/max arm is selected by current range facts.
-class BroadcastExtents {
-public:
-  explicit BroadcastExtents(func::FuncOp function) : function(function) {}
-
-  bool equal(Value value, int64_t expected) {
-    auto folded = dyn_cast<AffineConstantExpr>(simplifyAffineExpr(
-        expression(value), 0, symbols));
-    return folded && folded.getValue() == expected;
-  }
-
-private:
-  AffineExpr expression(Value value) {
-    if (auto found = expressions.find(value); found != expressions.end())
-      return found->second;
-    auto infer = [&]() -> AffineExpr {
-      auto bounds = integerInterval(value, function);
-      if (bounds && bounds->first == bounds->second)
-        return getAffineConstantExpr(bounds->first, function.getContext());
-      Operation *op = value.getDefiningOp();
-      if (!op || (!value.getType().isIndex() && !value.getType().isInteger(64)) ||
-          op->getNumOperands() != 2)
-        return getAffineSymbolExpr(symbols++, function.getContext());
-      Value lhs = op->getOperand(0), rhs = op->getOperand(1);
-      auto left = integerInterval(lhs, function);
-      auto right = integerInterval(rhs, function);
-      if (left && right) {
-        if (isa<arith::MinSIOp>(op)) {
-          if (left->second <= right->first) return expression(lhs);
-          if (right->second <= left->first) return expression(rhs);
-        }
-        if (isa<arith::MaxSIOp>(op)) {
-          if (left->first >= right->second) return expression(lhs);
-          if (right->first >= left->second) return expression(rhs);
-        }
-        std::optional<BinaryOperator> kind;
-        if (isa<arith::AddIOp>(op)) kind = BinaryOperator::Add;
-        if (isa<arith::SubIOp>(op)) kind = BinaryOperator::Subtract;
-        if (isa<arith::MulIOp>(op)) kind = BinaryOperator::Multiply;
-        if (kind && provesSignedNoWrap(*kind,
-                ConstantIntRanges::fromSigned(APInt(64, left->first), APInt(64, left->second)),
-                ConstantIntRanges::fromSigned(APInt(64, right->first), APInt(64, right->second)))) {
-          if (*kind == BinaryOperator::Add) return expression(lhs) + expression(rhs);
-          if (*kind == BinaryOperator::Subtract) return expression(lhs) - expression(rhs);
-          return expression(lhs) * expression(rhs);
-        }
-      }
-      return getAffineSymbolExpr(symbols++, function.getContext());
-    };
-    AffineExpr result = infer();
-    expressions[value] = result;
-    return result;
-  }
-
-  func::FuncOp function;
-  DenseMap<Value, AffineExpr> expressions;
-  unsigned symbols = 0;
-};
 
 enum class BroadcastAxis { Rows, Columns };
 
@@ -75,7 +14,7 @@ struct BroadcastOperand {
 };
 
 std::optional<BroadcastOperand> queryBroadcastOperand(dsa::BinaryOp binary,
-    dsa::StorageAnalysis &storage, BroadcastExtents &extents) {
+    dsa::StorageAnalysis &storage, LocalSupplyRelations &extents) {
   auto type = cast<MemRefType>(binary.getOutput().getType());
   if (!type.getLayout().isIdentity() || type.getDimSize(0) <= 1 ||
       binary.getRhs().getType() != type || binary.getScratch() ||
@@ -138,7 +77,7 @@ bool bindBroadcastOperands(func::FuncOp function) {
   bool changed = false;
   for (auto binary : binaries) {
     dsa::StorageAnalysis storage(function);
-    BroadcastExtents extents(function);
+    LocalSupplyRelations extents(function);
     auto broadcast = queryBroadcastOperand(binary, storage, extents);
     if (!broadcast) continue;
     Value source = broadcast->source;
