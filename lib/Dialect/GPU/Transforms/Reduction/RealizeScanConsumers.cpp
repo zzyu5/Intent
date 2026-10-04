@@ -1,8 +1,11 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
@@ -13,6 +16,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <functional>
@@ -27,6 +31,7 @@ struct ScanConsumerMatch {
   scf::ForOp loop;
   Value identity;
   SmallVector<MakeRangeOp> ranges;
+  SmallVector<GatherOp> terminals;
 };
 
 bool isScanProjection(CastOp cast) {
@@ -40,6 +45,22 @@ bool isScanProjection(CastOp cast) {
          source.getValidity() == result.getValidity();
 }
 
+bool isLastScanRead(GatherOp gather, Value stop) {
+  if (gather.getCoordinates().size() != 1 ||
+      gather.getSourceAxes() != ArrayRef<int64_t>{0} ||
+      !gather.getResult().getType().isIntOrIndexOrFloat())
+    return false;
+  Value coordinate = gather.getCoordinates().front();
+  auto value = IndexRelations().constant(coordinate);
+  auto end = IndexRelations().constant(stop);
+  if (value && end && *end > 0 && *value == *end - 1)
+    return true;
+  auto subtract = coordinate.getDefiningOp<BinaryOp>();
+  return subtract && subtract.getOperatorKind() == BinaryOperator::Subtract &&
+         samePhysicalScalarExpression(subtract.getLhs(), stop) &&
+         IndexRelations().constant(subtract.getRhs()) == 1;
+}
+
 std::optional<ScanConsumerMatch>
 matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
@@ -49,7 +70,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
   if (!type || type.getShape().size() != 1)
     return std::nullopt;
-  ScanConsumerMatch match{scan, {}, scan.getIdentities().front(), {}};
+  ScanConsumerMatch match{scan, {}, scan.getIdentities().front(), {}, {}};
   while (true) {
     if (auto splat = match.identity.getDefiningOp<SplatOp>())
       match.identity = splat.getValue();
@@ -59,6 +80,11 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
       break;
   }
   if (match.identity.getType() != type.getElementType())
+    return std::nullopt;
+  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
+  auto root = queryExactLogicalRange(ranges);
+  if (failed(root) || ranges.roots.empty() ||
+      !analysis.lockstepRanges(ranges.roots).isExact())
     return std::nullopt;
   SmallVector<Value> projections{scan.getResult(0)};
   llvm::DenseSet<Value> visitedProjections;
@@ -72,8 +98,14 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
         continue;
       }
     auto gather = dyn_cast<GatherOp>(user);
+    if (gather && gather.getSource() == projections[position] &&
+        isLastScanRead(gather, (*root).getLogicalStop())) {
+      match.terminals.push_back(gather);
+      continue;
+    }
     auto loop = user->getParentOfType<scf::ForOp>();
-    if (!gather || !loop || !loop->hasAttr(independentIterationAttr) ||
+    if (!gather || gather.getSource() != projections[position] ||
+        !loop || !loop->hasAttr(independentIterationAttr) ||
         loop.getNumRegionIterArgs() || gather->getBlock() != loop.getBody() ||
         loop->getBlock() != scan->getBlock() || !scan->isBeforeInBlock(loop) ||
         (match.loop && match.loop != loop) || gather.getCoordinates().size() != 1 ||
@@ -96,10 +128,12 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   if (!isConstant(match.loop.getLowerBound(), 0) ||
       !isConstant(match.loop.getStep(), 1))
     return std::nullopt;
-  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
-  if (failed(queryExactLogicalRange(ranges)) || ranges.roots.empty() ||
-      !analysis.lockstepRanges(ranges.roots).isExact())
-    return std::nullopt;
+  DominanceInfo dominance(scan->getParentOfType<func::FuncOp>());
+  for (GatherOp terminal : match.terminals) {
+    if (!scan.getInclusive() || match.loop->isAncestor(terminal) ||
+        !dominance.properlyDominates(match.loop, terminal))
+      return std::nullopt;
+  }
   match.ranges.assign(ranges.roots.begin(), ranges.roots.end());
   for (MakeRangeOp range : ranges.roots)
     if (!isConstant(range.getStart(), 0) ||
@@ -117,15 +151,32 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
     auto load = dyn_cast<LoadOp>(access);
     auto view =
         load ? dyn_cast<ViewType>(load.getResource().getType()) : ViewType();
-    if (!load || !view || view.getRank() != 1 ||
-        load.getCoordinates().size() != 1 ||
-        !llvm::is_contained(
-            ranges.roots,
-            load.getCoordinates().front().getDefiningOp<MakeRangeOp>()) ||
+    if (!load || !view ||
         !canReplayReadAt(load, match.loop) ||
-        !analysis.boundaryValidity(load, /*allowRangeGuards=*/true).isExact() ||
-        queryLaunchExpression(match.loop.getUpperBound()) !=
-            view.getLayout().getExtents()[0])
+        !analysis.boundaryValidity(load, /*allowRangeGuards=*/true).isExact())
+      return std::nullopt;
+    std::optional<unsigned> memberCoordinate;
+    for (auto [index, coordinate] : llvm::enumerate(load.getCoordinates())) {
+      auto fragment = dyn_cast<FragmentType>(coordinate.getType());
+      if (!fragment) {
+        if (!coordinate.getType().isIndex() ||
+            !match.loop.isDefinedOutsideOfLoop(coordinate))
+          return std::nullopt;
+        continue;
+      }
+      if (memberCoordinate || fragment.getShape().size() != 1 ||
+          !fragment.getElementType().isIndex())
+        return std::nullopt;
+      auto coordinates = analysis.axisRanges(coordinate, 0);
+      if (!coordinates.isExact() || coordinates.roots.empty() ||
+          !llvm::all_of(coordinates.roots, [&](MakeRangeOp root) {
+            return llvm::is_contained(ranges.roots, root);
+          }) || queryLaunchExpression(match.loop.getUpperBound()) !=
+                     view.getLayout().getExtents()[load.getSourceAxes()[index]])
+        return std::nullopt;
+      memberCoordinate = index;
+    }
+    if (!memberCoordinate)
       return std::nullopt;
     bool matched = false;
     for (Operation &operation : match.loop.getBody()->without_terminator()) {
@@ -133,9 +184,16 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
         break;
       auto reader = dyn_cast<LoadOp>(operation);
       if (reader && reader.getResource() == load.getResource() &&
-          reader.getCoordinates() == ValueRange{match.loop.getInductionVar()} &&
-          reader.getSourceAxes() == ArrayRef<int64_t>{0} &&
-          analysis.boundaryValidity(reader).isExact()) {
+          reader.getSourceAxes() == load.getSourceAxes() &&
+          reader.getCoordinates().size() == load.getCoordinates().size() &&
+          analysis.boundaryValidity(reader).isExact() &&
+          llvm::all_of(llvm::enumerate(load.getCoordinates()), [&](auto item) {
+            if (item.index() == *memberCoordinate)
+              return llvm::is_contained(ranges.roots,
+                         item.value().template getDefiningOp<MakeRangeOp>()) &&
+                     reader.getCoordinates()[item.index()] == match.loop.getInductionVar();
+            return samePhysicalScalarExpression(item.value(), reader.getCoordinates()[item.index()]);
+          })) {
         matched = true;
         break;
       }
@@ -176,6 +234,50 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   if (!safeSource(scan.getSources().front()))
     return std::nullopt;
   return match;
+}
+
+LogicalResult restoreReplayedReadBounds(OpBuilder &builder) {
+  SmallVector<LoadOp> reads;
+  for (Operation &operation : *builder.getInsertionBlock())
+    if (auto load = dyn_cast<LoadOp>(operation))
+      reads.push_back(load);
+  for (LoadOp load : reads) {
+    auto type = dyn_cast<FragmentType>(load.getType());
+    if (!type || !isa<ViewType>(load.getResource().getType()))
+      return failure();
+    OpBuilder at(load);
+    Value valid = load.getValid();
+    for (auto [axis, coordinate] :
+         llvm::zip(load.getSourceAxes(), load.getCoordinates())) {
+      Value zero = at.create<arith::ConstantIndexOp>(load.getLoc(), 0);
+      Value extent = at.create<DimOp>(load.getLoc(), at.getIndexType(),
+                                     load.getResource(), axis);
+      Type predicateType = at.getI1Type();
+      if (auto fragment = dyn_cast<FragmentType>(coordinate.getType())) {
+        auto projectedZero = projectPhysicalValueToSchema(at, load.getLoc(), zero, fragment);
+        auto projectedExtent = projectPhysicalValueToSchema(at, load.getLoc(), extent, fragment);
+        if (failed(projectedZero) || failed(projectedExtent))
+          return failure();
+        zero = *projectedZero;
+        extent = *projectedExtent;
+        predicateType = FragmentType::get(
+            load.getContext(), at.getI1Type(), fragment.getShape(),
+            fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+      }
+      Value lower = at.create<CompareOp>(load.getLoc(), predicateType,
+                                        coordinate, zero, ComparePredicate::Ge);
+      Value upper = at.create<CompareOp>(load.getLoc(), predicateType,
+                                        coordinate, extent, ComparePredicate::Lt);
+      Value bounds = at.create<BinaryOp>(load.getLoc(), predicateType,
+                                        lower, upper, BinaryOperator::LogicalAnd);
+      auto bounded = materializeValidityConjunction(at, load.getLoc(), valid, bounds, type);
+      if (failed(bounded))
+        return failure();
+      valid = *bounded;
+    }
+    load.getValidMutable().assign(valid);
+  }
+  return success();
 }
 
 FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
@@ -219,7 +321,7 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
   };
   OpBuilder builder(match.loop);
   bool failedBody = false;
-  createTraversalLoop(
+  auto traversal = createTraversalLoop(
       builder, scan.getLoc(), match.loop.getLowerBound(), match.loop.getUpperBound(), chunk,
       ValueRange{match.identity},
       [&](OpBuilder &nested, Location location, Value offset, ValueRange carry) {
@@ -238,9 +340,15 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
                      ? value
                      : Value(nested.create<BroadcastOp>(location, target, value));
         };
-        Value tail = nested.create<CompareOp>(
+        Value upperTail = nested.create<CompareOp>(
             location, fragment(nested.getI1Type()), range,
             lift(match.loop.getUpperBound()), ComparePredicate::Lt);
+        Value lowerTail = nested.create<CompareOp>(
+            location, fragment(nested.getI1Type()), range,
+            lift(match.loop.getLowerBound()), ComparePredicate::Ge);
+        Value tail = nested.create<BinaryOp>(
+            location, fragment(nested.getI1Type()), lowerTail, upperTail,
+            BinaryOperator::LogicalAnd);
         Value identity = lift(match.identity);
         IRMapping replay;
         replay.map(scan.getIdentities().front(), identity);
@@ -257,6 +365,14 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
             nested, location, scan.getSources().front(), source, extent, replay,
             match.loop, options);
         if (failed(replayed)) {
+          failedBody = true;
+          return;
+        }
+        // Original full-domain bounds may have been simplified before replay.
+        // Re-establish them on each actual selected resource axis, without
+        // replacing clamped coordinates or changing the original load fill.
+        // matchScanConsumer proved these reads valid over every original member.
+        if (failed(restoreReplayedReadBounds(nested))) {
           failedBody = true;
           return;
         }
@@ -374,6 +490,34 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
       });
   if (failedBody)
     return failure();
+  for (GatherOp terminal : match.terminals) {
+    OpBuilder at(terminal);
+    Value result = traversal.getResult(0);
+    SmallVector<CastOp> projections;
+    for (Value source = terminal.getSource(); source != scan.getResult(0);) {
+      auto cast = source.getDefiningOp<CastOp>();
+      projections.push_back(cast);
+      source = cast.getValue();
+    }
+    for (CastOp projection : llvm::reverse(projections)) {
+      IRMapping mapping;
+      mapping.map(projection.getValue(), result);
+      auto cast = cloneWithSchema(at, projection, mapping,
+          TypeRange{mlir::cast<FragmentType>(projection.getType()).getElementType()});
+      if (failed(cast))
+        return failure();
+      result = cast->front();
+    }
+    if (terminal.getValid()) {
+      Value fill = terminal.getFill();
+      if (!fill)
+        fill = at.create<arith::ConstantOp>(terminal.getLoc(), at.getZeroAttr(result.getType()));
+      result = at.create<SelectOp>(terminal.getLoc(), result.getType(),
+                                  terminal.getValid(), result, fill);
+    }
+    terminal.getResult().replaceAllUsesWith(result);
+    terminal.erase();
+  }
   match.loop.erase();
   eraseDeadPhysicalValues(kernel);
   return chunk;
@@ -387,6 +531,10 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       !isProgramAllocationContext(scan, kernel) ||
       !type || type.getShape().size() != 1)
     return false;
+  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
+  FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
+  if (failed(root))
+    return false;
   SmallVector<GatherOp> readers;
   SmallVector<StoreOp> stores;
   llvm::SmallPtrSet<Operation *, 8> pointwiseUsers;
@@ -399,23 +547,25 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
       stores.push_back(store);
       continue;
     }
+    if (auto gather = dyn_cast<GatherOp>(user)) {
+      if (gather.getSource() != scan.getResult(0) ||
+          gather.getCoordinates().size() != 1 ||
+          gather.getSourceAxes() != ArrayRef<int64_t>{0})
+        return false;
+      // Keep genuine terminal reads on the scan until its complete traversal
+      // supplies the final carry. Other indexed reads need the stored prefix.
+      if (!scan.getInclusive() || !isLastScanRead(gather, (*root).getLogicalStop()))
+        readers.push_back(gather);
+      continue;
+    }
     if (user->getBlock() == scan->getBlock() && scan->isBeforeInBlock(user) &&
         canPredicateValueOperation(user)) {
       pointwiseUsers.insert(user);
       continue;
     }
-    auto gather = dyn_cast<GatherOp>(user);
-    if (!gather || gather.getSource() != scan.getResult(0) ||
-        gather.getCoordinates().size() != 1 ||
-        gather.getSourceAxes() != ArrayRef<int64_t>{0})
-      return false;
-    readers.push_back(gather);
+    return false;
   }
   if (readers.empty() && stores.empty() && pointwiseUsers.empty())
-    return false;
-  PhysicalRangeFact ranges = analysis.axisRanges(scan.getSources().front(), 0);
-  FailureOr<MakeRangeOp> root = queryExactLogicalRange(ranges);
-  if (failed(root))
     return false;
   for (MakeRangeOp range : ranges.roots) {
     auto begin = queryLaunchExpression(range.getStart());
@@ -542,8 +692,14 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
         outputRange.getSourceId(), outputRange.getSourceAxis(), outputRange.getDerived());
     Value end = builder.create<BroadcastOp>(
         location, fragment(builder.getIndexType()), outputRange.getLogicalStop());
-    Value valid = builder.create<CompareOp>(
+    Value upper = builder.create<CompareOp>(
         location, fragment(builder.getI1Type()), coordinate, end, ComparePredicate::Lt);
+    Value first = builder.create<BroadcastOp>(
+        location, fragment(builder.getIndexType()), begin);
+    Value lower = builder.create<CompareOp>(
+        location, fragment(builder.getI1Type()), coordinate, first, ComparePredicate::Ge);
+    Value valid = builder.create<BinaryOp>(
+        location, fragment(builder.getI1Type()), lower, upper, BinaryOperator::LogicalAnd);
     auto outputType = fragment(element);
     auto fill = materializeZeroFragment(builder, location, outputType);
     if (failed(fill))

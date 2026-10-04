@@ -1,6 +1,10 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
@@ -9,7 +13,11 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+
+#include <functional>
 
 using namespace mlir;
 
@@ -115,11 +123,55 @@ bool isOutsideIterationRange(Value coordinate, scf::ForOp loop) {
   return false;
 }
 
+bool isUnitIterationCoordinate(Value coordinate, scf::ForOp loop) {
+  // The shared difference query describes modular arithmetic. Address slices
+  // additionally require each arithmetic step to preserve signed coordinates.
+  llvm::DenseMap<Value, IntegerDifference> differences;
+  llvm::DenseSet<Value> active;
+  std::function<IntegerDifference(Value)> difference = [&](Value value) -> IntegerDifference {
+    if (value == loop.getInductionVar())
+      return 1;
+    if (loop.isDefinedOutsideOfLoop(value))
+      return 0;
+    auto known = differences.find(value);
+    if (known != differences.end())
+      return known->second;
+    if (!value.getType().isIndex() || !active.insert(value).second)
+      return std::nullopt;
+    Operation *producer = value.getDefiningOp();
+    IntegerDifference result;
+    if (producer && !producer->getNumRegions() && isMemoryEffectFree(producer)) {
+      UniformExpression expression = describeUniformValue(value);
+      bool preservesInteger = true;
+      if (expression.kind == UniformKind::Add ||
+          expression.kind == UniformKind::Subtract ||
+          expression.kind == UniformKind::Multiply)
+        preservesInteger = integerOperationDoesNotWrap(value);
+      if (expression.kind == UniformKind::Cast)
+        preservesInteger = expression.operands.size() == 1 &&
+            isValuePreservingIntegerCast(expression.operands.front(), value.getType());
+      if (preservesInteger)
+        result = foldIntegerDifference(
+            expression, difference,
+            [](Value operand) { return IndexRelations().constant(operand); }, 64);
+    }
+    active.erase(value);
+    differences[value] = result;
+    return result;
+  };
+  return coordinate.getType().isIndex() &&
+         difference(coordinate) == IntegerDifference(1);
+}
+
 bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
                            SmallVectorImpl<Value> &guardedViews,
                            SmallVectorImpl<std::pair<Value, Value>> &disjointViews,
                            llvm::DenseMap<Value, bool> &varying) {
-  llvm::DenseMap<Value, unsigned> writtenAxes;
+  struct WrittenSlice {
+    unsigned axis;
+    Value coordinate;
+  };
+  llvm::DenseMap<Value, WrittenSlice> writtenAxes;
   bool independent = true;
   loop.walk([&](StoreOp store) {
     auto buffer = store.getResource().getDefiningOp<BufferOp>();
@@ -137,20 +189,26 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
     if (view && !llvm::is_contained(guardedViews, store.getResource()))
       guardedViews.push_back(store.getResource());
     std::optional<unsigned> selected;
+    Value selectedCoordinate;
     for (auto [axis, coordinate] :
          llvm::zip(store.getSourceAxes(), store.getCoordinates())) {
-      if (coordinate == loop.getInductionVar() && !selected)
+      if (!selected && isUnitIterationCoordinate(coordinate, loop)) {
         selected = axis;
-      else if (variesWithIteration(coordinate, loop, varying))
+        selectedCoordinate = coordinate;
+      } else if (variesWithIteration(coordinate, loop, varying))
         independent = false;
     }
     if (!selected) {
       independent = false;
       return;
     }
-    auto [previous, inserted] =
-        writtenAxes.try_emplace(store.getResource(), *selected);
-    independent &= inserted || previous->second == *selected;
+    auto [previous, inserted] = writtenAxes.try_emplace(
+        store.getResource(), WrittenSlice{*selected, selectedCoordinate});
+    // Two translated writers of the same resource must still own the same
+    // per-iteration slice; i and i+1 would introduce a loop-carried dependence.
+    independent &= inserted ||
+        (previous->second.axis == *selected &&
+         samePhysicalScalarExpression(previous->second.coordinate, selectedCoordinate));
   });
   if (!independent || writtenAxes.empty())
     return false;
@@ -190,9 +248,11 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
     bool independentRead = false;
     for (auto [axis, coordinate] :
          llvm::zip(load.getSourceAxes(), load.getCoordinates()))
-      if (axis == written->second)
-        independentRead = coordinate == loop.getInductionVar() ||
-                          isOutsideIterationRange(coordinate, loop);
+      if (axis == written->second.axis)
+        independentRead =
+            samePhysicalScalarExpression(coordinate, written->second.coordinate) ||
+            (written->second.coordinate == loop.getInductionVar() &&
+             isOutsideIterationRange(coordinate, loop));
     independent &= independentRead;
   });
   return independent;

@@ -231,11 +231,13 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
         safeIndex = safe->first;
         valid = safe->second;
       } else {
-        FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinate.getType());
-        if (failed(zero))
-          return gather.emitOpError("scalar gather coordinate has no integral zero");
-        safeIndex = builder.create<gpu::SelectOp>(
-            gather.getLoc(), coordinate.getType(), valid, coordinate, *zero);
+        auto safe = safeGatherIndex(
+            builder, location, coordinate,
+            cast<gpu::PhysicalExprAttr>(source.getShape()[0]), valid);
+        if (failed(safe))
+          return gather.emitOpError("scalar gather coordinate has no safe physical index projection");
+        safeIndex = safe->first;
+        valid = safe->second;
       }
       Type loadedType = gather.getResult().getType();
       if (result && result.getShape().size() > 1) {
