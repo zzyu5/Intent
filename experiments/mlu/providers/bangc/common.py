@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 
@@ -76,7 +77,7 @@ class RemoteSequence:
         report_stage("adapter_preparation")
         return outputs
 
-    def comparison(self, outputs, reference, tolerance):
+    def comparison(self, outputs, reference, tolerance, *, source=None):
         host = os.environ["INTENT_BANGC_HOST"]
         remote_root = os.environ["INTENT_BANGC_ROOT"]
         python = os.environ["INTENT_BANGC_PYTHON"]
@@ -119,6 +120,10 @@ class RemoteSequence:
             return index
 
         output_tree = _tree(output_spec, outputs)
+        if source is not None:
+            operation, tensor = source
+            manifest["source"] = {"operation": operation, "input": describe(tensor)}
+            shutil.copytree(self.context.project_root / "experiments/mlu/baselines/cnnl", path / "source")
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
         report_stage("source_launch")
         expected = _tree(lambda value: value.detach().cpu(), reference())
@@ -134,11 +139,15 @@ class RemoteSequence:
         execute(["scp", "-q", "-r", str(path), host + ":" + remote_root.rstrip("/") + "/cases/"], "remote_preparation")
 
         def measure():
-            command = ["env", "PYTHONPATH=" + remote_root.rstrip("/") + "/python", python,
-                "-m", "intent.runtime.bangc.benchmark", remote + "/manifest.json",
+            environment = ["env", "PYTHONPATH=" + remote_root.rstrip("/") + "/python", python]
+            arguments = [remote + "/manifest.json",
                 "--outputs", remote + "/outputs", "--device", str(self.context.target.device),
                 "--neuware", str(self.context.target.neuware)]
+            command = [*environment, "-m", "intent.runtime.bangc.benchmark", *arguments]
             execute(["ssh", host, shlex.join(command)], "generated_launch")
+            if source is not None:
+                command = [*environment, remote + "/source/runtime.py", *arguments]
+                execute(["ssh", host, shlex.join(command)], "source_native_execution")
             execute(["scp", "-q", "-r", host + ":" + remote + "/outputs", str(path)], "generated_result")
             measured = json.loads((path / "outputs/result.json").read_text())
             owners = {}
@@ -148,9 +157,20 @@ class RemoteSequence:
             tensors = [owners[item["buffer"]].as_strided(tuple(item["shape"]), tuple(item["strides"]), item["offset"])
                        for item in measured["outputs"]]
             generated = _tree(lambda index: tensors[index], output_tree)
+            if source is not None:
+                source_result = json.loads((path / "outputs/source-result.json").read_text())
+                specification = source_result["source_output"]
+                native = torch.frombuffer(bytearray((path / "outputs" / specification["file"]).read_bytes()),
+                    dtype=TORCH_DTYPES[specification["dtype"]]).reshape(specification["shape"])
+                return NativeComparisonResult(measured["generated_ms"], source_result["source_ms"],
+                    (generated, native), (expected, expected))
             return NativeComparisonResult(measured["generated_ms"], None, generated, expected)
 
-        return PreparedComparison(None, None, tolerance, cuda_graph=False, device_type="cpu",
+        return PreparedComparison(None, None, (tolerance, tolerance) if source is not None else tolerance,
+            cuda_graph=False, device_type="cpu",
             native_comparison=measure,
             note="MLU CNRT notifier timing; supplied tensor shapes and element strides specialize the compiled variant; "
-                 "original native source is a numerical reference; no cross-device latency ratio")
+                 + (f"CNNL same-device {source[0]} source; both results checked against the original numerical reference; "
+                    + ("accurate last-axis softmax; " if source[0] == "softmax" else "NaN-propagating ReLU; ") +
+                    "descriptor setup and host transfers excluded" if source is not None else
+                    "original native source is a numerical reference; no cross-device latency ratio"))
