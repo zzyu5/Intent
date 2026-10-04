@@ -252,6 +252,12 @@ void registerValueBufferizationInterfaces(DialectRegistry &registry) {
     registerHelperReturns<YieldOp, SliceReduceYieldOp, ScanYieldOp,
                           RegionYieldOp>(context);
   });
+  registry.addExtension(+[](MLIRContext *context, memref::MemRefDialect *) {
+    // The atomic update region exchanges only scalars. Its destination remains
+    // borrowed by the update; the scalar yield transfers no buffer ownership.
+    registerHelperOwnership<memref::GenericAtomicRMWOp>(context);
+    registerHelperReturns<memref::AtomicYieldOp>(context);
+  });
 }
 
 LogicalResult bufferizeValues(ModuleOp module) {
