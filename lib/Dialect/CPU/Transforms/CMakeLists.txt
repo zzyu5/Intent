@@ -48,6 +48,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Structure/IntegerSources.cpp
   Structure/ProducerReplay.cpp
   Structure/ProducerReuse.cpp
+  Structure/ProducerVersions.cpp
   Structure/MaterializeStructuredComputations.cpp
   Structure/Passes.cpp
 

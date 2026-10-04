@@ -1,6 +1,8 @@
 #include "ProducerReuse.h"
 #include "Intent/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
+#include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -256,13 +258,82 @@ bool isNonRepeatingProjection(AffineMap coordinates,
   return true;
 }
 
+namespace {
+
+// Reconstruct a stored representation from one no-wider element read. This is
+// a traffic heuristic, not zero work: conversion executes in each consumer,
+// while the removed version no longer writes or reads its wider materialization.
+// Numeric computation, packed-format decoding and multi-source payloads do not
+// qualify. In particular, float8 conversion is not assumed to be a cheap cast.
+bool replacesConvertedLoad(const ProducerReplay &payload, Value result,
+                           AffineMap coordinates) {
+  auto bytes = [](Type type) -> unsigned {
+    if (type.isIndex()) return 8;
+    if (auto integer = dyn_cast<IntegerType>(type)) {
+      unsigned width = integer.getWidth();
+      return width == 1 || width == 8 || width == 16 || width == 32 || width == 64
+          ? (width + 7) / 8 : 0;
+    }
+    if (type.isF16() || type.isBF16()) return 2;
+    if (type.isF32()) return 4;
+    if (type.isF64()) return 8;
+    return 0;
+  };
+  unsigned resultBytes = bytes(result.getType());
+  if (!resultBytes) return false;
+  Value source = result;
+  while (!isLoadReplacement(payload, source)) {
+    Operation *conversion = source.getDefiningOp();
+    if (!conversion || !llvm::is_contained(payload.nodes, conversion) ||
+        conversion->getNumOperands() != 1 || conversion->getNumResults() != 1 ||
+        !bytes(conversion->getOperand(0).getType()) ||
+        !bytes(conversion->getResult(0).getType()) ||
+        !isa<arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp,
+             arith::IndexCastOp, arith::IndexCastUIOp, arith::BitcastOp>(conversion) ||
+        !isMemoryEffectFree(conversion) || !isSpeculatable(conversion))
+      return false;
+    source = conversion->getOperand(0);
+  }
+  unsigned sourceBytes = bytes(source.getType());
+  if (source == result || !sourceBytes || sourceBytes > resultBytes) return false;
+  if (payload.reads.empty()) return true;
+  // A stored representation also buys known dense addressing. Removing it must
+  // not add dynamic-stride versioning or turn a contiguous consumer into a
+  // permuted/strided traversal just because its source element occupies less.
+  auto producer = dyn_cast<linalg::GenericOp>(payload.scope);
+  auto formal = dyn_cast<BlockArgument>(source);
+  if (!producer || !formal || formal.getOwner() != &producer.getRegion().front() ||
+      formal.getArgNumber() >= producer.getInputs().size() ||
+      producer.getOutputs().size() != 1) return false;
+  Value input = producer.getInputs()[formal.getArgNumber()];
+  if (payload.reads.size() != 1 || payload.reads.front() != input ||
+      !isContiguousDescriptor(input)) return false;
+  auto addressAxes = [&](Value memory, AffineMap map) {
+    SmallVector<AffineExpr> axes;
+    for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
+      auto extent = queryExtentValue(memory, axis);
+      if (extent && getConstantIntValue(*extent) == 1) continue;
+      axes.push_back(expression);
+    }
+    return AffineMap::get(map.getNumDims(), map.getNumSymbols(), axes,
+                          map.getContext()).compose(coordinates);
+  };
+  auto maps = producer.getIndexingMapsArray();
+  return addressAxes(input, maps[formal.getArgNumber()]) ==
+         addressAxes(producer.getOutputs()[0], maps.back());
+}
+
+} // namespace
+
 bool shouldFuseProducerResult(const ProducerReplay &payload, Value result,
                               AffineMap coordinates,
                               ArrayRef<int64_t> iterationExtents,
-                              bool removesProducer) {
+                              bool removesProducer,
+                              unsigned consumerTraversals) {
   return isLoadReplacement(payload, result) ||
          isRebuildableCoordinate(payload, result) ||
-         (removesProducer && isNonRepeatingProjection(coordinates, iterationExtents));
+         (removesProducer && isNonRepeatingProjection(coordinates, iterationExtents) &&
+          (consumerTraversals == 1 || replacesConvertedLoad(payload, result, coordinates)));
 }
 
 FailureOr<SmallVector<ProducerReplayGroup>> groupProducerReplays(

@@ -23,10 +23,14 @@ mlir::FailureOr<mlir::AffineMap>
 fullOutputProjection(mlir::Value output, mlir::AffineMap outputMap);
 bool isNonRepeatingProjection(mlir::AffineMap coordinates,
                               llvm::ArrayRef<int64_t> iterationExtents);
+// A complete-version rewrite supplies its actual number of consumer traversals.
+// Repeating data computation is retained; simple representation reconstruction
+// can trade conversions for eliminating wider stored elements and their reads.
 bool shouldFuseProducerResult(const ProducerReplay &payload, mlir::Value result,
                               mlir::AffineMap coordinates,
                               llvm::ArrayRef<int64_t> iterationExtents,
-                              bool removesProducer);
+                              bool removesProducer,
+                              unsigned consumerTraversals = 1);
 bool isRemovableProducerMetadata(mlir::Operation *operation);
 
 struct ProducerReplayUse {
