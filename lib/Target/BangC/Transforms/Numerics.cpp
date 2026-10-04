@@ -665,6 +665,9 @@ LogicalResult realizeNativeWorkspace(ModuleOp module,
   reuseConsumedExp2Inputs(function, config);
   if (batchIndependentRowPrograms(function, config) && failed(cleanup()))
     return failure();
+  // Native composition reads actual storage versions. Remove fully overwritten
+  // initialization before it can obscure a producer's unique value consumer.
+  if (failed(composeLocalStorage(function, cleanup))) return failure();
   fuseNarrowDivisions(function, config);
   realizeRoundedDivisions(function, config);
   realizeApproximateReciprocals(function, config);

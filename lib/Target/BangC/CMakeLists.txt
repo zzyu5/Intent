@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentBangC
   Transforms/Numerics.cpp
   Transforms/IndexLowering.cpp
   Transforms/Supply.cpp
+  Transforms/CoarsenLocal.cpp
   Transforms/InvariantSupply.cpp
   Transforms/PipelineSupply.cpp
   Transforms/Storage.cpp

@@ -41,11 +41,14 @@ Value allocate(OpBuilder &b, Location loc, Type element, ArrayRef<int64_t> shape
 bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool placeInvariantSupply(func::FuncOp function, dsa::ConfigurationAttr config);
+bool coarsenLocalPrograms(func::FuncOp function, dsa::ConfigurationAttr config);
 void pipelineLocalSupply(func::FuncOp function, dsa::ConfigurationAttr config);
 LogicalResult realizeNativeComputations(ModuleOp module);
 LogicalResult realizeNativeWorkspace(ModuleOp module,
     llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult selectNativeImplementations(ModuleOp module);
+LogicalResult composeLocalStorage(func::FuncOp function,
+    llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult composeLocalProgram(ModuleOp module,
     llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult scheduleProgramSupply(ModuleOp module);
