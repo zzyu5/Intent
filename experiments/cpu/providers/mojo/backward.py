@@ -65,11 +65,16 @@ def group_norm(context):
             dweight.zero_()
             dbias.zero_()
 
-        return PreparedLaunch(launch, lambda: state["output"], prepare=prepare)
+        return PreparedLaunch(
+            launch, lambda: (state["output"], dweight, dbias), prepare=prepare
+        )
+
+    def source(*arguments):
+        return runtime.group_norm_silu_backward(*arguments)[0]
 
     report_stage("adapter_preparation")
     return PreparedComparison(
-        side(artifact.run), side(runtime.group_norm_silu_backward),
+        side(artifact.run), side(source),
         (Tolerance(atol=4e-2), Tolerance(atol=3e-2), Tolerance(atol=3e-2)),
         cuda_graph=False, device_type="cpu", cpu_host_timing=True,
         note="既有B32-C256-S1024-G32 bf16 GroupNorm-SiLU backward，dx及scatter-reduce参数梯度；单NUMA8核，PyTorch CPU reference，完整host调用；每次清零梯度且清零不计时。",
