@@ -2,6 +2,7 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Quantization.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -14,6 +15,16 @@ namespace intent::weft_provider {
 using namespace intent::cpu;
 namespace {
 
+constexpr int64_t directRhsSupply = 1;
+constexpr int64_t invocationRhsSupply = 2;
+
+bool hasReductionContiguousRhs(linalg::GenericOp operation) {
+  auto type = cast<MemRefType>(operation.getInputs()[1].getType());
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  return succeeded(type.getStridesAndOffset(strides, offset)) && strides[0] == 1;
+}
+
 LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
     const ContractionTile &tile, ConfigurationAttr, ImplementationAttr binding) {
   Location loc = operation.getLoc();
@@ -25,6 +36,26 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
     return b.create<memref::SubViewOp>(loc, source,
         ArrayRef<OpFoldResult>{row, column}, ArrayRef<OpFoldResult>{b.getIndexAttr(m), b.getIndexAttr(n)},
         ArrayRef<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
+  };
+  const InputSupply *rightSupply = nullptr;
+  for (const InputSupply &input : tile.inputs)
+    if (input.operand == 1) rightSupply = &input;
+  if (rightSupply && (rightSupply->panelAxis != 1 || rightSupply->panelSize != 1 ||
+                      rightSupply->begins.size() != 2))
+    return operation.emitError("integer contraction requires its declared transposed RHS supply");
+  auto right = [&](Value k, Value n, int64_t depth, int64_t columns) -> Value {
+    if (!rightSupply) return view(tile.rhs, k, n, depth, columns);
+    Value row = b.create<arith::SubIOp>(loc, n, rightSupply->begins[1]);
+    Value column = b.create<arith::SubIOp>(loc, k, rightSupply->begins[0]);
+    SmallVector<OpFoldResult> offsets{row, column, b.getIndexAttr(0)};
+    SmallVector<OpFoldResult> sizes{b.getIndexAttr(columns), b.getIndexAttr(depth), b.getIndexAttr(1)};
+    SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
+    auto type = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+        {columns, depth}, cast<MemRefType>(rightSupply->storage.getType()), offsets, sizes, strides));
+    Value selected = b.create<memref::SubViewOp>(loc, type, rightSupply->storage, offsets, sizes, strides);
+    return b.create<memref::TransposeOp>(loc, selected,
+        AffineMapAttr::get(AffineMap::getPermutationMap(
+            ArrayRef<unsigned>{1, 0}, b.getContext())));
   };
   auto pointwise = [&](Value lhs, Value rhs, Value output) {
     SmallVector<Value> inputs{lhs};
@@ -43,7 +74,7 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
     b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{accumulator});
     auto issue = [&](Value k, int64_t count) {
       Value lhs = view(tile.lhs, m, k, rows, count);
-      Value rhs = view(tile.rhs, k, n, count, columns);
+      Value rhs = right(k, n, count, columns);
       if (count == 1) {
         Value partial = b.create<memref::AllocaOp>(loc, type);
         AffineExpr row, column;
@@ -162,7 +193,7 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
-  result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k"});
+  result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k", "rhs_supply"});
   result.addProfile("weft.q8_k", {"chunk"});
   for (StringRef family : {"weft.region_contract_f32", "weft.region_structured",
                           "weft.contract_f32", "weft.structured"})
@@ -212,7 +243,7 @@ cpu::ImplementationRegistry implementations() {
       auto generic = dyn_cast<linalg::GenericOp>(op);
       return generic && isMatrixContraction(generic) &&
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isSignlessInteger(8);
-    }, [](Operation *, CapabilitiesAttr, const Configuration &config) -> std::optional<std::string> {
+    }, [](Operation *operation, CapabilitiesAttr, const Configuration &config) -> std::optional<std::string> {
       int64_t m = config.parameter("micro_m"), n = config.parameter("micro_n");
       if (config.tileM % m != 0)
         return "tile_m " + std::to_string(config.tileM) + " must be divisible by micro_m " + std::to_string(m);
@@ -220,12 +251,27 @@ cpu::ImplementationRegistry implementations() {
         return "tile_n " + std::to_string(config.tileN) + " must be divisible by micro_n " + std::to_string(n);
       if (config.tileK % 8 != 0)
         return "tile_k " + std::to_string(config.tileK) + " must be divisible by micro_k 8";
+      if (config.parameter("rhs_supply") == invocationRhsSupply &&
+          !hasReductionContiguousRhs(cast<linalg::GenericOp>(operation)) &&
+          !hasInvocationInputScope(operation))
+        return "invocation RHS preparation must precede concurrent work items";
       return std::nullopt;
     }, {ImplementationParameter::local("micro_m", {false, {}, 0, {1, 4}}),
         ImplementationParameter::local("micro_n", {false, {}, 0, {4, 16}}),
-        ImplementationParameter::local("micro_k", {false, {}, 0, {8}})},
+        ImplementationParameter::local("micro_k", {false, {}, 0, {8}}),
+        ImplementationParameter::local("rhs_supply", {false, {}, 0,
+            {directRhsSupply, invocationRhsSupply}})},
     formIntegerTile, {}, {true, true, true}, {}, true};
   integer.parameterRelations = checkMatrix;
+  integer.inputs = [](linalg::GenericOp operation, ConfigurationAttr,
+                      ImplementationAttr binding) -> SmallVector<InputRequirement> {
+    if (implementationParameter(binding, "rhs_supply") == directRhsSupply ||
+        hasReductionContiguousRhs(operation))
+      return {};
+    auto type = cast<MemRefType>(operation.getInputs()[1].getType());
+    return {{1, type.getElementType(), 1, 1, 64, InputReuse::Consumers, 1,
+             InputStorageScope::Invocation}};
+  };
   result.add<linalg::GenericOp>(std::move(integer));
   result.add<linalg::GenericOp>({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);

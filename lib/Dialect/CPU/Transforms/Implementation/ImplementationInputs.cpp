@@ -11,9 +11,16 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 
 using namespace mlir;
 namespace intent::cpu {
+
+bool hasInvocationInputScope(Operation *operation) {
+  return !operation->getParentOfType<scf::ParallelOp>() &&
+         !operation->getParentOfType<TasksOp>() &&
+         !operation->getParentOfType<TaskDispatchOp>();
+}
 
 struct ImplementationInputs::Impl {
   explicit Impl(func::FuncOp function) : function(function) {}
@@ -71,7 +78,8 @@ namespace {
 
 bool sameRepresentation(const InputRequirement &first, const InputRequirement &second) {
   return first.elementType == second.elementType && first.panelAxis == second.panelAxis &&
-      first.panelSize == second.panelSize && first.alignment == second.alignment && first.reuse == second.reuse;
+      first.panelSize == second.panelSize && first.alignment == second.alignment &&
+      first.reuse == second.reuse && first.storageScope == second.storageScope;
 }
 
 SmallVector<OpFoldResult> sourceExtents(OpBuilder &b, Location loc, Value source) {
@@ -112,8 +120,85 @@ memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc,
   return storage;
 }
 
+bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
+    Value storage, const InputRequirement &requirement, Operation *point) {
+  auto type = cast<MemRefType>(source.getType());
+  if (type.getRank() != 2 || requirement.panelAxis != 1 ||
+      requirement.panelSize != 1 || type.getElementType().isInteger(1) ||
+      requirement.elementType.isInteger(1))
+    return false;
+  auto capabilities = point->getParentOfType<ModuleOp>()
+      ->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+  auto bits = [](Type type) -> int64_t {
+    return type.isIndex() ? 64 : type.getIntOrFloatBitWidth();
+  };
+  int64_t width = capabilities.getVectorBits() /
+      std::max<int64_t>(8, std::max(bits(type.getElementType()),
+                                  bits(requirement.elementType)));
+  if (width <= 1) return false;
+
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  Value step = index(b, loc, width);
+  Value rows = b.create<memref::DimOp>(loc, source, 0);
+  Value columns = b.create<memref::DimOp>(loc, source, 1);
+  Value fullRows = b.create<arith::SubIOp>(loc, rows,
+      b.create<arith::RemSIOp>(loc, rows, step));
+  Value columnTiles = b.create<arith::CeilDivSIOp>(loc, columns, step);
+  auto slab = [&](Value row, Value column, int64_t count) {
+    auto view = [&](Value memory, ArrayRef<OpFoldResult> offsets,
+                    ArrayRef<OpFoldResult> sizes) -> Value {
+      SmallVector<OpFoldResult> strides(sizes.size(), b.getIndexAttr(1));
+      auto result = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          ArrayRef<int64_t>{count}, cast<MemRefType>(memory.getType()),
+          offsets, sizes, strides));
+      return b.create<memref::SubViewOp>(loc, result, memory, offsets, sizes, strides);
+    };
+    Value input = view(source, {row, column},
+        {b.getIndexAttr(count), b.getIndexAttr(1)});
+    Value output = view(storage, {column, row, b.getIndexAttr(0)},
+        {b.getIndexAttr(1), b.getIndexAttr(count), b.getIndexAttr(1)});
+    auto identity = b.getMultiDimIdentityMap(1);
+    b.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
+        ArrayRef<AffineMap>{identity, identity},
+        ArrayRef<utils::IteratorType>{utils::IteratorType::parallel},
+        [&](OpBuilder &body, Location at, ValueRange arguments) {
+          Value value = arguments[0];
+          if (value.getType() != requirement.elementType)
+            value = body.create<arith::ExtFOp>(at, requirement.elementType, value);
+          body.create<linalg::YieldOp>(at, value);
+        });
+  };
+  auto tile = [&](Value ordinal) {
+    Value begin = multiply(b, loc, ordinal, step);
+    Value remaining = b.create<arith::SubIOp>(loc, columns, begin);
+    Value end = add(b, loc, begin, b.create<arith::MinSIOp>(loc, step, remaining));
+    // Bound both sides of the layout exchange. Each shaped copy holds only one
+    // vector of rows, while the surrounding column traversal reuses the same
+    // source rectangle and writes contiguous prepared slices.
+    loop(b, loc, zero, fullRows, width, [&](Value row) {
+      loop(b, loc, begin, end, 1, [&](Value column) { slab(row, column, width); });
+    });
+    loop(b, loc, fullRows, rows, 1, [&](Value row) {
+      loop(b, loc, begin, end, 1, [&](Value column) { slab(row, column, 1); });
+    });
+  };
+  if (point->getParentOfType<scf::ForOp>() || point->getParentOfType<scf::ParallelOp>() ||
+      point->getParentOfType<TasksOp>() || point->getParentOfType<TaskDispatchOp>()) {
+    loop(b, loc, zero, columnTiles, 1, tile);
+  } else {
+    auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero},
+        ValueRange{columnTiles}, ValueRange{one});
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(parallel.getBody());
+    tile(parallel.getInductionVars()[0]);
+  }
+  return true;
+}
+
 void copyRepresentation(OpBuilder &b, Location loc, Value source,
     Value storage, const InputRequirement &requirement, Operation *point) {
+  if (copyTransposedRepresentation(b, loc, source, storage, requirement, point))
+    return;
   auto type = cast<MemRefType>(source.getType());
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
   Value panel = index(b, loc, requirement.panelSize);
@@ -209,6 +294,9 @@ FailureOr<InputSupply> ImplementationInputs::prepareCaptured(
 
 FailureOr<InputSupply> ImplementationInputs::prepareAt(Value window,
     ValueRange begins, const InputRequirement &requirement, Operation *scope) {
+  if (requirement.storageScope == InputStorageScope::Invocation &&
+      !hasInvocationInputScope(scope))
+    return scope->emitError("invocation input preparation must precede its concurrent work items"), failure();
   auto type = dyn_cast<MemRefType>(window.getType());
   DominanceInfo dominance(impl->function);
   if (!type || begins.size() != static_cast<size_t>(type.getRank()) ||
@@ -237,6 +325,9 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepare(linalg::
   for (auto requirement : requirements) {
     Value source = operation.getInputs()[requirement.operand];
     if (requirement.reuse == InputReuse::Group) continue;
+    if (requirement.storageScope == InputStorageScope::Invocation &&
+        !hasInvocationInputScope(operation))
+      return operation.emitError("invocation input preparation must precede its concurrent work items"), failure();
     if (auto supply = prepareWindow(source, requirement, operation)) supplies.push_back(*supply);
     else {
       auto scope = findPreparationScope(source, operation, requirement);
@@ -410,6 +501,9 @@ FailureOr<InputSupply> ImplementationInputs::Impl::prepareCaptured(linalg::Gener
   if (input->getBlock() != &operation.getRegion().front() ||
       requirement.reuse != InputReuse::Consumers)
     return operation.emitError("captured input supply requires its consumer load and enclosing scope"), failure();
+  if (requirement.storageScope == InputStorageScope::Invocation &&
+      !hasInvocationInputScope(operation))
+    return operation.emitError("invocation input preparation must precede its concurrent work items"), failure();
   Value source = input.getMemref();
   if (auto reason = checkInputRequirement(source, input.getResult(), requirement))
     return operation.emitError(*reason), failure();
@@ -430,6 +524,7 @@ InputSupply ImplementationInputs::Impl::materialize(Value source, const InputReq
     if (previous.source != source || previous.requirement.panelAxis != requirement.panelAxis ||
         previous.requirement.elementType != requirement.elementType ||
         previous.requirement.panelSize != requirement.panelSize ||
+        previous.requirement.storageScope != requirement.storageScope ||
         previous.requirement.alignment < requirement.alignment ||
         (previous.initialized && (!readPoint || previous.scope != scope)) ||
         !consumer || !dominance.dominates(previous.allocation.getOperation(), scope) ||

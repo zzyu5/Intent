@@ -1,4 +1,5 @@
 #include "TaskConversion.h"
+#include "ScalarValues.h"
 #include "Views.h"
 #include "Intent/Analysis/ControlFlow.h"
 #include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
@@ -616,7 +617,8 @@ LogicalResult TaskConversion::lower(memref::LoadOp load) {
   SmallVector<Attribute> selectors(indices.size(), b.getStringAttr("index"));
   Value selected = b.create<wk::SliceOp>(loc, sliceType(*region, {}, {}),
       *region, indices, b.getArrayAttr(selectors));
-  values.map(load.getResult(), b.create<wk::AdmitOp>(loc, load.getType(), selected));
+  values.map(load.getResult(), b.create<wk::AdmitOp>(loc,
+      nativeScalarType(load.getType()), selected));
   return success();
 }
 

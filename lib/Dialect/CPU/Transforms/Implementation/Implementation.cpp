@@ -109,6 +109,9 @@ std::optional<std::string> checkInputRequirement(
     return "implementation has an invalid input representation requirement";
   if (!requirement.elementType || !requirement.elementType.isIntOrIndexOrFloat())
     return "implementation input requires an explicit scalar representation type";
+  if (requirement.storageScope == InputStorageScope::Invocation &&
+      requirement.reuse != InputReuse::Consumers)
+    return "invocation input storage requires consumer reuse";
   if (requirement.elementType != type.getElementType()) {
     if (element.use_empty() || !llvm::all_of(element.getUsers(), [&](Operation *user) {
           auto widen = dyn_cast<arith::ExtFOp>(user);

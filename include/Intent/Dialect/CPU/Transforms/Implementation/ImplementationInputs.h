@@ -10,6 +10,10 @@ class LoadOp;
 
 namespace intent::cpu {
 
+// Preparation at this point is outside concurrent work items and can own an
+// addressable allocation captured by the compute tasks formed afterwards.
+bool hasInvocationInputScope(mlir::Operation *operation);
+
 // One context per function owns prepared input snapshots and their reuse.
 class ImplementationInputs {
 public:

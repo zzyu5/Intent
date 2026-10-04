@@ -1,8 +1,10 @@
 {
   "cpu": {
     "weft.contract_i8_i32": [
-      {"shared": [1, 4, 256, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8}},
-      {"shared": [1, 4, 512, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8}}
+      {"shared": [1, 4, 256, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8, "rhs_supply": 1}},
+      {"shared": [1, 4, 256, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8, "rhs_supply": 2}},
+      {"shared": [1, 4, 512, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8, "rhs_supply": 1}},
+      {"shared": [1, 4, 512, 128, 1], "local": {"micro_m": 4, "micro_n": 4, "micro_k": 8, "rhs_supply": 2}}
     ],
     "weft.region_contract_f32": [
       {"shared": [1, 16, 16, 16, 16], "local": {}},

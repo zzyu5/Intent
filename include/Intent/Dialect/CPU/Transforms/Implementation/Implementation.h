@@ -18,6 +18,7 @@
 namespace intent::cpu {
 
 enum class InputReuse { Group, Consumers };
+enum class InputStorageScope { Consumer, Invocation };
 
 // Storage order is [panel, unsplit source axes..., lane within panel]. A group
 // supply covers one compute group; consumer reuse preserves a source snapshot.
@@ -29,6 +30,9 @@ struct InputRequirement {
   int64_t alignment;
   InputReuse reuse;
   int64_t windowAlignment; // Required panel-axis origin multiple for non-singleton windows.
+  // Invocation storage remains addressable across task invocations. Consumer
+  // storage may instead become a provider's task-local value representation.
+  InputStorageScope storageScope = InputStorageScope::Consumer;
 };
 
 std::optional<std::string> checkInputRequirement(

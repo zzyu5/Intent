@@ -36,7 +36,8 @@ std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
     CapabilitiesAttr capabilities, StorageAnalysis &storage) {
   // Two supplied operands have different reuse axes. Keep their actual shared
   // representations rather than repeatedly preparing one to share the other.
-  if (requirements.size() != 1 || requirements.front().reuse != InputReuse::Consumers)
+  if (requirements.size() != 1 || requirements.front().reuse != InputReuse::Consumers ||
+      requirements.front().storageScope == InputStorageScope::Invocation)
     return std::nullopt;
   auto requirement = requirements.front();
   Value source = operation.getInputs()[requirement.operand];
