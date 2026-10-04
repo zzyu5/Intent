@@ -5,6 +5,7 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
+#include "ReplayPolicy.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -160,18 +161,8 @@ public:
       !relocate && selected.fragmentAxes.size() == 1) {
     unsigned axis = selected.fragmentAxes.front();
     PhysicalProgramAnalysis analysis(kernel);
-    auto realization = analysis.axisRealization(value, axis);
-    auto ranges = analysis.axisRanges(value, axis);
-    auto authority = queryExactLogicalRange(ranges);
-    auto capacity = constantPhysicalExpression(
-        cast<PhysicalExprAttr>(originalResultType.getShape()[axis]));
-    if (realization.isExact() && realization.physicalized &&
-        !realization.constructionScalarSeed && succeeded(authority) &&
-        isUnitStepRange(*authority) && analysis.lockstepRanges(ranges.roots).isExact() &&
-        capacity && *capacity > 0 &&
-        constantLogicalRangeCardinality(*authority) == capacity &&
-        samePhysicalScalarExpression((*authority).getStart(),
-                                     (*authority).getLogicalStart()) &&
+    auto authority = completeSnapshotRange(value, axis, analysis);
+    if (succeeded(authority) &&
         availableAtInsertionPoint((*authority).getStart(), builder, dominance) &&
         availableAtInsertionPoint((*authority).getExtent(), builder, dominance) &&
         availableAtInsertionPoint((*authority).getLogicalStop(), builder, dominance))

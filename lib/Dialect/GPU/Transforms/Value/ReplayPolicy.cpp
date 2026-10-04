@@ -3,6 +3,8 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -170,6 +172,25 @@ Attribute tailValue(Value value, unsigned axis, PhysicalProgramAnalysis &analysi
   for (MakeRangeOp range : ranges.roots) tails.emplace_back(range, range.getLogicalStop());
   UniformValueAnalysis values(describeUniformValue);
   UniformBindings bindings;
+  SmallVector<Value> pending{value};
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value current = pending.pop_back_val();
+    if (!visited.insert(current).second) continue;
+    auto fragment = dyn_cast<FragmentType>(current.getType());
+    Type element = fragment ? fragment.getElementType() : current.getType();
+    if (element.isInteger(1) && inactiveBeyondRange(current, tails, analysis)) {
+      bindings[current] = IntegerAttr::get(IntegerType::get(value.getContext(), 1), 0);
+      continue;
+    }
+    Operation *producer = current.getDefiningOp();
+    if (producer && !producer->getNumRegions() && hasReplayPayload(producer))
+      llvm::append_range(pending, producer->getOperands());
+  }
+  // A consumer may already have neutralized the pure value after its reads.
+  // Use that actual predicate before requiring every upstream access to be
+  // independently inactive (e.g. a completed contraction is an SSA snapshot).
+  if (Attribute constant = values.evaluate(value, bindings)) return constant;
   for (Operation *operation : ranges.accesses) {
     Value result, fill, valid;
     if (auto load = dyn_cast<LoadOp>(operation)) {
@@ -198,6 +219,25 @@ Attribute tailValue(Value value, unsigned axis, PhysicalProgramAnalysis &analysi
 }
 
 } // namespace
+
+FailureOr<MakeRangeOp> completeSnapshotRange(
+    Value value, unsigned axis, PhysicalProgramAnalysis &analysis) {
+  auto type = dyn_cast<FragmentType>(value.getType());
+  if (!type || axis >= type.getShape().size()) return failure();
+  auto realization = analysis.axisRealization(value, axis);
+  auto ranges = analysis.axisRanges(value, axis);
+  auto authority = queryExactLogicalRange(ranges);
+  auto capacity = constantPhysicalExpression(cast<PhysicalExprAttr>(type.getShape()[axis]));
+  if (!realization.isExact() || !realization.physicalized ||
+      realization.constructionScalarSeed || failed(authority) ||
+      !isUnitStepRange(*authority) || !analysis.lockstepRanges(ranges.roots).isExact() ||
+      !capacity || *capacity <= 0 ||
+      constantLogicalRangeCardinality(*authority) != capacity ||
+      !samePhysicalScalarExpression((*authority).getStart(), (*authority).getLogicalStart()) ||
+      !IndexRelations().atMost((*authority).getStart(), (*authority).getLogicalStop()))
+    return failure();
+  return *authority;
+}
 
 ReplayPolicy::ReplayPolicy(func::FuncOp kernel, ValueRange roots,
                            ArrayRef<Operation *> replacedConsumers,
@@ -340,20 +380,26 @@ FailureOr<Value> ReplayPolicy::retainSlice(
       !available((*authority).getLogicalStop(), builder, dominance)) return Value();
   IndexRelations relations;
   auto capacity = cast<PhysicalExprAttr>(source.getShape()[axis]);
-  if (!relations.same((*authority).getStart(), (*authority).getLogicalStart()) ||
-      !relations.nonnegative((*authority).getStart()) ||
-      !relations.atMost((*authority).getStart(), capacity) ||
-      !relations.atMost((*authority).getLogicalStop(), capacity)) return Value();
+  bool complete = succeeded(completeSnapshotRange(value, axis, analysis));
+  if (!complete &&
+      (!relations.same((*authority).getStart(), (*authority).getLogicalStart()) ||
+       !relations.nonnegative((*authority).getStart()) ||
+       !relations.atMost((*authority).getStart(), capacity) ||
+       !relations.atMost((*authority).getLogicalStop(), capacity))) return Value();
   auto requested = coordinates.getDefiningOp<MakeRangeOp>();
   if (!requested || !isUnitStepRange(requested)) return Value();
+  auto atMostStop = [&](Value bound) {
+    return complete ? relations.atMost(bound, (*authority).getLogicalStop())
+                    : relations.atMost(bound, capacity);
+  };
   bool boundedStart = relations.atMost((*authority).getStart(), requested.getStart()) &&
-                      relations.atMost(requested.getStart(), capacity);
+                      atMostStop(requested.getStart());
   for (Operation *parent = requested->getParentOp(); !boundedStart && parent;
        parent = parent->getParentOp()) {
     auto loop = dyn_cast<scf::ForOp>(parent);
     boundedStart = loop && relations.same(requested.getStart(), loop.getInductionVar()) &&
         relations.atMost((*authority).getStart(), loop.getLowerBound()) &&
-        relations.atMost(loop.getUpperBound(), capacity);
+        atMostStop(loop.getUpperBound());
   }
   auto capacityBounds = queryPositiveExtentBounds(capacity, kernel);
   auto widthBounds = queryPositiveExtentBounds(
@@ -365,6 +411,12 @@ FailureOr<Value> ReplayPolicy::retainSlice(
   if (!boundedStart || !capacityBounds || !widthBounds ||
       capacityBounds->second > std::numeric_limits<int64_t>::max() - widthBounds->second)
     return Value();
+  if (complete) {
+    auto stopBounds = queryIntegerRange((*authority).getLogicalStop());
+    if (!stopBounds ||
+        static_cast<__int128>(stopBounds->smax().getSExtValue()) + widthBounds->second - 1 >
+            std::numeric_limits<int64_t>::max()) return Value();
+  }
   SmallVector<Attribute> shape(source.getShape().begin(), source.getShape().end());
   SmallVector<Attribute> axes(source.getAxisMaps().begin(), source.getAxisMaps().end());
   shape[axis] = extent;

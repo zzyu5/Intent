@@ -7,6 +7,11 @@
 
 namespace intent::gpu {
 
+// A current, fully realized snapshot covers this whole logical interval. This
+// proves the saved lanes only; replay padding still needs its own value proof.
+mlir::FailureOr<MakeRangeOp> completeSnapshotRange(
+    mlir::Value value, unsigned axis, PhysicalProgramAnalysis &analysis);
+
 // Profitability for one rewrite of the named consumers. Legality and coordinate
 // transport continue to belong to the existing replay and projection queries.
 class ReplayPolicy {
