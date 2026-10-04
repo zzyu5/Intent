@@ -161,40 +161,15 @@ bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr confi
   return reuseConsumedStorage(function, config, candidates);
 }
 
-void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config) {
-  SmallVector<memref::AllocaOp> allocations;
-  function.walk([&](memref::AllocaOp allocation) { allocations.push_back(allocation); });
-  DominanceInfo dominance(function);
-  int64_t currentNram = 0, currentWram = 0;
-  measureStorage(function, currentNram, currentWram);
-  for (auto allocation : allocations) {
-    auto loop = dyn_cast<scf::ForOp>(allocation->getParentOp());
-    if (!loop || allocation->getBlock() != loop.getBody()) continue;
-    Value buffer = allocation.getResult();
-    dsa::StorageAnalysis storage(function);
-    auto initialization = dyn_cast_or_null<dsa::FillOp>(storage.uniqueWriter(buffer));
-    if (!initialization || initialization->getBlock() != loop.getBody() ||
-        initialization.getOutput() != buffer || buffer.hasOneUse() ||
-        !loop.isDefinedOutsideOfLoop(initialization.getValue())) continue;
-    auto accesses = storage.accesses(buffer);
-    if (!accesses.complete || llvm::any_of(accesses.entries, [&](const auto &entry) {
-          return entry.operation != initialization &&
-              !isa<MemoryEffects::Allocate>(entry.effect.getEffect()) &&
-              !dominance.dominates(initialization, entry.operation);
-        })) continue;
-    Operation *allocationNext = allocation->getNextNode(), *initializationNext = initialization->getNextNode();
-    allocation->moveBefore(loop);
-    initialization->moveBefore(loop);
-    // Sharing the immutable tile across iterations extends its live range.
-    // Retain a move only when it does not increase the program's peak storage.
-    int64_t nram = 0, wram = 0;
-    measureStorage(function, nram, wram);
-    if (nram > currentNram || wram > currentWram ||
-        nram > config.getLocalBytes() || nram > 768 * 1024 || wram > 1024 * 1024) {
-      initialization->moveBefore(initializationNext);
-      allocation->moveBefore(allocationNext);
-    } else { currentNram = nram; currentWram = wram; }
-  }
+bool storageFitsBudget(func::FuncOp function, dsa::ConfigurationAttr config,
+                       StorageUsage usage) {
+  int64_t internalNram = 0;
+  function.walk([&](Operation *op) {
+    if (auto bytes = op->getAttrOfType<IntegerAttr>("bangc.internal_nram_bytes"))
+      internalNram = std::max(internalNram, bytes.getInt());
+  });
+  return usage.nram <= std::min<int64_t>(config.getLocalBytes(), 768 * 1024) - internalNram &&
+         usage.wram <= 1024 * 1024 && usage.sram <= 3968 * 1024;
 }
 
 LogicalResult bindProgramStorage(ModuleOp module) {
@@ -203,12 +178,7 @@ LogicalResult bindProgramStorage(ModuleOp module) {
   StorageUsage usage = bindStorage(function);
   int64_t nram = usage.nram, wram = usage.wram, shared = usage.sram;
   if (shared > 3968 * 1024) return function.emitError("selected shared supply exceeds the MLU370 SRAM budget");
-  int64_t internalNram = 0;
-  function.walk([&](Operation *op) {
-    if (auto bytes = op->getAttrOfType<IntegerAttr>("bangc.internal_nram_bytes"))
-      internalNram = std::max(internalNram, bytes.getInt());
-  });
-  if (nram + internalNram > config.getLocalBytes() || nram + internalNram > 768 * 1024 || wram > 1024 * 1024)
+  if (!storageFitsBudget(function, config, usage))
     return function.emitError("selected local implementation exceeds the MLU370 per-task storage budget")
         << "; NRAM=" << nram << ", WRAM=" << wram;
   Builder builder(module.getContext());

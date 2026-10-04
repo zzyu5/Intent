@@ -26,6 +26,8 @@ struct StorageUsage { int64_t nram = 0, wram = 0, sram = 0; };
 StorageUsage measureStorage(func::FuncOp function);
 void measureStorage(func::FuncOp function, int64_t &nram, int64_t &wram);
 StorageUsage bindStorage(func::FuncOp function);
+bool storageFitsBudget(func::FuncOp function, dsa::ConfigurationAttr config,
+                       StorageUsage usage);
 LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config);
 bool supportedScalarBinary(BinaryOperator kind);
 bool specializeZeroMatrixTiles(func::FuncOp function);
@@ -38,7 +40,7 @@ bool batchIndependentRowPrograms(func::FuncOp function, dsa::ConfigurationAttr c
 Value allocate(OpBuilder &b, Location loc, Type element, ArrayRef<int64_t> shape, int64_t space);
 bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool reuseConsumedExp2Inputs(func::FuncOp function, dsa::ConfigurationAttr config);
-void hoistInvariantFills(func::FuncOp function, dsa::ConfigurationAttr config);
+bool placeInvariantSupply(func::FuncOp function, dsa::ConfigurationAttr config);
 LogicalResult realizeNativeComputations(ModuleOp module);
 LogicalResult realizeNativeWorkspace(ModuleOp module,
     llvm::function_ref<LogicalResult()> cleanup);

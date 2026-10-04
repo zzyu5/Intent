@@ -865,8 +865,10 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (vectorizeIndexLoops(function, config) && failed(cleanup())) return failure();
   realizeGatherWorkspace(function, config);
   if (dsa::batchPointwiseTasks(function) && failed(cleanup())) return failure();
+  while (placeInvariantSupply(function, config)) {
+    if (failed(cleanup()) || failed(composeStorage())) return failure();
+  }
   if (reuseConsumedBinaryInputs(function, config) && failed(cleanup())) return failure();
-  hoistInvariantFills(function, config);
   coalesceTileLoads(function, config);
   return success();
 }
