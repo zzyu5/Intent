@@ -38,6 +38,47 @@ bool samePhysicalShape(Type lhs, Type rhs) {
           left.getOwner() == right.getOwner());
 }
 
+FailureOr<std::pair<Value, Value>> safeGatherIndex(
+    OpBuilder &builder, Location location, Value coordinate,
+    gpu::PhysicalExprAttr elements, Value valid = {}) {
+  if (!gpu::uniformElementType(coordinate.getType()).isIndex()) {
+    Type indexType = builder.getIndexType();
+    if (auto fragment = dyn_cast<gpu::FragmentType>(coordinate.getType()))
+      indexType = gpu::FragmentType::get(
+          fragment.getContext(), builder.getIndexType(), fragment.getShape(),
+          fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+    coordinate = builder.create<gpu::CastOp>(location, indexType, coordinate);
+  }
+  Type predicateType = builder.getI1Type();
+  Value extent = builder.create<gpu::PhysicalExprOp>(
+      location, builder.getIndexType(), elements);
+  if (auto fragment = dyn_cast<gpu::FragmentType>(coordinate.getType())) {
+    predicateType = gpu::FragmentType::get(
+        fragment.getContext(), builder.getI1Type(), fragment.getShape(),
+        fragment.getAxisMaps(), fragment.getValidity(), fragment.getOwner());
+    auto projected = gpu::projectPhysicalValueToSchema(
+        builder, location, extent, fragment);
+    if (failed(projected))
+      return failure();
+    extent = *projected;
+  }
+  auto zero = zeroLike(builder, location, coordinate.getType());
+  if (failed(zero))
+    return failure();
+  Value lower = builder.create<gpu::CompareOp>(
+      location, predicateType, coordinate, *zero, ComparePredicate::Ge);
+  Value upper = builder.create<gpu::CompareOp>(
+      location, predicateType, coordinate, extent, ComparePredicate::Lt);
+  Value bounded = builder.create<gpu::BinaryOp>(
+      location, predicateType, lower, upper, BinaryOperator::LogicalAnd);
+  if (valid)
+    bounded = builder.create<gpu::BinaryOp>(
+        location, predicateType, valid, bounded, BinaryOperator::LogicalAnd);
+  Value safe = builder.create<gpu::SelectOp>(
+      location, coordinate.getType(), bounded, coordinate, *zero);
+  return std::pair<Value, Value>{safe, bounded};
+}
+
 std::optional<unsigned>
 expandedGatherAxis(gpu::FragmentType source, gpu::FragmentType result,
                    unsigned selectedSourceAxis) {
@@ -144,6 +185,7 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
           return gather.emitOpError("gather validity has no exact result-axis projection");
         valid = *projected;
       }
+      Value safeIndex;
       if (source.getShape().size() > 1) {
         auto elements = cast<gpu::PhysicalExprAttr>(source.getShape()[0]);
         auto first = projectIndex(builder.create<arith::ConstantIndexOp>(location, 0));
@@ -183,25 +225,18 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
           return gather.emitOpError("scalar gather has no exact row-major linearization");
         sourceValue = builder.create<gpu::ReshapeOp>(
             location, flatType, sourceValue, *reassociation);
-        Value size = builder.create<gpu::PhysicalExprOp>(
-            location, builder.getIndexType(), elements);
-        auto projectedSize = projectIndex(size);
-        if (failed(projectedSize))
+        auto safe = safeGatherIndex(builder, location, coordinate, elements, valid);
+        if (failed(safe))
           return failure();
-        Value lower = builder.create<gpu::CompareOp>(
-            location, predicateType, coordinate, *first, ComparePredicate::Ge);
-        Value upper = builder.create<gpu::CompareOp>(
-            location, predicateType, coordinate, *projectedSize, ComparePredicate::Lt);
-        valid = builder.create<gpu::BinaryOp>(
-            location, predicateType, valid, lower, BinaryOperator::LogicalAnd);
-        valid = builder.create<gpu::BinaryOp>(
-            location, predicateType, valid, upper, BinaryOperator::LogicalAnd);
+        safeIndex = safe->first;
+        valid = safe->second;
+      } else {
+        FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinate.getType());
+        if (failed(zero))
+          return gather.emitOpError("scalar gather coordinate has no integral zero");
+        safeIndex = builder.create<gpu::SelectOp>(
+            gather.getLoc(), coordinate.getType(), valid, coordinate, *zero);
       }
-      FailureOr<Value> zero = zeroLike(builder, gather.getLoc(), coordinate.getType());
-      if (failed(zero))
-        return gather.emitOpError("scalar gather coordinate has no integral zero");
-      Value safeIndex = builder.create<gpu::SelectOp>(
-          gather.getLoc(), coordinate.getType(), valid, coordinate, *zero);
       Type loadedType = gather.getResult().getType();
       if (result && result.getShape().size() > 1) {
         auto elements = cast<gpu::PhysicalExprAttr>(result.getShape()[0]);
@@ -417,16 +452,17 @@ LogicalResult legalizeMaskedGather(func::FuncOp kernel) {
         !samePhysicalShape(gather.getValid().getType(),
                            gather.getResult().getType()))
       continue;
-    FailureOr<Value> zero =
-        zeroLike(builder, gather.getLoc(), coordinate.getType());
-    if (failed(zero))
+    if (!source || gather.getSourceAxes().size() != 1)
       continue;
-    Value safeIndex = builder.create<gpu::SelectOp>(
-        gather.getLoc(), coordinate.getType(), gather.getValid(), coordinate,
-        *zero);
+    unsigned axis = gather.getSourceAxes().front();
+    auto safe = safeGatherIndex(
+        builder, gather.getLoc(), coordinate,
+        cast<gpu::PhysicalExprAttr>(source.getShape()[axis]), gather.getValid());
+    if (failed(safe))
+      return gather.emitOpError("gather coordinate has no safe physical index projection");
     auto safeGather = builder.create<gpu::GatherOp>(
         gather.getLoc(), gather.getResult().getType(), gather.getSource(),
-        ValueRange{safeIndex}, Value(), Value(), gather.getSourceAxes());
+        ValueRange{safe->first}, Value(), Value(), gather.getSourceAxes());
     auto selected = builder.create<gpu::SelectOp>(
         gather.getLoc(), gather.getResult().getType(), gather.getValid(),
         safeGather.getResult(), gather.getFill());
@@ -562,8 +598,16 @@ LogicalResult legalizeExpandingGathers(func::FuncOp kernel) {
       offset = binary(offset, binary(index, inner, BinaryOperator::Multiply),
                       BinaryOperator::Add);
       offset = binary(offset, tail, BinaryOperator::Add);
+      // The incoming gather already has safe per-axis indices. Preserve that
+      // executable safety boundary after row-major linearization as well: an
+      // inactive lane may have selected axis index zero while retaining its
+      // other coordinates. The original validity/fill selection remains at
+      // the gather's consumer.
+      auto safe = safeGatherIndex(nested, location, offset, sourceElements);
+      if (failed(safe))
+        return failure();
       Value selected = nested.create<gpu::GatherOp>(
-          location, flatResultType, *flatSource, ValueRange{offset}, Value(),
+          location, flatResultType, *flatSource, ValueRange{safe->first}, Value(),
           Value(), ArrayRef<int64_t>{0});
       return reshape(selected, result);
     };

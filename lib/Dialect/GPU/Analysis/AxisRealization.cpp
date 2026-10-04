@@ -208,6 +208,24 @@ PhysicalProgramAnalysis::axisRealization(Value value, unsigned fragmentAxis) {
     if (const FragmentAxisGroup *group = relations->front().groupForResultAxis(fragmentAxis)) {
       if (group->kind == FragmentAxisRelationKind::Corresponding)
         return axisRealization(reshape.getValue(), group->sourceAxes.front());
+      auto source = cast<FragmentType>(reshape.getValue().getType());
+      if (group->kind == FragmentAxisRelationKind::Reassociation &&
+          group->sourceAxes.size() == 1 && group->resultAxes.size() == 1 &&
+          source.getShape()[group->sourceAxes.front()] == extent) {
+        // Changing an axis occurrence through a one-to-one reassociation does
+        // not discard a boundary's extent authority. It also does not realize
+        // that boundary's traversal before its incoming slots are closed.
+        auto input = axisRealization(reshape.getValue(), group->sourceAxes.front());
+        if (input.hasExtentAuthority()) {
+          result.state = input.state;
+          result.physicalized = input.physicalized;
+          result.constructionScalarSeed = input.constructionScalarSeed;
+          result.roots = std::move(input.roots);
+          result.extentAuthority =
+              PhysicalAxisRealizationFact::ExtentAuthority::Structural;
+          return result;
+        }
+      }
       bool physicalized = llvm::all_of(
           group->sourceAxes, [&](unsigned axis) {
             auto input = axisRealization(reshape.getValue(), axis);

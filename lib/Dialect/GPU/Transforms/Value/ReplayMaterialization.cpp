@@ -9,6 +9,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -153,13 +154,37 @@ public:
   }
   if (selected.fragmentAxes.empty() && !relocate)
     return rememberInvariant(value, roots);
-  if (isa<BlockArgument>(value) && !relocate &&
+  Operation *producer = value.getDefiningOp();
+  bool retainedBoundary = isa<BlockArgument>(value);
+  if (!retainedBoundary && producer && producer->getNumRegions() &&
+      !relocate && selected.fragmentAxes.size() == 1) {
+    unsigned axis = selected.fragmentAxes.front();
+    PhysicalProgramAnalysis analysis(kernel);
+    auto realization = analysis.axisRealization(value, axis);
+    auto ranges = analysis.axisRanges(value, axis);
+    auto authority = queryExactLogicalRange(ranges);
+    auto capacity = constantPhysicalExpression(
+        cast<PhysicalExprAttr>(originalResultType.getShape()[axis]));
+    if (realization.isExact() && realization.physicalized &&
+        !realization.constructionScalarSeed && succeeded(authority) &&
+        isUnitStepRange(*authority) && analysis.lockstepRanges(ranges.roots).isExact() &&
+        capacity && *capacity > 0 &&
+        constantLogicalRangeCardinality(*authority) == capacity &&
+        samePhysicalScalarExpression((*authority).getStart(),
+                                     (*authority).getLogicalStart()) &&
+        availableAtInsertionPoint((*authority).getStart(), builder, dominance) &&
+        availableAtInsertionPoint((*authority).getExtent(), builder, dominance) &&
+        availableAtInsertionPoint((*authority).getLogicalStop(), builder, dominance))
+      retainedBoundary = true;
+  }
+  if (retainedBoundary && !relocate &&
       selected.fragmentAxes.size() == 1 &&
       PhysicalProgramAnalysis(kernel)
           .axisRealization(value, selected.fragmentAxes.front()).physicalized) {
-    // A dominating loop/helper argument is an existing SSA snapshot. Its
-    // selected lanes are gathered from that value; there is no producer to
-    // clone, and following an outer range does not authorize replaying state.
+    // A dominating argument or completed region result is an existing SSA
+    // snapshot. Slice its actual lanes rather than replaying ordered state.
+    // Region results above cover their complete selected physical axis, so
+    // slicing cannot replace an existing padded lane with the helper's fill.
     auto slice = materializeRetainedSlice(
         builder, location, value, selected.fragmentAxes.front(), blockedExtent,
         replacement, insertionAnchor);
@@ -168,7 +193,6 @@ public:
     mapping.map(value, *slice);
     return *slice;
   }
-  Operation *producer = value.getDefiningOp();
   if (!producer || (isa<MakeRangeOp>(producer) && !relocate)) {
     if (producer)
       producer->emitOpError(
