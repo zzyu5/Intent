@@ -3,8 +3,32 @@
 
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 namespace intent::dsa::detail {
+
+// The operation defines every element of this operand, including padding.
+// An accumulator read/write (matrix or collective state) is not an overwrite.
+inline mlir::OpOperand *completeLocalOutput(mlir::Operation *operation) {
+  if (auto op = mlir::dyn_cast<FillOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<LoadTileOp>(operation))
+    return op.getAsynchronous() ? nullptr : &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<GatherRowsOp>(operation))
+    return op.getAsynchronous() ? nullptr : &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<TransposeOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<CastOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<UnaryOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<BinaryOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<SelectOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<CompareOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<MaskedFillOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<IndexBinaryOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<IotaOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<DivideRNOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<DivideCastOp>(operation)) return &op.getOutputMutable();
+  if (auto op = mlir::dyn_cast<mlir::memref::CopyOp>(operation)) return &op.getTargetMutable();
+  return nullptr;
+}
 
 // These rewrites substitute coordinates directly. A common allocation alone
 // does not preserve their indexing: both descriptors must expose the complete

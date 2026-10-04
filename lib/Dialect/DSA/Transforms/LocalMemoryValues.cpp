@@ -1,6 +1,7 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
+#include "StoragePatterns.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
@@ -108,27 +109,6 @@ bool coversMemory(Value complete, Value memory, StorageAnalysis &storage) {
       completeView(complete, origin);
 }
 
-Value completeOutput(Operation *operation) {
-  if (auto op = dyn_cast<FillOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<LoadTileOp>(operation))
-    return op.getAsynchronous() ? Value() : op.getOutput();
-  if (auto op = dyn_cast<GatherRowsOp>(operation))
-    return op.getAsynchronous() ? Value() : op.getOutput();
-  if (auto op = dyn_cast<TransposeOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<CastOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<UnaryOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<BinaryOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<SelectOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<CompareOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<MaskedFillOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<IndexBinaryOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<IotaOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<DivideRNOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<DivideCastOp>(operation)) return op.getOutput();
-  if (auto op = dyn_cast<memref::CopyOp>(operation)) return op.getTarget();
-  return {};
-}
-
 bool sameTileRead(LoadTileOp lhs, LoadTileOp rhs) {
   if (lhs.getSource() != rhs.getSource() ||
       lhs.getOutput().getType() != rhs.getOutput().getType() ||
@@ -221,7 +201,8 @@ public:
         for (Block &nested : region) analyze(nested, inherited);
       }
 
-      Value complete = completeOutput(&operation);
+      auto output = detail::completeLocalOutput(&operation);
+      Value complete = output ? output->get() : Value{};
       if (scalar && scalar->write) {
         auto type = cast<MemRefType>(scalar->memory.getType());
         if (type.hasStaticShape() && type.getNumElements() == 1)
