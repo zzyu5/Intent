@@ -457,10 +457,8 @@ bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel) {
          fullReductionNeedsTraversal(contract);
 }
 
-bool hasCompleteStorePath(ContractOp contract) {
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  return collectStorePaths(contract.getResult(), {}, paths, visited);
+bool hasCompleteEpilogue(ContractOp contract) {
+  return collectContractionEpilogue(contract.getResult()).has_value();
 }
 
 bool outputCoordinatesNeedRealization(ContractOp contract) {
@@ -468,19 +466,18 @@ bool outputCoordinatesNeedRealization(ContractOp contract) {
       !contract.getLhsBatchAxes().empty() ||
       !contract.getRhsBatchAxes().empty())
     return false;
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
+  auto epilogue = collectContractionEpilogue(contract.getResult());
+  if (!epilogue)
     return false;
   auto kernel = contract->getParentOfType<func::FuncOp>();
   PhysicalProgramAnalysis analysis(kernel);
-  return llvm::any_of(paths, [&](StorePath &path) {
-    if (path.store.getCoordinates().size() != 2 ||
-        path.store.getSourceAxes() != ArrayRef<int64_t>{0, 1})
+  return llvm::any_of(epilogue->stores, [&](StoreOp store) {
+    if (store.getCoordinates().size() != 2 ||
+        store.getSourceAxes() != ArrayRef<int64_t>{0, 1})
       return false;
     MakeRangeOp outputRanges[2], sourceRanges[2];
     for (unsigned axis = 0; axis < 2; ++axis) {
-      auto output = sourceRange(path.store.getCoordinates()[axis]);
+      auto output = sourceRange(store.getCoordinates()[axis]);
       auto source = queryExactLogicalRange(
           analysis.axisRanges(contract.getResult(), axis));
       if (!output || failed(source))
@@ -637,13 +634,11 @@ bool hasRangeContractForm(ContractOp contract,
             value, sourceAxisIdentity(mapping))))
       return false;
   }
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
+  auto epilogue = collectContractionEpilogue(contract.getResult());
+  if (!epilogue)
     return false;
   if (stores)
-    for (const StorePath &path : paths)
-      stores->push_back(path.store);
+    llvm::append_range(*stores, epilogue->stores);
   return true;
 }
 

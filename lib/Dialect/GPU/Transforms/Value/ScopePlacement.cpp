@@ -6,10 +6,12 @@
 #include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
+#include <algorithm>
 #include <functional>
 
 using namespace mlir;
@@ -103,6 +105,75 @@ bool moveInputsBefore(Operation *first, Operation *second,
   for (Operation *operation : hoist)
     operation->moveBefore(first);
   return true;
+}
+
+FailureOr<SmallVector<Block *>> conditionalPath(Block *scope,
+                                                Operation *operation) {
+  SmallVector<Block *> path;
+  for (Block *block = operation->getBlock(); block != scope;) {
+    auto branch = dyn_cast_or_null<scf::IfOp>(block->getParentOp());
+    if (!branch || (block->getParent() != &branch.getThenRegion() &&
+                    block->getParent() != &branch.getElseRegion()))
+      return failure();
+    path.push_back(block);
+    block = branch->getBlock();
+  }
+  std::reverse(path.begin(), path.end());
+  return path;
+}
+
+bool canMoveEffectBefore(Operation *operation, Operation *before,
+                         ResourceAliasAnalysis &aliases) {
+  if (failed(conditionalPath(before->getBlock(), operation)))
+    return false;
+  Operation *boundary = operation;
+  while (boundary->getBlock() != before->getBlock()) {
+    for (Operation &preceding : *boundary->getBlock()) {
+      if (&preceding == boundary)
+        break;
+      if (!independentMemoryEffects(operation, &preceding, aliases))
+        return false;
+    }
+    boundary = boundary->getParentOp();
+  }
+  if (!before->isBeforeInBlock(boundary))
+    return false;
+  for (Operation *preceding = before; preceding != boundary;
+       preceding = preceding->getNextNode())
+    if (!independentMemoryEffects(operation, preceding, aliases))
+      return false;
+  return true;
+}
+
+LogicalResult ConditionalPlacement::emit(
+    OpBuilder &builder, ArrayRef<Block *> path,
+    llvm::function_ref<FailureOr<Value>(OpBuilder &, Operation *)> condition,
+    llvm::function_ref<LogicalResult(OpBuilder &)> body) {
+  OpBuilder::InsertionGuard restore(builder);
+  for (Block *block : path) {
+    auto original = cast<scf::IfOp>(block->getParentOp());
+    scf::IfOp replacement;
+    if (Operation *existing = branches.lookup(original)) {
+      if (existing->getBlock() != builder.getInsertionBlock() ||
+          (builder.getInsertionPoint() != builder.getInsertionBlock()->end() &&
+           !existing->isBeforeInBlock(&*builder.getInsertionPoint())))
+        return failure();
+      replacement = cast<scf::IfOp>(existing);
+    } else {
+      auto predicate = condition(builder, original);
+      if (failed(predicate) || !(*predicate).getType().isInteger(1))
+        return failure();
+      replacement = builder.create<scf::IfOp>(
+          original.getLoc(), *predicate, /*withElseRegion=*/true);
+      replacement->setDiscardableAttrs(original->getDiscardableAttrDictionary());
+      branches[original] = replacement;
+    }
+    bool isThen = block->getParent() == &original.getThenRegion();
+    Block &target = isThen ? replacement.getThenRegion().front()
+                           : replacement.getElseRegion().front();
+    builder.setInsertionPoint(target.getTerminator());
+  }
+  return body(builder);
 }
 
 } // namespace intent::gpu::placement

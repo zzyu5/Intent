@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "../Value/ScopePlacement.h"
 #include "Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -6,9 +7,12 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Analysis/MemoryEffects.h"
+#include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUTypes.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -49,6 +53,71 @@ public:
 private:
   llvm::SmallPtrSet<Operation *, 16> observed;
 };
+
+// A mutually exclusive branch is also exclusive across row iterations only
+// when its scalar condition is invariant in this newly constructed loop.
+static bool mutuallyExclusiveRows(Operation *first, Operation *second,
+                                  scf::ForOp loop) {
+  llvm::DenseSet<Value> active;
+  std::function<bool(Value)> invariant = [&](Value value) {
+    Operation *owner = value.getParentBlock()->getParentOp();
+    if (owner != loop && !loop->isAncestor(owner))
+      return true;
+    if (!active.insert(value).second)
+      return false;
+    Operation *producer = value.getDefiningOp();
+    bool result = producer && producer->getNumRegions() == 0 &&
+                  isMemoryEffectFree(producer) &&
+                  llvm::all_of(producer->getOperands(), invariant);
+    active.erase(value);
+    return result;
+  };
+  for (Operation *current = first; current != loop;
+       current = current->getParentOp()) {
+    auto branch = dyn_cast<scf::IfOp>(current->getParentOp());
+    if (!branch || !invariant(branch.getCondition()))
+      continue;
+    for (Operation *other = second; other != loop;
+         other = other->getParentOp())
+      if (other->getParentOp() == branch &&
+          other->getBlock() != current->getBlock())
+        return true;
+  }
+  return false;
+}
+
+static LogicalResult verifyRowReplayReads(scf::ForOp loop) {
+  SmallVector<Operation *> reads;
+  SmallVector<StoreOp> stores;
+  WalkResult effects = loop.walk([&](Operation *operation) {
+    auto access = dyn_cast<AccessOpInterface>(operation);
+    if (!access)
+      return WalkResult::advance();
+    if (auto store = dyn_cast<StoreOp>(operation)) {
+      stores.push_back(store);
+      return WalkResult::advance();
+    }
+    auto effects = getEffectsRecursively(operation);
+    if (!effects || !hasOnlyReadEffects(operation))
+      return WalkResult::interrupt();
+    if (llvm::any_of(*effects, [](const MemoryEffects::EffectInstance &effect) {
+          return isa<MemoryEffects::Read>(effect.getEffect());
+        }))
+      reads.push_back(operation);
+    return WalkResult::advance();
+  });
+  if (effects.wasInterrupted())
+    return loop.emitOpError("runtime row replay contains an unordered or unknown access");
+  ResourceAliasAnalysis aliases;
+  for (Operation *read : reads)
+    for (StoreOp store : stores)
+      if (!mutuallyExclusiveRows(read, store, loop) &&
+          !placement::independentMemoryEffects(read, store, aliases))
+        return store.emitOpError(
+                   "runtime row output may change a subsequent replayed input read")
+               << "; read=" << *read;
+  return success();
+}
 
 LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
                               SmallVectorImpl<ContractOp> &pending) {
@@ -206,10 +275,53 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       !isUnitStepRange(columnRange))
     return unhandled("blocking currently requires unit-step source ranges");
 
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
-    return unhandled("result does not have a complete unique-store path");
+  auto epilogue = collectContractionEpilogue(contract.getResult());
+  if (!epilogue)
+    return unhandled("result does not have a closed store epilogue");
+  SmallVector<SmallVector<Block *>> storeScopes;
+  llvm::SmallPtrSet<Operation *, 8> checkedConditions;
+  if (runtimeRowTraversal) {
+    ResourceAliasAnalysis aliases;
+    PhysicalProgramAnalysis analysis(kernel);
+    for (auto [index, store] : llvm::enumerate(epilogue->stores)) {
+      auto path = placement::conditionalPath(contract->getBlock(), store);
+      if (failed(path))
+        return unhandled("runtime row output crosses a non-conditional execution scope");
+      if (!placement::canMoveEffectBefore(store, contract, aliases))
+        return unhandled("runtime row output cannot cross intervening memory effects");
+      auto resourceBindings = scalarCaptureBindings(store.getResource(), contract);
+      if (failed(resourceBindings) ||
+          !analysis.replayAt(store.getResource(), sourceAxisIdentity(*rowMap),
+                             PhysicalReplayScope::ValueGraph,
+                             /*allowAccesses=*/true, contract, *resourceBindings)
+               .isReplayable())
+        return unhandled("runtime row output resource is unavailable in its relocated scope");
+      for (unsigned earlier = 0; earlier < index; ++earlier) {
+        bool exclusive = llvm::any_of(storeScopes[earlier], [&](Block *first) {
+          return llvm::any_of(*path, [&](Block *second) {
+            return first != second && first->getParentOp() == second->getParentOp();
+          });
+        });
+        if (!exclusive && !placement::independentMemoryEffects(
+                              epilogue->stores[earlier], store, aliases))
+          return unhandled("runtime row outputs lack independent memory effects");
+      }
+      for (Block *block : *path) {
+        auto branch = cast<scf::IfOp>(block->getParentOp());
+        if (checkedConditions.contains(branch))
+          continue;
+        auto bindings = scalarCaptureBindings(branch.getCondition(), contract);
+        if (failed(bindings) ||
+            !analysis.replayAt(branch.getCondition(), sourceAxisIdentity(*rowMap),
+                               PhysicalReplayScope::ValueGraph,
+                               /*allowAccesses=*/true, contract, *bindings)
+                 .isReplayable())
+          return unhandled("runtime row output condition has no stable scalar replay");
+        checkedConditions.insert(branch);
+      }
+      storeScopes.push_back(std::move(*path));
+    }
+  }
   SmallVector<std::pair<MakeRangeOp, Value>> outputTailRanges = {
       {rowRange, rowLogicalEnd},
       {columnRange, columnLogicalEnd},
@@ -545,8 +657,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     IRMapping rowReplay;
     if (runtimeRowTraversal)
       rowReplay.map(rowRange.getResult(), rows);
-    SmallVector<SmallVector<Value>> replayedStoreCoordinates;
-    SmallVector<Value> replayedStoreValidities;
     if (indirectRow) {
       for (AssumeInBoundsOp assumption : rowAssumptions) {
         FailureOr<Value> index = replaySourceValue(
@@ -561,36 +671,12 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         if (Attribute origin = assumption->getAttr(originAttr))
           replacement->setAttr(originAttr, origin);
       }
-      for (auto [pathIndex, path] : llvm::enumerate(paths)) {
-        SmallVector<Value> coordinates;
-        for (Value coordinate : path.store.getCoordinates()) {
-          FailureOr<Value> replayed = replaySourceValue(
-              rowBuilder, location, kernel, coordinate,
-              sourceAxisIdentity(*rowMap),
-              unitM, rowRange, rows, rowReplay, contract.getOperation());
-          if (failed(replayed))
-            return path.store.emitOpError(
-                "blocked contraction could not replay an output coordinate graph");
-          coordinates.push_back(*replayed);
-        }
-        replayedStoreCoordinates.push_back(std::move(coordinates));
-        Value validity;
-        if (path.store.getValid()) {
-          FailureOr<Value> replayed = replaySourceValue(
-              rowBuilder, location, kernel, path.store.getValid(),
-              sourceAxisIdentity(*rowMap), unitM, rowRange, rows, rowReplay,
-              contract.getOperation());
-          if (failed(replayed))
-            return path.store.emitOpError(
-                "blocked contraction could not replay output validity");
-          validity = *replayed;
-        }
-        replayedStoreValidities.push_back(validity);
-      }
     }
-    FailureOr<Value> accumulator = materializeResultCapture(
-        rowBuilder, kernel, contract.getAccumulator(), blockedResultType,
-        rows, columns, contract.getOperation());
+    ContractionEpilogueMaterialization epilogueValues(
+        kernel, *epilogue, blockedResultType, rows, columns,
+        contract.getAccumulator());
+    FailureOr<Value> accumulator = epilogueValues.capture(
+        rowBuilder, contract.getAccumulator(), contract.getOperation());
     if (failed(accumulator))
       return contract.emitOpError(
           "blocked contraction accumulator has no exact result projection");
@@ -716,45 +802,71 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     Value outputValid = binary(rowBuilder, location, outputPredicateType,
                                outputRows, outputColumns,
                                BinaryOperator::LogicalAnd);
-    for (auto [pathIndex, path] : llvm::enumerate(paths)) {
+    placement::ConditionalPlacement storePlacement;
+    for (auto [pathIndex, store] : llvm::enumerate(epilogue->stores)) {
+      auto emitStore = [&](OpBuilder &rowBuilder) -> LogicalResult {
       OpBuilder::InsertionGuard storeInsertion(rowBuilder);
       if (!runtimeRowTraversal)
-        rowBuilder.setInsertionPoint(path.store);
-      auto output = materializeStorePath(
-          rowBuilder, kernel, path, contract.getResult(), loop.getResult(0),
-          rows, columns,
-          runtimeRowTraversal ? contract.getOperation() : path.store.getOperation());
+        rowBuilder.setInsertionPoint(store);
+      auto output = epilogueValues.storeValue(
+          rowBuilder, store, loop.getResult(0),
+          runtimeRowTraversal ? contract.getOperation() : store.getOperation());
       if (failed(output))
-        return path.store.emitOpError(
+        return store.emitOpError(
             "blocked contraction could not replay its pointwise epilogue");
-      SmallVector<Value> coordinates =
-          indirectRow ? replayedStoreCoordinates[pathIndex]
-                      : SmallVector<Value>(path.store.getCoordinates());
+      SmallVector<Value> coordinates(store.getCoordinates());
+      Value rowValidity;
+      if (indirectRow) {
+        // Address arithmetic and residual validity remain under the original
+        // conditional path. Do not share a branch-local mapping with a sibling.
+        IRMapping storeRowReplay;
+        storeRowReplay.map(rowRange.getResult(), rows);
+        for (Value &coordinate : coordinates) {
+          auto replayed = replaySourceValue(
+              rowBuilder, location, kernel, coordinate,
+              sourceAxisIdentity(*rowMap), unitM, rowRange, rows,
+              storeRowReplay, contract.getOperation());
+          if (failed(replayed))
+            return store.emitOpError(
+                "blocked contraction could not replay an output coordinate graph");
+          coordinate = *replayed;
+        }
+        if (store.getValid()) {
+          auto replayed = replaySourceValue(
+              rowBuilder, location, kernel, store.getValid(),
+              sourceAxisIdentity(*rowMap), unitM, rowRange, rows,
+              storeRowReplay, contract.getOperation());
+          if (failed(replayed))
+            return store.emitOpError(
+                "blocked contraction could not replay output validity");
+          rowValidity = *replayed;
+        }
+      }
       FailureOr<unsigned> storeColumn = directRankOneAccessPosition(
-          path.store.getCoordinates(), path.store.getValue().getType(), 1);
+          store.getCoordinates(), store.getValue().getType(), 1);
       if (failed(storeColumn))
         storeColumn = queryCoordinatePosition(
-            path.store.getCoordinates(), sourceAxisIdentity(*columnMap));
+            store.getCoordinates(), sourceAxisIdentity(*columnMap));
       FailureOr<unsigned> storeRow = failure();
       if (!indirectRow) {
         storeRow = directRankOneAccessPosition(
-            path.store.getCoordinates(), path.store.getValue().getType(), 0);
+            store.getCoordinates(), store.getValue().getType(), 0);
         if (failed(storeRow))
           storeRow = queryCoordinatePosition(
-              path.store.getCoordinates(), sourceAxisIdentity(*rowMap));
+              store.getCoordinates(), sourceAxisIdentity(*rowMap));
       }
       if (failed(storeColumn))
-        return path.store.emitOpError(
+        return store.emitOpError(
             "blocked contract output lost its logical source coordinates");
       SmallVector<std::pair<MakeRangeOp, Value>> storeTailRanges(outputTailRanges);
       if (!indirectRow) {
         if (failed(storeRow))
-          return path.store.emitOpError(
+          return store.emitOpError(
               "blocked contract output lost its logical source coordinates");
         for (auto [position, authority, end] : {
                  std::tuple<unsigned, MakeRangeOp, Value>{*storeRow, rowRange, rowStop},
                  std::tuple<unsigned, MakeRangeOp, Value>{*storeColumn, columnRange, columnStop}}) {
-          MakeRangeOp stored = sourceRange(path.store.getCoordinates()[position]);
+          MakeRangeOp stored = sourceRange(store.getCoordinates()[position]);
           if (!stored)
             continue;
           Value storedEnd = (stored).getLogicalStop();
@@ -768,7 +880,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       coordinates[*storeColumn] = columns;
       FailureOr<Value> valid = failure();
       if (indirectRow) {
-        Value replayed = replayedStoreValidities[pathIndex];
+        Value replayed = rowValidity;
         if (!replayed) {
           valid = outputValid;
         } else {
@@ -779,14 +891,14 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
               columnReplay, &*rowBuilder.getInsertionPoint());
           if (failed(columnValidity))
-            return path.store.emitOpError(
+            return store.emitOpError(
                 "blocked contraction could not replay output column validity");
           valid = materializeValidityConjunction(
               rowBuilder, location, outputValid, *columnValidity,
               outputPredicateType);
         }
       } else {
-        Value originalValidity = path.store.getValid();
+        Value originalValidity = store.getValid();
         // The new row/column mask covers proven tails. Other predicates are
         // replayed through each exact range occurrence below.
         if (originalValidity &&
@@ -800,7 +912,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
               sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
               &*rowBuilder.getInsertionPoint());
           if (failed(replayed))
-            return path.store.emitOpError(
+            return store.emitOpError(
                 "blocked contraction could not relocate output validity");
           originalValidity = *replayed;
         }
@@ -812,7 +924,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
               replay, &*rowBuilder.getInsertionPoint());
           if (failed(replayed))
-            return path.store.emitOpError(
+            return store.emitOpError(
                 "blocked contraction could not relocate output column validity");
           originalValidity = *replayed;
         }
@@ -821,13 +933,52 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
             outputPredicateType);
       }
       if (failed(valid))
-        return path.store.emitOpError(
+        return store.emitOpError(
             "blocked contract output validity could not be retargeted");
+      Value resource = store.getResource();
+      if (runtimeRowTraversal) {
+        auto captured = epilogueValues.capture(rowBuilder, resource, contract);
+        if (failed(captured))
+          return store.emitOpError("blocked contraction could not replay its output resource");
+        resource = *captured;
+        for (auto [position, coordinate] : llvm::enumerate(coordinates)) {
+          if (position == *storeColumn ||
+              (succeeded(storeRow) && position == *storeRow))
+            continue;
+          if (!isa<FragmentType>(coordinate.getType())) {
+            auto captured = epilogueValues.capture(rowBuilder, coordinate, contract);
+            if (failed(captured))
+              return store.emitOpError("blocked contraction could not replay a scalar output coordinate");
+            coordinates[position] = *captured;
+          }
+        }
+      }
       auto replacement = rowBuilder.create<StoreOp>(
-          location, path.store.getResource(), coordinates, *output, *valid,
-          path.store.getSourceAxes());
-      if (Attribute origin = path.store->getAttr(originAttr))
+          location, resource, coordinates, *output, *valid,
+          store.getSourceAxes());
+      if (Attribute origin = store->getAttr(originAttr))
         replacement->setAttr(originAttr, origin);
+      return success();
+      };
+      if (runtimeRowTraversal) {
+        auto condition = [&](OpBuilder &nested, Operation *original)
+            -> FailureOr<Value> {
+          auto branch = cast<scf::IfOp>(original);
+          // Execution-group refinement may have replaced original coordinates
+          // since preflight. Recompute bindings from the current SSA graph.
+          auto bindings = scalarCaptureBindings(branch.getCondition(), contract);
+          if (failed(bindings))
+            return failure();
+          return materializeReplayedValue(
+              nested, branch.getLoc(), branch.getCondition(),
+              sourceAxisIdentity(*rowMap), unitM, *bindings, contract);
+        };
+        if (failed(storePlacement.emit(rowBuilder, storeScopes[pathIndex],
+                                        condition, emitStore)))
+          return store.emitOpError("blocked contraction could not preserve its output control scope");
+      } else if (failed(emitStore(rowBuilder))) {
+        return failure();
+      }
     }
     return success();
   };
@@ -846,7 +997,8 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     auto rowLoop = builder.create<scf::ForOp>(
         location, rowStart, rowStop, rowStep);
     OpBuilder nested(rowLoop.getBody()->getTerminator(), &created);
-    if (failed(emitRowBlock(nested, rowLoop.getInductionVar()))) {
+    if (failed(emitRowBlock(nested, rowLoop.getInductionVar())) ||
+        failed(verifyRowReplayReads(rowLoop))) {
       rowLoop.erase();
       return failure();
     }
@@ -862,19 +1014,11 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       return failure();
   }
 
-  for (StorePath &path : paths)
-    path.store.erase();
   // Retiling a pointwise epilogue can replay a sibling matrix expression.
   // Retire the obsolete epilogue before its original products are visited,
   // and let the new products receive their own bounded reduction traversal.
   // Keep products themselves alive until their worklist entry is consumed.
-  llvm::SmallPtrSet<Operation *, 16> retired;
-  for (StorePath &path : paths)
-    for (Operation *operation : llvm::reverse(path.operations))
-      if (!retired.contains(operation) && operation->use_empty()) {
-        retired.insert(operation);
-        operation->erase();
-      }
+  eraseContractionEpilogue(*epilogue);
   llvm::append_range(pending, created.products);
   for (AssumeInBoundsOp assumption : rowAssumptions)
     if (assumption->getBlock())
@@ -1022,10 +1166,9 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
   if (!isUnitStepRange(*rowRange) || !isUnitStepRange(*blockRange) ||
       !isUnitStepRange(*innerRange) || !isUnitStepRange(*columnRange))
     return reject("blocking currently requires unit-step source ranges");
-  SmallVector<StorePath> paths;
-  llvm::SmallPtrSet<Operation *, 8> visited;
-  if (!collectStorePaths(contract.getResult(), {}, paths, visited))
-    return reject("result does not have a complete unique-store path");
+  auto epilogue = collectContractionEpilogue(contract.getResult());
+  if (!epilogue)
+    return reject("result does not have a closed store epilogue");
   Value rowLogicalEnd = (*rowRange).getLogicalStop();
   Value blockLogicalEnd = (*blockRange).getLogicalStop();
   Value innerLogicalEnd = (*innerRange).getLogicalStop();
@@ -1069,8 +1212,8 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       !validIsTail(rhsLoad.getValid(), rhsTailRanges) ||
       !validIsTail(rhsScaleLoad.getValid(), rhsScaleTailRanges))
     return reject("data/scale loads contain non-tail residual validity");
-  for (StorePath &path : paths)
-    if (!validIsTail(path.store.getValid(), outputTailRanges))
+  for (StoreOp store : epilogue->stores)
+    if (!validIsTail(store.getValid(), outputTailRanges))
       return reject("result store contains non-tail residual validity");
   if ((lhsLoad.getFill() && !isZeroScalar(lhsLoad.getFill())) ||
       (rhsLoad.getFill() && !isZeroScalar(rhsLoad.getFill())))
@@ -1486,23 +1629,25 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
       broadcastAxis(builder, location, outputPredicateType, columnValid, 1);
   Value outputValid = binary(builder, location, outputPredicateType, outputRows,
                              outputColumns, BinaryOperator::LogicalAnd);
-  for (StorePath &path : paths) {
+  ContractionEpilogueMaterialization epilogueValues(
+      kernel, *epilogue, blockedResultType, rows, columns,
+      contract.getAccumulator());
+  for (StoreOp store : epilogue->stores) {
     OpBuilder::InsertionGuard storeInsertion(builder);
-    builder.setInsertionPoint(path.store);
-    auto output = materializeStorePath(
-        builder, kernel, path, contract.getResult(), loop.getResult(0), rows,
-        columns, path.store.getOperation());
+    builder.setInsertionPoint(store);
+    auto output = epilogueValues.storeValue(
+        builder, store, loop.getResult(0), store.getOperation());
     if (failed(output))
       return reject("pointwise epilogue could not be replayed");
-    SmallVector<Value> coordinates(path.store.getCoordinates());
+    SmallVector<Value> coordinates(store.getCoordinates());
     FailureOr<unsigned> storeRow = queryCoordinatePosition(
-        path.store.getCoordinates(),
+        store.getCoordinates(),
         sourceAxisIdentity(*rowMap));
     FailureOr<unsigned> storeColumn = queryCoordinatePosition(
-        path.store.getCoordinates(),
+        store.getCoordinates(),
         sourceAxisIdentity(*columnMap));
     if (failed(storeRow) || failed(storeColumn))
-      return path.store.emitOpError(
+      return store.emitOpError(
           "blocked scaled-contract output lost source coordinates");
     coordinates[*storeRow] = rows;
     coordinates[*storeColumn] = columns;
@@ -1511,19 +1656,18 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
     // and its tail authority describing different traversals. Any scalar
     // residual already dominates this original store insertion point.
     FailureOr<Value> valid = materializeRetargetedValidity(
-        builder, location, path.store.getValid(), outputTailRanges,
+        builder, location, store.getValid(), outputTailRanges,
         outputValid, outputPredicateType);
     if (failed(valid))
       return reject("result store residual validity could not be retargeted");
     auto replacement = builder.create<StoreOp>(
-        location, path.store.getResource(), coordinates, *output, *valid,
-        path.store.getSourceAxes());
-    if (Attribute origin = path.store->getAttr(originAttr))
+        location, store.getResource(), coordinates, *output, *valid,
+        store.getSourceAxes());
+    if (Attribute origin = store->getAttr(originAttr))
       replacement->setAttr(originAttr, origin);
   }
 
-  for (StorePath &path : paths)
-    path.store.erase();
+  eraseContractionEpilogue(*epilogue);
   return success();
 }
 

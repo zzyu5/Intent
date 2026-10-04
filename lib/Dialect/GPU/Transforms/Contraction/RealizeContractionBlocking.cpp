@@ -170,7 +170,7 @@ static LogicalResult realizeContractionBlockingImpl(ModuleOp module) {
     } else if (!rangeSingleReduction && singleReduction &&
                contract.getLhsBatchAxes().empty() &&
                contract.getRhsBatchAxes().empty() &&
-               hasCompleteStorePath(contract) &&
+               hasCompleteEpilogue(contract) &&
                freeAxesNeedRealization(contract, kernel)) {
       if (failed(realizeSelectedContract(contract)))
         return failure();

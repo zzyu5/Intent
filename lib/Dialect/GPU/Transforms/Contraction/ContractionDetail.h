@@ -11,6 +11,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include <optional>
+#include <memory>
 
 namespace intent::gpu::contraction {
 using namespace mlir;
@@ -18,9 +19,10 @@ using namespace mlir;
 inline constexpr int64_t contractionReductionCandidates[] = {
     4, 8, 16, 32, 64, 128, 256};
 
-struct StorePath {
+struct ContractionEpilogue {
+  Value root;
   SmallVector<Operation *> operations;
-  StoreOp store;
+  SmallVector<StoreOp> stores;
 };
 
 enum class ProgramMappingScope { SameBlock, Dominating };
@@ -176,18 +178,32 @@ Value rangeBoundsValidity(OpBuilder &builder, Location location,
 FailureOr<Value> retargetFill(OpBuilder &builder, Location location,
                               Value original, FragmentType result);
 
-bool collectStorePaths(Value value, SmallVector<Operation *> operations,
-                       SmallVectorImpl<StorePath> &paths,
-                       llvm::SmallPtrSetImpl<Operation *> &visited,
-                       Value root = {});
+std::optional<ContractionEpilogue> collectContractionEpilogue(Value root);
 
-FailureOr<Value> materializeResultCapture(
-    OpBuilder &builder, func::FuncOp kernel, Value value, FragmentType tile,
-    Value rows, Value columns, Operation *insertionAnchor);
+// Preserve complete, already available values while replaying a scalar capture.
+// A nonavailable fragment is not a scalar control-domain projection.
+FailureOr<IRMapping> scalarCaptureBindings(Value value, Operation *anchor);
 
-FailureOr<Value> materializeStorePath(
-    OpBuilder &builder, func::FuncOp kernel, StorePath &path, Value original,
-    Value blocked, Value rows, Value columns, Operation *insertionAnchor);
+// A materialization owns one complete tile and coordinate selection. Values
+// are reused only at available insertion points within the same block.
+class ContractionEpilogueMaterialization {
+public:
+  ContractionEpilogueMaterialization(func::FuncOp kernel,
+                                    const ContractionEpilogue &epilogue,
+                                    FragmentType tile, Value rows, Value columns,
+                                    Value initialAccumulator);
+  ~ContractionEpilogueMaterialization();
+  FailureOr<Value> capture(OpBuilder &builder, Value value,
+                           Operation *insertionAnchor);
+  FailureOr<Value> storeValue(OpBuilder &builder, StoreOp store, Value blocked,
+                              Operation *insertionAnchor);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl;
+};
+
+void eraseContractionEpilogue(const ContractionEpilogue &epilogue);
 
 LoadOp matrixOperandLoad(Value value);
 
@@ -206,7 +222,7 @@ bool freeAxesReadyForReductionTraversal(ContractOp contract,
 
 bool reductionAxesNeedTraversal(ContractOp contract, func::FuncOp kernel);
 
-bool hasCompleteStorePath(ContractOp contract);
+bool hasCompleteEpilogue(ContractOp contract);
 
 bool outputCoordinatesNeedRealization(ContractOp contract);
 
