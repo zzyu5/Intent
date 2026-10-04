@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Task/Tasks.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ParallelReductions.h"
 #include "Intent/Dialect/CPU/Transforms/Control/Traversals.h"
 #include "../Control/TraversalFusion.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -198,6 +199,7 @@ void localize(memref::AllocOp allocation, scf::ParallelOp loop) {
 }
 
 LogicalResult groupWorksetComputations(func::FuncOp function, const ImplementationRegistry &implementations) {
+  if (failed(orientParallelReductions(function))) return failure();
   SmallVector<Value> extents;
   for (auto loop : function.front().getOps<scf::ParallelOp>())
     if (workset(loop)) extents.push_back(loop.getUpperBound()[0]);

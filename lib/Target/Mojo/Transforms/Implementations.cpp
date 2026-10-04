@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ParallelReductions.h"
 #include "Intent/Dialect/CPU/Transforms/Vector/Vectorization.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
@@ -316,7 +317,9 @@ cpu::ImplementationRegistry implementations() {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return true;
     }, check, vectorParameters(), {}, {}};
-  vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr) {
+  vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr binding) {
+    if (queryParallelReduction(operation))
+      return implementationParameter(binding, "vector_width");
     return registerContractionRows(operation);
   };
   vector.materialize = materializeVectorComputation;

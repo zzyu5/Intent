@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ParallelReductions.h"
 #include "ReductionSources.h"
 #include "../Vector/ContiguousMemory.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
@@ -344,6 +345,9 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width,
   auto maps = operation.getIndexingMapsArray();
   if (!llvm::all_of(maps, supportedMap))
     return operation.emitError("CPU pointwise coordinate map has no implemented scalar projection");
+  auto parallel = materializeParallelReduction(operation, width, listener);
+  if (failed(parallel)) return operation.emitError("CPU parallel reduction cannot be materialized");
+  if (*parallel) return success();
   ReductionSources sources(operation);
   auto product = materializeProductReduction(operation, width, listener, sources);
   if (failed(product)) return operation.emitError("CPU reduction source member cannot be materialized");
