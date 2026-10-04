@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include <limits>
 
 using namespace mlir;
 
@@ -467,6 +468,17 @@ LogicalResult materialize(ScanOp operation, int64_t width,
     operation->moveBefore(dispatch.elseBlock(), dispatch.elseBlock()->begin());
     return materialize(operation, 1, listener);
   }
+  bool pairBlocks = width > 1 && width <= std::numeric_limits<int64_t>::max() / 2 &&
+      (type.isDynamicDim(scanAxis) || type.getDimSize(scanAxis) / width >= 2);
+  if (pairBlocks) {
+    StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+    for (auto [number, output] : llvm::enumerate(operation.getOutputs())) {
+      for (Value source : operation.getSources())
+        pairBlocks &= storage.disjoint(source, output);
+      for (Value previous : operation.getOutputs().take_front(number))
+        pairBlocks &= storage.disjoint(previous, output);
+    }
+  }
   SmallVector<Value> sizes, position(type.getRank());
   for (int64_t axis = 0; axis < type.getRank(); ++axis)
     sizes.push_back(b.create<memref::DimOp>(loc, operation.getSources()[0], axis));
@@ -521,16 +533,16 @@ LogicalResult materialize(ScanOp operation, int64_t width,
     if (width > 1) {
       Value step = index(b, loc, width);
       Value completeEnd = b.create<arith::SubIOp>(loc, extent, b.create<arith::RemSIOp>(loc, extent, step));
-      auto blocks = b.create<scf::ForOp>(loc, begin, completeEnd, step, initials);
-      {
-        OpBuilder::InsertionGuard guard(b);
-        b.setInsertionPointToStart(blocks.getBody());
-        Value coordinate = blocks.getInductionVar();
+      SmallVector<int64_t> reverseLanes;
+      for (int64_t lane = width - 1; lane >= 0; --lane) reverseLanes.push_back(lane);
+      auto blockPosition = [&](Value ordinal) {
+        Value coordinate = ordinal;
         if (operation.getReverse()) coordinate = b.create<arith::SubIOp>(loc,
             b.create<arith::SubIOp>(loc, extent, step), coordinate);
         position[scanAxis] = coordinate;
-        SmallVector<int64_t> reverseLanes;
-        for (int64_t lane = width - 1; lane >= 0; --lane) reverseLanes.push_back(lane);
+      };
+      auto localPrefix = [&](Value ordinal) {
+        blockPosition(ordinal);
         SmallVector<Value> prefix;
         for (Value source : operation.getSources()) {
           auto vectorType = VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType());
@@ -542,17 +554,61 @@ LogicalResult materialize(ScanOp operation, int64_t width,
         // Each stage combines adjacent ranges in the selected traversal order.
         for (int64_t offset = 1; offset < width; offset *= 2)
           prefix = combine(shift(prefix, identity, offset), prefix, true);
-        auto incoming = broadcast(blocks.getRegionIterArgs());
-        prefix = combine(incoming, prefix, true);
-        auto output = operation.getInclusive() ? prefix : shift(prefix, incoming, 1);
+        return prefix;
+      };
+      auto last = [&](ValueRange prefix) {
+        SmallVector<Value> result;
+        for (Value value : prefix)
+          result.push_back(b.create<vector::ExtractElementOp>(loc, value, index(b, loc, width - 1)));
+        return result;
+      };
+      auto storePrefix = [&](Value ordinal, ValueRange prefix, ValueRange incoming) {
+        blockPosition(ordinal);
+        SmallVector<Value> output(prefix);
+        if (!operation.getInclusive()) output = shift(prefix, incoming, 1);
         for (auto [value, destination] : llvm::zip(output, operation.getOutputs())) {
           if (operation.getReverse()) value = b.create<vector::ShuffleOp>(loc, value, value, reverseLanes);
           b.create<vector::StoreOp>(loc, value, destination, position);
         }
-        SmallVector<Value> next;
-        for (Value value : prefix)
-          next.push_back(b.create<vector::ExtractElementOp>(loc, value, index(b, loc, width - 1)));
-        b.create<scf::YieldOp>(loc, next);
+      };
+      if (pairBlocks) {
+        Value pairStep = index(b, loc, 2 * width);
+        Value pairEnd = b.create<arith::SubIOp>(loc, extent,
+            b.create<arith::RemSIOp>(loc, extent, pairStep));
+        auto pairs = b.create<scf::ForOp>(loc, begin, pairEnd, pairStep, initials);
+        {
+          OpBuilder::InsertionGuard guard(b);
+          b.setInsertionPointToStart(pairs.getBody());
+          Value first = pairs.getInductionVar(), second = add(b, loc, first, step);
+          auto firstPrefix = localPrefix(first);
+          auto secondPrefix = localPrefix(second);
+          auto firstTotal = last(firstPrefix), secondTotal = last(secondPrefix);
+          // The carried dependency uses only scalar summaries of this pair;
+          // output-vector adjustment does not feed the next iteration.
+          auto total = combine(firstTotal, secondTotal, false);
+          auto next = combine(pairs.getRegionIterArgs(), total, false);
+          auto following = combine(pairs.getRegionIterArgs(), firstTotal, false);
+          auto incoming = broadcast(pairs.getRegionIterArgs());
+          auto followingIncoming = broadcast(following);
+          firstPrefix = combine(incoming, firstPrefix, true);
+          secondPrefix = combine(followingIncoming, secondPrefix, true);
+          storePrefix(first, firstPrefix, incoming);
+          storePrefix(second, secondPrefix, followingIncoming);
+          b.create<scf::YieldOp>(loc, next);
+        }
+        begin = pairEnd;
+        initials.assign(pairs.getResults().begin(), pairs.getResults().end());
+      }
+      auto blocks = b.create<scf::ForOp>(loc, begin, completeEnd, step, initials);
+      {
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToStart(blocks.getBody());
+        Value ordinal = blocks.getInductionVar();
+        auto prefix = localPrefix(ordinal);
+        auto incoming = broadcast(blocks.getRegionIterArgs());
+        prefix = combine(incoming, prefix, true);
+        storePrefix(ordinal, prefix, incoming);
+        b.create<scf::YieldOp>(loc, last(prefix));
       }
       begin = completeEnd;
       initials.assign(blocks.getResults().begin(), blocks.getResults().end());
