@@ -197,23 +197,26 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
       if (!depth || *depth <= 0 || !storage.disjoint(tile.lhs, tile.output) ||
           !storage.disjoint(tile.rhs, tile.output))
         return operation.emitError("retained LHS supply requires a bounded reduction and disjoint output");
-      // Keep one complete row over the N traversal. A whole M panel would
-      // unnecessarily multiply its register lifetime by the microkernel height.
-      // Copy is a real numeric snapshot; the target owns its representation.
+      // Keep the existing M panel so each RHS member still serves every row.
+      // The independent K window bounds the snapshot retained over N.
       auto issue = [&](Value k, int64_t count, bool first) {
         Value width = index(b, loc, count);
-        loop(b, loc, tile.mBegin, add(b, loc, tile.mBegin, tile.mCount), 1, [&](Value m) {
-          Value lhs = view(tile.lhs, m, k, b.getIndexAttr(1), width);
-          Value saved = b.create<memref::AllocaOp>(loc, MemRefType::get({1, count}, b.getF32Type()));
+        auto supply = [&](Value m, int64_t rows) {
+          Value lhs = view(tile.lhs, m, k, b.getIndexAttr(rows), width);
+          Value saved = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, count}, b.getF32Type()));
           b.create<memref::CopyOp>(loc, lhs, saved);
           if (count == 1) {
             loop(b, loc, tile.nBegin, add(b, loc, tile.nBegin, tile.nCount), 1,
                 [&](Value n) { form(m, n, 1, 1, saved, k, width, first); });
           } else {
             panels(tile.nBegin, *columns,
-                [&](Value n, int64_t columns) { form(m, n, 1, columns, saved, k, width, first); });
+                [&](Value n, int64_t columns) { form(m, n, rows, columns, saved, k, width, first); });
           }
-        });
+        };
+        if (count == 1)
+          loop(b, loc, tile.mBegin, add(b, loc, tile.mBegin, tile.mCount), 1,
+              [&](Value m) { supply(m, 1); });
+        else panels(tile.mBegin, *rows, supply);
       };
       int64_t window = implementationParameter(binding, "lhs_window");
       // This is a physical K supply window, independent of the outer K tile.
