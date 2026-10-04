@@ -11,7 +11,7 @@ swiglu,8192x14336-bf16,0.239104,0.243528,0.242568,1.018502,1.014487,pass,pass,,I
 embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.089520,0.095152,0.094752,1.062913,1.058445,pass,pass,,Intent target=cutile; source corpus=triton.
 cross_entropy,8192x32768-bf16,0.732592,1.033336,0.856400,1.410520,1.169000,pass,pass,,Intent target=cutile; source corpus=triton.
 padded_rope_cache_update,B32-QH32-KVH8-D128-cache8192-fp16,0.005952,0.006208,0.008288,1.043011,1.392473,pass,pass,,Intent target=cutile; source corpus=triton.
-fused_add_rms_norm,8192x4096-bf16,0.094384,0.094352,0.094104,0.999661,0.997033,pass,pass,,Intent target=cutile; source corpus=triton.
+fused_add_rms_norm,8192x4096-bf16,0.094704,0.093728,0.094104,0.989694,0.993664,pass,pass,,Intent target=cutile; source corpus=triton.
 rms_norm,8192x4096-bf16,0.050296,0.050128,0.050496,0.996660,1.003976,pass,pass,,Intent target=cutile; source corpus=triton.
 xformers_rms_norm,8192x4096-bf16,0.049856,0.048920,0.050224,0.981226,1.007381,pass,pass,,Intent target=cutile; source corpus=triton.
 qkv_projection_pipeline,M4096-K4096-QKV4096-fp16,1.162536,1.250128,1.140840,1.075346,0.981337,pass,pass,,Intent target=cutile; source corpus=triton.
@@ -26,7 +26,7 @@ varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.047200,0.110800,0
 causal_conv1d_update,B32-D4096-W4-bf16,0.005544,0.045448,0.005680,8.197691,1.024531,pass,pass,,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.336496,0.287200,0.164312,0.853502,0.488303,pass,pass,source launch uses num_stages=1 and num_warps=4.,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.027520,0.054520,0.009232,1.981105,0.335465,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.591832,1.565520,0.714576,2.645210,1.207397,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.598144,1.549160,0.714576,2.589945,1.194655,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.833440,1.982688,2.012416,0.699746,0.710238,pass,pass,,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.038880,0.471065,0.464113,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,0.977636,1.416933,pass,pass,,Intent target=cutile; source corpus=triton.
