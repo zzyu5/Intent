@@ -4,6 +4,8 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/Region/Realization.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
+#include "Reduction/ReductionRealization.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -310,7 +312,12 @@ public:
     auto transform = [&]() -> LogicalResult {
       if (failed(fuseIndependentTraversals(module))) return failure();
       auto kernel = getPhysicalKernel(module);
-      return succeeded(kernel) ? verifySharedConfigTuples(*kernel) : failure();
+      if (failed(kernel)) return failure();
+      if (reduction::normalizeCompletedReductions(*kernel)) {
+        eraseDeadPhysicalValues(*kernel);
+        if (failed(closeValueRelations(*kernel))) return failure();
+      }
+      return verifySharedConfigTuples(*kernel);
     };
     if (failed(finishTransformation(module, getArgument(), transform())))
       signalPassFailure();

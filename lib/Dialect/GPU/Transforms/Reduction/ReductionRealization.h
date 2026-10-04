@@ -40,5 +40,8 @@ bool hoistNestedReduction(mlir::scf::ForOp outer, mlir::func::FuncOp kernel);
 
 bool sinkReductionIntoSourceIf(ReduceOp reduce, mlir::func::FuncOp kernel);
 
+// Collapse sole-use ordinary reduction chains over complete physical members.
+bool normalizeCompletedReductions(mlir::func::FuncOp kernel);
+
 } // namespace intent::gpu::reduction
 #endif
