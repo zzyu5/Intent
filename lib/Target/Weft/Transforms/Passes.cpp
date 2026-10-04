@@ -3,6 +3,7 @@
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/IR/WeftDialect.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -69,6 +70,7 @@ void registerWeftPasses() {
 
 void buildWeftPipeline(OpPassManager &manager) {
   manager.addPass(createWeftPrepareTaskViews());
+  manager.addPass(cpu::createCPUReuseScratchStorage());
   manager.addPass(createWeftConvertProgram());
   manager.addPass(createWeftVerifyProgram());
 }

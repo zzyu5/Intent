@@ -21,6 +21,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
@@ -50,29 +51,41 @@ bool needsFloatingPointEnvironment(Operation *scope) {
 void promotePrivateScratch(func::FuncOp function, int64_t budget) {
   cpu::PhysicalProgramAnalysis physical(function);
   auto allocations = physical.allocations();
+  llvm::DenseMap<Operation *, int64_t> remaining;
+  llvm::DenseSet<Operation *> unavailable;
   auto alignmentOf = [](auto allocation) -> int64_t {
     Type element = allocation.getType().getElementType();
     int64_t bytes = element.isIndex() ? 8 : (element.getIntOrFloatBitWidth() + 7) / 8;
     return allocation.getAlignment().value_or(bytes);
   };
-  auto fits = [&](int64_t bytes, int64_t alignment) {
-    return bytes >= 0 && bytes <= budget && alignment > 0 && alignment - 1 <= budget - bytes;
+  auto fits = [](int64_t bytes, int64_t alignment, int64_t available) {
+    return bytes >= 0 && bytes <= available && alignment > 0 && alignment - 1 <= available - bytes;
   };
   // Count every static slot, including mutually exclusive lifetimes, to bound
-  // the worker frame without relying on the lower compiler's stack coloring.
+  // each automatic allocation scope without relying on stack coloring. Task
+  // dispatches have separate worker frames from their enclosing function.
   for (auto facts : allocations) {
     if (!facts.stack) continue;
     auto allocation = facts.value.getDefiningOp<memref::AllocaOp>();
+    Operation *owner = allocation->getParentWithTrait<OpTrait::AutomaticAllocationScope>();
+    if (!owner || unavailable.contains(owner)) continue;
+    int64_t &available = remaining.try_emplace(owner, budget).first->second;
     int64_t alignment = alignmentOf(allocation);
-    if (!facts.bytes || !fits(*facts.bytes, alignment)) return;
-    budget -= *facts.bytes + alignment - 1;
+    if (!facts.bytes || !fits(*facts.bytes, alignment, available)) {
+      unavailable.insert(owner);
+      continue;
+    }
+    available -= *facts.bytes + alignment - 1;
   }
   for (auto facts : allocations) {
     auto allocation = facts.value.getDefiningOp<memref::AllocOp>();
     if (!allocation || !facts.bytes || *facts.bytes <= 0 || *facts.bytes > 1024 ||
         !allocation.getType().getLayout().isIdentity()) continue;
+    Operation *owner = allocation->getParentWithTrait<OpTrait::AutomaticAllocationScope>();
+    if (!owner || unavailable.contains(owner)) continue;
+    int64_t &available = remaining.try_emplace(owner, budget).first->second;
     int64_t alignment = alignmentOf(allocation);
-    if (!fits(*facts.bytes, alignment)) continue;
+    if (!fits(*facts.bytes, alignment, available)) continue;
     cpu::StorageAnalysis storage(function);
     auto lifetime = storage.lifetime(allocation);
     if (!lifetime || !lifetime->aliases.complete) continue;
@@ -85,7 +98,7 @@ void promotePrivateScratch(func::FuncOp function, int64_t budget) {
     lifetime->end.erase();
     allocation.replaceAllUsesWith(stack.getResult());
     allocation.erase();
-    budget -= *facts.bytes + alignment - 1;
+    available -= *facts.bytes + alignment - 1;
   }
 }
 
@@ -270,8 +283,11 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
   arith::populateCeilFloorDivExpandOpsPatterns(integerDivision);
   if (failed(applyPatternsGreedily(module, std::move(integerDivision)))) return failure();
   if (failed(expandAtomicUpdates(module))) return failure();
-  for (func::FuncOp function : module.getOps<func::FuncOp>())
+  for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+    if (failed(cpu::reuseScratchStorage(
+            function, cpu::ScratchRepresentation::LinearCapacity))) return failure();
     promotePrivateScratch(function, capabilities.getPrivateBytes());
+  }
   SmallVector<Block *> scopes;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     if (function.isExternal()) continue;

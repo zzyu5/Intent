@@ -34,6 +34,9 @@ add_mlir_library(MLIRIntentCPUTransforms
   Storage/FuseIntermediateBuffers.cpp
   Storage/Passes.cpp
   Storage/ReusePrivateStorage.cpp
+  Storage/ScratchCapacity.cpp
+  Storage/ScratchPlacement.cpp
+  Storage/ScratchReuse.cpp
 
   Structure/ContiguousAccesses.cpp
   Structure/FoldUniformComputations.cpp

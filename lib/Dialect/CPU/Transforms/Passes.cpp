@@ -77,6 +77,7 @@ void buildCPUPipeline(OpPassManager &manager,
   CPUPartitionTasksOptions tasks;
   tasks.provider = options.provider;
   manager.addPass(createCPUPartitionTasks(tasks));
+  manager.addPass(createCPUReuseScratchStorage());
   addNormalization(manager);
   manager.addPass(createCPUIsolateTasks());
 }

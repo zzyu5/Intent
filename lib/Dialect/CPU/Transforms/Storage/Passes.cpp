@@ -8,6 +8,7 @@ namespace intent::cpu {
 
 #define GEN_PASS_DEF_CPUBUFFERIZEVALUES
 #define GEN_PASS_DEF_CPUREUSEPRIVATESTORAGE
+#define GEN_PASS_DEF_CPUREUSESCRATCHSTORAGE
 #include "Intent/Dialect/CPU/Transforms/Passes.h.inc"
 
 namespace {
@@ -33,6 +34,19 @@ public:
   void runOnOperation() final {
     if (failed(detail::transformFunctions(getOperation(), getArgument(),
                                           reusePrivateStorage)))
+      signalPassFailure();
+  }
+};
+
+class ReuseScratchStoragePass
+    : public impl::CPUReuseScratchStorageBase<ReuseScratchStoragePass> {
+public:
+  using CPUReuseScratchStorageBase::CPUReuseScratchStorageBase;
+  void runOnOperation() final {
+    if (failed(detail::transformFunctions(getOperation(), getArgument(),
+            [](func::FuncOp function) {
+              return reuseScratchStorage(function, ScratchRepresentation::PreserveDescriptors);
+            })))
       signalPassFailure();
   }
 };

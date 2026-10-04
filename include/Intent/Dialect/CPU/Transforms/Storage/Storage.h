@@ -7,6 +7,9 @@ namespace intent::cpu {
 
 void eraseDeadPrivateBuffers(mlir::func::FuncOp function);
 mlir::LogicalResult reusePrivateStorage(mlir::func::FuncOp function);
+enum class ScratchRepresentation { PreserveDescriptors, LinearCapacity };
+mlir::LogicalResult reuseScratchStorage(mlir::func::FuncOp function,
+                                       ScratchRepresentation representation);
 void forwardCPUOutputs(mlir::func::FuncOp function);
 mlir::LogicalResult fuseIntermediateBuffers(mlir::func::FuncOp function);
 

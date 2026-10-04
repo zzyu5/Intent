@@ -147,6 +147,17 @@ def CPUReusePrivateStorage : CPUTransform<"intent-cpu-reuse-private-storage",
   }];
 }
 
+def CPUReuseScratchStorage : CPUTransform<"intent-cpu-reuse-scratch-storage",
+    "Reuse bounded scratch capacity within its sequential execution owner"> {
+  let description = [{
+    Requires and preserves the CPU Buffers contract. Reuses nonescaping scratch
+    slots with disjoint lifetimes and places storage outside serial traversals.
+    Preserves the existing descriptor representation. Initialization and
+    accesses retain their original locations; parallel and task allocation
+    owners are not crossed.
+  }];
+}
+
 def CPUPrepareInputs : CPUTransform<"intent-cpu-prepare-inputs",
     "Share prepared input representations required by selected implementations"> {
   let description = [{
