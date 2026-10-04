@@ -63,6 +63,13 @@ bool reuseScratchSlots(ScratchSnapshot &snapshot, int64_t byteLimit,
     auto firstType = cast<MemRefType>(firstOperation->getResult(0).getType());
     if (!firstType.getLayout().isIdentity()) continue;
     bool firstStack = isa<memref::AllocaOp>(firstOperation);
+    Operation *directRelease = nullptr;
+    if (!firstStack)
+      for (Operation *user : firstOperation->getResult(0).getUsers())
+        if (isa<memref::DeallocOp>(user) && user->getBlock() == firstOperation->getBlock()) {
+          directRelease = user;
+          break;
+        }
     for (size_t other = number + 1; other < candidates.size(); ++other) {
       Operation *secondOperation = candidates[other].operation;
       auto secondType = cast<MemRefType>(secondOperation->getResult(0).getType());
@@ -71,12 +78,17 @@ bool reuseScratchSlots(ScratchSnapshot &snapshot, int64_t byteLimit,
           firstType.getElementType() != secondType.getElementType() ||
           firstType.getMemorySpace() != secondType.getMemorySpace() ||
           !secondType.getLayout().isIdentity()) continue;
+      if (representation == ScratchRepresentation::PreserveDescriptors &&
+          firstType != secondType) continue;
+      // A direct release supplies only a necessary ordering condition. The
+      // complete lifetime proof below still rejects missing or multiple frees.
+      if (directRelease && !directRelease->isBeforeInBlock(secondOperation)) continue;
       auto *first = snapshot.get(number);
       if (!first) break;
-      auto *second = snapshot.get(other);
-      if (!second || !sameStorageInterpretation(*first, *second)) continue;
       Operation *end = first->release ? first->release.getOperation() : first->lastUse;
       if (!end->isBeforeInBlock(secondOperation)) continue;
+      auto *second = snapshot.get(other);
+      if (!second || !sameStorageInterpretation(*first, *second)) continue;
       int64_t alignment = std::max(scratchAlignment(*first), scratchAlignment(*second));
       if (sameDescriptor(*first, *second)) {
         alignScratch(*first, alignment);
