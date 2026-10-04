@@ -238,10 +238,15 @@ public:
         bool floating = element.isF32() || element.isF64();
         bool integer = element.isSignlessInteger(8) || element.isSignlessInteger(16) ||
                        element.isSignlessInteger(32) || element.isSignlessInteger(64);
+        bool arithmetic = op.getKind() == vector::CombiningKind::ADD ||
+                          op.getKind() == vector::CombiningKind::MUL;
+        bool extrema = op.getKind() == vector::CombiningKind::MAXIMUMF ||
+                       op.getKind() == vector::CombiningKind::MINIMUMF;
         if (vectorType.getRank() != 1 || vectorType.isScalable() || (!floating && !integer) ||
-            (op.getKind() != vector::CombiningKind::ADD && op.getKind() != vector::CombiningKind::MUL))
-          return op.emitOpError("requires a fixed one-dimensional same-dtype add/mul reduction for Mojo");
-        if (floating && (op.getFastmath() & arith::FastMathFlags::reassoc) == arith::FastMathFlags::none)
+            (!arithmetic && !(floating && extrema)))
+          return op.emitOpError("requires a fixed one-dimensional same-dtype add/mul or floating maximum/minimum reduction for Mojo");
+        if (floating && arithmetic &&
+            (op.getFastmath() & arith::FastMathFlags::reassoc) == arith::FastMathFlags::none)
           return op.emitOpError("requires floating reassociation permission for Mojo SIMD reduction");
         return success();
       });
@@ -388,6 +393,19 @@ private:
     return success();
   }
   LogicalResult emitTyped(vector::ReductionOp op) {
+    if (op.getKind() == vector::CombiningKind::MAXIMUMF ||
+        op.getKind() == vector::CombiningKind::MINIMUMF) {
+      bool maximum = op.getKind() == vector::CombiningKind::MAXIMUMF;
+      std::string intrinsic = maximum ? "llvm.vector.reduce.fmaximum" : "llvm.vector.reduce.fminimum";
+      std::string type = valueType(op.getDest().getType());
+      std::string expression = "llvm_intrinsic[\"" + intrinsic + "\", " + type + "](" +
+                               name(op.getVector()) + ")";
+      if (op.getAcc())
+        expression = "llvm_intrinsic[\"" + std::string(maximum ? "llvm.maximum" : "llvm.minimum") +
+                     "\", " + type + "](" + name(op.getAcc()) + ", " + expression + ")";
+      assign(op.getDest(), expression);
+      return success();
+    }
     bool add = op.getKind() == vector::CombiningKind::ADD;
     std::string expression = "(" + name(op.getVector()) + ")" +
                             (add ? ".reduce_add()" : ".reduce_mul()");

@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Vector/Vectorization.h"
 #include "ProducerVectorization.h"
+#include "../Storage/AccessAliases.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
@@ -55,7 +56,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
              original.getBody()->getTerminator()->getOperands())) {
       if (!carry.getType().isF32() || !carry.hasOneUse()) return;
       Operation *combine = yielded.getDefiningOp();
-      if (!combine || !isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MaximumFOp>(combine)) return;
+      if (!combine || !isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MaximumFOp, arith::MinimumFOp>(combine)) return;
       if (combine->getOperand(0) == carry) reductionInputs.push_back(combine->getOperand(1));
       else if (combine->getOperand(1) == carry) reductionInputs.push_back(combine->getOperand(0));
       else return;
@@ -330,6 +331,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
 LogicalResult vectorizeLoop(scf::ForOp loop, int64_t width, int64_t replicas) {
   if (width <= 0 || replicas <= 0)
     return loop.emitError("CPU loop vectorization requires positive width and replicas");
+  if (failed(foldLoopAccessSubviews(loop))) return failure();
   vectorize(loop, width, replicas);
   return success();
 }

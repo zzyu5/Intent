@@ -23,6 +23,10 @@ std::optional<IndependentReduction> matchIndependentReduction(
       return IndependentReduction{vector::CombiningKind::ADD, add.getFastmath()};
     if (auto multiply = dyn_cast<arith::MulFOp>(operation))
       return IndependentReduction{vector::CombiningKind::MUL, multiply.getFastmath()};
+    if (auto maximum = dyn_cast<arith::MaximumFOp>(operation))
+      return IndependentReduction{vector::CombiningKind::MAXIMUMF, maximum.getFastmath()};
+    if (auto minimum = dyn_cast<arith::MinimumFOp>(operation))
+      return IndependentReduction{vector::CombiningKind::MINIMUMF, minimum.getFastmath()};
   } else if (type.isSignlessInteger(8) || type.isSignlessInteger(16) ||
              type.isSignlessInteger(32) || type.isSignlessInteger(64)) {
     if (isa<arith::AddIOp>(operation))
@@ -52,7 +56,9 @@ SmallVector<Value> horizontalReduce(
     for (auto [value, reduction] : llvm::zip(values, independent)) {
       Type element = cast<VectorType>(value.getType()).getElementType();
       auto flags = reduction.fastMath;
-      if (isa<FloatType>(element)) flags = flags | arith::FastMathFlags::reassoc;
+      if (isa<FloatType>(element) && (reduction.kind == vector::CombiningKind::ADD ||
+                                     reduction.kind == vector::CombiningKind::MUL))
+        flags = flags | arith::FastMathFlags::reassoc;
       Value neutral;
       if (isa<FloatType>(element) && reduction.kind == vector::CombiningKind::ADD)
         neutral = builder.create<arith::ConstantOp>(
