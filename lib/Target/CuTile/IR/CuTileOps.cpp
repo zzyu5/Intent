@@ -661,6 +661,16 @@ LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
   if (!getKind()) {
+    if (getSources().size() > 1) {
+      auto kernel = (*this)->getParentOfType<func::FuncOp>();
+      auto capabilities = kernel
+          ? kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr)
+          : gpu::CapabilitiesAttr();
+      if (!capabilities || !capabilities.getNativeTupleReductions() ||
+          !capabilities.getNativeTupleReductionRequiresConstantIdentity())
+        return emitOpError(
+            "cuTile tuple reduction requires constant-identity provider capability");
+    }
     if (failed(gpu::verifyScalarCollective(
             getOperation(), getSources(), getIdentities(), getResults(),
             getCombine(), getAxis(), false)))

@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "../Access/AccessComposition.h"
 #include "../Value/ScopePlacement.h"
 
@@ -265,7 +266,17 @@ ReduceOp tryFuse(ReduceOp first, ReduceOp second, func::FuncOp kernel) {
   auto shape = dyn_cast<FragmentType>(first.getSources().front().getType());
   if (!shape)
     return {};
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  UniformValueAnalysis constants(describeUniformValue);
   for (ReduceOp reduce : {first, second}) {
+    // Joint custom primitives can have a narrower identity domain than a
+    // provider's single-component builtins. Keep those builtins available when
+    // the new tuple would not have a legal native identity.
+    if (capabilities.getNativeTupleReductionRequiresConstantIdentity() &&
+        llvm::any_of(reduce.getIdentities(), [&](Value identity) {
+          return !constants.evaluate(identity);
+        }))
+      return {};
     for (NamedAttribute attribute : reduce->getDiscardableAttrs())
       if (attribute.getName() != originAttr)
         return {};

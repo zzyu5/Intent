@@ -16,6 +16,7 @@ enum class Family { GPU, CPU, DSA };
 struct GPUBackend {
   static constexpr Family family = Family::GPU;
   bool nativeTupleReductions;
+  bool nativeTupleReductionRequiresConstantIdentity;
   bool nativeFragmentGather;
   gpu::TuningProfileSchema profiles;
   llvm::StringRef profileFilename;

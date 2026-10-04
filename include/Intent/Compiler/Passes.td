@@ -16,6 +16,7 @@ def ConstructGPU : Pass<"intent-construct-gpu", "mlir::ModuleOp"> {
     Option<"matrixUnits", "matrix-units", "bool", "false", "Matrix capability">,
     Option<"dynamicVectorWidth", "dynamic-vector-width", "bool", "false", "Dynamic vector width">,
     Option<"nativeTupleReductions", "native-tuple-reductions", "bool", "false", "Provider tuple reductions">,
+    Option<"nativeTupleReductionRequiresConstantIdentity", "native-tuple-reduction-requires-constant-identity", "bool", "false", "Provider tuple reduction requires compile-time identities">,
     Option<"nativeFragmentGather", "native-fragment-gather", "bool", "false", "Provider fragment gather">
   ];
   let dependentDialects = ["intent::gpu::IntentGPUDialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect", "mlir::scf::SCFDialect"];

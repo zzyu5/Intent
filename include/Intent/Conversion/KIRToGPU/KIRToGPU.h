@@ -17,6 +17,7 @@ struct GPUCapabilities {
   bool matrixUnits;
   bool dynamicVectorWidth;
   bool nativeTupleReductions;
+  bool nativeTupleReductionRequiresConstantIdentity;
   bool nativeFragmentGather;
 };
 

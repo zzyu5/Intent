@@ -278,6 +278,7 @@ LogicalResult constructGPUProgram(
       capabilities.computeCapabilityMinor,
       capabilities.singleToDoublePrecisionPerfRatio, capabilities.matrixUnits,
       capabilities.dynamicVectorWidth, capabilities.nativeTupleReductions,
+      capabilities.nativeTupleReductionRequiresConstantIdentity,
       capabilities.nativeFragmentGather);
   SmallVector<NamedAttribute> functionAttrs{
       builder.getNamedAttr(gpu::kernelAttr, builder.getUnitAttr()),

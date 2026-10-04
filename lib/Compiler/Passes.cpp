@@ -33,7 +33,8 @@ public:
         maxDynamicSharedMemoryPerBlock, registersPerUnit, maxThreadsPerBlock,
         computeCapabilityMajor, computeCapabilityMinor,
         singleToDoublePrecisionPerfRatio, matrixUnits, dynamicVectorWidth,
-        nativeTupleReductions, nativeFragmentGather};
+        nativeTupleReductions, nativeTupleReductionRequiresConstantIdentity,
+        nativeFragmentGather};
     if (failed(lowerCanonicalKIRToGPU(getOperation(), capabilities)))
       signalPassFailure();
   }
