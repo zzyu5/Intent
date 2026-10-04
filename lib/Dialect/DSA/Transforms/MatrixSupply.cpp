@@ -1,5 +1,6 @@
 #include "PassSupport.h"
 #include "StoragePatterns.h"
+#include "MatrixSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -14,28 +15,12 @@
 using namespace mlir;
 namespace intent::dsa {
 namespace {
-struct Slice {
-  Value extent, begin;
-};
-std::optional<Slice> sliceBounds(Value count, int64_t width) {
-  auto minimum = count.getDefiningOp<arith::MinSIOp>();
-  if (!minimum) return std::nullopt;
-  for (unsigned side = 0; side < 2; ++side) {
-    APInt bound;
-    if (!matchPattern(minimum->getOperand(side), m_ConstantInt(&bound)) || bound.getSExtValue() != width) continue;
-    auto difference = minimum->getOperand(1 - side).getDefiningOp<arith::SubIOp>();
-    if (difference) return Slice{difference.getLhs(), difference.getRhs()};
-  }
-  return std::nullopt;
-}
-
 // This match refers only to the existing tiled program, including its epilogue.
 // It does not retain a KIR clone or authorize an alternative algorithm.
 struct MatrixSupplyMatch {
   scf::ForOp work, reduction;
   MatMulOp matrix;
   LoadTileOp lhs, rhs;
-  Value m, n, rows, columns, M, N, K;
 };
 std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, ConfigurationAttr config) {
   if (!work.getLowerBound().getDefiningOp<TaskIdOp>() ||
@@ -45,46 +30,20 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   if (matrices.size() != 1) return std::nullopt;
   MatMulOp matrix = matrices.front();
   auto function = work->getParentOfType<func::FuncOp>();
+  // Group launch is function-wide. All observable work must belong to this
+  // complete workset; unrelated tasks cannot start executing on the new memory
+  // participants merely because one matrix traversal was cooperative.
+  if (function->hasAttr("intent_dsa.group_width") ||
+      work->getBlock() != &function.front() ||
+      llvm::any_of(function.front(), [&](Operation &operation) {
+        return &operation != work.getOperation() &&
+               !operation.hasTrait<OpTrait::IsTerminator>() &&
+               (!isMemoryEffectFree(&operation) || !isSpeculatable(&operation));
+      })) return std::nullopt;
   StorageAnalysis storage(function);
   auto reduction = dyn_cast<scf::ForOp>(matrix->getParentOp());
-  APInt step;
   if (!reduction || reduction->getBlock() != work.getBody() || !reduction.getInitArgs().empty() ||
-      !matchPattern(reduction.getLowerBound(), m_Zero()) ||
-      !matchPattern(reduction.getStep(), m_ConstantInt(&step)) || step.getSExtValue() != config.getTileK() ||
       matrix.getRhsTransposed()) return std::nullopt;
-  auto row = sliceBounds(matrix.getRows(), config.getTileM());
-  auto column = sliceBounds(matrix.getColumns(), config.getTileN());
-  auto depth = sliceBounds(matrix.getDepth(), config.getTileK());
-  if (!row || !column || !depth || depth->begin != reduction.getInductionVar() ||
-      depth->extent != reduction.getUpperBound()) return std::nullopt;
-  auto tileCoordinate = [](Value begin, int64_t width) -> Value {
-    auto product = begin.getDefiningOp<arith::MulIOp>();
-    if (!product) return {};
-    for (unsigned side = 0; side < 2; ++side) {
-      APInt constant;
-      if (matchPattern(product->getOperand(side), m_ConstantInt(&constant)) && constant.getSExtValue() == width)
-        return product->getOperand(1 - side);
-    }
-    return {};
-  };
-  Value rowCoordinate = tileCoordinate(row->begin, config.getTileM());
-  Value columnCoordinate = tileCoordinate(column->begin, config.getTileN());
-  if (!rowCoordinate || !columnCoordinate) return std::nullopt;
-  auto mi = rowCoordinate.getDefiningOp<arith::DivSIOp>();
-  auto ni = columnCoordinate.getDefiningOp<arith::RemSIOp>();
-  auto grid = work.getUpperBound().getDefiningOp<arith::MulIOp>();
-  if (!mi || !ni || !grid || mi.getLhs() != work.getInductionVar() ||
-      ni.getLhs() != work.getInductionVar() || mi.getRhs() != ni.getRhs()) return std::nullopt;
-  auto tileCount = [](Value value, Value extent, int64_t width) {
-    auto count = value.getDefiningOp<arith::CeilDivSIOp>();
-    APInt constant;
-    return count && count.getLhs() == extent && matchPattern(count.getRhs(), m_ConstantInt(&constant)) &&
-        constant.getSExtValue() == width;
-  };
-  Value gridN = mi.getRhs();
-  Value gridM = grid.getLhs() == gridN ? grid.getRhs() : grid.getRhs() == gridN ? grid.getLhs() : Value{};
-  if (!gridM || !tileCount(gridM, row->extent, config.getTileM()) ||
-      !tileCount(gridN, column->extent, config.getTileN())) return std::nullopt;
   LoadTileOp lhs, rhs;
   SmallVector<FillOp> inputInitializers;
   for (Operation &operation : reduction.getBody()->without_terminator()) {
@@ -108,56 +67,19 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
         return std::nullopt;
     } else if (!isMemoryEffectFree(&operation)) return std::nullopt;
   }
-  if (!lhs || !rhs || lhs.getRows() != matrix.getRows() || lhs.getColumns() != matrix.getDepth() ||
-      rhs.getRows() != matrix.getDepth() || rhs.getColumns() != matrix.getColumns() ||
+  if (!lhs || !rhs ||
       !lhs->isBeforeInBlock(matrix) || !rhs->isBeforeInBlock(matrix)) return std::nullopt;
-  if (!isSumOfIntegerProducts(lhs.getOffset(), {{row->begin, lhs.getRowStride()}, {depth->begin, lhs.getColumnStride()}}) ||
-      !isSumOfIntegerProducts(rhs.getOffset(), {{depth->begin, rhs.getRowStride()}, {column->begin, rhs.getColumnStride()}}))
-    return std::nullopt;
   auto external = [](Value source) {
     auto type = dyn_cast<MemRefType>(source.getType());
     return type && type.getRank() == 2 && type.getMemorySpaceAsInt() == 0;
   };
   if (!external(lhs.getSource()) || !external(rhs.getSource())) return std::nullopt;
-  auto interface = intent::getPublicInterface(function);
-  auto viewStride = [&](Value stride, Value source, unsigned axis) {
-    auto argument = dyn_cast<BlockArgument>(source);
-    if (!argument || argument.getOwner() != &function.front()) return false;
-    auto view = intent::getPublicView(interface, argument.getArgNumber());
-    if (!view || view.getAccess() != 0) return false;
-    if (auto query = stride.getDefiningOp<StrideOp>())
-      return query.getSource() == source && query.getAxis() == axis;
-    if (!view.getConstraints().getHasStrides()) return false;
-    auto fixed = dyn_cast<IntegerAttr>(view.getConstraints().getStrides()[axis]);
-    APInt value;
-    return fixed && matchPattern(stride, m_ConstantInt(&value)) && value.getSExtValue() == fixed.getInt();
-  };
-  if (!viewStride(lhs.getRowStride(), lhs.getSource(), 0) ||
-      !viewStride(lhs.getColumnStride(), lhs.getSource(), 1) ||
-      !viewStride(rhs.getRowStride(), rhs.getSource(), 0) ||
-      !viewStride(rhs.getColumnStride(), rhs.getSource(), 1)) return std::nullopt;
-  auto fullDimension = [](Value extent, Value source, unsigned axis) {
-    if (auto dim = extent.getDefiningOp<memref::DimOp>())
-      return dim.getSource() == source && dim.getConstantIndex() == axis;
-    APInt constant;
-    auto type = cast<MemRefType>(source.getType());
-    return !type.isDynamicDim(axis) && matchPattern(extent, m_ConstantInt(&constant)) &&
-        constant.getSExtValue() == type.getDimSize(axis);
-  };
-  if (!fullDimension(row->extent, lhs.getSource(), 0) || !fullDimension(depth->extent, lhs.getSource(), 1) ||
-      !fullDimension(column->extent, rhs.getSource(), 1)) return std::nullopt;
   auto lhsSourceType = cast<MemRefType>(lhs.getSource().getType());
   auto rhsSourceType = cast<MemRefType>(rhs.getSource().getType());
   Type element = lhsSourceType.getElementType();
   if (!element.isF16() && !element.isBF16() && !element.isF32()) return std::nullopt;
-  if (!lhsSourceType.isDynamicDim(1) && !rhsSourceType.isDynamicDim(0)) {
-    if (lhsSourceType.getDimSize(1) != rhsSourceType.getDimSize(0)) return std::nullopt;
-  } else {
-    auto leftView = intent::getPublicView(interface, cast<BlockArgument>(lhs.getSource()).getArgNumber());
-    auto rightView = intent::getPublicView(interface, cast<BlockArgument>(rhs.getSource()).getArgNumber());
-    int64_t reduction = intent::publicViewDimensions(leftView)[1];
-    if (reduction <= 0 || reduction != intent::publicViewDimensions(rightView)[0]) return std::nullopt;
-  }
+  if (rhsSourceType.getElementType() != element ||
+      !detail::hasCompleteMatrixWorkset(work, reduction, matrix, lhs, rhs)) return std::nullopt;
   if (!storage.disjoint(matrix.getLhs(), matrix.getRhs()) ||
       !storage.disjoint(matrix.getAccumulator(), matrix.getLhs()) ||
       !storage.disjoint(matrix.getAccumulator(), matrix.getRhs()))
@@ -230,8 +152,7 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
       if (!fill || !llvm::is_contained(inputInitializers, fill)) return std::nullopt;
     }
   }
-  DenseSet<Value> available{matrix.getAccumulator(), row->begin, column->begin,
-                            matrix.getRows(), matrix.getColumns()};
+  DenseSet<Value> available{matrix.getAccumulator(), work.getInductionVar()};
   DenseSet<Value> visiting;
   std::function<bool(Value)> canCapture = [&](Value value) {
     if (available.contains(value)) return true;
@@ -246,7 +167,6 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     if (legal) available.insert(value);
     return legal;
   };
-  if (!canCapture(row->extent) || !canCapture(column->extent) || !canCapture(depth->extent)) return std::nullopt;
   for (Operation *operation = reduction->getNextNode(); operation && !operation->hasTrait<OpTrait::IsTerminator>();
        operation = operation->getNextNode()) {
     if (operation->getNumRegions() ||
@@ -255,8 +175,7 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     if (!llvm::all_of(operation->getOperands(), canCapture)) return std::nullopt;
     available.insert(operation->result_begin(), operation->result_end());
   }
-  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs, row->begin, column->begin,
-      matrix.getRows(), matrix.getColumns(), row->extent, column->extent, depth->extent};
+  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs};
 }
 
 class MatrixSupplyRewrite {
@@ -267,17 +186,20 @@ public:
     auto matrix = match.matrix;
     Location loc = matrix.getLoc();
     Value lhsSource = match.lhs.getSource(), rhsSource = match.rhs.getSource();
-    Value M = capture(match.M), N = capture(match.N), K = capture(match.K);
+    Value M = b.createOrFold<memref::DimOp>(loc, lhsSource, 0);
+    Value N = b.createOrFold<memref::DimOp>(loc, rhsSource, 1);
+    Value K = b.createOrFold<memref::DimOp>(loc, lhsSource, 1);
     Value tm = index(loc, config.getTileM()), tn = index(loc, config.getTileN()), tk = index(loc, config.getTileK());
     Value gridM = b.create<arith::CeilDivSIOp>(loc, M, tm), gridN = b.create<arith::CeilDivSIOp>(loc, N, tn);
-    auto aType = cast<MemRefType>(lhsSource.getType()), bType = cast<MemRefType>(rhsSource.getType());
+    auto aType = cast<MemRefType>(lhsSource.getType());
     Type matrixElement = aType.getElementType();
     int64_t elementBytes = matrixElement.getIntOrFloatBitWidth() / 8;
-    auto emitOutput = [&](Value accumulator, Value m, Value n, Value rows, Value columns) {
+    auto emitOutput = [&](Value accumulator, Value m, Value n, Value, Value) {
       IRMapping mapping;
       mapping.map(match.matrix.getAccumulator(), accumulator);
-      mapping.map(match.m, m); mapping.map(match.n, n);
-      mapping.map(match.rows, rows); mapping.map(match.columns, columns);
+      Value mi = b.create<arith::DivSIOp>(loc, m, tm);
+      Value ni = b.create<arith::DivSIOp>(loc, n, tn);
+      mapping.map(match.work.getInductionVar(), add(loc, mul(loc, mi, gridN), ni));
       std::function<Value(Value)> operand = [&](Value value) -> Value {
         if (Value replacement = mapping.lookupOrNull(value)) return replacement;
         Operation *definition = value.getDefiningOp();
@@ -508,14 +430,6 @@ public:
     }
   }
 private:
-  Value capture(Value value) {
-    Operation *definition = value.getDefiningOp();
-    if (!definition || !match.work->isAncestor(definition)) return value;
-    if (Value replacement = captures.lookupOrNull(value)) return replacement;
-    for (Value input : definition->getOperands()) captures.map(input, capture(input));
-    b.clone(*definition, captures);
-    return captures.lookup(value);
-  }
   Value index(Location loc, int64_t value) { return b.create<arith::ConstantIndexOp>(loc, value); }
   Value add(Location loc, Value a, Value c) { return b.create<arith::AddIOp>(loc, a, c); }
   Value sub(Location loc, Value a, Value c) { return b.create<arith::SubIOp>(loc, a, c); }
@@ -543,7 +457,6 @@ private:
   ConfigurationAttr config;
   func::FuncOp function;
   OpBuilder b;
-  IRMapping captures;
 };
 } // namespace
 
