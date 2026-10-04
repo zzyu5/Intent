@@ -781,7 +781,7 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       BinaryOperator::Multiply);
   bool bodyFailed = false;
   std::string failureReason;
-  auto loop = builder.create<scf::ForOp>(
+  auto loop = createTraversalLoop(builder,
       range.getLoc(), range.getStart(), stop, loopStep, ValueRange{},
       [&](OpBuilder &nested, Location location, Value tileStart, ValueRange) {
         Value blocked = nested.create<MakeRangeOp>(
