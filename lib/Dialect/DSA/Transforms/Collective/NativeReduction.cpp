@@ -32,8 +32,8 @@ bool Lowering::nativeReduction() {
        kind == BinaryOperator::MinimumNum);
   if (!boolean && !numeric)
     return false;
-  if (isa<MemRefType>(field.initial.getType()) && !field.freeShape.empty())
-    return false;
+  bool shapedInitial = isa<MemRefType>(field.initial.getType()) &&
+                       !field.freeShape.empty();
   auto function = operation->getParentOfType<func::FuncOp>();
   auto configuration = function->getAttrOfType<ConfigurationAttr>(
       "intent_dsa.configuration");
@@ -49,9 +49,23 @@ bool Lowering::nativeReduction() {
   if (!rowwise && axis + 1 != unsigned(type.getRank()))
     return false;
 
+  // Native row reductions take one scalar identity. A carried vector is a
+  // seed, not that identity: reduce the current members, then apply the actual
+  // helper to the incoming seed exactly once. Use the native arith identity
+  // rules (notably NaN for maxnum/minnum); addition needs negative zero so the
+  // extra partial-reduction identity does not change signed zero.
+  std::optional<TypedAttr> neutral;
+  if (rowwise && numeric && shapedInitial) {
+    neutral = arith::getNeutralElement(&expression);
+    if (kind == BinaryOperator::Add)
+      neutral = builder.getFloatAttr(element,
+          APFloat::getZero(cast<FloatType>(element).getFloatSemantics(), true));
+    if (!neutral) return false;
+  }
+
   Value input = physicalView(builder, location, field.source);
   Value initial = field.initial;
-  if (isa<MemRefType>(initial.getType()))
+  if (isa<MemRefType>(initial.getType()) && !shapedInitial)
     initial = load(builder, location, initial, {});
   if (boolean) {
     Value promoted = allocate(builder, location, builder.getF32Type(),
@@ -72,7 +86,8 @@ bool Lowering::nativeReduction() {
         ? allocate(builder, location, builder.getF32Type(),
                    {1, columns * (type.getDimSize(1) + 1)})
         : allocate(builder, location, builder.getF32Type(), {1, columns});
-    Value identity = boolean ? zero() : initial;
+    Value identity = boolean ? zero() : shapedInitial
+        ? Value(builder.create<arith::ConstantOp>(location, *neutral)) : initial;
     builder.create<ReduceOp>(location, input, accumulator, scratch,
         field.counts[axis], identity,
         BinaryOperatorAttr::get(builder.getContext(),
@@ -92,13 +107,22 @@ bool Lowering::nativeReduction() {
             location, kind == BinaryOperator::LogicalAnd
                 ? arith::CmpFPredicate::OEQ : arith::CmpFPredicate::UNE,
             sum, threshold);
+        Value seed = shapedInitial
+            ? load(builder, location, initial, coordinates) : initial;
         Value result = kind == BinaryOperator::LogicalAnd
-            ? Value(builder.create<arith::AndIOp>(location, initial, predicate))
-            : Value(builder.create<arith::OrIOp>(location, initial, predicate));
+            ? Value(builder.create<arith::AndIOp>(location, seed, predicate))
+            : Value(builder.create<arith::OrIOp>(location, seed, predicate));
         store(builder, location, result, field.output, coordinates);
         return success();
       });
     } else {
+      if (shapedInitial) {
+        auto combined = liftScalarCombine(builder, location, body,
+            {initial, view(builder, location, accumulator, field.freeShape)},
+            field.freeShape);
+        assert(succeeded(combined) && "native binary helper has a tile mapping");
+        accumulator = physicalView(builder, location, combined->front());
+      }
       builder.create<LoadTileOp>(
           location, accumulator, physicalView(builder, location, field.output),
           index(builder, location, 0), index(builder, location, 0),
@@ -115,14 +139,15 @@ bool Lowering::nativeReduction() {
   Value scratch = allocate(builder, location, builder.getF32Type(),
                             {1, capacity});
   Value reduced = allocate(builder, location, builder.getF32Type(), {1, 1});
-  Value identity = initial;
-  if (boolean) {
-    identity = builder.create<arith::UIToFPOp>(location, builder.getF32Type(), initial);
+  if (boolean)
     kind = kind == BinaryOperator::LogicalOr ? BinaryOperator::Maximum
                                             : BinaryOperator::Minimum;
-  }
   (void)forEach(builder, location, field.freeCounts,
                 [&](ValueRange coordinates) {
+    Value identity = shapedInitial
+        ? load(builder, location, initial, coordinates) : initial;
+    if (boolean)
+      identity = builder.create<arith::UIToFPOp>(location, builder.getF32Type(), identity);
     SmallVector<Value> source(coordinates);
     source.push_back(index(builder, location, 0));
     if (!direct)

@@ -87,6 +87,31 @@ FailureOr<SmallVector<Value>> Lowering::combine(ValueRange left,
   return results;
 }
 
+bool Lowering::transferFreeAxis(const Field &field, Value slot,
+                               ValueRange reduced, bool read) {
+  auto source = cast<MemRefType>(field.source.getType());
+  // One contiguous member vector is already the helper's physical component.
+  // Keep arbitrary higher-rank/strided free slices on the existing coordinate
+  // path rather than flattening away their actual geometry.
+  if (field.freeShape.size() != 1 || source.getRank() == 0 ||
+      llvm::is_contained(axes, source.getRank() - 1)) return false;
+  Value zero = index(builder, location, 0), one = index(builder, location, 1);
+  auto coordinates = sourceCoordinates(field, ValueRange{zero}, reduced);
+  Value offset = linearOffset(builder, location, source, coordinates);
+  if (read)
+    builder.create<LoadTileOp>(location, physicalView(builder, location, field.source),
+        physicalView(builder, location, slot), offset, zero, one, one,
+        field.freeCounts.front());
+  else
+    builder.create<StoreTileOp>(location, physicalView(builder, location, slot),
+        physicalView(builder, location, field.output), offset, zero, one, one,
+        field.freeCounts.front());
+  // LoadTile defines inactive physical lanes as zero, exactly as the previous
+  // full-slot fill followed by active member copies. StoreTile writes only the
+  // active free-axis members, including for exclusive and reverse scans.
+  return true;
+}
+
 LogicalResult Lowering::realizeAt(ValueRange independent) {
   SmallVector<Value> state, next, items;
   SmallVector<bool> shaped;
@@ -120,6 +145,8 @@ LogicalResult Lowering::realizeAt(ValueRange independent) {
     auto transfer = [&](bool read) -> LogicalResult {
       for (auto [ordinal, field] : llvm::enumerate(fields)) {
         Value slot = read ? items[ordinal] : state[ordinal];
+        if (shaped[ordinal] && transferFreeAxis(field, slot, reduced, read))
+          continue;
         if (read && shaped[ordinal]) {
           auto element = cast<MemRefType>(slot.getType()).getElementType();
           fill(builder, location, slot,

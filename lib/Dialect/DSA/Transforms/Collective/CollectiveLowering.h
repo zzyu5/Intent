@@ -66,6 +66,8 @@ private:
   bool treeReduction();
   mlir::LogicalResult realize();
   mlir::LogicalResult realizeAt(mlir::ValueRange independent);
+  bool transferFreeAxis(const Field &field, mlir::Value slot,
+                        mlir::ValueRange reduced, bool read);
   llvm::SmallVector<mlir::Value> sourceCoordinates(
       const Field &field, mlir::ValueRange free,
       mlir::ValueRange reduced) const;
