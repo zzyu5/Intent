@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentBangC
   Transforms/IndexLowering.cpp
   Transforms/Supply.cpp
   Transforms/InvariantSupply.cpp
+  Transforms/PipelineSupply.cpp
   Transforms/Storage.cpp
   Transforms/Verifier.cpp
   Serialization/Serializer.cpp
