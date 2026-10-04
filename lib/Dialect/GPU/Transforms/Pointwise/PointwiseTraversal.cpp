@@ -762,10 +762,15 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
   SmallVector<Operation *> replacedConsumers;
   for (StoreOp store : group) {
     replayRoots.push_back(store.getValue());
+    if (store.getValid()) replayRoots.push_back(store.getValid());
+    llvm::append_range(replayRoots, store.getCoordinates());
     replacedConsumers.push_back(store);
   }
   ReplayPolicy replayPolicy(kernel, replayRoots, replacedConsumers,
-      [&](Value current) { return containsTraversal(current, logicalSource, payloadTraversalDimensions); });
+      [&](Value current) {
+        return containsTraversal(current, logicalSource, payloadTraversalDimensions) ||
+               containsTraversal(current, logicalSource, *traversalDimensions);
+      });
   OpBuilder builder(group.front());
   Operation *loopInsertionAnchor = group.front().getOperation();
   Value stop = range.getLogicalStop();

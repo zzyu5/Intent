@@ -805,11 +805,22 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
     outputAxes.push_back(axis);
   if (!canReplayEpilogue(store.getValue(), std::move(outputAxes)))
     return false;
-  ReplayPolicy reuse(kernel, ValueRange{store.getValue()}, {store.getOperation()});
-  // This rewrite changes the complete reassociation frame. Retain a profitable
-  // shared epilogue in its existing frame rather than cloning it for one store.
-  if (llvm::any_of(checked, [&](const auto &entry) {
-        return reuse.retains(entry.first, store);
+  SmallVector<Value> replayRoots{store.getValue()};
+  if (store.getValid()) replayRoots.push_back(store.getValid());
+  for (LoadOp companion : companions) {
+    llvm::append_range(replayRoots, companion.getCoordinates());
+    if (companion.getValid()) replayRoots.push_back(companion.getValid());
+    if (companion.getFill()) replayRoots.push_back(companion.getFill());
+  }
+  // The input side of an aligned reshape is reused as existing SSA. Only its
+  // output-frame epilogue and the accesses' actual coordinate suffixes replay.
+  ReplayPolicy reuse(kernel, replayRoots, {store.getOperation()}, [&](Value value) {
+    return llvm::none_of(sourceReshapes, [&](ReshapeOp source) {
+      return source.getResult() == value;
+    });
+  });
+  if (llvm::any_of(replayRoots, [&](Value root) {
+        return reuse.duplicatesExpensiveWork(root);
       })) return false;
   auto input = dyn_cast<FragmentType>(reshape.getValue().getType());
   if (!input)
@@ -962,6 +973,21 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
       });
     }
   }
+  Value source = reshape.getValue();
+  if (source.getType() != input)
+    source = builder.create<BroadcastOp>(store.getLoc(), input, source);
+  mapping.map(reshape.getResult(), source);
+  for (ReshapeOp companion : llvm::drop_begin(sourceReshapes)) {
+    auto original = cast<FragmentType>(companion.getValue().getType());
+    auto target = FragmentType::get(
+        input.getContext(), original.getElementType(), input.getShape(),
+        input.getAxisMaps(), input.getValidity(), input.getOwner());
+    FailureOr<Value> value = projectPhysicalValueToSchema(
+        builder, store.getLoc(), companion.getValue(), target);
+    if (failed(value))
+      return store.emitOpError("aligned reshapes have no common input relation");
+    mapping.map(companion.getResult(), *value);
+  }
   FailureOr<Value> valid = replayFragmentValue(
       builder, store.getValid(), input, mapping, analysis, store);
   if (failed(valid))
@@ -984,21 +1010,6 @@ FailureOr<bool> composeReshapedStore(StoreOp store) {
         store.getLoc(), predicate, nonNegative, belowEnd, BinaryOperator::LogicalAnd);
     active = active ? Value(builder.create<BinaryOp>(
         store.getLoc(), predicate, active, within, BinaryOperator::LogicalAnd)) : within;
-  }
-  Value source = reshape.getValue();
-  if (source.getType() != input)
-    source = builder.create<BroadcastOp>(store.getLoc(), input, source);
-  mapping.map(reshape.getResult(), source);
-  for (ReshapeOp companion : llvm::drop_begin(sourceReshapes)) {
-    auto original = cast<FragmentType>(companion.getValue().getType());
-    auto target = FragmentType::get(
-        input.getContext(), original.getElementType(), input.getShape(),
-        input.getAxisMaps(), input.getValidity(), input.getOwner());
-    FailureOr<Value> value = projectPhysicalValueToSchema(
-        builder, store.getLoc(), companion.getValue(), target);
-    if (failed(value))
-      return store.emitOpError("aligned reshapes have no common input relation");
-    mapping.map(companion.getResult(), *value);
   }
   for (LoadOp companion : companions) {
     auto companionType = FragmentType::get(

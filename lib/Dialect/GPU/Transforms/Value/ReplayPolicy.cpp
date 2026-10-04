@@ -17,9 +17,32 @@ using namespace mlir;
 namespace intent::gpu {
 namespace {
 
-bool expensive(Value value) {
-  if (isa_and_nonnull<ContractOp, ReduceOp>(value.getDefiningOp())) return true;
-  auto unary = value.getDefiningOp<UnaryOp>();
+bool hasReplayPayload(Operation *operation) {
+  // Whole-control replay is proved by replayAt, rather than by the leaf-node
+  // query. Include those owners in the cost slice without granting legality.
+  return operation &&
+         (isa<scf::IfOp, scf::ForOp>(operation) ||
+          isPhysicalReplayNode(operation, PhysicalReplayScope::ValueGraph,
+                               /*allowAccesses=*/true));
+}
+
+bool expensiveOperation(Operation *operation) {
+  // These operations either traverse members or perform a matrix primitive.
+  // Their provider-local implementation and machine scheduling remain opaque.
+  if (isa<ContractOp, ScaledContractOp, SparseContractOp,
+          ReduceOp, ScanOp, scf::ForOp>(operation)) return true;
+  if (auto binary = dyn_cast<BinaryOp>(operation)) {
+    switch (binary.getOperatorKind()) {
+    case BinaryOperator::TrueDivide:
+    case BinaryOperator::FloorDivide:
+    case BinaryOperator::Remainder:
+    case BinaryOperator::Power:
+      return true;
+    default:
+      return false;
+    }
+  }
+  auto unary = dyn_cast<UnaryOp>(operation);
   if (!unary) return false;
   switch (unary.getOperatorKind()) {
   case UnaryOperator::Exp:
@@ -45,6 +68,15 @@ bool expensive(Value value) {
     return false;
   }
   llvm_unreachable("unknown unary replay cost");
+}
+
+bool expensivePayload(Operation *operation) {
+  // A cloned region carries its computation with it. Looking only at the outer
+  // result opcode loses the cost of math inside an if or a structured payload.
+  return operation->walk([](Operation *nested) {
+    return expensiveOperation(nested) ? WalkResult::interrupt()
+                                      : WalkResult::advance();
+  }).wasInterrupted();
 }
 
 // Preserve the existing multi-output/reduction sharing case even when its
@@ -180,8 +212,7 @@ ReplayPolicy::ReplayPolicy(func::FuncOp kernel, ValueRange roots,
     if (!isa<FragmentType, RecordType>(value.getType()) ||
         (rebuilt && !rebuilt(value))) continue;
     Operation *producer = value.getDefiningOp();
-    if (!producer || !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                                           /*allowAccesses=*/true) ||
+    if (!hasReplayPayload(producer) ||
         !slice.insert(producer).second) continue;
     llvm::append_range(pending, producer->getOperands());
     llvm::SetVector<Value> captures;
@@ -210,14 +241,48 @@ bool ReplayPolicy::survives(Operation *operation,
   return false;
 }
 
-bool ReplayPolicy::retains(Value value, Operation *anchor) const {
+bool ReplayPolicy::duplicatesExpensiveWork(Value root,
+                                          const IRMapping *bindings) const {
+  SmallVector<Value> pending{root};
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!visited.insert(value).second ||
+        (bindings && bindings->lookupOrNull(value)) ||
+        !isa<FragmentType, RecordType>(value.getType())) continue;
+    Operation *producer = value.getDefiningOp();
+    if (!producer || !slice.contains(producer)) continue;
+    // Replay projects a known record field directly. Other fields do not become
+    // new work merely because they share the same aggregate construction.
+    if (auto extract = dyn_cast<ExtractOp>(producer)) {
+      if (auto record = extract.getRecord().getDefiningOp<MakeRecordOp>()) {
+        pending.push_back(record.getFields()[extract.getField()]);
+        continue;
+      }
+    }
+    if (expensivePayload(producer)) {
+      llvm::DenseSet<Operation *> active;
+      if (survives(producer, active)) return true;
+    }
+    llvm::append_range(pending, producer->getOperands());
+    llvm::SetVector<Value> captures;
+    for (Region &region : producer->getRegions())
+      getUsedValuesDefinedAbove(region, captures);
+    llvm::append_range(pending, captures);
+  }
+  return false;
+}
+
+bool ReplayPolicy::retains(Value value, Operation *anchor,
+                           const IRMapping *bindings) const {
   auto fragment = dyn_cast<FragmentType>(value.getType());
   Operation *producer = value.getDefiningOp();
   if (!kernel || !fragment || !producer || !anchor ||
-      (!expensive(value) && !sharedReductionOutputs(value)) ||
       !DominanceInfo(kernel).dominates(value, anchor)) return false;
-  llvm::DenseSet<Operation *> active;
-  if (!survives(producer, active)) return false;
+  if (!duplicatesExpensiveWork(value, bindings)) {
+    llvm::DenseSet<Operation *> active;
+    if (!sharedReductionOutputs(value) || !survives(producer, active)) return false;
+  }
   PhysicalProgramAnalysis analysis(kernel);
   for (unsigned axis = 0; axis < fragment.getShape().size(); ++axis) {
     auto realization = analysis.axisRealization(value, axis);
@@ -243,10 +308,9 @@ bool ReplayPolicy::preservesSharedTraversal(Value root, PhysicalSourceAxis sourc
     if (!visited.insert(value).second) continue;
     auto projection = queryFragmentAxis(value.getType(), source, dimension);
     if (projection.isExact() && sharedReductionOutputs(
-            value, expensive(value) ? 1 : 2, source, dimension)) return true;
+            value, duplicatesExpensiveWork(value) ? 1 : 2, source, dimension)) return true;
     Operation *producer = value.getDefiningOp();
-    if (!producer || !isPhysicalReplayNode(producer, PhysicalReplayScope::ValueGraph,
-                                           /*allowAccesses=*/true)) continue;
+    if (!hasReplayPayload(producer)) continue;
     llvm::append_range(pending, producer->getOperands());
   }
   return false;
@@ -254,8 +318,9 @@ bool ReplayPolicy::preservesSharedTraversal(Value root, PhysicalSourceAxis sourc
 
 FailureOr<Value> ReplayPolicy::retainSlice(
     OpBuilder &builder, Value value, unsigned axis, PhysicalExprAttr extent,
-    Value coordinates, Operation *anchor, AxisMapAttr resultMapping) const {
-  if (!retains(value, anchor)) return Value();
+    Value coordinates, Operation *anchor, AxisMapAttr resultMapping,
+    const IRMapping *bindings) const {
+  if (!retains(value, anchor, bindings)) return Value();
   auto source = cast<FragmentType>(value.getType());
   auto coordinate = dyn_cast<FragmentType>(coordinates.getType());
   if (!coordinate || !coordinate.getElementType().isIndex() ||
@@ -346,7 +411,7 @@ LogicalResult ReplayPolicy::bindSlices(
           ++selectedAxes;
     if (projection.isExact() && selectedAxes == 1) {
       auto retained = retainSlice(builder, value, projection.fragmentAxis, extent,
-                                  coordinates, anchor, resultMapping);
+                                  coordinates, anchor, resultMapping, &mapping);
       if (failed(retained)) return failure();
       if (*retained) {
         mapping.map(value, *retained);

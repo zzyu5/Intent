@@ -15,7 +15,14 @@ public:
                llvm::ArrayRef<mlir::Operation *> replacedConsumers,
                llvm::function_ref<bool(mlir::Value)> rebuilt = {});
 
-  bool retains(mlir::Value value, mlir::Operation *anchor) const;
+  // Only work in this rewrite's producer slice is considered. Bound values and
+  // scalar captures are frontiers; work that dies with the consumers is moved,
+  // not duplicated. This is a profitability query, not replay permission.
+  bool duplicatesExpensiveWork(mlir::Value root,
+                              const mlir::IRMapping *bindings = nullptr) const;
+
+  bool retains(mlir::Value value, mlir::Operation *anchor,
+               const mlir::IRMapping *bindings = nullptr) const;
 
   // Early traversal selection still owns full coverage for a shared producer
   // whose physical slice is not available yet. Keep that existing route until
@@ -29,7 +36,8 @@ public:
   mlir::FailureOr<mlir::Value> retainSlice(
       mlir::OpBuilder &builder, mlir::Value value, unsigned axis,
       PhysicalExprAttr extent, mlir::Value coordinates,
-      mlir::Operation *anchor, AxisMapAttr resultMapping = {}) const;
+      mlir::Operation *anchor, AxisMapAttr resultMapping = {},
+      const mlir::IRMapping *bindings = nullptr) const;
 
   // Bind profitable, representable subexpressions before replaying the cheap
   // suffix. Mappings belong to the caller's single coordinate/scope selection.

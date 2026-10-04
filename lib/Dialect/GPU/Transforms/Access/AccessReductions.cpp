@@ -29,8 +29,12 @@ FailureOr<bool> composeReducedGather(GatherOp gather) {
 
   auto input = cast<FragmentType>(reduce.getSources().front().getType());
   auto kernel = gather->getParentOfType<func::FuncOp>();
-  ReplayPolicy reuse(kernel, ValueRange{gather.getSource()}, {gather.getOperation()});
-  if (reuse.retains(gather.getSource(), gather)) return false;
+  ReplayPolicy reuse(kernel, ValueRange{gather.getSource()}, {gather.getOperation()},
+                     [&](Value value) { return value == gather.getSource(); });
+  IRMapping bindings;
+  for (Value value : reduce.getSources()) bindings.map(value, value);
+  for (Value value : reduce.getIdentities()) bindings.map(value, value);
+  if (reuse.duplicatesExpensiveWork(gather.getSource(), &bindings)) return false;
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<Value> freeCoordinates(output.getShape().size());
   for (auto [coordinate, axis] :
@@ -221,6 +225,24 @@ FailureOr<bool> composeReductionGathers(ReduceOp reduce) {
   PhysicalSourceAxis source = sourceAxisIdentity(range);
   if (!analysis.replayability(input, source, PhysicalReplayScope::ValueGraph,
                              /*allowAccesses=*/true).isReplayable())
+    return false;
+
+  SmallVector<Value> replayRoots{input};
+  IRMapping bindings;
+  for (MakeRangeOp original : ranges)
+    bindings.map(original.getResult(), original.getResult());
+  for (GatherOp gather : gathers) {
+    // The rewrite projects the existing parent SSA and rebuilds only the
+    // validity/fill and suffix; it never replays the gathered parent graph.
+    bindings.map(gather.getResult(), gather.getResult());
+    replayRoots.push_back(gather.getValid());
+    replayRoots.push_back(gather.getFill());
+  }
+  ReplayPolicy reuse(kernel, replayRoots, {reduce.getOperation()},
+                     [&](Value value) { return visited.contains(value); });
+  if (llvm::any_of(replayRoots, [&](Value value) {
+        return reuse.duplicatesExpensiveWork(value, &bindings);
+      }))
     return false;
 
   // Ordinary reduce permits a permutation of its inputs. For a shifted

@@ -251,8 +251,11 @@ FailureOr<bool> composePointwiseGather(GatherOp gather) {
       gather.getSourceAxes().size() != source.getShape().size())
     return false;
   ReplayPolicy reuse(gather->getParentOfType<func::FuncOp>(),
-                     ValueRange{gather.getSource()}, {gather.getOperation()});
-  if (reuse.retains(gather.getSource(), gather)) return false;
+                     ValueRange{gather.getSource()}, {gather.getOperation()},
+                     [&](Value value) { return value == gather.getSource(); });
+  IRMapping bindings;
+  for (Value operand : producer->getOperands()) bindings.map(operand, operand);
+  if (reuse.duplicatesExpensiveWork(gather.getSource(), &bindings)) return false;
   if (auto binary = dyn_cast<BinaryOp>(producer);
       binary && !isa<FloatType>(source.getElementType())) {
     // Masked operands below are filled with zero. Do not introduce undefined
