@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentDSATransforms
   CollectiveGather.cpp
   IndexPrograms.cpp
   LocalValues.cpp
+  LocalMemoryValues.cpp
   Collective/Passes.cpp
   Collective/Realize.cpp
   Collective/Storage.cpp

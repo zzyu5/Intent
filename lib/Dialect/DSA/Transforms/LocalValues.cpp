@@ -52,49 +52,6 @@ void bindUniformOperands(func::FuncOp function) {
     eliminateUnreadLocalWrites(function);
 }
 
-void eliminateOverwrittenFills(func::FuncOp function) {
-  SmallVector<dsa::FillOp> fills;
-  function.walk([&](dsa::FillOp fill) { fills.push_back(fill); });
-  for (auto fill : fills) {
-    Value output = fill.getOutput();
-    if (!output.getDefiningOp<memref::AllocaOp>()) continue;
-    StorageAnalysis storage(function);
-    if (!storage.aliases(output).complete)
-      continue;
-    for (Operation *next = fill->getNextNode(); next;
-         next = next->getNextNode()) {
-      auto effects = storage.effects(next);
-      if (!effects.complete || effects.ordered)
-        break;
-      bool read = false, written = false;
-      for (const auto &entry : effects.entries) {
-        const auto &effect = entry.effect;
-        if (isa<MemoryEffects::Allocate>(effect.getEffect()) ||
-            storage.disjoint(output, effect.getValue()))
-          continue;
-        written |= isa<MemoryEffects::Write>(effect.getEffect());
-        read |= !isa<MemoryEffects::Write>(effect.getEffect());
-        if (!effect.getValue()) read = true;
-      }
-      if (read) break;
-      if (!written) continue;
-      bool complete = isa<dsa::FillOp, dsa::LoadTileOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::TransposeOp, dsa::UnaryOp, dsa::BinaryOp, dsa::CompareOp,
-                          dsa::CastOp, dsa::SelectOp, memref::CopyOp>(next);
-      if (auto divide = dyn_cast<dsa::DivideCastOp>(next)) complete = divide.getOutput() == output;
-      // Aliasing alone does not prove that a write covers the original tile.
-      if (complete) {
-        for (const auto &entry : effects.entries)
-          if (isa<MemoryEffects::Write>(entry.effect.getEffect()) &&
-              !storage.disjoint(output, entry.effect.getValue()))
-            complete &=
-                isCompleteStorageViewOf(entry.effect.getValue(), output);
-      }
-      if (complete) fill.erase();
-      break;
-    }
-  }
-}
-
 bool eliminateUnreadLocalWrites(func::FuncOp function) {
   SmallVector<memref::AllocaOp> allocations;
   function.walk([&](memref::AllocaOp allocation) {
@@ -182,52 +139,54 @@ bool forwardFullLocalCopies(func::FuncOp function) {
     auto destinationAliases = storage.aliases(destination);
     if (!destinationAliases.complete || !storage.aliases(sourceOwner).complete)
       continue;
-    Operation *last = copy;
+    DominanceInfo dominance(function);
+    SmallVector<OpOperand *> reads;
     bool eligible = true;
-    // A copied snapshot can be forwarded only to read-only consumers. Views
-    // retain the entire owned allocation, as required by the DSA verifier.
+    // Forward actual read operands, not the allocation identity: descriptors
+    // may precede the copy, while reads in nested control retain their guards.
     for (Operation *user : destinationAliases.users) {
       if (user == copy) continue;
-      if (user->getBlock() != copy->getBlock() || !copy->isBeforeInBlock(user)) { eligible = false; break; }
-      if (last->isBeforeInBlock(user)) last = user;
+      if (isBufferStorageAliasOperation(user)) continue;
       auto completion = storage.completionOfUse(user);
-      if (failed(completion) || *completion != user ||
-          !storage.preserves(user, destination))
+      if (!dominance.properlyDominates(copy, user) || failed(completion) ||
+          *completion != user || !storage.preserves(user, destination) ||
+          !storage.readStable(source, copy, user)) {
         eligible = false;
+        break;
+      }
+      for (OpOperand &operand : user->getOpOperands()) {
+        if (!llvm::is_contained(destinationAliases.values, operand.get())) continue;
+        auto type = dyn_cast<MemRefType>(operand.get().getType());
+        if (!type || !type.hasStaticShape() || !type.getLayout().isIdentity() ||
+            type.getElementType() != input.getElementType() ||
+            type.getNumElements() != input.getNumElements() ||
+            !isCompleteStorageViewOf(operand.get(), destination)) {
+          eligible = false;
+          break;
+        }
+        reads.push_back(&operand);
+      }
+      if (!eligible) break;
     }
-    if (!eligible || last == copy) continue;
-    // Preserve the source snapshot through its final redirected read, including
-    // writes nested in intervening control flow and writes by that last user.
-    if (!storage.unchangedBetween(source, copy, last) ||
-        !storage.preserves(last, source))
-      continue;
+    if (!eligible || reads.empty()) continue;
     OpBuilder builder(copy);
-    auto replacement =
-        materializeCollectiveView(builder, copy->getLoc(), source, output);
-    assert(succeeded(replacement) &&
-           "complete copies preserve local storage capacity");
-    destination.replaceAllUsesExcept(*replacement, copy);
+    llvm::DenseMap<Type, Value> replacements;
+    for (OpOperand *read : reads) {
+      Type type = read->get().getType();
+      Value &replacement = replacements[type];
+      if (!replacement) {
+        auto view = materializeCollectiveView(
+            builder, copy->getLoc(), source, cast<MemRefType>(type));
+        assert(succeeded(view) && "complete copies preserve local storage capacity");
+        replacement = *view;
+      }
+      read->set(replacement);
+    }
     copy->erase();
-    if (destination.use_empty()) destination.getDefiningOp()->erase();
+    for (Value alias : llvm::reverse(destinationAliases.values))
+      if (alias.use_empty() && alias.getDefiningOp()) alias.getDefiningOp()->erase();
     changed = true;
   }
-  return changed;
-}
-
-bool forwardUniformScalarLoads(func::FuncOp function) {
-  SmallVector<memref::LoadOp> loads;
-  function.walk([&](memref::LoadOp load) { loads.push_back(load); });
-  bool changed = false;
-  for (auto load : loads) {
-    auto initialization = uniformFillBefore(load.getMemref(), load);
-    if (!initialization)
-      continue;
-    load.getResult().replaceAllUsesWith(initialization.getValue());
-    load.erase();
-    changed = true;
-  }
-  if (changed)
-    eliminateUnreadLocalWrites(function);
   return changed;
 }
 

@@ -836,8 +836,18 @@ LogicalResult composeLocalProgram(ModuleOp module,
     llvm::function_ref<LogicalResult()> cleanup) {
   auto function = *module.getOps<func::FuncOp>().begin();
   auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
+  auto composeStorage = [&]() -> LogicalResult {
+    while (true) {
+      bool changed = dsa::reuseLocalMemoryValues(function);
+      changed |= dsa::forwardFullLocalCopies(function);
+      changed |= dsa::eliminateUnreadLocalWrites(function);
+      if (!changed) return success();
+      if (failed(cleanup())) return failure();
+    }
+  };
   if (failed(cleanup())) return failure();
-  dsa::eliminateOverwrittenFills(function);
+  while (dsa::reuseLocalMemoryValues(function))
+    if (failed(cleanup())) return failure();
   if (dsa::realizeRangeComparisons(function) && failed(cleanup())) return failure();
   if (dsa::foldRangeCounts(function) && failed(cleanup())) return failure();
   while (dsa::foldUniformBooleanTiles(function)) if (failed(cleanup())) return failure();
@@ -846,11 +856,10 @@ LogicalResult composeLocalProgram(ModuleOp module,
   while (dsa::eliminateUnreadLocalWrites(function)) if (failed(cleanup())) return failure();
   if (realizeRowBroadcasts(function, config) && failed(cleanup())) return failure();
   if (bindRowScalarOperands(function) && failed(cleanup())) return failure();
-  if (dsa::forwardUniformScalarLoads(function) && failed(cleanup())) return failure();
-  while (dsa::forwardFullLocalCopies(function)) if (failed(cleanup())) return failure();
+  if (failed(composeStorage())) return failure();
   if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
-  dsa::eliminateOverwrittenFills(function);
+  if (failed(composeStorage())) return failure();
   if (dsa::forwardIndexExpressions(function) && failed(cleanup())) return failure();
   if (dsa::reuseGatherOffsets(function) && failed(cleanup())) return failure();
   if (vectorizeIndexLoops(function, config) && failed(cleanup())) return failure();
