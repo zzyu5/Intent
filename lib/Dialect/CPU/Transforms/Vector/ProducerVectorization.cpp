@@ -120,10 +120,10 @@ class Widening {
 public:
   Widening(const ProducerReplay &payload, Value coordinate, int64_t width,
            OpBuilder &builder, IRMapping &scalars, IRMapping &vectors,
-           OpBuilder *invariants)
-      : payload(payload), coordinate(coordinate), adapter(payload, coordinate),
+           OpBuilder *invariants, ValueRange varyingFrontier = {})
+      : payload(payload), coordinate(coordinate), adapter(payload, coordinate, varyingFrontier),
         width(width), builder(builder), scalars(scalars), vectors(vectors),
-        invariants(invariants) {}
+        invariants(invariants), varyingFrontier(varyingFrontier.begin(), varyingFrontier.end()) {}
 
   FailureOr<Value> scalar(Value value) {
     return adapter.materializeScalar(value, builder, scalars, invariants);
@@ -211,7 +211,7 @@ private:
       // Never use the outer invariant insertion point inside a conditional:
       // scalar loads and non-speculatable arithmetic belong to this branch.
       Widening nested(branchPayload, coordinate, width, branchBuilder,
-                      branchScalars, branchVectors, nullptr);
+                      branchScalars, branchVectors, nullptr, varyingFrontier);
       SmallVector<Value> yielded;
       for (Value input : source.front().getTerminator()->getOperands()) {
         auto widened = nested.value(input);
@@ -236,6 +236,7 @@ private:
   IRMapping &scalars;
   IRMapping &vectors;
   OpBuilder *invariants;
+  SmallVector<Value> varyingFrontier;
 };
 
 } // namespace
@@ -246,11 +247,16 @@ bool ProducerVectorization::dependsOn(Value value, Value input) const {
 }
 
 bool ProducerVectorization::isUniform(Value value) const {
-  return !dependsOn(value, coordinate);
+  return (!coordinate || !dependsOn(value, coordinate)) &&
+      llvm::none_of(varyingFrontier, [&](Value input) { return dependsOn(value, input); });
 }
 
 std::optional<int64_t> ProducerVectorization::coefficient(Value value) const {
   if (value == coordinate) return 1;
+  // A bound varying element is not necessarily an affine loop coordinate.
+  // In particular a zero-operand linalg.index must not fall through to the
+  // vacuous all-operands-uniform rule below.
+  if (llvm::is_contained(varyingFrontier, value)) return std::nullopt;
   if (isUniform(value)) return 0;
   // Intent's logical index coordinates have the signed 64-bit contract. This
   // is the same affine coefficient query previously owned by VectorizeLoops.
@@ -277,7 +283,7 @@ bool ProducerVectorization::isElementType(Type type) {
 bool ProducerVectorization::canWiden(
     Value value, SmallVectorImpl<Value> *guardedMemories) const {
   if (!isElementType(value.getType())) return false;
-  if (value == coordinate) return true;
+  if (value == coordinate || llvm::is_contained(varyingFrontier, value)) return true;
   Operation *operation = value.getDefiningOp();
   if (operation && llvm::is_contained(payload.nodes, operation) &&
       !supportedRegions(operation)) return false;
@@ -338,7 +344,8 @@ FailureOr<Value> ProducerVectorization::materialize(
     Value value, int64_t width, OpBuilder &builder, IRMapping &scalars,
     IRMapping &vectors, OpBuilder *invariants) const {
   if (width <= 0) return failure();
-  Widening widening(payload, coordinate, width, builder, scalars, vectors, invariants);
+  Widening widening(payload, coordinate, width, builder, scalars, vectors, invariants,
+                    varyingFrontier);
   return widening.value(value);
 }
 

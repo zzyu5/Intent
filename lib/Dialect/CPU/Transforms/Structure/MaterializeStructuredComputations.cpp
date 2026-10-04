@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
+#include "ReductionSources.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
@@ -52,8 +53,8 @@ bool supportedMap(AffineMap map) {
   });
 }
 
-bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
-                                 OpBuilder::Listener *listener) {
+FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t width,
+                                 OpBuilder::Listener *listener, ReductionSources &sources) {
   auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
   if (!order || !order.getAdjacentReassociation() || width <= 1)
     return false;
@@ -65,7 +66,10 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
   auto iterators = operation.getIteratorTypesArray();
   if (iterators.back() != utils::IteratorType::reduction) return false;
   auto maps = operation.getIndexingMapsArray();
-  auto sourceType = dyn_cast<MemRefType>(operation.getInputs()[0].getType());
+  Value domainSource;
+  for (Value input : operation.getInputs().take_front(components))
+    if (isa<MemRefType>(input.getType())) { domainSource = input; break; }
+  auto sourceType = domainSource ? dyn_cast<MemRefType>(domainSource.getType()) : MemRefType{};
   if (!sourceType || sourceType.getRank() != operation.getNumLoops()) return false;
   auto scalarType = [](Type type) { return isa<FloatType, IntegerType, IndexType>(type); };
   SmallVector<AffineExpr> freeAxes;
@@ -80,16 +84,18 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
   for (unsigned component = 0; component < components; ++component) {
     auto source = dyn_cast<MemRefType>(operation.getInputs()[component].getType());
     auto output = dyn_cast<MemRefType>(operation.getOutputs()[component].getType());
+    Type element = source ? source.getElementType() : operation.getInputs()[component].getType();
     SmallVector<int64_t> strides;
     int64_t offset;
-    if (!source || !output || source.getShape() != sourceType.getShape() ||
-        source.getElementType() != output.getElementType() ||
-        !scalarType(source.getElementType()) ||
-        !maps[component].isIdentity() || maps[inputs + component] != outputMap ||
-        output.getShape() != ArrayRef<int64_t>(outputShape) ||
-        failed(source.getStridesAndOffset(strides, offset)))
+    if (!output || element != output.getElementType() || !scalarType(element) ||
+        maps[inputs + component] != outputMap ||
+        output.getShape() != ArrayRef<int64_t>(outputShape))
       return false;
-    vectorLoads[component] = strides.back() == 1 && !source.getElementType().isInteger(1);
+    if (source) {
+      if (source.getShape() != sourceType.getShape() || !maps[component].isIdentity() ||
+          failed(source.getStridesAndOffset(strides, offset))) return false;
+      vectorLoads[component] = strides.back() == 1 && !source.getElementType().isInteger(1);
+    } else if (maps[component].getNumResults()) return false;
   }
   for (unsigned capture = components; capture < inputs; ++capture)
     for (AffineExpr expression : maps[capture].getResults())
@@ -130,7 +136,7 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
   Location loc = operation.getLoc();
   SmallVector<Value> sizes, position(sourceType.getRank());
   for (int64_t axis = 0; axis < sourceType.getRank(); ++axis)
-    sizes.push_back(b.create<memref::DimOp>(loc, operation.getInputs()[0], axis));
+    sizes.push_back(b.create<memref::DimOp>(loc, domainSource, axis));
   auto combine = [&](ValueRange left, ValueRange right, ValueRange captures, int64_t lanes) {
     IRMapping mapping;
     for (unsigned component = 0; component < components; ++component) {
@@ -159,13 +165,14 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
     for (Value value : body.getTerminator()->getOperands()) result.push_back(mapped(value));
     return result;
   };
-  std::function<void(unsigned)> traverse = [&](unsigned axis) {
+  std::function<LogicalResult(unsigned)> traverse = [&](unsigned axis) -> LogicalResult {
     if (axis + 1 < sizes.size()) {
+      LogicalResult status = success();
       loop(b, loc, index(b, loc, 0), sizes[axis], 1, [&](Value coordinate) {
         position[axis] = coordinate;
-        traverse(axis + 1);
+        status = traverse(axis + 1);
       });
-      return;
+      return status;
     }
     Value zero = index(b, loc, 0), one = index(b, loc, 1), extent = sizes.back();
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, extent, zero);
@@ -190,10 +197,21 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
         return combine(left, right, captures, lanes);
       }, independent);
     };
-    auto loadBlock = [&](Value begin) {
+    auto loadBlock = [&](Value begin) -> FailureOr<SmallVector<Value>> {
       position.back() = begin;
+      sources.beginMember();
       SmallVector<Value> partial;
       for (auto [component, source] : llvm::enumerate(operation.getInputs().take_front(components))) {
+        if (!isa<MemRefType>(source.getType())) {
+          partial.push_back(b.create<vector::BroadcastOp>(loc, VectorType::get({width}, source.getType()), source));
+          continue;
+        }
+        if (sources.replays(component)) {
+          auto member = sources.materialize(b, component, position, width);
+          if (failed(member)) return failure();
+          partial.push_back(*member);
+          continue;
+        }
         auto type = VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType());
         if (vectorLoads[component]) {
           partial.push_back(b.create<vector::LoadOp>(loc, type, source, position));
@@ -219,13 +237,15 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
       {
         OpBuilder::InsertionGuard fullGuard(b);
         b.setInsertionPointToStart(full.thenBlock());
-        SmallVector<Value> seeds = loadBlock(zero);
-        auto blocks = b.create<scf::ForOp>(loc, step, completeEnd, step, seeds);
+        auto seeds = loadBlock(zero);
+        if (failed(seeds)) return failure();
+        auto blocks = b.create<scf::ForOp>(loc, step, completeEnd, step, *seeds);
         {
           OpBuilder::InsertionGuard blockGuard(b);
           b.setInsertionPointToStart(blocks.getBody());
           auto partial = loadBlock(blocks.getInductionVar());
-          b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), partial, captures, width));
+          if (failed(partial)) return failure();
+          b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), *partial, captures, width));
         }
         auto partial = horizontal(SmallVector<Value>(blocks.getResults()));
         b.create<scf::YieldOp>(loc, combine(initials, partial, captures, 0));
@@ -238,7 +258,9 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
       {
         OpBuilder::InsertionGuard blockGuard(b);
         b.setInsertionPointToStart(blocks.getBody());
-        auto partial = horizontal(loadBlock(blocks.getInductionVar()));
+        auto members = loadBlock(blocks.getInductionVar());
+        if (failed(members)) return failure();
+        auto partial = horizontal(*members);
         b.create<scf::YieldOp>(loc, combine(blocks.getRegionIterArgs(), partial, captures, 0));
       }
       reduced.assign(blocks.getResults().begin(), blocks.getResults().end());
@@ -248,16 +270,25 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
       OpBuilder::InsertionGuard tailGuard(b);
       b.setInsertionPointToStart(tail.getBody());
       position.back() = tail.getInductionVar();
+      sources.beginMember();
       SmallVector<Value> values;
-      for (Value source : operation.getInputs().take_front(components))
-        values.push_back(b.create<memref::LoadOp>(loc, source, position));
+      for (auto [component, source] : llvm::enumerate(operation.getInputs().take_front(components))) {
+        if (sources.replays(component)) {
+          auto member = sources.materialize(b, component, position);
+          if (failed(member)) return failure();
+          values.push_back(*member);
+        } else values.push_back(isa<MemRefType>(source.getType())
+            ? Value(b.create<memref::LoadOp>(loc, source, position)) : source);
+      }
       b.create<scf::YieldOp>(loc, combine(tail.getRegionIterArgs(), values, captures, 0));
     }
     for (auto [value, output] : llvm::zip(tail.getResults(), operation.getOutputs()))
       b.create<memref::StoreOp>(loc, value, output, outputPosition);
+    return success();
   };
-  traverse(0);
+  if (failed(traverse(0))) return failure();
   operation.erase();
+  sources.eraseUnusedProducers();
   return true;
 }
 
@@ -294,7 +325,10 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width,
   auto maps = operation.getIndexingMapsArray();
   if (!llvm::all_of(maps, supportedMap))
     return operation.emitError("CPU pointwise coordinate map has no implemented scalar projection");
-  if (materializeProductReduction(operation, width, listener)) return success();
+  ReductionSources sources(operation);
+  auto product = materializeProductReduction(operation, width, listener, sources);
+  if (failed(product)) return operation.emitError("CPU reduction source member cannot be materialized");
+  if (*product) return success();
   OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   SmallVector<Value> sizes(operation.getNumLoops()), position;
@@ -333,12 +367,19 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width,
       break;
     }
   }
-  auto compute = [&](Value carry = {}) {
+  auto compute = [&](Value carry = {}) -> FailureOr<SmallVector<Value>> {
+    sources.beginMember();
     IRMapping mapping;
     for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
       Value value = input;
-      if (isa<MemRefType>(input.getType()))
-        value = b.create<memref::LoadOp>(loc, input, coordinates(b, loc, maps[number], position));
+      if (isa<MemRefType>(input.getType())) {
+        auto selected = coordinates(b, loc, maps[number], position);
+        if (sources.replays(number)) {
+          auto member = sources.materialize(b, number, selected);
+          if (failed(member)) return failure();
+          value = *member;
+        } else value = b.create<memref::LoadOp>(loc, input, selected);
+      }
       mapping.map(body.getArgument(number), value);
     }
     for (auto [number, output] : llvm::enumerate(operation.getOutputs())) {
@@ -355,7 +396,7 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width,
     for (Value value : body.getTerminator()->getOperands()) results.push_back(mapping.lookupOrDefault(value));
     return results;
   };
-  std::function<void(unsigned)> visit = [&](unsigned axis) {
+  std::function<LogicalResult(unsigned)> visit = [&](unsigned axis) -> LogicalResult {
     if (carryReduction && axis + 1 == sizes.size()) {
       Value zero = index(b, loc, 0), one = index(b, loc, 1);
       auto active = b.create<scf::IfOp>(loc,
@@ -370,25 +411,31 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width,
         OpBuilder::InsertionGuard loopGuard(b);
         b.setInsertionPointToStart(reduction.getBody());
         position.push_back(reduction.getInductionVar());
-        b.create<scf::YieldOp>(loc, compute(reduction.getRegionIterArgs()[0]));
+        auto values = compute(reduction.getRegionIterArgs()[0]);
+        if (failed(values)) return failure();
+        b.create<scf::YieldOp>(loc, *values);
         position.pop_back();
       }
       b.create<memref::StoreOp>(loc, reduction.getResult(0), output, position);
-      return;
+      return success();
     }
     if (axis != sizes.size()) {
+      LogicalResult status = success();
       loop(b, loc, index(b, loc, 0), sizes[axis], 1, [&](Value i) {
-        position.push_back(i); visit(axis + 1); position.pop_back();
+        position.push_back(i); status = visit(axis + 1); position.pop_back();
       });
-      return;
+      return status;
     }
     auto results = compute();
+    if (failed(results)) return failure();
     for (auto [number, output] : llvm::enumerate(operation.getOutputs()))
-      b.create<memref::StoreOp>(loc, results[number], output,
+      b.create<memref::StoreOp>(loc, (*results)[number], output,
           coordinates(b, loc, maps[operation.getInputs().size() + number], position));
+    return success();
   };
-  visit(0);
+  if (failed(visit(0))) return operation.emitError("CPU computation source member cannot be materialized");
   operation.erase();
+  sources.eraseUnusedProducers();
   return success();
 }
 
@@ -654,6 +701,38 @@ LogicalResult materializeStructuredComputation(Operation *operation,
 LogicalResult materializeStructuredComputations(
     func::FuncOp function,
     llvm::function_ref<LogicalResult(Operation *)> materializeOperation) {
+  // Keep source definitions structured until a tuple consumer has had a chance
+  // to supply its real members directly. The combine remains a general function
+  // of two states, including when a source field is a constant fill.
+  SmallVector<linalg::FillOp> fills;
+  function.walk([&](linalg::FillOp fill) { fills.push_back(fill); });
+  for (auto fill : fills) {
+    if (fill.getOutputs().size() != 1 || fill.getNumResults())
+      return fill.emitError("CPU fill requires one physical buffer");
+    OpBuilder builder(fill);
+    int64_t rank = cast<MemRefType>(fill.getOutputs()[0].getType()).getRank();
+    auto generic = builder.create<linalg::GenericOp>(fill.getLoc(), fill.getInputs(), fill.getOutputs(),
+        SmallVector<AffineMap>{AffineMap::get(rank, 0, {}, builder.getContext()),
+                              builder.getMultiDimIdentityMap(rank)},
+        SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+        [](OpBuilder &nested, Location loc, ValueRange arguments) {
+          nested.create<linalg::YieldOp>(loc, arguments[0]);
+        });
+    if (Attribute binding = fill->getAttr("intent_cpu.implementation"))
+      generic->setAttr("intent_cpu.implementation", binding);
+    fill.erase();
+  }
+  SmallVector<linalg::GenericOp> products;
+  function.walk([&](linalg::GenericOp operation) {
+    if (operation.getOutputs().size() > 1 && !operation.getNumResults())
+      products.push_back(operation);
+  });
+  for (auto operation : products) {
+    auto uniform = ReductionSources(operation).foldUniformMembers();
+    if (failed(uniform)) return operation.emitError("CPU uniform source member cannot be materialized");
+    bool supplied = ReductionSources(operation).hasReplays();
+    if (supplied && failed(materializeOperation(operation))) return failure();
+  }
   function.walk([&](linalg::GenericOp operation) { collapseProductReductionAxes(operation); });
   SmallVector<Operation *> views;
   function.walk([&](Operation *operation) {
@@ -720,26 +799,10 @@ LogicalResult materializeStructuredComputations(
   }
   SmallVector<Operation *> operations;
   function.walk([&](Operation *operation) {
-    if (isa<linalg::GenericOp, linalg::FillOp, ReduceOp, ScanOp>(operation)) operations.push_back(operation);
+    if (isa<linalg::GenericOp, ReduceOp, ScanOp>(operation)) operations.push_back(operation);
   });
-  for (Operation *operation : operations) {
-    if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
-      if (fill.getOutputs().size() != 1 || fill.getNumResults())
-        return fill.emitError("CPU fill requires one physical buffer");
-      OpBuilder b(fill);
-      int64_t rank = cast<MemRefType>(fill.getOutputs()[0].getType()).getRank();
-      auto generic = b.create<linalg::GenericOp>(fill.getLoc(), fill.getInputs(), fill.getOutputs(),
-          SmallVector<AffineMap>{AffineMap::get(rank, 0, {}, b.getContext()), b.getMultiDimIdentityMap(rank)},
-          SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
-          [](OpBuilder &nested, Location loc, ValueRange arguments) {
-            nested.create<linalg::YieldOp>(loc, arguments[0]);
-          });
-      if (Attribute binding = fill->getAttr("intent_cpu.implementation"))
-        generic->setAttr("intent_cpu.implementation", binding);
-      fill.erase();
-      if (failed(materializeOperation(generic))) return failure();
-    } else if (failed(materializeOperation(operation))) return failure();
-  }
+  for (Operation *operation : operations)
+    if (failed(materializeOperation(operation))) return failure();
   return success();
 }
 

@@ -102,6 +102,10 @@ std::optional<unsigned> readingInput(Operation *operation, Value buffer,
 
 } // namespace
 
+bool completelyWritesBuffer(Operation *operation, Value buffer) {
+  return completeWrite(operation, buffer);
+}
+
 FailureOr<ProducerVersion> queryProducerVersion(linalg::GenericOp producer,
                                                StorageAnalysis &storage) {
   if (producer.getOutputs().size() != 1) return failure();

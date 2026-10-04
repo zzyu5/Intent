@@ -18,6 +18,8 @@ struct ProducerVersion {
   llvm::SmallVector<ProducerVersionUse> uses;
 };
 
+bool completelyWritesBuffer(mlir::Operation *operation, mlir::Value buffer);
+
 mlir::FailureOr<ProducerVersion> queryProducerVersion(
     mlir::linalg::GenericOp producer, StorageAnalysis &storage);
 

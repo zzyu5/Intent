@@ -10,8 +10,10 @@ namespace intent::cpu {
 // source stability and full-width bounds remain the caller's responsibility.
 class ProducerVectorization {
 public:
-  ProducerVectorization(const ProducerReplay &payload, mlir::Value coordinate)
-      : payload(payload), coordinate(coordinate) {}
+  ProducerVectorization(const ProducerReplay &payload, mlir::Value coordinate,
+                        mlir::ValueRange varyingFrontier = {})
+      : payload(payload), coordinate(coordinate),
+        varyingFrontier(varyingFrontier.begin(), varyingFrontier.end()) {}
 
   bool dependsOn(mlir::Value value, mlir::Value input) const;
   bool isUniform(mlir::Value value) const;
@@ -34,6 +36,7 @@ public:
 private:
   const ProducerReplay &payload;
   mlir::Value coordinate;
+  llvm::SmallVector<mlir::Value> varyingFrontier;
 };
 
 } // namespace intent::cpu
