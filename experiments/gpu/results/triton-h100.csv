@@ -1,6 +1,6 @@
 kernel,case,source_p50_ms,intent_triton_p50_ms,intent_cutile_p50_ms,intent_triton_ratio,intent_cutile_ratio,intent_triton_status,intent_cutile_status,intent_triton_note,intent_cutile_note
 fused_softmax,8192x8192-fp16,0.121424,0.119776,0.121528,0.986428,1.000857,pass,pass,,Intent target=cutile; source corpus=triton.
-dense_gemm,M4096-N14336-K4096-fp16,1.438608,1.299008,1.331304,0.902962,0.925411,pass,pass,,Intent target=cutile; source corpus=triton.
+dense_gemm,M4096-N14336-K4096-fp16,1.451800,1.497144,1.331304,1.031233,0.917002,pass,pass,,Intent target=cutile; source corpus=triton.
 grouped_gemm,E8-M1024-K4096-N14336-fp16,4.657024,3.715232,4.434936,0.797770,0.952311,pass,pass,,Intent target=cutile; source corpus=triton.
 flash_attention_forward,B4-H32-S4096-D128-fp16-causal,1.832048,2.022080,2.117720,1.103727,1.155930,pass,pass,同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。,Intent target=cutile; source corpus=triton. 同算法；CUDA graph 设备执行计时；source 额外写 f32 M 辅助结果。
 layer_norm,8192x4096-fp16,0.062192,0.053024,0.053624,0.852586,0.862233,pass,pass,,Intent target=cutile; source corpus=triton.
@@ -26,14 +26,14 @@ varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.047200,0.110800,0
 causal_conv1d_update,B32-D4096-W4-bf16,0.005544,0.045448,0.005680,8.197691,1.024531,pass,pass,,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.336496,0.287200,0.164312,0.853502,0.488303,pass,pass,source launch uses num_stages=1 and num_warps=4.,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.027520,0.054520,0.009232,1.981105,0.335465,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
-flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.598144,1.549160,0.714576,2.589945,1.194655,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
+flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.601592,0.691040,0.714576,1.148685,1.187808,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。
 moe_expert_projection,T2048-E8-top2-4096x14336-bf16,2.833440,1.982688,2.012416,0.699746,0.710238,pass,pass,,Intent target=cutile; source corpus=triton.
 moe_splitk_expert_projection,T2048-E8-top2-4096x14336-bf16,4.393072,2.069424,2.038880,0.471065,0.464113,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,0.977636,1.416933,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.013488,0.012176,0.011648,0.902728,0.863582,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.045328,0.035768,0.049648,0.789093,1.095305,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.178240,0.294280,0.251328,1.651032,1.410054,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
-paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.299968,0.509728,0.218592,1.699275,0.728718,pass,pass,,Intent target=cutile; source corpus=triton.
+paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.311064,0.209232,0.218592,0.672633,0.702724,pass,pass,,Intent target=cutile; source corpus=triton.
 splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.813296,0.379112,0.215888,0.466143,0.265448,pass,pass,,Intent target=cutile; source corpus=triton.
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.370520,0.384048,0.226072,1.036511,0.610148,pass,pass,同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
 block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.061544,0.064240,0.100936,1.043806,1.640062,pass,pass,同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配
