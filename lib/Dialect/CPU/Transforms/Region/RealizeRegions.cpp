@@ -234,10 +234,10 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       };
       auto expression = [&](UniformKind kind, Value lhs, Value rhs) -> Value {
         switch (kind) {
-        case UniformKind::Add: return b.create<arith::AddIOp>(loc, lhs, rhs);
-        case UniformKind::Subtract: return b.create<arith::SubIOp>(loc, lhs, rhs);
-        case UniformKind::Minimum: return b.create<arith::MinSIOp>(loc, lhs, rhs);
-        case UniformKind::Maximum: return b.create<arith::MaxSIOp>(loc, lhs, rhs);
+        case UniformKind::Add: return b.createOrFold<arith::AddIOp>(loc, lhs, rhs);
+        case UniformKind::Subtract: return b.createOrFold<arith::SubIOp>(loc, lhs, rhs);
+        case UniformKind::Minimum: return b.createOrFold<arith::MinSIOp>(loc, lhs, rhs);
+        case UniformKind::Maximum: return b.createOrFold<arith::MaxSIOp>(loc, lhs, rhs);
         default: llvm_unreachable("unexpected coordinate expression");
         }
       };
@@ -297,6 +297,9 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
   };
   auto visit = [&](Value lower, Value upper, int64_t width, std::optional<bool> knownPredicate,
                    bool omitValidity) -> LogicalResult {
+    if (lower == upper) return success();
+    auto lowerConstant = getConstantIntValue(lower), upperConstant = getConstantIntValue(upper);
+    if (lowerConstant && upperConstant && *upperConstant <= *lowerConstant) return success();
     auto loop = b.create<scf::ForOp>(loc, lower, upper, b.create<arith::ConstantIndexOp>(loc, width));
     loop->setAttr("intent_cpu.region_axis", b.getI64IntegerAttr(program.getAxis()));
     OpBuilder::InsertionGuard guard(b);
@@ -314,6 +317,14 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
     Value lower = b.create<arith::MinSIOp>(loc, start, completeEnd);
     if (intervals) {
+      // Predicate intervals are in [0, count], and each emitted boundary is
+      // clipped to [lower, completeEnd]. Preserve known domain edges before
+      // creating alignment expressions that would hide those equalities.
+      auto clippedBoundary = [&](Value raw, Value lower, auto build) -> Value {
+        if (raw == zero || getConstantIntValue(raw) == 0) return lower;
+        if (raw == count) return completeEnd;
+        return build();
+      };
       auto alignUp = [&](Value raw) -> Value {
         Value residue = b.create<arith::RemSIOp>(loc, raw, step);
         Value adjustment = b.create<arith::MinSIOp>(loc, b.create<arith::SubIOp>(loc, count, raw),
@@ -321,20 +332,28 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
         return b.create<arith::SelectOp>(loc, b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, residue, zero),
             raw, b.create<arith::AddIOp>(loc, raw, adjustment));
       };
-      Value falseEnd = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
-          b.create<arith::RemSIOp>(loc, intervals->possibleBegin, step));
-      falseEnd = b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, falseEnd));
+      Value falseEnd = clippedBoundary(intervals->possibleBegin, lower, [&]() -> Value {
+        Value aligned = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
+            b.create<arith::RemSIOp>(loc, intervals->possibleBegin, step));
+        return b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
+      });
       if (failed(visit(lower, falseEnd, segmentSize, false, omitValidity))) return failure();
       lower = falseEnd;
-      Value aligned = alignUp(intervals->allTrueBegin);
-      Value trueBegin = b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
-      Value trueEnd = b.create<arith::SubIOp>(loc, intervals->allTrueEnd,
-          b.create<arith::RemSIOp>(loc, intervals->allTrueEnd, step));
-      trueEnd = b.create<arith::MaxSIOp>(loc, trueBegin, b.create<arith::MinSIOp>(loc, completeEnd, trueEnd));
+      Value trueBegin = clippedBoundary(intervals->allTrueBegin, lower, [&]() -> Value {
+        Value aligned = alignUp(intervals->allTrueBegin);
+        return b.create<arith::MinSIOp>(loc, completeEnd, b.create<arith::MaxSIOp>(loc, lower, aligned));
+      });
+      Value trueEnd = clippedBoundary(intervals->allTrueEnd, trueBegin, [&]() -> Value {
+        Value aligned = b.create<arith::SubIOp>(loc, intervals->allTrueEnd,
+            b.create<arith::RemSIOp>(loc, intervals->allTrueEnd, step));
+        return b.create<arith::MaxSIOp>(loc, trueBegin, b.create<arith::MinSIOp>(loc, completeEnd, aligned));
+      });
       if (failed(visit(lower, trueBegin, segmentSize, std::nullopt, omitValidity)) ||
           failed(visit(trueBegin, trueEnd, segmentSize, true, omitValidity))) return failure();
-      Value falseBegin = b.create<arith::MinSIOp>(loc, completeEnd,
-          b.create<arith::MaxSIOp>(loc, trueEnd, alignUp(intervals->possibleEnd)));
+      Value falseBegin = clippedBoundary(intervals->possibleEnd, trueEnd, [&]() -> Value {
+        return b.create<arith::MinSIOp>(loc, completeEnd,
+            b.create<arith::MaxSIOp>(loc, trueEnd, alignUp(intervals->possibleEnd)));
+      });
       if (failed(visit(trueEnd, falseBegin, segmentSize, std::nullopt, omitValidity)) ||
           failed(visit(falseBegin, completeEnd, segmentSize, false, omitValidity))) return failure();
       lower = completeEnd;
