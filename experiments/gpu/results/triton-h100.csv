@@ -22,8 +22,8 @@ jagged_mean,B512-T33024-D128-fp32,0.016880,0.013840,0.014752,0.819905,0.873934,p
 fp8_groupwise_quantize,8192x4096-group128-bf16-e4m3,0.163216,0.040904,0.055384,0.250613,0.339329,pass,pass,,Intent target=cutile; source corpus=triton.
 rope_qk,B4-S4096-QH32-KVH8-D128-fp16,0.483032,0.126080,0.123952,0.261018,0.256612,pass,pass,,Intent target=cutile; source corpus=triton.
 causal_conv1d,B4-C4096-S4096-W4-bf16-silu,0.163032,0.134784,0.198280,0.826733,1.216203,pass,pass,,Intent target=cutile; source corpus=triton.
-varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.047200,0.110800,0.060712,2.347458,1.286271,pass,pass,,Intent target=cutile; source corpus=triton.
-causal_conv1d_update,B32-D4096-W4-bf16,0.005544,0.045448,0.005680,8.197691,1.024531,pass,pass,,Intent target=cutile; source corpus=triton.
+varlen_causal_conv1d,lengths2048-1536-1024-512-D4096-W4-bf16,0.048312,0.047720,0.066720,0.987746,1.381023,pass,pass,,Intent target=cutile; source corpus=triton.
+causal_conv1d_update,B32-D4096-W4-bf16,0.005432,0.006128,0.005664,1.128130,1.042710,pass,pass,,Intent target=cutile; source corpus=triton.
 modern_flash_attention_forward,B2-H16-S2048-D128-fp16-causal,0.336496,0.287200,0.164312,0.853502,0.488303,pass,pass,source launch uses num_stages=1 and num_warps=4.,Intent target=cutile; source corpus=triton. source launch uses num_stages=1 and num_warps=4.
 mamba3_siso_step,B32-HQK4-H16-DQK32-DV64-bf16,0.027520,0.054520,0.009232,1.981105,0.335465,pass,pass,同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 tanh/sin/cos；完整调用计时包含其输出分配，generated 使用预分配输出
 flash_attention_backward,B2-H16-S2048-D128-fp16-causal,0.601592,0.691040,0.714576,1.148685,1.187808,pass,pass,source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。,Intent target=cutile; source corpus=triton. source 修正了中间量写死 bf16 与原 fp16 输入冲突的 dtype 转换；保持原输入与容差。

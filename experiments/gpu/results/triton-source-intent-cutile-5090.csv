@@ -43,7 +43,7 @@ flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173872,0.1759
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087808,0.087848,0.999545,pass,Intent target=cutile; source corpus=triton.
 flaggems_transpose_copy,4093x8191-fp16,0.104480,0.312008,0.334863,pass,Intent target=cutile; source corpus=triton.
 flaggems_batch_norm_training,B32-C64-S4096-fp16,0.038816,0.026640,1.457057,pass,Intent target=cutile; source corpus=triton.
-flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.042784,0.057104,0.749229,pass,Intent target=cutile; source corpus=triton.
+flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.041304,0.055040,0.750436,pass,Intent target=cutile; source corpus=triton.
 flaggems_logsumexp,8192x8192-fp32,0.177952,0.177704,1.001396,pass,Intent target=cutile; source corpus=triton.
 flaggems_softmax_backward,4096x4097-fp32,0.116800,0.161440,0.723489,pass,Intent target=cutile; source corpus=triton.
 flaggems_fused_adamw,N8388608-fp32,0.153656,0.157256,0.977107,pass,Intent target=cutile; source corpus=triton.

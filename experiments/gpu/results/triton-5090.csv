@@ -43,7 +43,7 @@ flaggems_embedding_lookup,tokens16384-vocab32768-hidden4096-bf16,0.173872,0.1759
 flaggems_roll,8192x4096-fp16-shift-1-axis0,0.087824,0.087784,1.000456,pass,
 flaggems_transpose_copy,4093x8191-fp16,0.104208,0.307440,0.338954,pass,
 flaggems_batch_norm_training,B32-C64-S4096-fp16,0.202536,0.027120,7.468142,pass,Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理；原输入与容差。
-flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.040752,0.057104,0.713645,pass,
+flaggems_group_norm_backward,B32-C256-S1024-G32-fp16,0.044640,0.056192,0.794419,pass,
 flaggems_logsumexp,8192x8192-fp32,0.175176,0.177704,0.985774,pass,
 flaggems_softmax_backward,4096x4097-fp32,0.115368,0.157608,0.731993,pass,
 flaggems_fused_adamw,N8388608-fp32,0.151552,0.157696,0.961039,pass,
