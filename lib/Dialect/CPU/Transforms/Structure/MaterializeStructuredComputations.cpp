@@ -108,6 +108,15 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
       return false;
   auto function = operation->getParentOfType<func::FuncOp>();
   bool accumulatePartials = order.getElementPermutation();
+  SmallVector<IndependentReduction> independent;
+  if (accumulatePartials) {
+    for (unsigned component = 0; component < components; ++component) {
+      auto reduction = matchIndependentReduction(body.getArgument(inputs + component),
+          body.getArgument(component), body.getTerminator()->getOperand(component));
+      if (!reduction) { independent.clear(); break; }
+      independent.push_back(*reduction);
+    }
+  }
   StorageAnalysis storage(function);
   for (auto [component, output] : llvm::enumerate(operation.getOutputs())) {
     for (Value input : operation.getInputs())
@@ -178,7 +187,7 @@ bool materializeProductReduction(linalg::GenericOp operation, int64_t width,
     auto horizontal = [&](ValueRange partial) {
       return horizontalReduce(b, loc, partial, [&](ValueRange left, ValueRange right, int64_t lanes) {
         return combine(left, right, captures, lanes);
-      });
+      }, independent);
     };
     auto loadBlock = [&](Value begin) {
       position.back() = begin;

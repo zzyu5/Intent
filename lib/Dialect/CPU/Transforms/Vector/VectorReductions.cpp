@@ -7,9 +7,36 @@ using namespace mlir;
 
 namespace intent::cpu {
 
+std::optional<IndependentReduction> matchIndependentReduction(
+    Value lhs, Value rhs, Value result) {
+  if (lhs.getType() != rhs.getType() || lhs.getType() != result.getType())
+    return std::nullopt;
+  Operation *operation = result.getDefiningOp();
+  if (!operation || operation->getNumOperands() != 2 ||
+      operation->getNumResults() != 1 ||
+      !((operation->getOperand(0) == lhs && operation->getOperand(1) == rhs) ||
+        (operation->getOperand(0) == rhs && operation->getOperand(1) == lhs)))
+    return std::nullopt;
+  Type type = result.getType();
+  if (type.isF32() || type.isF64()) {
+    if (auto add = dyn_cast<arith::AddFOp>(operation))
+      return IndependentReduction{vector::CombiningKind::ADD, add.getFastmath()};
+    if (auto multiply = dyn_cast<arith::MulFOp>(operation))
+      return IndependentReduction{vector::CombiningKind::MUL, multiply.getFastmath()};
+  } else if (type.isSignlessInteger(8) || type.isSignlessInteger(16) ||
+             type.isSignlessInteger(32) || type.isSignlessInteger(64)) {
+    if (isa<arith::AddIOp>(operation))
+      return IndependentReduction{vector::CombiningKind::ADD, arith::FastMathFlags::none};
+    if (isa<arith::MulIOp>(operation))
+      return IndependentReduction{vector::CombiningKind::MUL, arith::FastMathFlags::none};
+  }
+  return std::nullopt;
+}
+
 SmallVector<Value> horizontalReduce(
     OpBuilder &builder, Location location, ValueRange values,
-    llvm::function_ref<SmallVector<Value>(ValueRange, ValueRange, int64_t)> combine) {
+    llvm::function_ref<SmallVector<Value>(ValueRange, ValueRange, int64_t)> combine,
+    ArrayRef<IndependentReduction> independent) {
   assert(!values.empty());
   auto type = cast<VectorType>(values.front().getType());
   int64_t width = type.getDimSize(0);
@@ -18,6 +45,22 @@ SmallVector<Value> horizontalReduce(
     auto component = cast<VectorType>(value.getType());
     assert(component.getShape() == type.getShape() && !component.isScalable());
     (void)component;
+  }
+  if (!independent.empty() && width > 1) {
+    assert(independent.size() == values.size());
+    SmallVector<Value> result;
+    for (auto [value, reduction] : llvm::zip(values, independent)) {
+      Type element = cast<VectorType>(value.getType()).getElementType();
+      auto flags = reduction.fastMath;
+      if (isa<FloatType>(element)) flags = flags | arith::FastMathFlags::reassoc;
+      Value neutral;
+      if (isa<FloatType>(element) && reduction.kind == vector::CombiningKind::ADD)
+        neutral = builder.create<arith::ConstantOp>(
+            location, builder.getFloatAttr(element, -0.0));
+      result.push_back(builder.create<vector::ReductionOp>(
+          location, reduction.kind, value, neutral, flags));
+    }
+    return result;
   }
   SmallVector<Value> partial(values);
   for (int64_t count = width; count > 1; count /= 2) {

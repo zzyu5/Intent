@@ -47,6 +47,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
   if (!matchPattern(original.getStep(), m_One())) return;
   SmallVector<Value> reductionInputs;
   SmallVector<Operation *> combines;
+  SmallVector<IndependentReduction> nativeReductions;
   if (original.getNumResults()) {
     auto order = original->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
     if (!order || !order.getAdjacentReassociation()) return;
@@ -54,11 +55,19 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
              original.getBody()->getTerminator()->getOperands())) {
       if (!carry.getType().isF32() || !carry.hasOneUse()) return;
       Operation *combine = yielded.getDefiningOp();
-      if (!combine || !isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp>(combine)) return;
+      if (!combine || !isa<arith::AddFOp, arith::MulFOp, arith::MaxNumFOp, arith::MaximumFOp>(combine)) return;
       if (combine->getOperand(0) == carry) reductionInputs.push_back(combine->getOperand(1));
       else if (combine->getOperand(1) == carry) reductionInputs.push_back(combine->getOperand(0));
       else return;
       combines.push_back(combine);
+    }
+    if (order.getElementPermutation()) {
+      for (auto [number, carry] : llvm::enumerate(original.getRegionIterArgs())) {
+        auto reduction = matchIndependentReduction(carry, reductionInputs[number],
+            original.getBody()->getTerminator()->getOperand(number));
+        if (!reduction) { nativeReductions.clear(); break; }
+        nativeReductions.push_back(*reduction);
+      }
     }
   }
   SmallVector<memref::StoreOp> stores;
@@ -251,7 +260,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
         auto values = vectorBody(blocks.getInductionVar(), invariants);
         b.create<scf::YieldOp>(loc, combineValues(blocks.getRegionIterArgs(), values, logicalWidth));
       }
-      auto partial = horizontalReduce(b, loc, blocks.getResults(), combineValues);
+      auto partial = horizontalReduce(b, loc, blocks.getResults(), combineValues, nativeReductions);
       b.create<scf::YieldOp>(loc, combineValues(original.getInitArgs(), partial, 0));
       b.setInsertionPointToStart(active.elseBlock());
       b.create<scf::YieldOp>(loc, original.getInitArgs());

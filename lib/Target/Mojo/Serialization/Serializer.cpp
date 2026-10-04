@@ -232,6 +232,19 @@ public:
       addNative<vector::StepOp>(result);
       addNative<vector::ShuffleOp>(result);
       addNative<vector::ExtractElementOp>(result);
+      addNative<vector::ReductionOp>(result, [](vector::ReductionOp op) -> LogicalResult {
+        auto vectorType = cast<VectorType>(op.getVector().getType());
+        Type element = vectorType.getElementType();
+        bool floating = element.isF32() || element.isF64();
+        bool integer = element.isSignlessInteger(8) || element.isSignlessInteger(16) ||
+                       element.isSignlessInteger(32) || element.isSignlessInteger(64);
+        if (vectorType.getRank() != 1 || vectorType.isScalable() || (!floating && !integer) ||
+            (op.getKind() != vector::CombiningKind::ADD && op.getKind() != vector::CombiningKind::MUL))
+          return op.emitOpError("requires a fixed one-dimensional same-dtype add/mul reduction for Mojo");
+        if (floating && (op.getFastmath() & arith::FastMathFlags::reassoc) == arith::FastMathFlags::none)
+          return op.emitOpError("requires floating reassociation permission for Mojo SIMD reduction");
+        return success();
+      });
       addNative<cpu::TaskDispatchOp>(result);
       return result;
     }();
@@ -372,6 +385,19 @@ private:
     std::string expression = name(op.getVector()) + "[" + name(op.getPosition()) + "]";
     if (op.getResult().getType().isIndex()) expression = "Int(" + expression + ")";
     assign(op.getResult(), expression);
+    return success();
+  }
+  LogicalResult emitTyped(vector::ReductionOp op) {
+    bool add = op.getKind() == vector::CombiningKind::ADD;
+    std::string expression = "(" + name(op.getVector()) + ")" +
+                            (add ? ".reduce_add()" : ".reduce_mul()");
+    std::string accumulator;
+    if (op.getAcc()) accumulator = name(op.getAcc());
+    else if (add && isa<FloatType>(op.getDest().getType()))
+      accumulator = valueType(op.getDest().getType()) + "(0.0)";
+    if (!accumulator.empty())
+      expression = "(" + accumulator + (add ? " + " : " * ") + expression + ")";
+    assign(op.getDest(), expression);
     return success();
   }
   LogicalResult emitTyped(memref::AllocaOp op) {

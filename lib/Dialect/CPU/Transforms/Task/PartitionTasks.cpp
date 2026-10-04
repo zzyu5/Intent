@@ -22,11 +22,13 @@ using namespace mlir;
 namespace intent::cpu {
 namespace {
 
-void partitionScalarSums(func::FuncOp function, int64_t grain) {
+SmallVector<scf::ParallelOp> partitionScalarSums(func::FuncOp function, int64_t grain) {
+  SmallVector<scf::ParallelOp> partitioned;
   auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
-  if (capabilities.getWorkers() <= 1) return;
+  if (capabilities.getWorkers() <= 1) return partitioned;
   int64_t limit = std::min(grain, capabilities.getPrivateBytes() / 4 / capabilities.getWorkers()) * capabilities.getWorkers();
-  if (!limit) return;
+  if (!limit) return partitioned;
+  int64_t capacity = limit / grain + (limit % grain != 0);
   SmallVector<ReduceOp> reductions(function.front().getOps<ReduceOp>());
   for (ReduceOp operation : reductions) {
     if (!operation.getResult().getType().isF32() || !operation.getOrder().getAdjacentReassociation() ||
@@ -41,17 +43,27 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
     Value count = b.create<arith::CeilDivSIOp>(loc, operation.getExtent(), index(b, loc, 4096));
     count = b.create<arith::MinSIOp>(loc, index(b, loc, limit),
         b.create<arith::MaxSIOp>(loc, one, count));
+    Value chunk = index(b, loc, grain);
+    Value taskCount = b.create<arith::CeilDivSIOp>(loc, count, chunk);
     Value width = b.create<arith::DivSIOp>(loc, operation.getExtent(), count);
     Value remainder = b.create<arith::RemSIOp>(loc, operation.getExtent(), count);
-    Value partials = b.create<memref::AllocOp>(loc, MemRefType::get({limit}, b.getF32Type()));
-    auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+    Value partials = b.create<memref::AllocOp>(loc, MemRefType::get({capacity}, b.getF32Type()));
+    auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{taskCount}, ValueRange{one});
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(tasks.getBody());
       Value group = tasks.getInductionVars()[0];
-      Value begin = add(b, loc, multiply(b, loc, group, width), b.create<arith::MinSIOp>(loc, group, remainder));
-      Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, group, remainder);
-      Value size = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, one, zero));
+      // Consume the task grain before forming partial reductions. These are
+      // exactly the adjacent intervals that the generic task partitioner would
+      // assign to this task, now with one accumulator and one published value.
+      Value first = multiply(b, loc, group, chunk);
+      Value last = b.create<arith::MinSIOp>(loc, add(b, loc, first, chunk), count);
+      auto boundary = [&](Value ordinal) {
+        return add(b, loc, multiply(b, loc, ordinal, width),
+                   b.create<arith::MinSIOp>(loc, ordinal, remainder));
+      };
+      Value begin = boundary(first);
+      Value size = b.create<arith::SubIOp>(loc, boundary(last), begin);
       SmallVector<Value> inputs;
       for (auto [input, attr] : llvm::zip(operation.getInputs(), operation.getIndexingMaps())) {
         auto type = dyn_cast<MemRefType>(input.getType());
@@ -71,7 +83,7 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
       operation.getCombine().cloneInto(&partial.getCombine(), mapping);
       b.create<memref::StoreOp>(loc, partial.getResult(), partials, ValueRange{group});
     }
-    auto result = b.create<ReduceOp>(loc, b.getF32Type(), count, operation.getInitial(), ValueRange{partials},
+    auto result = b.create<ReduceOp>(loc, b.getF32Type(), taskCount, operation.getInitial(), ValueRange{partials},
         b.getArrayAttr({AffineMapAttr::get(b.getMultiDimIdentityMap(1))}), operation.getOrder());
     result->setAttr("intent_cpu.implementation", operation->getAttr("intent_cpu.implementation"));
     {
@@ -84,7 +96,9 @@ void partitionScalarSums(func::FuncOp function, int64_t grain) {
     b.create<memref::DeallocOp>(loc, partials);
     operation.replaceAllUsesWith(result.getResult());
     operation.erase();
+    partitioned.push_back(tasks);
   }
+  return partitioned;
 }
 
 }
@@ -547,13 +561,15 @@ void foldSequentialAtomicAdds(func::FuncOp function) {
 }
 
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
-  partitionScalarSums(function, grain);
+  auto reductions = partitionScalarSums(function, grain);
   if (failed(exposeStructuredWorksets(function, implementations))) return failure();
   SmallVector<scf::ParallelOp> roots;
   function.walk([&](scf::ParallelOp operation) {
     if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);
   });
   for (scf::ParallelOp root : roots) {
+    // These worksets already contain one complete partial per final task.
+    if (llvm::is_contained(reductions, root)) continue;
     foldDisjointCompareExchange(function, root);
     auto owners = partitionAtomicRows(function, root, grain);
     // Atomic row worksets have already consumed the grain and worker budget.
