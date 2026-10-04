@@ -4,6 +4,8 @@
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
+#include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "IntegerSources.h"
 #include "ProducerReuse.h"
@@ -27,25 +29,150 @@ struct PointwiseProducer {
   linalg::GenericOp operation;
   ProducerReplay payload;
   AffineMap outputProjection;
+  bool overwritten = false;
 };
+
+// A complete write starts a new version of this exact descriptor. Its inputs
+// and payload must not observe the previous version, including through aliases.
+bool completeOverwrite(Operation *operation, Value buffer, StorageAnalysis &storage) {
+  auto writer = dyn_cast<linalg::LinalgOp>(operation);
+  if (!writer || operation->getNumResults() || writer.getNumDpsInits() != 1 ||
+      writer.getDpsInits().front() != buffer || writer.getNumReductionLoops() ||
+      failed(fullOutputProjection(buffer, writer.getIndexingMapsArray().back())))
+    return false;
+  // A bijective output map covers the loop domain. Also establish that its
+  // actual, possibly dynamic bounds cover this destination's complete shape.
+  AffineMap bounds = writer.getShapesToLoopsMap();
+  if (!bounds || bounds.getNumSymbols()) return false;
+  SmallVector<std::pair<Value, int64_t>> dimensions;
+  for (OpOperand &operand : operation->getOpOperands())
+    for (int64_t axis = 0, rank = writer.getShape(&operand).size(); axis < rank; ++axis)
+      dimensions.emplace_back(operand.get(), axis);
+  for (auto [axis, expression] : llvm::enumerate(writer.getIndexingMapsArray().back().getResults())) {
+    auto loop = dyn_cast<AffineDimExpr>(expression);
+    if (!loop) continue; // fullOutputProjection proved this unit output axis.
+    auto dimension = dyn_cast<AffineDimExpr>(bounds.getResult(loop.getPosition()));
+    if (!dimension || dimension.getPosition() >= dimensions.size()) return false;
+    auto [value, sourceAxis] = dimensions[dimension.getPosition()];
+    if (!haveEqualExtents(ValueBoundsConstraintSet::Variable(buffer, axis),
+                          ValueBoundsConstraintSet::Variable(value, sourceAxis)))
+      return false;
+  }
+  Block &body = operation->getRegion(0).front();
+  if (!body.getArguments().back().use_empty() ||
+      llvm::any_of(body.without_terminator(), [](Operation &nested) {
+        return nested.getNumRegions() || !isMemoryEffectFree(&nested);
+      })) return false;
+  auto effects = storage.effects(operation);
+  if (!effects.complete || effects.ordered) return false;
+  for (const StorageEffect &entry : effects.entries) {
+    if (!isa<MemoryEffects::Read>(entry.effect.getEffect())) continue;
+    Value memory = entry.effect.getValue();
+    if (!memory || (isa<BaseMemRefType>(memory.getType()) &&
+                    !storage.disjoint(memory, buffer))) return false;
+  }
+  return true;
+}
+
+// Prove that every observation of this version in the consumer is an input
+// slot that fuseOne replaces. Operation-level Read effects alone lose that
+// distinction when the same buffer occurs with different indexing maps.
+bool replacesAllReads(Operation *consumer, Value buffer, StorageAnalysis &storage) {
+  auto generic = dyn_cast<linalg::GenericOp>(consumer);
+  auto reduce = dyn_cast<ReduceOp>(consumer);
+  ValueRange inputs = generic ? ValueRange(generic.getInputs()) : ValueRange(reduce.getInputs());
+  SmallVector<AffineMap> maps = generic ? generic.getIndexingMapsArray()
+      : llvm::to_vector(llvm::map_range(reduce.getIndexingMaps(), [](Attribute attribute) {
+          return cast<AffineMapAttr>(attribute).getValue();
+        }));
+  AffineMap selected;
+  for (auto [number, input] : llvm::enumerate(inputs)) {
+    if (!isa<BaseMemRefType>(input.getType()) || storage.disjoint(input, buffer)) continue;
+    if (input != buffer || (selected && selected != maps[number])) return false;
+    selected = maps[number];
+  }
+  if (!selected) return false;
+  if (generic)
+    for (Value output : generic.getOutputs())
+      if (!storage.disjoint(output, buffer)) return false;
+  Block &body = generic ? generic.getRegion().front() : reduce.getCombine().front();
+  for (Operation &nested : body.without_terminator()) {
+    auto effects = storage.effects(&nested);
+    if (!effects.complete || effects.ordered) return false;
+    for (const StorageEffect &entry : effects.entries) {
+      Value memory = entry.effect.getValue();
+      if (!memory || (isa<BaseMemRefType>(memory.getType()) &&
+                      !storage.disjoint(memory, buffer))) return false;
+    }
+  }
+  return true;
+}
+
+linalg::GenericOp overwrittenProducer(Value buffer, Operation *consumer,
+                                       StorageAnalysis &storage) {
+  if (!isContiguousDescriptor(buffer) || !replacesAllReads(consumer, buffer, storage)) return {};
+  Value origin = storage.uniqueOrigin(buffer);
+  if (!origin || !storage.aliases(origin).complete) return {};
+  // Stop at the first possibly overlapping write in either direction. Reads,
+  // frees, unknown effects and ordering boundaries cannot be crossed. Later
+  // users beyond the overwrite observe its new contents and remain untouched.
+  auto boundary = [&](Operation *operation) -> std::optional<bool> {
+    auto effects = storage.effects(operation);
+    if (!effects.complete || effects.ordered) return std::nullopt;
+    bool writes = false;
+    for (const StorageEffect &entry : effects.entries) {
+      Value memory = entry.effect.getValue();
+      if (memory && (!isa<BaseMemRefType>(memory.getType()) ||
+                     storage.disjoint(memory, buffer))) continue;
+      if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) return std::nullopt;
+      writes = true;
+    }
+    return writes;
+  };
+  linalg::GenericOp producer;
+  for (Operation *previous = consumer->getPrevNode(); previous; previous = previous->getPrevNode()) {
+    auto writes = boundary(previous);
+    if (!writes) return {};
+    if (!*writes) continue;
+    producer = dyn_cast<linalg::GenericOp>(previous);
+    if (!producer || !completeOverwrite(producer, buffer, storage)) return {};
+    break;
+  }
+  if (!producer) return {};
+  for (Operation *next = consumer->getNextNode(); next; next = next->getNextNode()) {
+    auto writes = boundary(next);
+    if (!writes) return {};
+    if (*writes) return completeOverwrite(next, buffer, storage) ? producer : linalg::GenericOp();
+  }
+  return {};
+}
 
 std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *consumer,
                                                   StorageAnalysis &storage) {
-  auto allocation = buffer.getDefiningOp<memref::AllocOp>();
-  if (!allocation) return std::nullopt;
-  auto lifetime = storage.lifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
-  linalg::GenericOp producer;
-  for (Operation *user : lifetime->aliases.users) {
-    if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
-      if (!llvm::is_contained(generic.getOutputs(), buffer)) {
-        if (!storage.preserves(user, buffer)) return std::nullopt;
-        continue;
-      }
-      if (producer) return std::nullopt;
-      producer = generic;
-    } else if (!isa<memref::DimOp, memref::DeallocOp>(user) &&
-               !storage.preserves(user, buffer)) return std::nullopt;
+  auto privateProducer = [&]() -> linalg::GenericOp {
+    auto allocation = buffer.getDefiningOp<memref::AllocOp>();
+    if (!allocation) return {};
+    auto lifetime = storage.lifetime(allocation);
+    if (!lifetime || !lifetime->aliases.complete) return {};
+    linalg::GenericOp producer;
+    for (Operation *user : lifetime->aliases.users) {
+      if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
+        if (!llvm::is_contained(generic.getOutputs(), buffer)) {
+          if (!storage.preserves(user, buffer)) return {};
+          continue;
+        }
+        if (producer) return {};
+        producer = generic;
+      } else if (!isa<memref::DimOp, memref::DeallocOp>(user) &&
+                 !storage.preserves(user, buffer)) return {};
+    }
+    return producer;
+  };
+  linalg::GenericOp producer = privateProducer();
+  bool overwritten = false;
+  if (!producer) {
+    producer = overwrittenProducer(buffer, consumer, storage);
+    overwritten = static_cast<bool>(producer);
   }
   if (!producer || producer == consumer || producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer) || producer.getOutputs().size() != 1 ||
@@ -66,7 +193,7 @@ std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *cons
   ValueRange outputs = generic ? ValueRange(generic.getOutputs()) : ValueRange{};
   if (!canReplayProducerAt(*payload, producer, consumer, storage, outputs))
     return std::nullopt;
-  return PointwiseProducer{producer, std::move(*payload), *projection};
+  return PointwiseProducer{producer, std::move(*payload), *projection, overwritten};
 }
 
 bool fuseOne(Operation *consumer, unsigned inputNumber,
@@ -98,6 +225,7 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
     }) && llvm::all_of(llvm::enumerate(oldInputs), [&](auto item) {
       return item.value() != buffer || llvm::is_contained(fusedInputs, item.index());
     });
+  removesProducer |= source.overwritten;
   SmallVector<int64_t> iterationExtents;
   if (generic) iterationExtents = generic.getStaticLoopRanges();
   else {
@@ -211,7 +339,8 @@ bool fuseOne(Operation *consumer, unsigned inputNumber,
     reduce.getResult().replaceAllUsesWith(replacement.getResult());
     reduce.erase();
   }
-  eraseUnusedProducer(producer);
+  if (source.overwritten) producer.erase();
+  else eraseUnusedProducer(producer);
   return true;
 }
 
