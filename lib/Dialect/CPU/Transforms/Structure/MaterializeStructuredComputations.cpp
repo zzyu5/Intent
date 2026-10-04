@@ -1,5 +1,6 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
 #include "ReductionSources.h"
+#include "../Vector/ContiguousMemory.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
@@ -81,6 +82,7 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
     }
   auto outputMap = AffineMap::get(operation.getNumLoops(), 0, freeAxes, operation.getContext());
   SmallVector<bool> vectorLoads(components, false);
+  SmallVector<Value> guardedMemories;
   for (unsigned component = 0; component < components; ++component) {
     auto source = dyn_cast<MemRefType>(operation.getInputs()[component].getType());
     auto output = dyn_cast<MemRefType>(operation.getOutputs()[component].getType());
@@ -95,6 +97,9 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
       if (source.getShape() != sourceType.getShape() || !maps[component].isIdentity() ||
           failed(source.getStridesAndOffset(strides, offset))) return false;
       vectorLoads[component] = strides.back() == 1 && !source.getElementType().isInteger(1);
+      if (!sources.replays(component) && !source.getElementType().isInteger(1) &&
+          ShapedType::isDynamic(strides.back()))
+        guardedMemories.push_back(operation.getInputs()[component]);
     } else if (maps[component].getNumResults()) return false;
   }
   for (unsigned capture = components; capture < inputs; ++capture)
@@ -134,6 +139,8 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
 
   OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
+  auto contiguous = materializeContiguousMemoryGuard(b, loc, guardedMemories);
+  IRMapping supplied;
   SmallVector<Value> sizes, position(sourceType.getRank());
   for (int64_t axis = 0; axis < sourceType.getRank(); ++axis)
     sizes.push_back(b.create<memref::DimOp>(loc, domainSource, axis));
@@ -213,8 +220,9 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
           continue;
         }
         auto type = VectorType::get({width}, cast<MemRefType>(source.getType()).getElementType());
-        if (vectorLoads[component]) {
-          partial.push_back(b.create<vector::LoadOp>(loc, type, source, position));
+        Value memory = supplied.lookupOrDefault(source);
+        if (vectorLoads[component] || memory != source) {
+          partial.push_back(b.create<vector::LoadOp>(loc, type, memory, position));
           continue;
         }
         // Scalar lane reads retain the memref's element representation and
@@ -222,7 +230,7 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
         SmallVector<Value> lanes, coordinate(position);
         for (int64_t lane = 0; lane < width; ++lane) {
           coordinate.back() = b.create<arith::AddIOp>(loc, position.back(), index(b, loc, lane));
-          lanes.push_back(b.create<memref::LoadOp>(loc, source, coordinate));
+          lanes.push_back(b.create<memref::LoadOp>(loc, memory, coordinate));
         }
         partial.push_back(b.create<vector::FromElementsOp>(loc, type, lanes));
       }
@@ -278,7 +286,7 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
           if (failed(member)) return failure();
           values.push_back(*member);
         } else values.push_back(isa<MemRefType>(source.getType())
-            ? Value(b.create<memref::LoadOp>(loc, source, position)) : source);
+            ? Value(b.create<memref::LoadOp>(loc, supplied.lookupOrDefault(source), position)) : source);
       }
       b.create<scf::YieldOp>(loc, combine(tail.getRegionIterArgs(), values, captures, 0));
     }
@@ -286,7 +294,18 @@ FailureOr<bool> materializeProductReduction(linalg::GenericOp operation, int64_t
       b.create<memref::StoreOp>(loc, value, output, outputPosition);
     return success();
   };
-  if (failed(traverse(0))) return failure();
+  if (contiguous.condition) {
+    // Both realizations consume the same proved source graph. Moving cloned
+    // generics into these branches would lose its original producer scope.
+    auto dispatch = b.create<scf::IfOp>(loc, contiguous.condition, true);
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(dispatch.thenBlock());
+    contiguous.bind(b, loc, supplied);
+    if (failed(traverse(0))) return failure();
+    supplied.clear();
+    b.setInsertionPointToStart(dispatch.elseBlock());
+    if (failed(traverse(0))) return failure();
+  } else if (failed(traverse(0))) return failure();
   operation.erase();
   sources.eraseUnusedProducers();
   return true;
@@ -475,41 +494,17 @@ LogicalResult materialize(ScanOp operation, int64_t width,
   int64_t scanAxis = operation.getAxis();
   if (width > 1 && !supportsVectorScan(operation))
     return operation.emitError("selected vector scan requires an elementwise last-axis scan with supported strides");
-  SmallVector<memref::ExtractStridedMetadataOp> descriptors;
-  Value contiguous;
-  if (width > 1)
-    for (Value memory : llvm::concat<const Value>(operation.getSources(), operation.getOutputs())) {
-      auto memoryType = cast<MemRefType>(memory.getType());
-      auto [strides, offset] = memoryType.getStridesAndOffset();
-      if (!ShapedType::isDynamic(strides.back())) continue;
-      auto metadata = b.create<memref::ExtractStridedMetadataOp>(loc, memory);
-      descriptors.push_back(metadata);
-      Value unit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-          metadata.getStrides().back(), index(b, loc, 1));
-      contiguous = contiguous ? Value(b.create<arith::AndIOp>(loc, contiguous, unit)) : unit;
-    }
-  if (contiguous) {
-    auto dispatch = b.create<scf::IfOp>(loc, contiguous, true);
+  ContiguousMemoryGuard contiguous;
+  if (width > 1) {
+    SmallVector<Value> memories(operation.getSources());
+    llvm::append_range(memories, operation.getOutputs());
+    contiguous = materializeContiguousMemoryGuard(b, loc, memories);
+  }
+  if (contiguous.condition) {
+    auto dispatch = b.create<scf::IfOp>(loc, contiguous.condition, true);
     b.setInsertionPointToStart(dispatch.thenBlock());
     IRMapping mapping;
-    for (auto metadata : descriptors) {
-      auto sourceType = cast<MemRefType>(metadata.getSource().getType());
-      auto [strides, offset] = sourceType.getStridesAndOffset();
-      strides.back() = 1;
-      SmallVector<OpFoldResult> sizes, steps;
-      for (int64_t axis = 0; axis < sourceType.getRank(); ++axis) {
-        sizes.push_back(sourceType.isDynamicDim(axis) ? OpFoldResult(metadata.getSizes()[axis])
-            : OpFoldResult(b.getIndexAttr(sourceType.getDimSize(axis))));
-        steps.push_back(ShapedType::isDynamic(strides[axis]) ? OpFoldResult(metadata.getStrides()[axis])
-            : OpFoldResult(b.getIndexAttr(strides[axis])));
-      }
-      auto viewType = MemRefType::get(sourceType.getShape(), sourceType.getElementType(),
-          StridedLayoutAttr::get(b.getContext(), offset, strides), sourceType.getMemorySpace());
-      OpFoldResult begin = ShapedType::isDynamic(offset) ? OpFoldResult(metadata.getOffset())
-          : OpFoldResult(b.getIndexAttr(offset));
-      mapping.map(metadata.getSource(), b.create<memref::ReinterpretCastOp>(loc,
-          viewType, metadata.getBaseBuffer(), begin, sizes, steps));
-    }
+    contiguous.bind(b, loc, mapping);
     auto vectorScan = cast<ScanOp>(b.clone(*operation, mapping));
     if (failed(materialize(vectorScan, width, listener))) return failure();
     operation->moveBefore(dispatch.elseBlock(), dispatch.elseBlock()->begin());

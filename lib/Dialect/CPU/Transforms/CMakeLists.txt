@@ -58,6 +58,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Task/PartitionTasks.cpp
   Task/Passes.cpp
 
+  Vector/ContiguousMemory.cpp
   Vector/ProducerVectorization.cpp
   Vector/VectorReductions.cpp
   Vector/VectorizeLoops.cpp

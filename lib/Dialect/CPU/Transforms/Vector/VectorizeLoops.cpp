@@ -1,4 +1,5 @@
 #include "Intent/Dialect/CPU/Transforms/Vector/Vectorization.h"
+#include "ContiguousMemory.h"
 #include "ProducerVectorization.h"
 #include "../Storage/AccessAliases.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
@@ -138,14 +139,8 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
     });
   });
   if (!guardedMemories.empty() || (!nonempty && needsInvariantGuard)) {
-    Value one = index(b, loc, 1), condition;
-    SmallVector<memref::ExtractStridedMetadataOp> descriptors;
-    for (Value memory : guardedMemories) {
-      auto metadata = b.create<memref::ExtractStridedMetadataOp>(loc, memory);
-      descriptors.push_back(metadata);
-      Value unit = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, metadata.getStrides().back(), one);
-      condition = condition ? Value(b.create<arith::AndIOp>(loc, condition, unit)) : unit;
-    }
+    auto contiguous = materializeContiguousMemoryGuard(b, loc, guardedMemories);
+    Value condition = contiguous.condition;
     if (!nonempty && needsInvariantGuard) {
       Value active = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
           original.getUpperBound(), original.getLowerBound());
@@ -155,28 +150,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
     original.replaceAllUsesWith(dispatch.getResults());
     b.setInsertionPointToStart(&dispatch.getThenRegion().front());
     IRMapping mapping;
-    for (auto [memory, metadata] : llvm::zip(guardedMemories, descriptors)) {
-      auto type = cast<MemRefType>(memory.getType());
-      SmallVector<int64_t> strides;
-      int64_t offset;
-      (void)type.getStridesAndOffset(strides, offset);
-      strides.back() = 1;
-      auto contiguousType = MemRefType::get(type.getShape(), type.getElementType(),
-          StridedLayoutAttr::get(b.getContext(), offset, strides), type.getMemorySpace());
-      SmallVector<OpFoldResult> sizes, physicalStrides;
-      for (int64_t axis = 0; axis < type.getRank(); ++axis) {
-        sizes.push_back(type.isDynamicDim(axis) ? OpFoldResult(metadata.getSizes()[axis])
-                                               : OpFoldResult(b.getIndexAttr(type.getDimSize(axis))));
-        physicalStrides.push_back(ShapedType::isDynamic(strides[axis]) ? OpFoldResult(metadata.getStrides()[axis])
-                                                                     : OpFoldResult(b.getIndexAttr(strides[axis])));
-      }
-      OpFoldResult physicalOffset = ShapedType::isDynamic(offset) ? OpFoldResult(metadata.getOffset())
-                                                                 : OpFoldResult(b.getIndexAttr(offset));
-      // A descriptor reconstruction retains the proved stride through vector
-      // canonicalization, which can strip memref.cast from vector loads.
-      mapping.map(memory, b.create<memref::ReinterpretCastOp>(loc, contiguousType,
-          metadata.getBaseBuffer(), physicalOffset, sizes, physicalStrides));
-    }
+    contiguous.bind(b, loc, mapping);
     auto contiguousLoop = cast<scf::ForOp>(b.clone(*original, mapping));
     if (original.getNumResults()) {
       b.setInsertionPointToEnd(&dispatch.getThenRegion().front());
