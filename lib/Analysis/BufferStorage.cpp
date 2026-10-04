@@ -299,22 +299,47 @@ bool BufferStorageAnalysis::disjoint(Value first, Value second) {
   return true;
 }
 
+bool BufferStorageAnalysis::disjointAt(Value first, Value second, Operation *scope) {
+  if (disjoint(first, second)) return true;
+  if (!isBuffer(first) || !isBuffer(second) || first == second ||
+      !scope || enclosingFunction(scope) != function ||
+      !dominance.dominates(first, scope) || !dominance.dominates(second, scope))
+    return false;
+  auto freshDuring = [&](Value memory, Value existing) {
+    auto sources = origins(memory);
+    return sources.complete && llvm::all_of(sources.values, [&](Value source) {
+      auto allocation = source.getDefiningOp<memref::AllocOp>();
+      if (!allocation) return false;
+      Attribute space = allocation.getType().getMemorySpace();
+      auto numericSpace = dyn_cast_or_null<IntegerAttr>(space);
+      if (space && (!numericSpace || numericSpace.getInt() != 0)) return false;
+      Operation *consumer = allocation->getBlock()->findAncestorOpInBlock(*scope);
+      return consumer && allocation->isBeforeInBlock(consumer) &&
+          dominance.properlyDominates(existing, allocation);
+    });
+  };
+  // A backedge can carry an earlier instance of this static heap allocation.
+  // Freshness distinguishes it only after the new allocation and within this
+  // execution scope. Static alias/access closure must still retain that edge.
+  return freshDuring(first, second) || freshDuring(second, first);
+}
+
 bool BufferStorageAnalysis::preserves(Operation *scope, Value memory) {
   auto summary = effects(scope);
-  return !summary.ordered && preservesContents(summary, memory);
+  return !summary.ordered && preservesContents(summary, memory, scope);
 }
 
 bool BufferStorageAnalysis::preservesContents(Operation *scope, Value memory) {
-  return preservesContents(effects(scope), memory);
+  return preservesContents(effects(scope), memory, scope);
 }
 
 bool BufferStorageAnalysis::preservesContents(const BufferStorageEffects &summary,
-                                             Value memory) {
+                                             Value memory, Operation *scope) {
   if (!summary.complete) return false;
   for (const auto &entry : summary.entries) {
     const auto &effect = entry.effect;
     if (isa<MemoryEffects::Read, MemoryEffects::Allocate>(effect.getEffect())) continue;
-    if (!disjoint(memory, effect.getValue())) return false;
+    if (!disjointAt(memory, effect.getValue(), scope)) return false;
   }
   return true;
 }

@@ -83,6 +83,10 @@ public:
   // unchangedBetween/readStable limit their checks to an execution interval.
   BufferStorageEffects accesses(mlir::Value memory);
   bool disjoint(mlir::Value first, mlir::Value second);
+  // Coexisting instances during this scope. Unlike static disjoint(), this may
+  // distinguish a new heap instance from an incoming loop-carried descriptor;
+  // it must not filter a whole-lifetime alias/access closure.
+  bool disjointAt(mlir::Value first, mlir::Value second, mlir::Operation *scope);
   // A content observation may cross ordering alone; moving a read may not.
   bool preservesContents(mlir::Operation *scope, mlir::Value memory);
   bool preserves(mlir::Operation *scope, mlir::Value memory);
@@ -103,7 +107,8 @@ private:
   mlir::BufferOriginAnalysis &getBufferOrigins();
   bool unchangedBetween(mlir::Value memory, mlir::Operation *from,
                         mlir::Operation *to, bool respectOrdering);
-  bool preservesContents(const BufferStorageEffects &effects, mlir::Value memory);
+  bool preservesContents(const BufferStorageEffects &effects, mlir::Value memory,
+                         mlir::Operation *scope);
   bool isLiveAt(mlir::Value memory, mlir::Operation *operation) const;
   mlir::func::FuncOp function;
   BufferStoragePolicy policy;

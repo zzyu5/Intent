@@ -123,7 +123,7 @@ void vectorize(scf::ForOp original, int64_t width, int64_t replicas, bool nonemp
                          producer, guardedMemories)) return;
   auto independent = [&](Value lhs, ValueRange lhsIndices, Value rhs, ValueRange rhsIndices) {
     if (lhs == rhs && lhsIndices == rhsIndices) return true;
-    return storage.disjoint(lhs, rhs);
+    return storage.disjointAt(lhs, rhs, original);
   };
   for (auto [number, store] : llvm::enumerate(stores)) {
     for (auto load : loads)
