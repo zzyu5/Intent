@@ -1,10 +1,13 @@
 #include "ConfigurationPolicy.h"
+#include "Intent/Analysis/ControlFlow.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/IR/FragmentOpInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 #include <algorithm>
@@ -459,15 +462,77 @@ correlatedReductionContractionParameters(
   return correlated;
 }
 
-unsigned carriedMatrixCount(Type type) {
-  if (auto fragment = dyn_cast<FragmentType>(type))
-    return fragment.getShape().size() >= 2 &&
-           isa<FloatType>(fragment.getElementType());
-  unsigned count = 0;
-  if (auto record = dyn_cast<RecordType>(type))
-    for (Attribute field : record.getFieldTypes())
-      count += carriedMatrixCount(cast<TypeAttr>(field).getValue());
-  return count;
+bool carriesContraction(
+    Value value, ArrayRef<unsigned> path, scf::ForOp scope,
+    llvm::DenseMap<Value, SmallVector<SmallVector<unsigned>>> &visited) {
+  auto &paths = visited[value];
+  if (llvm::any_of(paths, [&](const auto &seen) {
+        return ArrayRef<unsigned>(seen) == path;
+      })) return false;
+  paths.emplace_back(path.begin(), path.end());
+  Type component = value.getType();
+  for (unsigned field : path) {
+    auto record = dyn_cast<RecordType>(component);
+    if (!record || field >= record.getFieldTypes().size()) return false;
+    component = cast<TypeAttr>(record.getFieldTypes()[field]).getValue();
+  }
+  auto type = dyn_cast<FragmentType>(component);
+  // Follow matrix data, not a predicate derived from a contraction. In
+  // particular, Select's condition does not make its other operands matrix
+  // accumulators. Casts between floating element types still carry that data.
+  if (!type || !isa<FloatType>(type.getElementType())) return false;
+  if (auto record = value.getDefiningOp<MakeRecordOp>())
+    return !path.empty() && carriesContraction(
+        record.getFields()[path.front()], path.drop_front(), scope, visited);
+  if (auto extract = value.getDefiningOp<ExtractOp>()) {
+    SmallVector<unsigned> nested{static_cast<unsigned>(extract.getField())};
+    llvm::append_range(nested, path);
+    return carriesContraction(extract.getRecord(), nested, scope, visited);
+  }
+
+  Operation *definition = value.getDefiningOp();
+  Operation *owner = definition ? definition : value.getParentBlock()->getParentOp();
+  if (!owner || !scope->isAncestor(owner)) return false;
+  if (definition && isa<ContractOp, ScaledContractOp, SparseContractOp>(definition))
+    return path.empty();
+
+  auto incoming = queryControlFlowIncoming(value);
+  if (incoming.complete && !incoming.edges.empty())
+    return llvm::any_of(incoming.edges, [&](const ControlFlowEdge &edge) {
+      return edge.operand && carriesContraction(
+          edge.operand->get(), path, scope, visited);
+    });
+  if (!path.empty() || !definition || definition->getNumRegions() ||
+      !isMemoryEffectFree(definition)) return false;
+  auto relations = queryFragmentOperandRelations(cast<OpResult>(value));
+  if (failed(relations)) return false;
+  return llvm::any_of(*relations, [&](const FragmentOperandRelation &relation) {
+    // A reduced/broadcast statistic may depend on matrix values without
+    // retaining a matrix accumulator. Require the actual data lane relation.
+    return relation.invariantResultAxes.empty() &&
+           relation.preservesNonUnitAxes() &&
+           carriesContraction(definition->getOperand(relation.operandNumber),
+                              {}, scope, visited);
+  });
+}
+
+unsigned carriedMatrixCount(Value value, Type type, ArrayRef<unsigned> path,
+                            scf::ForOp scope) {
+  if (auto record = dyn_cast<RecordType>(type)) {
+    unsigned count = 0;
+    for (auto [field, attribute] : llvm::enumerate(record.getFieldTypes())) {
+      SmallVector<unsigned> nested(path);
+      nested.push_back(field);
+      count += carriedMatrixCount(value, cast<TypeAttr>(attribute).getValue(),
+                                  nested, scope);
+    }
+    return count;
+  }
+  auto fragment = dyn_cast<FragmentType>(type);
+  if (!fragment || fragment.getShape().size() < 2 ||
+      !isa<FloatType>(fragment.getElementType())) return 0;
+  llvm::DenseMap<Value, SmallVector<SmallVector<unsigned>>> visited;
+  return carriesContraction(value, path, scope, visited);
 }
 
 bool hasMultipleRegionMatrixAccumulators(func::FuncOp kernel) {
@@ -478,8 +543,9 @@ bool hasMultipleRegionMatrixAccumulators(func::FuncOp kernel) {
                         ParameterCategory::RegionContraction)
       return;
     unsigned matrices = 0;
-    for (Value carry : loop.getInitArgs())
-      matrices += carriedMatrixCount(carry.getType());
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    for (Value value : yield.getResults())
+      matrices += carriedMatrixCount(value, value.getType(), {}, loop);
     found |= matrices > 1;
   });
   return found;
