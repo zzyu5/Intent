@@ -2,6 +2,7 @@
 #define INTENT_CPU_TRANSFORMS_STRUCTURE_PRODUCERVERSIONS_H
 
 #include "ProducerReuse.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace intent::cpu {
 
@@ -19,6 +20,10 @@ struct ProducerVersion {
 
 mlir::FailureOr<ProducerVersion> queryProducerVersion(
     mlir::linalg::GenericOp producer, StorageAnalysis &storage);
+
+// Select an existing complete copy as the representative of a stored version.
+// Retarget the defining write and its reads; do not replay any computation.
+bool forwardProducerVersionCopies(mlir::func::FuncOp function);
 
 // In addition to ordinary replay, permit a source's current element to be read
 // immediately before its own injective pointwise overwrite. The source must be

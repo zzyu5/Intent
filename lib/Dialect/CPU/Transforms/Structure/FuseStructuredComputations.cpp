@@ -474,6 +474,8 @@ LogicalResult fuseStructuredComputations(func::FuncOp function) {
   forwardCPUOutputs(function);
   bool changed;
   do {
+    changed = forwardProducerVersionCopies(function);
+    if (changed) continue;
     changed = fuseOneVersion(function);
     if (changed) continue;
     SmallVector<Operation *> consumers;
