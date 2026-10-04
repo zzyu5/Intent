@@ -1,5 +1,6 @@
 #include "Intent/Target/Weft/Transforms/Passes.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Quantization.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h"
@@ -17,6 +18,8 @@ namespace {
 
 constexpr int64_t directRhsSupply = 1;
 constexpr int64_t invocationRhsSupply = 2;
+constexpr int64_t directLhsSupply = 1;
+constexpr int64_t retainedLhsSupply = 2;
 
 bool hasReductionContiguousRhs(linalg::GenericOp operation) {
   auto type = cast<MemRefType>(operation.getInputs()[1].getType());
@@ -142,9 +145,14 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         ArrayRef<OpFoldResult>{m, n}, ArrayRef<OpFoldResult>{rows, columns},
         ArrayRef<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
   };
-  auto form = [&](Value m, Value n, int64_t rows, int64_t columns) {
-    Value lhs = view(tile.lhs, m, tile.kBegin, b.getIndexAttr(rows), tile.depth);
-    Value rhs = view(tile.rhs, tile.kBegin, n, tile.depth, b.getIndexAttr(columns));
+  auto form = [&](Value m, Value n, int64_t rows, int64_t columns,
+                  Value suppliedLhs = {}, Value kBegin = {}, Value depth = {},
+                  std::optional<bool> first = std::nullopt) {
+    if (!kBegin) kBegin = tile.kBegin;
+    if (!depth) depth = tile.depth;
+    Value lhs = suppliedLhs ? suppliedLhs
+        : view(tile.lhs, m, kBegin, b.getIndexAttr(rows), depth);
+    Value rhs = view(tile.rhs, kBegin, n, depth, b.getIndexAttr(columns));
     Value out = view(tile.output, m, n, b.getIndexAttr(rows), b.getIndexAttr(columns));
     auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, b.getF32Type()));
     b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
@@ -155,13 +163,14 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         });
     term->setAttr("intent_cpu.implementation", binding);
     SmallVector<Value> inputs{partial};
-    if (!tile.first) inputs.insert(inputs.begin(), out);
+    bool initialize = first.value_or(tile.first);
+    if (!initialize) inputs.insert(inputs.begin(), out);
     b.create<linalg::GenericOp>(loc, inputs, ValueRange{out},
         SmallVector<AffineMap>(inputs.size() + 1, b.getMultiDimIdentityMap(2)),
         SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
         [&](OpBuilder &nested, Location loc, ValueRange args) {
           Value result = args[0];
-          if (!tile.first) result = nested.create<arith::AddFOp>(loc, result, args[1]);
+          if (!initialize) result = nested.create<arith::AddFOp>(loc, result, args[1]);
           nested.create<linalg::YieldOp>(loc, result);
         });
   };
@@ -182,9 +191,45 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
             [&](Value offset) { body(offset, panel); });
       if (extent != full) body(add(b, loc, begin, index(b, loc, full)), extent - full);
     };
-    panels(tile.mBegin, *rows, [&](Value m, int64_t rows) {
-      panels(tile.nBegin, *columns, [&](Value n, int64_t columns) { form(m, n, rows, columns); });
-    });
+    if (implementationParameter(binding, "lhs_supply") == retainedLhsSupply && *columns > panel) {
+      auto depth = getConstantIntValue(tile.depth);
+      StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+      if (!depth || *depth <= 0 || !storage.disjoint(tile.lhs, tile.output) ||
+          !storage.disjoint(tile.rhs, tile.output))
+        return operation.emitError("retained LHS supply requires a bounded reduction and disjoint output");
+      // Keep one complete row over the N traversal. A whole M panel would
+      // unnecessarily multiply its register lifetime by the microkernel height.
+      // Copy is a real numeric snapshot; the target owns its representation.
+      auto issue = [&](Value k, int64_t count, bool first) {
+        Value width = index(b, loc, count);
+        loop(b, loc, tile.mBegin, add(b, loc, tile.mBegin, tile.mCount), 1, [&](Value m) {
+          Value lhs = view(tile.lhs, m, k, b.getIndexAttr(1), width);
+          Value saved = b.create<memref::AllocaOp>(loc, MemRefType::get({1, count}, b.getF32Type()));
+          b.create<memref::CopyOp>(loc, lhs, saved);
+          if (count == 1) {
+            loop(b, loc, tile.nBegin, add(b, loc, tile.nBegin, tile.nCount), 1,
+                [&](Value n) { form(m, n, 1, 1, saved, k, width, first); });
+          } else {
+            panels(tile.nBegin, *columns,
+                [&](Value n, int64_t columns) { form(m, n, 1, columns, saved, k, width, first); });
+          }
+        });
+      };
+      int64_t window = implementationParameter(binding, "lhs_window");
+      // This is a physical K supply window, independent of the outer K tile.
+      // Each output keeps the same ascending member domain and first-write rule.
+      issue(tile.kBegin, std::min(*depth, window), tile.first);
+      int64_t full = *depth / window * window;
+      if (full > window)
+        loop(b, loc, index(b, loc, window), index(b, loc, full), window,
+            [&](Value k) { issue(add(b, loc, tile.kBegin, k), window, false); });
+      if (*depth > window && full != *depth)
+        issue(add(b, loc, tile.kBegin, index(b, loc, full)), *depth - full, false);
+    } else {
+      panels(tile.mBegin, *rows, [&](Value m, int64_t rows) {
+        panels(tile.nBegin, *columns, [&](Value n, int64_t columns) { form(m, n, rows, columns); });
+      });
+    }
   }
   return success();
 }
@@ -195,8 +240,9 @@ cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
   result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k", "rhs_supply"});
   result.addProfile("weft.q8_k", {"chunk"});
-  for (StringRef family : {"weft.region_contract_f32", "weft.region_structured",
-                          "weft.contract_f32", "weft.structured"})
+  for (StringRef family : {"weft.region_contract_f32", "weft.contract_f32"})
+    result.addProfile(family, {"lhs_supply", "lhs_window"});
+  for (StringRef family : {"weft.region_structured", "weft.structured"})
     result.addProfile(family, {});
   result.profile = [](func::FuncOp function) -> StringRef {
     bool quantize = false, contraction = false, integer = false, region = false;
@@ -279,8 +325,19 @@ cpu::ImplementationRegistry implementations() {
           cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32() &&
           cast<MemRefType>(generic.getInputs()[1].getType()).getElementType().isF32() &&
           cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isF32();
-    }, check, {ImplementationParameter::minimum("panel", 4,
-        {ImplementationParameter::Axis::TileM, ImplementationParameter::Axis::TileN})},
+    }, [](Operation *operation, CapabilitiesAttr, const Configuration &config) -> std::optional<std::string> {
+      if (config.parameter("lhs_supply") != retainedLhsSupply) return std::nullopt;
+      auto generic = cast<linalg::GenericOp>(operation);
+      StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+      if (!storage.disjoint(generic.getInputs()[0], generic.getOutputs()[0]) ||
+          !storage.disjoint(generic.getInputs()[1], generic.getOutputs()[0]))
+        return "retained LHS supply requires disjoint input and output storage";
+      return std::nullopt;
+    }, {ImplementationParameter::minimum("panel", 4,
+        {ImplementationParameter::Axis::TileM, ImplementationParameter::Axis::TileN}),
+        ImplementationParameter::local("lhs_supply", {false, {}, 0,
+            {directLhsSupply, retainedLhsSupply}}),
+        ImplementationParameter::local("lhs_window", {false, {}, 0, {16, 32, 64}})},
     formTile, {}, {true, true, true}});
   Implementation structured{"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
