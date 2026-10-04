@@ -281,6 +281,14 @@ private:
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
       if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
+          implementation && implementation.getValue() == "cycle") {
+        StringRef callee = binary.getKind() == BinaryOperator::Add ? "__bang_cycle_add" :
+            binary.getKind() == BinaryOperator::Subtract ? "__bang_cycle_sub" : "__bang_cycle_mul";
+        line(callee.str() + "(" + name(binary.getOutput()) + ", " + name(binary.getLhs()) + ", " +
+            name(binary.getRhs()) + ", " + count(binary.getOutput()) + ", " + count(binary.getRhs()) + ");");
+        return success();
+      }
+      if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
           implementation && implementation.getValue() == "row_scalar") {
         auto type = cast<MemRefType>(binary.getOutput().getType());
         line("intent_binary_rows<" + ctype(type.getElementType()) + ", " +

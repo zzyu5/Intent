@@ -46,6 +46,22 @@ LogicalResult verifyProgram(ModuleOp module) {
         return WalkResult::interrupt();
       }
     }
+    if (auto binary = dyn_cast<dsa::BinaryOp>(operation)) {
+      auto rhs = dyn_cast<MemRefType>(binary.getRhs().getType());
+      auto implementation = operation->getAttrOfType<StringAttr>("bangc.implementation");
+      bool compact = rhs && rhs != binary.getLhs().getType();
+      bool selected = implementation && (implementation.getValue() == "cycle" ||
+                                         implementation.getValue() == "row_scalar");
+      if (compact || selected) {
+        StringRef expected = compact && rhs.getDimSize(0) == 1 ? "cycle" : "row_scalar";
+        dsa::StorageAnalysis storage(function);
+        if (!compact || !selected || implementation.getValue() != expected ||
+            !storage.disjoint(binary.getOutput(), binary.getRhs())) {
+          binary.emitError("broadcast primitive requires the matching unit-axis operand and independent short input");
+          return WalkResult::interrupt();
+        }
+      }
+    }
     return WalkResult::advance();
   });
   return failure(walk.wasInterrupted());

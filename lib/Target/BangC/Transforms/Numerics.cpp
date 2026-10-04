@@ -370,50 +370,6 @@ bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr con
   return changed;
 }
 
-bool bindRowScalarOperands(func::FuncOp function) {
-  SmallVector<dsa::BinaryOp> binaries;
-  function.walk([&](dsa::BinaryOp binary) { binaries.push_back(binary); });
-  auto exact = [](Value value, int64_t expected) {
-    APInt bits; return matchPattern(value, m_ConstantInt(&bits)) && bits.getSExtValue() == expected;
-  };
-  bool changed = false;
-  for (auto binary : binaries) {
-    dsa::StorageAnalysis storage(function);
-    auto type = cast<MemRefType>(binary.getOutput().getType());
-    int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
-    if (rows <= 1 || rows >= 16 || columns < 1024 || binary.getApproximate() || binary.getFlushToZero() ||
-        binary.getScratch() || !supportedScalarBinary(binary.getKind()) ||
-        (!type.getElementType().isF32() && !type.getElementType().isF16())) continue;
-    Value previous = binary.getRhs();
-    if (!previous.getDefiningOp<memref::AllocaOp>() ||
-        !storage.disjoint(previous, binary.getLhs())) continue;
-    auto broadcast = dyn_cast_or_null<dsa::LoadTileOp>(storage.uniqueWriter(previous));
-    auto accesses = storage.accesses(previous);
-    bool eligible = accesses.complete && llvm::all_of(accesses.entries, [&](const auto &entry) {
-      return entry.operation == binary || entry.operation == broadcast ||
-             isa<MemoryEffects::Allocate>(entry.effect.getEffect());
-    });
-    if (!eligible || !broadcast || !dsa::isCompleteStorageViewOf(broadcast.getOutput(), previous) ||
-        broadcast.getOutput().getType() != previous.getType() ||
-        broadcast->getBlock() != binary->getBlock() || !broadcast->isBeforeInBlock(binary) ||
-        broadcast.getAsynchronous() || !exact(broadcast.getRows(), rows) || !exact(broadcast.getColumns(), columns) ||
-        !exact(broadcast.getOffset(), 0) || !exact(broadcast.getRowStride(), 1) || !exact(broadcast.getColumnStride(), 0)) continue;
-    Value source = broadcast.getSource();
-    auto sourceType = cast<MemRefType>(source.getType());
-    if (!ownedCompleteStorage(source, storage) || sourceType.getShape() != ArrayRef<int64_t>({1, rows}) ||
-        sourceType.getElementType() != type.getElementType() || !sourceType.getLayout().isIdentity() ||
-        !storage.preservesContents(broadcast, source) ||
-        !storage.contentsUnchangedBetween(source, broadcast, binary) ||
-        !storage.preservesContents(binary, source)) continue;
-    binary.getRhsMutable().assign(source);
-    binary->setAttr("bangc.implementation", StringAttr::get(function.getContext(), "row_scalar"));
-    broadcast.erase();
-    if (previous.use_empty()) previous.getDefiningOp()->erase();
-    changed = true;
-  }
-  return changed;
-}
-
 void realizeRoundedDivisions(func::FuncOp function, dsa::ConfigurationAttr config) {
   SmallVector<dsa::BinaryOp> divisions;
   DenseMap<int64_t, Value> indicesByWidth;
@@ -683,7 +639,6 @@ LogicalResult realizeNativeWorkspace(ModuleOp module,
 
 LogicalResult selectNativeImplementations(ModuleOp module) {
   auto function = *module.getOps<func::FuncOp>().begin();
-  auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
   auto walk = function.walk([&](Operation *op) {
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
       bool approximateExp2 = unary.getKind() == UnaryOperator::Exp2 && unary.getApproximate() &&
@@ -712,6 +667,11 @@ LogicalResult selectNativeImplementations(ModuleOp module) {
     }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
       Type element = cast<MemRefType>(binary.getLhs().getType()).getElementType();
+      if (auto rhs = dyn_cast<MemRefType>(binary.getRhs().getType());
+          rhs && rhs != binary.getLhs().getType()) {
+        StringRef implementation = rhs.getDimSize(0) == 1 ? "cycle" : "row_scalar";
+        op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), implementation));
+      }
       if (!isa<MemRefType>(binary.getRhs().getType()) &&
           (!supportedScalarBinary(binary.getKind()) || (!element.isF16() && !element.isF32() && !element.isInteger(32)))) {
         op->emitError("scalar binary kind or dtype has no selected BANG C implementation"); return WalkResult::interrupt();

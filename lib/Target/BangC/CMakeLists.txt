@@ -2,6 +2,7 @@ add_mlir_library(MLIRIntentBangC
   Transforms/Legalize.cpp
   Transforms/Matrix.cpp
   Transforms/Numerics.cpp
+  Transforms/BroadcastOperands.cpp
   Transforms/IndexLowering.cpp
   Transforms/Supply.cpp
   Transforms/CoarsenLocal.cpp

@@ -596,8 +596,8 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (realizeAffineRanges(function, config) && failed(cleanup())) return failure();
   if (realizeFullWidthMasks(function, config) && failed(cleanup())) return failure();
   while (dsa::eliminateUnreadLocalWrites(function)) if (failed(cleanup())) return failure();
+  if (bindBroadcastOperands(function) && failed(cleanup())) return failure();
   if (realizeRowBroadcasts(function, config) && failed(cleanup())) return failure();
-  if (bindRowScalarOperands(function) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();
   if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();

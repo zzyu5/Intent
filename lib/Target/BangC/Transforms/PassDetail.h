@@ -32,7 +32,7 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
 bool supportedScalarBinary(BinaryOperator kind);
 bool specializeZeroMatrixTiles(func::FuncOp function);
 bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config);
-bool bindRowScalarOperands(func::FuncOp function);
+bool bindBroadcastOperands(func::FuncOp function);
 bool realizeAffineRanges(func::FuncOp function, dsa::ConfigurationAttr config);
 bool realizeFullWidthMasks(func::FuncOp function, dsa::ConfigurationAttr config);
 bool vectorizeIndexLoops(func::FuncOp function, dsa::ConfigurationAttr config);

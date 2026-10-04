@@ -334,14 +334,15 @@ LogicalResult BinaryOp::verify() {
   }
   auto lhs = cast<MemRefType>(getLhs().getType());
   auto rhs = dyn_cast<MemRefType>(getRhs().getType());
-  bool rowScalar = tile(getRhs()) && rhs.getElementType() == lhs.getElementType() &&
-      (lhs.getElementType().isF32() || lhs.getElementType().isF16()) && lhs.getDimSize(0) > 1 && lhs.getDimSize(0) < 16 &&
-      lhs.getDimSize(1) >= 1024 && rhs.getShape() == ArrayRef<int64_t>({1, lhs.getDimSize(0)}) &&
+  bool broadcast = tile(getRhs()) && rhs.getElementType() == lhs.getElementType() &&
+      (lhs.getElementType().isF32() || lhs.getElementType().isF16()) &&
+      (rhs.getShape() == ArrayRef<int64_t>({lhs.getDimSize(0), 1}) ||
+       rhs.getShape() == ArrayRef<int64_t>({1, lhs.getDimSize(1)})) &&
       lhs.getLayout().isIdentity() && rhs.getLayout().isIdentity() && !getApproximate() && !getFlushToZero() &&
       (getKind() == intent::BinaryOperator::Add || getKind() == intent::BinaryOperator::Subtract || getKind() == intent::BinaryOperator::Multiply);
-  return rowScalar || same(getLhs(), getRhs()) ||
+  return broadcast || same(getLhs(), getRhs()) ||
       getRhs().getType() == cast<MemRefType>(getLhs().getType()).getElementType()
-      ? success() : emitOpError("binary right operand must be a matching tile, scalar, or selected per-row scalar vector");
+      ? success() : emitOpError("binary right operand must be a matching tile, scalar, or same-dtype unit-axis broadcast");
 }
 LogicalResult CompareOp::verify() {
   if (Value scratch = getScratch()) {
