@@ -16,11 +16,23 @@
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/SetVector.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include <utility>
 
 using namespace mlir;
 
 namespace intent::cpu {
 namespace {
+
+std::pair<Value, Value> balancedTaskInterval(OpBuilder &b, Location loc,
+                                            Value ordinal, Value width,
+                                            Value remainder) {
+  Value extraBefore = b.create<arith::MinSIOp>(loc, ordinal, remainder);
+  Value begin = add(b, loc, multiply(b, loc, ordinal, width), extraBefore);
+  Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, remainder);
+  Value count = add(b, loc, width,
+      b.create<arith::SelectOp>(loc, extra, index(b, loc, 1), index(b, loc, 0)));
+  return {begin, add(b, loc, begin, count)};
+}
 
 SmallVector<scf::ParallelOp> partitionScalarSums(func::FuncOp function, int64_t grain) {
   SmallVector<scf::ParallelOp> partitioned;
@@ -209,7 +221,7 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
 
 namespace {
 
-LogicalResult partition(scf::ParallelOp root, int64_t grain) {
+LogicalResult partition(scf::ParallelOp root, int64_t grain, bool distributeToWorkers) {
   // Rectangularity depends on invariant bounds, not where their producers were
   // first materialized. Native LICM keeps effects and zero-trip speculation safe.
   root.walk<WalkOrder::PostOrder>([](scf::ParallelOp parallel) {
@@ -271,12 +283,40 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain) {
   for (Value extent : extents) size = multiply(b, loc, size, extent);
   Value chunk = index(b, loc, grain);
   Value taskCount = b.create<arith::CeilDivSIOp>(loc, size, chunk);
-  auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{taskCount}, ValueRange{one});
+  Value count = taskCount, width, remainder, fullChunks, tail;
+  if (distributeToWorkers) {
+    auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
+    auto active = b.create<scf::IfOp>(loc,
+        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, taskCount, zero), false);
+    b.setInsertionPointToStart(active.thenBlock());
+    count = b.create<arith::MinSIOp>(loc, taskCount, index(b, loc, capabilities.getWorkers()));
+    width = b.create<arith::DivSIOp>(loc, taskCount, count);
+    remainder = b.create<arith::RemSIOp>(loc, taskCount, count);
+    fullChunks = b.create<arith::DivSIOp>(loc, size, chunk);
+    tail = b.create<arith::RemSIOp>(loc, size, chunk);
+  }
+  auto tasks = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(tasks.getBody());
-    Value begin = multiply(b, loc, tasks.getInductionVars()[0], chunk);
-    Value end = b.create<arith::MinSIOp>(loc, add(b, loc, begin, chunk), size);
+    Value begin, end;
+    if (distributeToWorkers) {
+      auto [first, last] = balancedTaskInterval(b, loc, tasks.getInductionVars()[0], width, remainder);
+      // Preserve the original grain assignment, but decode its contiguous
+      // logical interval only once. The rounded final chunk may exceed index
+      // range, so materialize endpoints through the bounded full part and tail.
+      auto boundary = [&](Value ordinal) {
+        Value full = b.create<arith::MinSIOp>(loc, ordinal, fullChunks);
+        Value partial = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, ordinal, fullChunks);
+        return add(b, loc, multiply(b, loc, full, chunk),
+            b.create<arith::SelectOp>(loc, partial, tail, zero));
+      };
+      begin = boundary(first);
+      end = boundary(last);
+    } else {
+      begin = multiply(b, loc, tasks.getInductionVars()[0], chunk);
+      end = b.create<arith::MinSIOp>(loc, add(b, loc, begin, chunk), size);
+    }
     auto clonePoint = [&](ValueRange point) {
       IRMapping mapping;
       mapping.map(ValueRange(coordinates), point);
@@ -560,6 +600,15 @@ void foldSequentialAtomicAdds(func::FuncOp function) {
 
 }
 
+LogicalResult partitionWorkset(scf::ParallelOp workset, int64_t grain) {
+  if (grain <= 0)
+    return workset.emitError("CPU workset partitioning requires a positive grain");
+  if (workset->getParentOfType<scf::ParallelOp>() ||
+      workset->getParentOfType<TasksOp>() || workset->getParentOfType<TaskDispatchOp>())
+    return workset.emitError("CPU workset partitioning requires an independent root outside an existing task");
+  return partition(workset, grain, true);
+}
+
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
   auto reductions = partitionScalarSums(function, grain);
   if (failed(exposeStructuredWorksets(function, implementations))) return failure();
@@ -573,7 +622,9 @@ LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const Impleme
     foldDisjointCompareExchange(function, root);
     auto owners = partitionAtomicRows(function, root, grain);
     // Atomic row worksets have already consumed the grain and worker budget.
-    if (failed(partition(owners ? owners : root, owners ? 1 : grain))) return failure();
+    if (owners) {
+      if (failed(partition(owners, 1, false))) return failure();
+    } else if (failed(partitionWorkset(root, grain))) return failure();
   }
   foldSequentialAtomicAdds(function);
   return success();
@@ -632,14 +683,11 @@ LogicalResult materializeTaskDispatches(func::FuncOp function) {
   for (auto tasks : operations) {
     OpBuilder b(tasks);
     Location loc = tasks.getLoc();
-    Value workers = b.create<arith::MaxSIOp>(loc, index(b, loc, 1),
-        b.create<arith::MinSIOp>(loc, tasks.getCount(), index(b, loc, capabilities.getWorkers())));
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, tasks.getCount(), index(b, loc, 0));
     auto active = b.create<scf::IfOp>(loc, nonempty, false);
     b.setInsertionPointToStart(active.thenBlock());
-    Value width = b.create<arith::DivSIOp>(loc, tasks.getCount(), workers);
-    Value remainder = b.create<arith::RemSIOp>(loc, tasks.getCount(), workers);
-    auto dispatch = b.create<TaskDispatchOp>(loc, workers, workers);
+    Value workers = b.create<arith::MinSIOp>(loc, tasks.getCount(), index(b, loc, capabilities.getWorkers()));
+    auto dispatch = b.create<TaskDispatchOp>(loc, tasks.getCount(), workers);
     Block *body = &dispatch.getBody().emplaceBlock();
     body->addArgument(b.getIndexType(), loc);
     IRMapping mapping;
@@ -647,15 +695,8 @@ LogicalResult materializeTaskDispatches(func::FuncOp function) {
     for (auto [argument, capture] : llvm::zip(original.getArguments().drop_front(), tasks.getCaptures()))
       mapping.map(argument, capture);
     b.setInsertionPointToStart(body);
-    Value ordinal = body->getArgument(0);
-    Value extraBefore = b.create<arith::MinSIOp>(loc, ordinal, remainder);
-    Value begin = add(b, loc, multiply(b, loc, ordinal, width), extraBefore);
-    Value extra = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ordinal, remainder);
-    Value count = add(b, loc, width, b.create<arith::SelectOp>(loc, extra, index(b, loc, 1), index(b, loc, 0)));
-    loop(b, loc, begin, add(b, loc, begin, count), 1, [&](Value task) {
-      mapping.map(original.getArgument(0), task);
-      for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
-    });
+    mapping.map(original.getArgument(0), body->getArgument(0));
+    for (Operation &operation : original.without_terminator()) b.clone(operation, mapping);
     b.create<TaskYieldOp>(loc);
     tasks.erase();
   }

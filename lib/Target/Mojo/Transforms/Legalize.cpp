@@ -220,6 +220,14 @@ LogicalResult prepareNativeProgram(ModuleOp module) {
           return (**implementations).materialize(operation);
         }))) return failure();
     // Implementation supplies may introduce additional independent worksets.
+    // Form their worker intervals before terminal dispatch, keeping the same
+    // grain-one assignment without repeating scheduling inside each callback.
+    SmallVector<scf::ParallelOp> worksets;
+    function.walk([&](scf::ParallelOp workset) {
+      if (!workset->getParentOfType<scf::ParallelOp>()) worksets.push_back(workset);
+    });
+    for (scf::ParallelOp workset : worksets)
+      if (failed(cpu::partitionWorkset(workset, 1))) return failure();
     if (failed(cpu::isolateTasks(function)) ||
         failed(cpu::materializeTaskDispatches(function))) return failure();
   }
