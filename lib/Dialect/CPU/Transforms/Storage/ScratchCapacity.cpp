@@ -9,21 +9,48 @@ using namespace mlir;
 
 namespace intent::cpu::detail {
 
+ScratchSnapshot::ScratchSnapshot(func::FuncOp function) : function(function) {
+  function.walk([&](Operation *operation) {
+    if (isa<memref::AllocOp, memref::AllocaOp>(operation))
+      allocations.push_back({operation, std::nullopt, false});
+  });
+}
+
+ScratchAllocation *ScratchSnapshot::get(unsigned number) {
+  auto &candidate = allocations[number];
+  if (!candidate.queried) {
+    candidate.queried = true;
+    auto type = cast<MemRefType>(candidate.operation->getResult(0).getType());
+    if (type.getLayout().isIdentity()) {
+      if (!storage) storage.emplace(function);
+      candidate.allocation = scratchAllocation(candidate.operation, *storage);
+    }
+  }
+  return candidate.allocation ? &*candidate.allocation : nullptr;
+}
+
+DominanceInfo &ScratchSnapshot::getDominance() {
+  if (!dominance) dominance.emplace(function);
+  return *dominance;
+}
+
 std::optional<ScratchAllocation> scratchAllocation(Operation *operation,
                                                    StorageAnalysis &storage) {
   if (!isa<memref::AllocOp, memref::AllocaOp>(operation)) return std::nullopt;
   Value memory = operation->getResult(0);
   auto type = cast<MemRefType>(memory.getType());
   if (!type.getLayout().isIdentity()) return std::nullopt;
-  auto aliases = storage.aliases(memory);
-  if (!aliases.complete) return std::nullopt;
+  StorageAliasFacts aliases;
   bool stack = isa<memref::AllocaOp>(operation);
   memref::DeallocOp release;
   if (!stack) {
     auto lifetime = storage.lifetime(cast<memref::AllocOp>(operation));
     if (!lifetime) return std::nullopt;
     release = lifetime->end;
+    aliases = std::move(lifetime->aliases);
   } else {
+    aliases = storage.aliases(memory);
+    if (!aliases.complete) return std::nullopt;
     Operation *owner = operation->getParentOp();
     while (owner && !owner->hasTrait<OpTrait::AutomaticAllocationScope>())
       owner = owner->getParentOp();
@@ -46,8 +73,7 @@ std::optional<ScratchAllocation> scratchAllocation(Operation *operation,
     Operation *anchor = block->findAncestorOpInBlock(*user);
     if (!anchor || anchor == operation || !operation->isBeforeInBlock(anchor))
       return std::nullopt;
-    auto effects = storage.effects(user);
-    if (!effects.complete) return std::nullopt;
+    // The complete alias closure already checked every user's effects.
     if (last == operation || last->isBeforeInBlock(anchor)) last = anchor;
   }
   if (last == operation) return std::nullopt;

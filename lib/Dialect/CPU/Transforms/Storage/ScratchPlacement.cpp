@@ -23,23 +23,18 @@ bool invariantCapacity(const ScratchAllocation &scratch, scf::ForOp loop,
 
 } // namespace
 
-bool placeScratchAllocations(func::FuncOp function, int64_t byteLimit,
+bool placeScratchAllocations(ScratchSnapshot &snapshot, int64_t byteLimit,
                              ScratchRepresentation representation) {
-  SmallVector<Operation *> allocations;
-  function.walk([&](Operation *operation) {
-    if (isa<memref::AllocOp, memref::AllocaOp>(operation))
-      allocations.push_back(operation);
-  });
-  for (Operation *operation : llvm::reverse(allocations)) {
+  auto candidates = snapshot.candidates();
+  for (size_t number = candidates.size(); number > 0;) {
+    Operation *operation = candidates[--number].operation;
     // A direct serial-loop boundary is the only motion edge. In particular,
     // If, task, parallel and automatic-allocation scopes retain their owners.
     auto loop = dyn_cast<scf::ForOp>(operation->getParentOp());
     if (!loop) continue;
-    StorageAnalysis storage(function);
-    auto scratch = scratchAllocation(operation, storage);
+    auto *scratch = snapshot.get(number);
     if (!scratch) continue;
-    DominanceInfo dominance(function);
-    if (invariantCapacity(*scratch, loop, dominance)) {
+    if (invariantCapacity(*scratch, loop, snapshot.getDominance())) {
       operation->moveBefore(loop);
       if (scratch->release) scratch->release->moveAfter(loop);
       return true;
