@@ -99,14 +99,18 @@ public:
                   mlir::Operation *to);
 
 private:
+  const mlir::BufferViewFlowAnalysis &getFlow() const;
+  mlir::BufferOriginAnalysis &getBufferOrigins();
   bool unchangedBetween(mlir::Value memory, mlir::Operation *from,
                         mlir::Operation *to, bool respectOrdering);
   bool preservesContents(const BufferStorageEffects &effects, mlir::Value memory);
   bool isLiveAt(mlir::Value memory, mlir::Operation *operation) const;
   mlir::func::FuncOp function;
   BufferStoragePolicy policy;
-  mlir::BufferViewFlowAnalysis flow;
-  mlir::BufferOriginAnalysis bufferOrigins;
+  // Native whole-function graphs are built only by queries that need them.
+  // Both belong to this snapshot and must be discarded after an IR mutation.
+  mutable std::optional<mlir::BufferViewFlowAnalysis> flow;
+  std::optional<mlir::BufferOriginAnalysis> bufferOrigins;
   mlir::AliasAnalysis aliasAnalysis;
   mlir::DominanceInfo dominance;
 };

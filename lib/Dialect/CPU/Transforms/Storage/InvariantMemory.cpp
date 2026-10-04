@@ -7,6 +7,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
+#include <memory>
 
 using namespace mlir;
 
@@ -95,16 +96,17 @@ bool placeInvariantMemory(func::FuncOp function) {
     {
       // Pure motion above may have changed descriptor dominance. These facts
       // belong to this current loop and do not survive the guard/move below.
-      StorageAnalysis storage(function);
+      std::unique_ptr<StorageAnalysis> storage;
       DominanceInfo dominance(function);
       for (Operation &operation : loop.getBody()->without_terminator()) {
         auto access = memoryAccess(&operation);
         if (!access || access->write ||
             !llvm::all_of(operation.getOperands(), [&](Value operand) {
               return dominance.properlyDominates(operand, loop);
-            }) ||
-            !storage.preserves(loop, access->memory))
+            }))
           continue;
+        if (!storage) storage = std::make_unique<StorageAnalysis>(function);
+        if (!storage->preserves(loop, access->memory)) continue;
         reads.push_back(&operation);
       }
     }

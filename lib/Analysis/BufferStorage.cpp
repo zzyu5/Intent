@@ -101,13 +101,24 @@ Value BufferStorageOriginFacts::uniqueOrigin() const {
 
 BufferStorageAnalysis::BufferStorageAnalysis(func::FuncOp function,
                                              BufferStoragePolicy policy)
-    : function(function), policy(std::move(policy)), flow(function),
-      bufferOrigins(function), aliasAnalysis(function), dominance(function) {}
+    : function(function), policy(std::move(policy)), aliasAnalysis(function),
+      dominance(function) {}
+
+const BufferViewFlowAnalysis &BufferStorageAnalysis::getFlow() const {
+  if (!flow) flow.emplace(function);
+  return *flow;
+}
+
+BufferOriginAnalysis &BufferStorageAnalysis::getBufferOrigins() {
+  if (!bufferOrigins) bufferOrigins.emplace(function);
+  return *bufferOrigins;
+}
 
 BufferStorageOriginFacts BufferStorageAnalysis::origins(Value memory) const {
   BufferStorageOriginFacts result;
   if (!isBuffer(memory)) return result;
   result.complete = true;
+  const auto &flow = getFlow();
   for (Value value : flow.resolveReverse(memory)) {
     if (!isBuffer(value) || !flow.mayBeTerminalBuffer(value)) continue;
     result.values.push_back(value);
@@ -140,11 +151,12 @@ BufferStorageAliasFacts BufferStorageAnalysis::aliases(Value root) const {
     return result;
   }
   llvm::DenseSet<Operation *> seenUsers;
-  for (Value value : flow.resolve(root)) {
+  for (Value value : getFlow().resolve(root)) {
     if (!isBuffer(value)) continue;
     result.values.push_back(value);
     for (Operation *user : value.getUsers()) {
-      if (seenUsers.insert(user).second) result.users.push_back(user);
+      if (!seenUsers.insert(user).second) continue;
+      result.users.push_back(user);
       // Calls and returns may escape storage. Unknown buffer-producing users
       // cannot be silently treated as ordinary reads just because their effects
       // are known. Native forwarding interfaces own their complete flow.
@@ -265,7 +277,7 @@ bool BufferStorageAnalysis::disjoint(Value first, Value second) {
   // the local allocation's freshness, never disjointness between those formals.
   if (allocatedAfter(left, second) || allocatedAfter(right, first)) return true;
   if (!left.values.empty() && !right.values.empty())
-    if (auto same = bufferOrigins.isSameAllocation(first, second); same && !*same)
+    if (auto same = getBufferOrigins().isSameAllocation(first, second); same && !*same)
       return true;
   if (!left.complete || !right.complete) return false;
   auto interface = getPublicInterface(function);

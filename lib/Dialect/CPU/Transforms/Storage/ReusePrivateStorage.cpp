@@ -8,6 +8,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include <memory>
 
 using namespace mlir;
 
@@ -16,10 +17,8 @@ namespace intent::cpu {
 void eraseDeadPrivateBuffers(func::FuncOp function) {
   SmallVector<memref::AllocOp> allocations;
   function.walk([&](memref::AllocOp allocation) { allocations.push_back(allocation); });
+  std::unique_ptr<StorageAnalysis> storage;
   for (auto allocation : llvm::reverse(allocations)) {
-    StorageAnalysis storage(function);
-    auto aliases = storage.aliases(allocation);
-    if (!aliases.complete || aliases.values.size() != 1) continue;
     SmallVector<Operation *> users;
     llvm::SmallPtrSet<Operation *, 8> seen;
     for (Operation *user : allocation.getResult().getUsers())
@@ -39,6 +38,14 @@ void eraseDeadPrivateBuffers(func::FuncOp function) {
       return isa<memref::DeallocOp>(user);
     });
     if (!unused) continue;
+    if (!storage) storage = std::make_unique<StorageAnalysis>(function);
+    {
+      auto aliases = storage->aliases(allocation);
+      if (!aliases.complete || aliases.values.size() != 1) continue;
+    }
+    // Failed candidates share this unchanged snapshot. Drop it before any
+    // dimension replacement or erasure changes the current function.
+    storage.reset();
     for (Operation *user : users) {
       if (auto dimension = dyn_cast<memref::DimOp>(user)) {
         OpBuilder b(dimension);
