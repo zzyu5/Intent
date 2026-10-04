@@ -1,5 +1,5 @@
 #include "PassDetail.h"
-#include "LocalSupplyRelations.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
 #include "Intent/Dialect/DSA/IR/MemoryEffects.h"
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
@@ -399,7 +399,7 @@ private:
   Operation *terminal;
   dsa::StorageAnalysis storage;
   DominanceInfo dominance;
-  LocalSupplyRelations relations;
+  dsa::LocalSupplyRelations relations;
   SmallVector<SupplyNode> nodes;
   DenseMap<std::pair<Value, Operation *>, unsigned> known;
   std::optional<unsigned> root;

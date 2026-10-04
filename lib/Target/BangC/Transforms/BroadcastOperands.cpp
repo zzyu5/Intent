@@ -1,5 +1,5 @@
 #include "PassDetail.h"
-#include "LocalSupplyRelations.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
 
 using namespace mlir;
 
@@ -14,7 +14,7 @@ struct BroadcastOperand {
 };
 
 std::optional<BroadcastOperand> queryBroadcastOperand(dsa::BinaryOp binary,
-    dsa::StorageAnalysis &storage, LocalSupplyRelations &extents) {
+    dsa::StorageAnalysis &storage, dsa::LocalSupplyRelations &extents) {
   auto type = cast<MemRefType>(binary.getOutput().getType());
   if (!type.getLayout().isIdentity() || type.getDimSize(0) <= 1 ||
       binary.getRhs().getType() != type || binary.getScratch() ||
@@ -77,7 +77,7 @@ bool bindBroadcastOperands(func::FuncOp function) {
   bool changed = false;
   for (auto binary : binaries) {
     dsa::StorageAnalysis storage(function);
-    LocalSupplyRelations extents(function);
+    dsa::LocalSupplyRelations extents(function);
     auto broadcast = queryBroadcastOperand(binary, storage, extents);
     if (!broadcast) continue;
     Value source = broadcast->source;

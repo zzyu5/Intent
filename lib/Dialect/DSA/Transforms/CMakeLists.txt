@@ -4,6 +4,7 @@ add_mlir_library(MLIRIntentDSATransforms
   MatrixSupplyRelations.cpp
   CollectiveGather.cpp
   IndexPrograms.cpp
+  LocalSupplyRelations.cpp
   LocalValues.cpp
   LocalCopies.cpp
   LocalMemoryValues.cpp

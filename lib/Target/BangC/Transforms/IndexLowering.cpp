@@ -1,88 +1,79 @@
 #include "PassDetail.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
+#include "Intent/Dialect/Intent/IR/CompileOptions.h"
 
 using namespace mlir;
 namespace intent::bangc {
 bool realizeAffineRanges(func::FuncOp function, dsa::ConfigurationAttr config) {
-  SmallVector<dsa::CompareRangeOp> ranges;
-  function.walk([&](dsa::CompareRangeOp range) { ranges.push_back(range); });
-  DominanceInfo dominance(function);
-  auto exact = [&](Value value, int64_t number) {
-    auto interval = integerInterval(value, function);
-    return interval && interval->first == number && interval->second == number;
-  };
+  SmallVector<Operation *> comparisons;
+  function.walk([&](Operation *operation) {
+    if (isa<dsa::CompareRangeOp, dsa::CompareOp>(operation)) comparisons.push_back(operation);
+  });
   bool changed = false;
-  for (auto range : ranges) {
-    auto type = cast<MemRefType>(range.getOutput().getType());
+  for (Operation *operation : comparisons) {
+    auto missed = [&](StringRef reason) {
+      auto options = function->getParentOfType<ModuleOp>()->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr);
+      if (options.getOptimizationRemarks()) operation->emitRemark("index-supply: ") << reason;
+    };
+    Value output = isa<dsa::CompareRangeOp>(operation)
+        ? cast<dsa::CompareRangeOp>(operation).getOutput() : cast<dsa::CompareOp>(operation).getOutput();
+    auto type = cast<MemRefType>(output.getType());
     int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
-    if (columns < 64 || !llvm::isPowerOf2_64(columns) || type.getNumElements() > 65536 || !exact(range.getRows(), rows)) continue;
+    if (!type.getLayout().isIdentity() || columns < 64 ||
+        !llvm::isPowerOf2_64(columns) || type.getNumElements() > 65536) continue;
     dsa::StorageAnalysis storage(function);
-    auto copy = dyn_cast_or_null<dsa::LoadTileOp>(storage.lastWriterBefore(range.getRowCoordinates(), range));
-    if (!copy || copy.getOutput() != range.getRowCoordinates() ||
-        !exact(copy.getRows(), rows) || !exact(copy.getColumns(), 1) || !exact(copy.getOffset(), 0) ||
-        !exact(copy.getRowStride(), 1) || !exact(copy.getColumnStride(), 1)) continue;
-    Value source = storage.uniqueOrigin(copy.getSource());
-    if (!source || !source.getDefiningOp<memref::AllocaOp>() ||
-        !dsa::isCompleteStorageViewOf(copy.getSource(), source) ||
-        cast<MemRefType>(source.getType()).getNumElements() != rows) continue;
-    auto writers = storage.writers(source);
-    if (failed(writers)) continue;
-    SmallVector<dsa::FillOp> fills;
-    memref::StoreOp initialization;
-    bool valid = true;
-    for (Operation *user : *writers) {
-      if (auto store = dyn_cast<memref::StoreOp>(user); store && dsa::isCompleteStorageViewOf(store.getMemref(), source)) {
-        if (initialization) valid = false;
-        initialization = store; continue;
+    DominanceInfo dominance(function);
+    dsa::LocalSupplyRelations relations(function);
+    std::optional<dsa::LocalIndexSequence> row, column;
+    int64_t base = 0;
+    bool strict = false;
+    if (auto range = dyn_cast<dsa::CompareRangeOp>(operation)) {
+      if (!relations.equal(range.getRows(), rows)) { missed("row range is not a full physical tile"); continue; }
+      row = dsa::queryLocalIndexSequence(range.getRowCoordinates(), range, storage, dominance, relations);
+      base = range.getBase();
+    } else {
+      auto compare = cast<dsa::CompareOp>(operation);
+      if (compare.getPredicate() != ComparePredicate::Ge && compare.getPredicate() != ComparePredicate::Gt) continue;
+      strict = compare.getPredicate() == ComparePredicate::Gt;
+      auto grid = dsa::queryLocalCoordinateGrid(compare, storage, relations);
+      if (!grid) { missed("comparison is not a closed row/column coordinate grid"); continue; }
+      if (!relations.equal(grid->rows.getRows(), rows)) { missed("coordinate grid has an unproven tail"); continue; }
+      row = dsa::queryLocalIndexSequence(grid->rows.getSource(), grid->rows, storage, dominance, relations);
+      column = dsa::queryLocalIndexSequence(grid->columns.getSource(), grid->columns, storage, dominance, relations);
+      if (!row || !column) continue;
+      auto bounds = [](dsa::SignedInterval value) {
+        return ConstantIntRanges::fromSigned(APInt(64, value->first, true), APInt(64, value->second, true));
+      };
+      auto lhs = bounds(row->bounds), rhs = bounds(column->bounds);
+      if (!provesSignedNoWrap(BinaryOperator::Subtract, lhs, rhs)) { missed("relative coordinate may overflow"); continue; }
+      if (strict) {
+        auto difference = inferIntegerBinary(BinaryOperator::Subtract, IndexType::get(function.getContext()), lhs, rhs);
+        if (!difference || !provesSignedNoWrap(BinaryOperator::Subtract, *difference,
+                ConstantIntRanges::constant(APInt(64, 1)))) continue;
       }
-      if (auto fill = dyn_cast<dsa::FillOp>(user); fill && dsa::isCompleteStorageViewOf(fill.getOutput(), source)) {
-        fills.push_back(fill); continue;
-      }
-      valid = false;
     }
-    auto ramp = initialization ? dyn_cast<scf::ForOp>(initialization->getParentOp()) : scf::ForOp();
-    if (!valid || !ramp || ramp->isProperAncestor(copy) || !dominance.dominates(ramp, copy) ||
-        !exact(ramp.getLowerBound(), 0) || !exact(ramp.getUpperBound(), rows) || !exact(ramp.getStep(), 1) ||
-        llvm::any_of(fills, [&](dsa::FillOp fill) { return !dominance.dominates(fill, ramp); })) continue;
-    auto indices = initialization.getIndices();
-    auto initialized = initialization.getMemRefType();
-    bool complete = indices.size() == 2 &&
-        ((initialized.getShape() == ArrayRef<int64_t>({1, rows}) && exact(indices[0], 0) && indices[1] == ramp.getInductionVar()) ||
-         (initialized.getShape() == ArrayRef<int64_t>({rows, 1}) && indices[0] == ramp.getInductionVar() && exact(indices[1], 0)));
-    if (!complete || !integerInterval(initialization.getValue(), function)) continue;
-    std::function<std::optional<int64_t>(Value)> coefficient = [&](Value value) -> std::optional<int64_t> {
-      if (value == ramp.getInductionVar()) return 1;
-      auto *op = value.getDefiningOp();
-      if (!op || !ramp->isProperAncestor(op)) return dominance.dominates(value, range) ? std::optional<int64_t>(0) : std::nullopt;
-      if (auto cast = dyn_cast<arith::IndexCastOp>(op)) return coefficient(cast.getIn());
-      if (auto cast = dyn_cast<arith::ExtSIOp>(op)) return coefficient(cast.getIn());
-      if (!isa<arith::AddIOp, arith::SubIOp>(op)) return std::nullopt;
-      auto a = coefficient(op->getOperand(0)), b = coefficient(op->getOperand(1));
-      if (!a || !b) return std::nullopt;
-      int64_t result = isa<arith::AddIOp>(op) ? *a + *b : *a - *b;
-      return result >= -1 && result <= 1 ? std::optional<int64_t>(result) : std::nullopt;
-    };
-    auto slope = coefficient(initialization.getValue());
-    if (!slope || *slope != 1) continue;
-    OpBuilder b(range); Location loc = range.getLoc();
-    IRMapping mapping;
-    mapping.map(ramp.getInductionVar(), b.create<arith::ConstantIndexOp>(loc, 0));
-    std::function<Value(Value)> atZero = [&](Value value) -> Value {
-      if (mapping.contains(value)) return mapping.lookup(value);
-      auto *op = value.getDefiningOp();
-      if (!op || !ramp->isProperAncestor(op)) return value;
-      for (Value operand : op->getOperands()) mapping.map(operand, atZero(operand));
-      b.clone(*op, mapping);
-      return mapping.lookup(value);
-    };
-    Value begin = atZero(initialization.getValue());
-    if (!begin.getType().isIndex()) begin = b.create<arith::IndexCastOp>(loc, b.getIndexType(), begin);
+    if (!row) continue;
+    struct Insertions : OpBuilder::Listener {
+      SmallVector<Operation *> operations;
+      void notifyOperationInserted(Operation *operation, OpBuilder::InsertPoint) override {
+        operations.push_back(operation);
+      }
+    } inserted;
+    OpBuilder b(function.getContext(), &inserted);
+    b.setInsertionPoint(operation);
+    Location loc = operation->getLoc();
+    Value begin = row->materializeBegin(b, loc);
+    if (column) begin = b.createOrFold<arith::SubIOp>(loc, begin, column->materializeBegin(b, loc));
+    if (strict) begin = b.createOrFold<arith::SubIOp>(loc, begin, b.create<arith::ConstantIndexOp>(loc, 1));
     Value scratch = allocate(b, loc, b.getF32Type(), {1, type.getNumElements()}, dsa::nramSpace);
-    auto replacement = b.create<dsa::CompareRampOp>(loc, begin, range.getOutput(), scratch, range.getBaseAttr());
-    int64_t nram = 0, wram = 0; measureStorage(function, nram, wram);
-    if (nram > config.getLocalBytes() || nram > 768 * 1024 || wram > 1024 * 1024) {
-      replacement.erase(); scratch.getDefiningOp()->erase(); continue;
+    b.create<dsa::CompareRampOp>(loc, begin, output, scratch, b.getI64IntegerAttr(base));
+    if (!storageFitsBudget(function, config, measureStorage(function))) {
+      for (Operation *created : llvm::reverse(inserted.operations)) created->erase();
+      continue;
     }
-    range.erase(); changed = true;
+    auto options = function->getParentOfType<ModuleOp>()->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr);
+    if (options.getOptimizationRemarks()) operation->emitRemark("index-supply: selected implicit coordinate comparison");
+    operation->erase(); changed = true;
   }
   return changed;
 }

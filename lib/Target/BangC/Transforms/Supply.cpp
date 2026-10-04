@@ -590,6 +590,7 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (failed(cleanup())) return failure();
   while (dsa::reuseLocalMemoryValues(function))
     if (failed(cleanup())) return failure();
+  if (dsa::forwardIndexExpressions(function) && failed(cleanup())) return failure();
   if (dsa::realizeRangeComparisons(function) && failed(cleanup())) return failure();
   if (dsa::foldRangeCounts(function) && failed(cleanup())) return failure();
   while (dsa::foldUniformBooleanTiles(function)) if (failed(cleanup())) return failure();
@@ -604,7 +605,6 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();
-  if (dsa::forwardIndexExpressions(function) && failed(cleanup())) return failure();
   if (dsa::reuseGatherOffsets(function) && failed(cleanup())) return failure();
   if (vectorizeIndexLoops(function, config) && failed(cleanup())) return failure();
   realizeGatherWorkspace(function, config);

@@ -1,5 +1,6 @@
 #include "PassSupport.h"
 #include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -100,112 +101,30 @@ bool forwardIndexExpressions(func::FuncOp function) {
 }
 
 bool realizeRangeComparisons(func::FuncOp function) {
-  DominanceInfo dominance(function);
-  auto integer = [](Value value) -> std::optional<int64_t> {
-    APInt bits;
-    if (matchPattern(value, m_ConstantInt(&bits))) return bits.getSExtValue();
-    return std::nullopt;
-  };
-  auto uniqueCopy = [&](Value buffer, Operation *consumer) -> Operation * {
-    StorageAnalysis storage(function);
-    Value origin = storage.uniqueOrigin(buffer);
-    if (!origin || !origin.getDefiningOp<memref::AllocaOp>())
-      return {};
-    Operation *copy = storage.uniqueWriter(buffer);
-    if (!copy || !dominance.dominates(copy, consumer))
-      return {};
-    auto load = dyn_cast<dsa::LoadTileOp>(copy);
-    auto transfer = dyn_cast<memref::CopyOp>(copy);
-    bool known =
-        (load && !load.getAsynchronous() &&
-         detail::sameCompleteView(storage, load.getOutput(), buffer) &&
-         storage.disjoint(load.getSource(), buffer)) ||
-        (transfer &&
-         detail::sameCompleteView(storage, transfer.getTarget(), buffer) &&
-         storage.disjoint(transfer.getSource(), buffer));
-    if (!known)
-      return {};
-    return copy;
-  };
-  auto rampBase = [&](Value buffer, int64_t columns, Operation *consumer) -> std::optional<int64_t> {
-    // Peel complete local copies; the remaining owned row must be initialized
-    // by exactly one unit-step integer ramp, with no subsequent writers.
-    while (Operation *copy = uniqueCopy(buffer, consumer)) {
-      Value input;
-      if (auto load = dyn_cast<dsa::LoadTileOp>(copy)) {
-        if (!matchPattern(load.getOffset(), m_Zero()) || !matchPattern(load.getColumnStride(), m_One()) ||
-            !matchPattern(load.getRows(), m_One()) || integer(load.getColumns()) != columns) return std::nullopt;
-        input = load.getSource();
-      } else input = cast<memref::CopyOp>(copy).getSource();
-      auto source = cast<MemRefType>(input.getType());
-      if (source.getMemorySpaceAsInt() != dsa::nramSpace || !source.getLayout().isIdentity() ||
-          source.getShape() != ArrayRef<int64_t>({1, columns})) return std::nullopt;
-      buffer = input;
-      consumer = copy;
-    }
-    StorageAnalysis storage(function);
-    Value origin = storage.uniqueOrigin(buffer);
-    if (!origin || !origin.getDefiningOp<memref::AllocaOp>())
-      return std::nullopt;
-    memref::StoreOp store;
-    SmallVector<dsa::FillOp> fills;
-    auto writers = storage.writers(buffer);
-    if (failed(writers))
-      return std::nullopt;
-    for (Operation *user : *writers) {
-      if (auto write = dyn_cast<memref::StoreOp>(user);
-          write &&
-          detail::sameCompleteView(storage, write.getMemref(), buffer)) {
-        if (store) return std::nullopt;
-        store = write; continue;
-      }
-      if (auto fill = dyn_cast<dsa::FillOp>(user);
-          fill && isCompleteStorageViewOf(fill.getOutput(), origin)) {
-        fills.push_back(fill);
-        continue;
-      }
-      return std::nullopt;
-    }
-    auto loop = store ? dyn_cast<scf::ForOp>(store->getParentOp()) : scf::ForOp();
-    if (!loop || !loop.getInitArgs().empty() || !dominance.dominates(loop, consumer) ||
-        !matchPattern(loop.getLowerBound(), m_Zero()) || !matchPattern(loop.getStep(), m_One()) ||
-        integer(loop.getUpperBound()) != columns || store.getIndices().size() != 2 ||
-        !matchPattern(store.getIndices()[0], m_Zero()) || store.getIndices()[1] != loop.getInductionVar() ||
-        llvm::any_of(fills, [&](dsa::FillOp fill) { return !dominance.dominates(fill, loop); })) return std::nullopt;
-    Value value = store.getValue();
-    while (auto cast = value.getDefiningOp<arith::IndexCastOp>()) value = cast.getIn();
-    if (value == loop.getInductionVar()) return 0;
-    if (auto sum = value.getDefiningOp<arith::AddIOp>()) {
-      if (sum.getLhs() == loop.getInductionVar()) return integer(sum.getRhs());
-      if (sum.getRhs() == loop.getInductionVar()) return integer(sum.getLhs());
-    }
-    return std::nullopt;
-  };
   SmallVector<dsa::CompareOp> comparisons;
   function.walk([&](dsa::CompareOp compare) { comparisons.push_back(compare); });
   bool changed = false;
   for (auto compare : comparisons) {
     if (compare.getPredicate() != ComparePredicate::Ge) continue;
-    auto type = cast<MemRefType>(compare.getLhs().getType());
-    if (!type.getElementType().isInteger(64)) continue;
-    int64_t rows = type.getDimSize(0), columns = type.getDimSize(1);
-    auto lhs = dyn_cast_or_null<dsa::LoadTileOp>(uniqueCopy(compare.getLhs(), compare));
-    auto rhs = dyn_cast_or_null<dsa::LoadTileOp>(uniqueCopy(compare.getRhs(), compare));
-    if (!lhs || !rhs || !matchPattern(lhs.getOffset(), m_Zero()) || !matchPattern(rhs.getOffset(), m_Zero()) ||
-        !matchPattern(lhs.getRowStride(), m_One()) || !matchPattern(lhs.getColumnStride(), m_Zero()) ||
-        !matchPattern(rhs.getRowStride(), m_Zero()) || !matchPattern(rhs.getColumnStride(), m_One()) ||
-        lhs.getRows() != rhs.getRows() || integer(lhs.getColumns()) != columns || integer(rhs.getColumns()) != columns ||
-        cast<MemRefType>(lhs.getSource().getType()).getShape() != ArrayRef<int64_t>({rows, 1}) ||
-        cast<MemRefType>(rhs.getSource().getType()).getShape() != ArrayRef<int64_t>({1, columns})) continue;
-    if (!uniqueCopy(lhs.getSource(), lhs)) continue;
-    auto base = rampBase(rhs.getSource(), columns, rhs);
-    if (!base || columns <= 0 || *base > std::numeric_limits<int64_t>::max() - (columns - 1)) continue;
+    StorageAnalysis storage(function);
+    DominanceInfo dominance(function);
+    LocalSupplyRelations relations(function);
+    auto grid = queryLocalCoordinateGrid(compare, storage, relations);
+    if (!grid) continue;
+    if (!storage.readStable(grid->rows.getSource(), grid->rows, compare)) continue;
+    auto column = queryLocalIndexSequence(grid->columns.getSource(), grid->columns,
+                                         storage, dominance, relations);
+    if (!column) continue;
+    auto base = dyn_cast<AffineConstantExpr>(column->begin);
+    int64_t columns = cast<MemRefType>(compare.getLhs().getType()).getDimSize(1);
+    if (!base || columns <= 0 || base.getValue() > std::numeric_limits<int64_t>::max() - (columns - 1)) continue;
     OpBuilder b(compare);
     Location loc = compare.getLoc();
     // Both broadcasts pad with zero: GE is true in their inactive rows too.
-    b.create<dsa::CompareRangeOp>(loc, lhs.getSource(), compare.getOutput(), lhs.getRows(), b.getI64IntegerAttr(*base));
+    b.create<dsa::CompareRangeOp>(loc, grid->rows.getSource(), compare.getOutput(),
+                                grid->rows.getRows(), b.getI64IntegerAttr(base.getValue()));
     compare.erase();
-    for (auto copy : {lhs, rhs})
+    for (auto copy : {grid->rows, grid->columns})
       if (llvm::all_of(copy.getOutput().getUsers(), [&](Operation *user) { return user == copy; })) copy.erase();
     changed = true;
   }
