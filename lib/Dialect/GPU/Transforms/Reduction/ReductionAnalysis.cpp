@@ -1,5 +1,6 @@
 #include "ReductionAnalysis.h"
 #include "../Value/ReplayPolicy.h"
+#include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -8,6 +9,8 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/IRMapping.h"
+#include <functional>
 
 using namespace mlir;
 
@@ -560,6 +563,83 @@ FailureOr<SourcePlan> nestedScalarReductionSource(ReduceOp reduce,
         retained.push_back(ancestor);
   }
   return plan;
+}
+
+namespace {
+
+bool sameCombineType(Type lhs, Type rhs) {
+  lhs = uniformElementType(lhs);
+  rhs = uniformElementType(rhs);
+  if (auto record = dyn_cast<RecordType>(lhs)) {
+    auto other = dyn_cast<RecordType>(rhs);
+    if (!other || record.getFieldNames() != other.getFieldNames()) return false;
+    return llvm::all_of(llvm::zip(record.getFieldTypes(), other.getFieldTypes()),
+        [](auto pair) {
+          return sameCombineType(cast<TypeAttr>(std::get<0>(pair)).getValue(),
+                                 cast<TypeAttr>(std::get<1>(pair)).getValue());
+        });
+  }
+  return lhs == rhs;
+}
+
+} // namespace
+
+bool matchReductionCombine(ReduceOp reference, Block *body, ValueRange left,
+    SmallVectorImpl<Value> &right, ValueRange results,
+    llvm::SmallPtrSetImpl<Operation *> &matched) {
+  unsigned count = reference.getSources().size();
+  Block &combine = reference.getCombine().front();
+  if (!reference.getCaptures().empty() || left.size() != count ||
+      right.size() != count || results.size() != count ||
+      combine.getNumArguments() != count * 2) return false;
+  IRMapping mapping;
+  auto structured = cast<StructuredOpInterface>(reference.getOperation());
+  auto rhs = structured.getCombineRhs();
+  for (unsigned i = 0; i < count; ++i) {
+    mapping.map(structured.getCombineLhs()[i], left[i]);
+    if (right[i]) mapping.map(rhs[i], right[i]);
+  }
+  SmallVector<Value> inferred(right.begin(), right.end());
+  llvm::SmallPtrSet<Operation *, 32> updates;
+  std::function<bool(Value, Value)> match = [&](Value pattern, Value value) {
+    if (!sameCombineType(pattern.getType(), value.getType())) return false;
+    if (Value mapped = mapping.lookupOrNull(pattern)) return mapped == value;
+    if (isa<BlockArgument>(pattern)) {
+      auto found = llvm::find(rhs, pattern);
+      if (found == rhs.end()) return false;
+      inferred[std::distance(rhs.begin(), found)] = value;
+      mapping.map(pattern, value);
+      return true;
+    }
+    auto scalar = scalarSource(pattern);
+    if (succeeded(scalar) && (*scalar).getDefiningOp<arith::ConstantOp>())
+      return sameScalarValue(pattern, value);
+    Operation *expected = pattern.getDefiningOp(), *actual = value.getDefiningOp();
+    if (!expected || !actual || actual->getBlock() != body ||
+        !isLaneWiseValueOperation(expected) ||
+        expected->getName() != actual->getName() ||
+        expected->getNumOperands() != actual->getNumOperands() ||
+        expected->getNumResults() != actual->getNumResults()) return false;
+    NamedAttrList expectedAttrs(expected->getAttrs()), actualAttrs(actual->getAttrs());
+    expectedAttrs.erase(originAttr);
+    actualAttrs.erase(originAttr);
+    if (expectedAttrs != actualAttrs) return false;
+    for (auto [a, b] : llvm::zip(expected->getOperands(), actual->getOperands()))
+      if (!match(a, b)) return false;
+    for (auto [a, b] : llvm::zip(expected->getResults(), actual->getResults())) {
+      if (!sameCombineType(a.getType(), b.getType())) return false;
+      mapping.map(a, b);
+    }
+    updates.insert(actual);
+    return mapping.lookup(pattern) == value;
+  };
+  for (auto [expected, actual] : llvm::zip(
+           cast<YieldOp>(combine.getTerminator()).getValues(), results))
+    if (!match(expected, actual)) return false;
+  if (!llvm::all_of(inferred, [](Value value) { return bool(value); })) return false;
+  right.assign(inferred.begin(), inferred.end());
+  matched.insert(updates.begin(), updates.end());
+  return true;
 }
 
 } // namespace intent::gpu::reduction

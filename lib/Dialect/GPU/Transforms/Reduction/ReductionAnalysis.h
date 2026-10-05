@@ -2,6 +2,7 @@
 #define INTENT_GPU_TRANSFORMS_REDUCTIONANALYSIS_H
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 namespace intent::gpu::reduction {
 
@@ -43,6 +44,13 @@ MakeRangeOp sourceRange(mlir::Value value);
 mlir::FailureOr<mlir::Value> scalarSource(mlir::Value value);
 
 bool sameScalarValue(mlir::Value lhs, mlir::Value rhs);
+
+// Match the complete typed callback at an actual update. Non-null right members
+// are constraints; null members are bound to the corresponding current SSA.
+bool matchReductionCombine(ReduceOp reference, mlir::Block *body,
+    mlir::ValueRange left, llvm::SmallVectorImpl<mlir::Value> &right,
+    mlir::ValueRange results,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &matched);
 
 bool isReplayableWithoutLoad(mlir::Value value, PhysicalSourceAxis source);
 

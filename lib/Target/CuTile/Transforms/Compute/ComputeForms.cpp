@@ -5,10 +5,14 @@
 #include "Intent/Target/CuTile/Analysis/IndexBounds.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
+#include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/APFloat.h"
+#include <numeric>
 
 using namespace mlir;
 namespace intent::cutile {
@@ -167,11 +171,46 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
   }
 
   for (gpu::ReduceOp reduce : inputs.reductions) {
-    if (!reduce.getCaptures().empty() || reduce.getAxes().size() != 1)
+    auto sourceType = cast<gpu::FragmentType>(reduce.getSources().front().getType());
+    bool allAxes = sourceType.getShape().size() > 1 &&
+        reduce.getAxes().size() == sourceType.getShape().size();
+    if (!reduce.getCaptures().empty() || (!allAxes && reduce.getAxes().size() != 1))
       return reduce.emitOpError(
-          "cuTile reduce requires one axis and no captures");
-    if (failed(checkCollectiveResults(reduce, reduce.getSources(),
-                                      reduce.getAxes().front(), false)))
+          "cuTile reduce requires one axis or a full reduction and no captures");
+    SmallVector<Value> sources(reduce.getSources());
+    int64_t axis = reduce.getAxes().front();
+    if (allAxes) {
+      if (failed(checkCollectiveResults(reduce, sources, -1, false)))
+        return failure();
+      // A full reduction has no retained coordinate to preserve. Flatten the
+      // complete tuple in one common order, then use the existing scalar tree.
+      // This is target IR construction, not a serializer layout decision.
+      auto capacity = gpu::fragmentElementCount(sourceType);
+      if (!gpu::queryPositiveExtentBounds(capacity, kernel))
+        return reduce.emitOpError("whole reduction extent has no finite representable bound");
+      if (auto count = gpu::constantPhysicalExpression(capacity))
+        capacity = gpu::PhysicalExprAttr::get(kernel.getContext(),
+            gpu::PhysicalExprKind::Constant, *count,
+            StringAttr::get(kernel.getContext(), ""),
+            ArrayAttr::get(kernel.getContext(), {}));
+      auto [sourceId, dimensionId] = gpu::nextPhysicalAxisIdentities(kernel);
+      SmallVector<int64_t> axes(sourceType.getShape().size());
+      std::iota(axes.begin(), axes.end(), 0);
+      OpBuilder builder(reduce);
+      auto groups = builder.getArrayAttr({gpu::ReshapeGroupAttr::get(kernel.getContext(),
+          builder.getDenseI64ArrayAttr(axes), builder.getDenseI64ArrayAttr({0}))});
+      auto shape = builder.getArrayAttr({capacity});
+      auto mappings = builder.getArrayAttr({gpu::AxisMapAttr::get(
+          kernel.getContext(), sourceId, 0, dimensionId, 0, true)});
+      for (Value &source : sources) {
+        auto type = cast<gpu::FragmentType>(source.getType());
+        auto flat = gpu::FragmentType::get(kernel.getContext(), type.getElementType(),
+            shape, mappings, type.getValidity(), type.getOwner());
+        source = builder.create<gpu::ReshapeOp>(reduce.getLoc(), flat, source, groups);
+      }
+      axis = 0;
+    }
+    if (failed(checkCollectiveResults(reduce, sources, axis, false)))
       return failure();
     std::optional<BinaryOperator> kind = nativeCombineKind(reduce.getCombine());
     bool native = reduce.getSources().size() == 1 && kind.has_value();
@@ -181,7 +220,7 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
       // it does not require that identity to be a compile-time literal.
       OpBuilder builder(reduce);
       auto replacement = builder.create<ReduceOp>(
-          reduce.getLoc(), reduce.getSources(), ValueRange{}, reduce.getAxes().front(),
+          reduce.getLoc(), sources, ValueRange{}, axis,
           false, BinaryOperatorAttr::get(kernel.getContext(), *kind));
       if (Attribute origin = reduce->getAttr(gpu::originAttr))
         replacement->setAttr(gpu::originAttr, origin);
@@ -198,7 +237,7 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
             reduce.getIdentities().front());
     if (propagatingMaximum) {
       auto sourceType =
-          dyn_cast<gpu::FragmentType>(reduce.getSources().front().getType());
+          dyn_cast<gpu::FragmentType>(sources.front().getType());
       if (!sourceType || !isa<FloatType>(sourceType.getElementType()))
         return reduce.emitOpError(
             "cuTile propagating maximum reduction requires a floating tile");
@@ -207,15 +246,15 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
       Type sourcePredicateType =
           withElementType(sourceType, builder.getI1Type());
       auto isNan = builder.create<gpu::CompareOp>(
-          location, sourcePredicateType, reduce.getSources().front(),
-          reduce.getSources().front(), ComparePredicate::Ne);
+          location, sourcePredicateType, sources.front(),
+          sources.front(), ComparePredicate::Ne);
       auto anyNan = builder.create<ReduceOp>(
           location, ValueRange{isNan.getResult()},
-          ValueRange{}, reduce.getAxes().front(), false,
+          ValueRange{}, axis, false,
           BinaryOperatorAttr::get(kernel.getContext(), BinaryOperator::LogicalOr));
       auto numericMaximum = builder.create<ReduceOp>(
-          location, reduce.getSources(),
-          ValueRange{}, reduce.getAxes().front(), false,
+          location, sources,
+          ValueRange{}, axis, false,
           BinaryOperatorAttr::get(kernel.getContext(), BinaryOperator::MaximumNum));
       auto floatType = cast<FloatType>(sourceType.getElementType());
       auto nan = builder.create<arith::ConstantOp>(
@@ -238,8 +277,8 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
 
     OpBuilder builder(reduce);
     auto replacement = builder.create<ReduceOp>(
-        reduce.getLoc(), reduce.getSources(),
-        reduce.getIdentities(), reduce.getAxes().front(), false,
+        reduce.getLoc(), sources,
+        reduce.getIdentities(), axis, false,
         BinaryOperatorAttr());
     if (failed(gpu::scalarizeElementwiseCallback(reduce.getCombine(),
                                                  replacement.getCombine())))

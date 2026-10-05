@@ -433,7 +433,7 @@ private:
       auto scan = dyn_cast<ScanOp>(operation);
       ValueRange sourceValues = reduce ? reduce.getSources() : scan.getSources();
       unsigned count = sourceValues.size();
-      int64_t axis = reduce ? reduce.getAxis() : scan.getAxis();
+      int64_t axis = reduce ? reduce.getAxisAttr().getInt() : scan.getAxisAttr().getInt();
       std::string sources = count == 1 ? valueString(sourceValues.front()) : "(";
       if (count != 1) {
         for (unsigned i = 0; i < count; ++i) {
@@ -443,7 +443,8 @@ private:
         sources += ")";
       }
       std::string call = (reduce ? "tl.reduce(" : "tl.associative_scan(") + sources +
-          ", axis=" + std::to_string(axis) + ", combine_fn=" + helperName(&operation);
+          ", axis=" + (reduce && axis == -1 ? "None" : std::to_string(axis)) +
+          ", combine_fn=" + helperName(&operation);
       if (scan) call += std::string(", reverse=") + (scan.getReverse() ? "True" : "False");
       assignResults(operation.getResults(), call + ")");
       return;

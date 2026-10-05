@@ -30,7 +30,7 @@ LogicalResult inferCollectiveTypes(MLIRContext *context,
   if (failed(operation.verify(location.value_or(UnknownLoc::get(context)))))
     return failure();
   return gpu::inferScalarCollectiveResultTypes(
-      location, operation.getSources(), operation.getAxis(), scan, results);
+      location, operation.getSources(), operation.getAxisAttr().getInt(), scan, results);
 }
 
 LogicalResult verifyDescriptorAccess(Operation *owner, Value descriptorValue,
@@ -112,12 +112,12 @@ LogicalResult ReduceOp::verify() {
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
   return gpu::verifyScalarCollective(getOperation(), getSources(), getIdentities(),
-                                     getResults(), getCombine(), getAxis(), false);
+                                     getResults(), getCombine(), getAxisAttr().getInt(), false);
 }
 
 LogicalResult ScanOp::verify() {
   return gpu::verifyScalarCollective(getOperation(), getSources(), getIdentities(),
-                                     getResults(), getCombine(), getAxis(), true);
+                                     getResults(), getCombine(), getAxisAttr().getInt(), true);
 }
 
 LogicalResult TensorDescriptorChoiceOp::verify() {

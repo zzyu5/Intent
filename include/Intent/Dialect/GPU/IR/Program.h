@@ -19,6 +19,8 @@ mlir::FailureOr<mlir::Type> inferCollectiveResultType(
     mlir::Type source, llvm::ArrayRef<int64_t> reducedAxes,
     mlir::Type resultElement);
 
+// Native reductions may use axis -1 for a whole-fragment scalar reduction.
+// Scans always require an explicit nonnegative source axis.
 mlir::LogicalResult inferScalarCollectiveResultTypes(
     std::optional<mlir::Location> location, mlir::ValueRange sources,
     int64_t axis, bool scan, llvm::SmallVectorImpl<mlir::Type> &results);

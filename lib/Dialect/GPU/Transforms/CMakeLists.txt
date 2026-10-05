@@ -27,6 +27,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Pointwise/PointwiseWorksets.cpp
   Pointwise/RealizePointwiseBlocking.cpp
 
+  Reduction/CompletedReductions.cpp
   Reduction/OnlineSummary.cpp
   Reduction/RealizeOnlineReduction.cpp
   Reduction/RealizeReductionBlocking.cpp

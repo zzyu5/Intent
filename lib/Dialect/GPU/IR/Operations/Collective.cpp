@@ -145,10 +145,14 @@ LogicalResult inferScalarCollectiveResultTypes(std::optional<Location> location,
     ValueRange sources, int64_t axis, bool scan, SmallVectorImpl<Type> &results) {
   if (sources.empty()) return emitOptionalError(location, "native collective requires a source");
   auto first = dyn_cast<FragmentType>(sources.front().getType());
-  if (!first || axis < 0 || axis >= static_cast<int64_t>(first.getShape().size()))
+  bool allAxes = !scan && axis == -1;
+  if (!first || (!allAxes && (axis < 0 || axis >= static_cast<int64_t>(first.getShape().size()))))
     return emitOptionalError(location, "collective axis is outside its source fragment");
   SmallVector<int64_t, 1> axes;
-  if (!scan) axes.push_back(axis);
+  if (allAxes)
+    for (int64_t i = 0; i < static_cast<int64_t>(first.getShape().size()); ++i)
+      axes.push_back(i);
+  else if (!scan) axes.push_back(axis);
   for (Value value : sources) {
     auto source = dyn_cast<FragmentType>(value.getType());
     if (!source || source.getShape() != first.getShape())

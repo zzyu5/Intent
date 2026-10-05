@@ -624,8 +624,10 @@ LogicalResult inferCollectiveTypes(MLIRContext *context,
   typename CollectiveOp::Adaptor operation(operands, attributes, properties, regions);
   if (failed(operation.verify(location.value_or(UnknownLoc::get(context)))))
     return failure();
+  if (operation.getAxisAttr().getInt() < 0)
+    return emitOptionalError(location, "cuTile collective requires an explicit source axis");
   return gpu::inferScalarCollectiveResultTypes(
-      location, operation.getSources(), operation.getAxis(), scan, results);
+      location, operation.getSources(), operation.getAxisAttr().getInt(), scan, results);
 }
 
 LogicalResult verifyLiteralIdentities(Operation *owner, ValueRange identities) {
@@ -658,6 +660,8 @@ LogicalResult ScanOp::inferReturnTypes(MLIRContext *context,
 }
 
 LogicalResult ReduceOp::verify() {
+  if (getAxisAttr().getInt() < 0)
+    return emitOpError("cuTile native reduction requires an explicit source axis");
   if (getReverse())
     return emitOpError("native reduction does not reverse logical order");
   if (!getKind()) {

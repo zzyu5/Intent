@@ -35,14 +35,18 @@ LogicalResult legalizeCollectiveCallbacks(func::FuncOp kernel) {
     auto scan = dyn_cast<gpu::ScanOp>(operation);
     ValueRange sources = reduce ? reduce.getSources() : scan.getSources();
     ValueRange identities = reduce ? reduce.getIdentities() : scan.getIdentities();
-    if ((reduce && (reduce.getAxes().size() != 1 || reduce.getCaptures().size())) ||
+    auto sourceType = sources.empty() ? gpu::FragmentType()
+        : dyn_cast<gpu::FragmentType>(sources.front().getType());
+    bool allAxes = reduce && sourceType && sourceType.getShape().size() > 1 &&
+        reduce.getAxes().size() == sourceType.getShape().size();
+    if ((reduce && ((!allAxes && reduce.getAxes().size() != 1) || reduce.getCaptures().size())) ||
         (scan && scan.getCaptures().size()))
-      return operation->emitOpError("native collective requires one axis and a capture-free callback");
+      return operation->emitOpError("native collective requires one axis or a full reduction and a capture-free callback");
     // ODS inferred builders treat failure as a construction error. Diagnose
     // unsupported native schemas before invoking that builder, and retain the
     // result contract of the shared operation being replaced.
     SmallVector<Type> resultTypes;
-    int64_t axis = reduce ? reduce.getAxes().front() : scan.getAxis();
+    int64_t axis = reduce ? (allAxes ? -1 : reduce.getAxes().front()) : scan.getAxis();
     if (failed(gpu::inferScalarCollectiveResultTypes(
             operation->getLoc(), sources, axis, bool(scan), resultTypes)))
       return failure();

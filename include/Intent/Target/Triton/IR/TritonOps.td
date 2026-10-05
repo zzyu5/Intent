@@ -108,7 +108,14 @@ class IntentTriton_ElementwiseCollective<string mnemonic> :
 }
 
 // Triton's native callbacks are scalar, unlike a shared fragment combiner.
-def IntentTriton_ReduceOp : IntentTriton_ElementwiseCollective<"reduce">;
+def IntentTriton_ReduceOp : IntentTriton_ElementwiseCollective<"reduce"> {
+  let description = [{
+    Native scalar-callback reduction. A nonnegative axis reduces that source
+    axis. Axis -1 reduces every axis of the complete source tuple to scalars,
+    using Triton's whole-tuple axis=None primitive; its native lowering owns
+    the coordinated element ordering. No other negative axis is valid.
+  }];
+}
 def IntentTriton_ScanOp : IntentTriton_ElementwiseCollective<"scan">;
 
 def IntentTriton_MapElementwiseOp : IntentTriton_Op<"map_elementwise", [
