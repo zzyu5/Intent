@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/MatrixPanels.h"
 
 using namespace mlir;
@@ -48,6 +49,73 @@ bool consumesMatrixRhs(dsa::MatMulOp matrix) {
       storage.allUsesCompleteBefore(origin, matrix, matrix);
 }
 
+namespace {
+struct MatrixInputSupply {
+  bool direct = false, zeroPadded = false;
+};
+struct MatrixSupply {
+  MatrixInputSupply lhs, rhs;
+  bool accumulator = false, consumeRhs = false, nonempty = false;
+};
+
+bool independentAccumulator(dsa::MatMulOp matrix) {
+  dsa::StorageAnalysis storage(matrix->getParentOfType<func::FuncOp>());
+  return storage.disjoint(matrix.getAccumulator(), matrix.getLhs()) &&
+      storage.disjoint(matrix.getAccumulator(), matrix.getRhs());
+}
+
+MatrixSupply matrixSupply(dsa::MatMulOp matrix, int64_t m, int64_t n, int64_t k) {
+  auto function = matrix->getParentOfType<func::FuncOp>();
+  // Staging an accumulator also protects overlapping input snapshots. Removing
+  // that staging requires actual storage independence, not distinct SSA names.
+  if (!independentAccumulator(matrix)) return {};
+  dsa::LocalSupplyRelations relations(function);
+  // Native execution is enclosed by positive For bounds or the active guard.
+  // At that execution point an upper bound suffices to prove a single tile;
+  // nonpositive counts outside it execute no matrix or preparation operation.
+  auto fitsOneTile = [&](Value extent, int64_t capacity) {
+    if (relations.equal(extent, capacity)) return true;
+    auto range = relations.interval(extent);
+    return range && range->second <= capacity;
+  };
+  auto positive = [&](Value extent, int64_t capacity) {
+    if (capacity > 0 && relations.equal(extent, capacity)) return true;
+    auto range = relations.interval(extent);
+    return range && range->first > 0;
+  };
+  auto available = [&](Value input, Value rows, Value columns,
+                       int64_t r, int64_t c) -> MatrixInputSupply {
+    auto type = cast<MemRefType>(input.getType());
+    if (!type.getLayout().isIdentity() ||
+        type.getShape() != ArrayRef<int64_t>({r, c}) ||
+        !fitsOneTile(rows, r) || !fitsOneTile(columns, c)) return {};
+    // A complete actual tile has no padding obligation, regardless of which
+    // local producer defined it. Partial tiles retain the existing zero proof.
+    bool padded = paddedInput(matrix, input, rows, columns);
+    return {(relations.equal(rows, r) && relations.equal(columns, c)) || padded, padded};
+  };
+  bool transposed = matrix.getRhsTransposed();
+  MatrixSupply supply;
+  supply.nonempty = positive(matrix.getRows(), m) &&
+      positive(matrix.getColumns(), n) && positive(matrix.getDepth(), k);
+  supply.lhs = available(matrix.getLhs(), matrix.getRows(), matrix.getDepth(), m, k);
+  supply.rhs = available(matrix.getRhs(),
+      transposed ? matrix.getColumns() : matrix.getDepth(),
+      transposed ? matrix.getDepth() : matrix.getColumns(),
+      transposed ? n : k, transposed ? k : n);
+  auto accumulator = cast<MemRefType>(matrix.getAccumulator().getType());
+  supply.accumulator = accumulator.getLayout().isIdentity() &&
+      accumulator.getShape() == ArrayRef<int64_t>({m, n}) &&
+      relations.equal(matrix.getRows(), m) && relations.equal(matrix.getColumns(), n);
+  // A whole MatMul may read its RHS in several M panels. Its last external use
+  // does not make that source disposable after the first internal preparation.
+  supply.consumeRhs = supply.rhs.direct && fitsOneTile(matrix.getRows(), m) &&
+      fitsOneTile(matrix.getColumns(), n) && fitsOneTile(matrix.getDepth(), k) &&
+      consumesMatrixRhs(matrix);
+  return supply;
+}
+} // namespace
+
 Value matrixReshapeWorkspace(OpBuilder &b, Location loc, Value input, Value transposed, bool consumeInput) {
   auto type = cast<MemRefType>(transposed.getType());
   if (type.getDimSize(0) == 64) return {};
@@ -93,9 +161,11 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
   // transposed RHS form. Preserve the initial accumulator through a transpose.
   if (!rhsTransposed && lhsType.getDimSize(0) == 64 && rhsType.getDimSize(1) < 64 &&
       rhsType.getDimSize(1) <= config.getTileM() && lhsType.getDimSize(1) == bk &&
+      lhsType.getLayout().isIdentity() && rhsType.getLayout().isIdentity() &&
+      accType.getLayout().isIdentity() &&
       full(matrix.getRows(), 64) && full(matrix.getColumns(), rhsType.getDimSize(1)) &&
       full(matrix.getDepth(), lhsType.getDimSize(1)) &&
-      matrix.getAccumulator() != matrix.getLhs() && matrix.getAccumulator() != matrix.getRhs()) {
+      independentAccumulator(matrix)) {
     int64_t n = rhsType.getDimSize(1), k = lhsType.getDimSize(1);
     Operation *previous = matrix->getPrevNode();
     Value left = allocate(b, loc, element, {n, k}, dsa::nramSpace);
@@ -114,27 +184,29 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
   }
   auto tryDirect = [&](int64_t bm, int64_t bn, int64_t panelDepth) {
     b.setInsertionPoint(matrix);
+    MatrixSupply supply = matrixSupply(matrix, bm, bn, panelDepth);
     if (!(dsa::matrixPanelStorage(element, bm, bn, panelDepth) &&
       lhsType.getShape() == ArrayRef<int64_t>({bm, panelDepth}) &&
       rhsType.getShape() == (rhsTransposed ? ArrayRef<int64_t>({bn, panelDepth}) : ArrayRef<int64_t>({panelDepth, bn})) &&
       accType.getShape() == ArrayRef<int64_t>({bm, bn}) &&
+      accType.getLayout().isIdentity() &&
       matrix.getAccumulator().getDefiningOp<memref::AllocaOp>() &&
-      matrix.getAccumulator() != matrix.getLhs() && matrix.getAccumulator() != matrix.getRhs() &&
-      paddedInput(matrix, matrix.getLhs(), matrix.getRows(), matrix.getDepth()) &&
-      paddedInput(matrix, matrix.getRhs(), rhsTransposed ? matrix.getColumns() : matrix.getDepth(),
-                  rhsTransposed ? matrix.getDepth() : matrix.getColumns())))
+      supply.lhs.direct && supply.rhs.direct &&
+      (supply.accumulator || (supply.lhs.zeroPadded && supply.rhs.zeroPadded))))
       return false;
     Operation *previous = matrix->getPrevNode();
-    Value active = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getDepth(), index(0));
-    active = b.create<arith::AndIOp>(loc, active,
-        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getRows(), index(0)));
-    active = b.create<arith::AndIOp>(loc, active,
-        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getColumns(), index(0)));
-    auto guard = b.create<scf::IfOp>(loc, active, false);
-    b.setInsertionPointToStart(&guard.getThenRegion().front());
+    if (!supply.nonempty) {
+      Value active = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getDepth(), index(0));
+      active = b.create<arith::AndIOp>(loc, active,
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getRows(), index(0)));
+      active = b.create<arith::AndIOp>(loc, active,
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getColumns(), index(0)));
+      auto guard = b.create<scf::IfOp>(loc, active, false);
+      b.setInsertionPointToStart(&guard.getThenRegion().front());
+    }
     Value transpose = rhsTransposed ? Value{} : allocate(b, loc, element, {bn, panelDepth}, dsa::nramSpace);
     Value reshaped = rhsTransposed ? (bn == 64 ? Value{} : allocate(b, loc, element, {bn, panelDepth}, dsa::nramSpace))
-                                  : matrixReshapeWorkspace(b, loc, matrix.getRhs(), transpose, consumesMatrixRhs(matrix));
+                                  : matrixReshapeWorkspace(b, loc, matrix.getRhs(), transpose, supply.consumeRhs);
     Value packed = allocate(b, loc, element, {panelDepth, bn}, dsa::matrixSpace);
     b.create<dsa::PrepareMatrixOp>(loc, matrix.getRhs(), packed, transpose, reshaped, b.getBoolAttr(rhsTransposed));
     b.create<dsa::MatrixTileOp>(loc, matrix.getLhs(), packed, matrix.getAccumulator());
@@ -148,7 +220,7 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
     while (matrix->getPrevNode() != previous) matrix->getPrevNode()->erase();
     return false;
   };
-  auto emitTiled = [&](int64_t bm, int64_t bn) {
+  auto emitTiled = [&](int64_t bm, int64_t bn, const MatrixSupply &supply) {
     OpBuilder::InsertionGuard insertion(b);
     b.setInsertionPoint(matrix);
     auto rows = b.create<scf::ForOp>(loc, index(0), matrix.getRows(), index(bm));
@@ -157,30 +229,37 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
     auto columns = b.create<scf::ForOp>(loc, index(0), matrix.getColumns(), index(bn));
     b.setInsertionPointToStart(columns.getBody());
     Value n = columns.getInductionVar(), nCount = count(matrix.getColumns(), n, bn);
-    Value lhs = allocate(b, loc, element, {bm, bk}, dsa::nramSpace);
-    Value rhs = allocate(b, loc, element, rhsTransposed ? ArrayRef<int64_t>({bn, bk}) : ArrayRef<int64_t>({bk, bn}), dsa::nramSpace);
-    Value accumulator = allocate(b, loc, b.getF32Type(), {bm, bn}, dsa::nramSpace);
+    Value lhs = supply.lhs.direct ? matrix.getLhs() : allocate(b, loc, element, {bm, bk}, dsa::nramSpace);
+    Value rhs = supply.rhs.direct ? matrix.getRhs() : allocate(b, loc, element,
+        rhsTransposed ? ArrayRef<int64_t>({bn, bk}) : ArrayRef<int64_t>({bk, bn}), dsa::nramSpace);
+    Value accumulator = supply.accumulator ? matrix.getAccumulator() :
+        allocate(b, loc, b.getF32Type(), {bm, bn}, dsa::nramSpace);
     Value transpose = rhsTransposed ? Value{} : allocate(b, loc, element, {bn, bk}, dsa::nramSpace);
     Value reshaped = rhsTransposed ? (bn == 64 ? Value{} : allocate(b, loc, element, {bn, bk}, dsa::nramSpace))
-                                  : matrixReshapeWorkspace(b, loc, rhs, transpose, true);
+                                  : matrixReshapeWorkspace(b, loc, rhs, transpose,
+                                                           !supply.rhs.direct || supply.consumeRhs);
     Value packed = allocate(b, loc, element, {bk, bn}, dsa::matrixSpace);
-    b.create<dsa::LoadTileOp>(loc, matrix.getAccumulator(), accumulator,
-        offset(m, n, accType.getDimSize(1)), index(accType.getDimSize(1)), index(1), mCount, nCount);
+    if (!supply.accumulator)
+      b.create<dsa::LoadTileOp>(loc, matrix.getAccumulator(), accumulator,
+          offset(m, n, accType.getDimSize(1)), index(accType.getDimSize(1)), index(1), mCount, nCount);
     auto reduction = b.create<scf::ForOp>(loc, index(0), matrix.getDepth(), index(bk));
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(reduction.getBody());
       Value k = reduction.getInductionVar(), kCount = count(matrix.getDepth(), k, bk);
-      b.create<dsa::LoadTileOp>(loc, matrix.getLhs(), lhs, offset(m, k, lhsType.getDimSize(1)),
-          index(lhsType.getDimSize(1)), index(1), mCount, kCount);
-      b.create<dsa::LoadTileOp>(loc, matrix.getRhs(), rhs,
-          offset(rhsTransposed ? n : k, rhsTransposed ? k : n, rhsType.getDimSize(1)),
-          index(rhsType.getDimSize(1)), index(1), rhsTransposed ? nCount : kCount, rhsTransposed ? kCount : nCount);
+      if (!supply.lhs.direct)
+        b.create<dsa::LoadTileOp>(loc, matrix.getLhs(), lhs, offset(m, k, lhsType.getDimSize(1)),
+            index(lhsType.getDimSize(1)), index(1), mCount, kCount);
+      if (!supply.rhs.direct)
+        b.create<dsa::LoadTileOp>(loc, matrix.getRhs(), rhs,
+            offset(rhsTransposed ? n : k, rhsTransposed ? k : n, rhsType.getDimSize(1)),
+            index(rhsType.getDimSize(1)), index(1), rhsTransposed ? nCount : kCount, rhsTransposed ? kCount : nCount);
       b.create<dsa::PrepareMatrixOp>(loc, rhs, packed, transpose, reshaped, b.getBoolAttr(rhsTransposed));
       b.create<dsa::MatrixTileOp>(loc, lhs, packed, accumulator);
     }
-    b.create<dsa::StoreTileOp>(loc, accumulator, matrix.getAccumulator(), offset(m, n, accType.getDimSize(1)),
-        index(accType.getDimSize(1)), index(1), mCount, nCount);
+    if (!supply.accumulator)
+      b.create<dsa::StoreTileOp>(loc, accumulator, matrix.getAccumulator(), offset(m, n, accType.getDimSize(1)),
+          index(accType.getDimSize(1)), index(1), mCount, nCount);
   };
   SmallVector<dsa::MatrixPanelShape> candidates;
   if (lhsType.getLayout().isIdentity() && rhsType.getLayout().isIdentity() &&
@@ -197,7 +276,7 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
     // not combine the original K updates or change their accumulation order.
     if (tryDirect(shape.rows, shape.columns, bk)) return success();
     Operation *previous = matrix->getPrevNode();
-    emitTiled(shape.rows, shape.columns);
+    emitTiled(shape.rows, shape.columns, matrixSupply(matrix, shape.rows, shape.columns, bk));
     if (storageFitsBudget(function, config, measureStorage(function))) {
       matrix.erase();
       return success();
@@ -206,7 +285,15 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
     while (matrix->getPrevNode() != previous) matrix->getPrevNode()->erase();
   }
   if (tryDirect(bm, bn, lhsType.getDimSize(1))) return success();
-  emitTiled(bm, bn);
+  MatrixSupply supply = matrixSupply(matrix, bm, bn, bk);
+  Operation *previous = matrix->getPrevNode();
+  emitTiled(bm, bn, supply);
+  if ((supply.lhs.direct || supply.rhs.direct || supply.accumulator) &&
+      !storageFitsBudget(function, config, measureStorage(function))) {
+    b.setInsertionPoint(matrix);
+    while (matrix->getPrevNode() != previous) matrix->getPrevNode()->erase();
+    emitTiled(bm, bn, {});
+  }
   matrix.erase();
   return success();
 }
