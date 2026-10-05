@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h"
 #include "InputWindows.h"
+#include "InputProducers.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -72,6 +73,7 @@ struct ImplementationInputs::Impl {
   SmallVector<Prepared> prepared;
   SmallVector<PreparedWindow> windows;
   SmallVector<Operation *> guardedLoops;
+  InputProducerCopies producerCopies;
 };
 
 namespace {
@@ -132,7 +134,8 @@ MemRefType privateRepresentationType(const InputRequirement &requirement,
 }
 
 bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
-    Value storage, const InputRequirement &requirement, Operation *point) {
+    Value storage, const InputRequirement &requirement, Operation *point,
+    InputProducerCopies &producers, unsigned preparation) {
   auto type = cast<MemRefType>(source.getType());
   if (type.getRank() != 2 || requirement.panelAxis != 1 ||
       requirement.panelSize != 1 || type.getElementType().isInteger(1) ||
@@ -169,7 +172,7 @@ bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
     Value output = view(storage, {column, row, b.getIndexAttr(0)},
         {b.getIndexAttr(1), b.getIndexAttr(count), b.getIndexAttr(1)});
     auto identity = b.getMultiDimIdentityMap(1);
-    b.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
+    auto copy = b.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
         ArrayRef<AffineMap>{identity, identity},
         ArrayRef<utils::IteratorType>{utils::IteratorType::parallel},
         [&](OpBuilder &body, Location at, ValueRange arguments) {
@@ -178,6 +181,7 @@ bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
             value = body.create<arith::ExtFOp>(at, requirement.elementType, value);
           body.create<linalg::YieldOp>(at, value);
         });
+    producers.record(preparation, copy);
   };
   auto tile = [&](Value ordinal) {
     Value begin = multiply(b, loc, ordinal, step);
@@ -207,8 +211,11 @@ bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
 }
 
 void copyRepresentation(OpBuilder &b, Location loc, Value source,
-    Value storage, const InputRequirement &requirement, Operation *point) {
-  if (copyTransposedRepresentation(b, loc, source, storage, requirement, point))
+    Value storage, const InputRequirement &requirement, Operation *point,
+    InputProducerCopies &producers) {
+  unsigned preparation = producers.begin(b.getInsertionBlock(), source);
+  if (copyTransposedRepresentation(b, loc, source, storage, requirement, point,
+                                   producers, preparation))
     return;
   auto type = cast<MemRefType>(source.getType());
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
@@ -225,7 +232,9 @@ void copyRepresentation(OpBuilder &b, Location loc, Value source,
         loop(b, loc, zero, width, 1, [&](Value lane) {
           logical[requirement.panelAxis] = add(b, loc, begin, lane);
           physical.push_back(lane);
-          Value value = b.create<memref::LoadOp>(loc, source, logical);
+          auto load = b.create<memref::LoadOp>(loc, source, logical);
+          producers.record(preparation, load);
+          Value value = load;
           if (value.getType() != requirement.elementType)
             value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
           b.create<memref::StoreOp>(loc, value, storage, physical);
@@ -270,6 +279,10 @@ ImplementationInputs::ImplementationInputs(func::FuncOp function)
     : impl(std::make_unique<Impl>(function)) {}
 
 ImplementationInputs::~ImplementationInputs() = default;
+
+LogicalResult ImplementationInputs::fuseProducerCopies() {
+  return impl->producerCopies.fold(impl->function);
+}
 
 bool ImplementationInputs::hasReusableScope(linalg::GenericOp operation,
     ArrayRef<InputRequirement> requirements) {
@@ -357,7 +370,8 @@ FailureOr<InputSupply> ImplementationInputs::prepareAt(Value window,
       return scope->emitError("prepared input window exceeds its proved capacity"), failure();
   }
   OpBuilder builder(scope);
-  copyRepresentation(builder, scope->getLoc(), window, storage, requirement, scope);
+  copyRepresentation(builder, scope->getLoc(), window, storage, requirement, scope,
+                     impl->producerCopies);
   return InputSupply{requirement.operand, requirement.panelAxis, requirement.panelSize,
                      storage, SmallVector<Value>(begins.begin(), begins.end())};
 }
@@ -461,6 +475,7 @@ std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value sourc
   Value count = getValueOrCreateConstantIndexOp(b, loc, sizes[axis]);
   Value width = getValueOrCreateConstantIndexOp(b, loc, sizes[1 - axis]);
   Value clear = b.create<arith::ConstantIntOp>(loc, 0, 1), ready = b.create<arith::ConstantIntOp>(loc, 1, 1);
+  unsigned preparation = producerCopies.begin(b.getInsertionBlock(), view);
   // A marker covers one complete source slice, including only its valid tail.
   // Fill at the original consumer so guards never introduce extra input reads.
   loop(b, loc, zero, count, 1, [&](Value row) {
@@ -474,7 +489,9 @@ std::optional<InputSupply> ImplementationInputs::Impl::prepareWindow(Value sourc
       SmallVector<Value> logical(2);
       logical[axis] = row;
       logical[1 - axis] = other;
-      Value value = b.create<memref::LoadOp>(loc, view, logical);
+      auto load = b.create<memref::LoadOp>(loc, view, logical);
+      producerCopies.record(preparation, load);
+      Value value = load;
       if (value.getType() != requirement.elementType) value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
       b.create<memref::StoreOp>(loc, value, prepared->storage, ValueRange{ordinal, storageRow, lane});
     };
@@ -598,7 +615,7 @@ InputSupply ImplementationInputs::Impl::materialize(Value source, const InputReq
       initialized = b.create<memref::AllocOp>(loc, MemRefType::get({}, b.getI1Type()));
       b.create<memref::StoreOp>(loc, b.create<arith::ConstantIntOp>(loc, 0, 1),
                                 initialized, ValueRange{});
-    } else copyRepresentation(b, loc, source, storage, requirement, scope);
+    } else copyRepresentation(b, loc, source, storage, requirement, scope, producerCopies);
     b.setInsertionPointAfter(scope);
     if (initialized) b.create<memref::DeallocOp>(loc, initialized);
     b.create<memref::DeallocOp>(loc, storage);
@@ -614,7 +631,7 @@ InputSupply ImplementationInputs::Impl::materialize(Value source, const InputReq
         ready, b.create<arith::ConstantIntOp>(loc, 0, 1));
     auto fill = b.create<scf::IfOp>(loc, needed, false);
     b.setInsertionPointToStart(fill.thenBlock());
-    copyRepresentation(b, loc, source, storage, requirement, readPoint);
+    copyRepresentation(b, loc, source, storage, requirement, readPoint, producerCopies);
     b.create<memref::StoreOp>(loc, b.create<arith::ConstantIntOp>(loc, 1, 1),
                               initialized, ValueRange{});
   }
@@ -666,13 +683,16 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepareGroup(OpB
     auto resultType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
         {ShapedType::kDynamic, ShapedType::kDynamic}, storage.getType(), packedOffsets, packedSizes, packedStrides));
     Value destination = b.create<memref::SubViewOp>(loc, resultType, storage, packedOffsets, packedSizes, packedStrides);
+    unsigned preparation = producerCopies.begin(b.getInsertionBlock(), window);
     if (requirement.panelAxis == 1 && sourceType.getElementType() == requirement.elementType) {
-      b.create<memref::CopyOp>(loc, window, destination);
+      producerCopies.record(preparation, b.create<memref::CopyOp>(loc, window, destination));
     } else {
       auto zero = index(b, loc, 0);
       loop(b, loc, zero, cast<Value>(sizes[0]), 1, [&](Value row) {
         loop(b, loc, zero, cast<Value>(sizes[1]), 1, [&](Value column) {
-          Value value = b.create<memref::LoadOp>(loc, window, ValueRange{row, column});
+          auto load = b.create<memref::LoadOp>(loc, window, ValueRange{row, column});
+          producerCopies.record(preparation, load);
+          Value value = load;
           if (value.getType() != requirement.elementType)
             value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
           SmallVector<Value> coordinates = requirement.panelAxis == 1 ? SmallVector<Value>{row, column}

@@ -20,6 +20,11 @@ public:
   explicit ImplementationInputs(mlir::func::FuncOp function);
   ~ImplementationInputs();
 
+  // Once the structured consumers have been expanded, compose complete
+  // producer versions into the actual preparation reads and remove only the
+  // versions whose observations have all been replaced.
+  mlir::LogicalResult fuseProducerCopies();
+
   bool hasReusableScope(mlir::linalg::GenericOp operation,
                         llvm::ArrayRef<InputRequirement> requirements);
 
