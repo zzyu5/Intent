@@ -2,6 +2,7 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
@@ -149,8 +150,55 @@ std::optional<ContractionEpilogue> queryContractionEpilogue(
                             {dependencies.begin(), dependencies.end()}};
 }
 
+bool canCompactContractionAccumulator(linalg::GenericOp contraction,
+    Operation *initialization, ContractionEpilogue &epilogue,
+    StorageAnalysis &storage) {
+  Value accumulator = contraction.getOutputs()[0];
+  auto type = cast<MemRefType>(accumulator.getType());
+  if (!type.getLayout().isIdentity()) return false;
+  for (Value input : contraction.getInputs())
+    if (!storage.disjoint(input, accumulator)) return false;
+  for (Operation *user : accumulator.getUsers()) {
+    if (user == contraction || user == initialization ||
+        user == epilogue.consumer || isa<memref::DeallocOp>(user)) continue;
+    auto dimension = dyn_cast<memref::DimOp>(user);
+    if (!dimension || !dimension.getConstantIndex()) return false;
+  }
+  return true;
+}
+
+LogicalResult eraseContractionAccumulator(Value accumulator) {
+  Operation *allocation = accumulator.getDefiningOp();
+  auto type = cast<MemRefType>(accumulator.getType());
+  SmallVector<Value> dynamicSizes;
+  if (auto heap = dyn_cast<memref::AllocOp>(allocation))
+    llvm::append_range(dynamicSizes, heap.getDynamicSizes());
+  else
+    llvm::append_range(dynamicSizes, cast<memref::AllocaOp>(allocation).getDynamicSizes());
+  SmallVector<Operation *> users(accumulator.getUsers());
+  for (Operation *user : users) {
+    if (auto release = dyn_cast<memref::DeallocOp>(user)) {
+      release.erase();
+      continue;
+    }
+    auto dimension = dyn_cast<memref::DimOp>(user);
+    if (!dimension || !dimension.getConstantIndex())
+      return allocation->emitError("compact contraction accumulator retains an unexpected observation");
+    int64_t axis = *dimension.getConstantIndex();
+    OpBuilder builder(dimension);
+    Value extent = type.isDynamicDim(axis)
+        ? dynamicSizes[type.getDynamicDimIndex(axis)]
+        : builder.create<arith::ConstantIndexOp>(dimension.getLoc(), type.getDimSize(axis)).getResult();
+    dimension.replaceAllUsesWith(extent);
+    dimension.erase();
+  }
+  allocation->erase();
+  return success();
+}
+
 LogicalResult emitContractionEpilogue(OpBuilder &builder,
-    ContractionEpilogue &epilogue, ValueRange offsets, ValueRange sizes) {
+    ContractionEpilogue &epilogue, ValueRange offsets, ValueRange sizes,
+    Value completedTile) {
   auto consumer = epilogue.consumer;
   Block *block = builder.getInsertionBlock();
   auto end = builder.getInsertionPoint();
@@ -167,6 +215,22 @@ LogicalResult emitContractionEpilogue(OpBuilder &builder,
   // needed; the original dtype, scalar operations, maps and attributes survive.
   auto operands = linalg::makeTiledShapes(builder, consumer.getLoc(), consumer,
       consumer->getOperands(), loopOffsets, loopSizes, {}, true);
+  if (completedTile) {
+    Value original = consumer.getInputs()[epilogue.accumulatorInput];
+    llvm::SetVector<Operation *> unusedSlices;
+    for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
+      if (input != original) continue;
+      Value unused = operands[number];
+      operands[number] = completedTile;
+      // This temporary source slice is superseded by the actual compact C.
+      // Other operand slices and linalg.index retain the logical output origin.
+      if (unused != original)
+        if (auto view = unused.getDefiningOp<memref::SubViewOp>())
+          unusedSlices.insert(view);
+    }
+    for (Operation *view : unusedSlices)
+      if (view->use_empty()) view->erase();
+  }
   auto tile = cast<linalg::GenericOp>(builder.clone(*consumer));
   tile->setOperands(operands);
   linalg::offsetIndices(builder, tile, loopOffsets);

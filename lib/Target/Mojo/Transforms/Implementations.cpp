@@ -89,7 +89,8 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         {b.getIndexAttr(rows), tile.depth}, {rows, ShapedType::kDynamic});
     Value right = subview(b, loc, packed, {b.getIndexAttr(0), b.getIndexAttr(0)},
         {tile.depth, b.getIndexAttr(columns)});
-    Value out = subview(b, loc, tile.output, {m, add(b, loc, tile.nBegin, n)},
+    Value out = subview(b, loc, tile.output,
+        {b.create<arith::SubIOp>(loc, m, tile.mBegin).getResult(), n},
         {b.getIndexAttr(rows), b.getIndexAttr(columns)});
     Type accumulator = cast<MemRefType>(tile.output.getType()).getElementType();
     Value partial = out;

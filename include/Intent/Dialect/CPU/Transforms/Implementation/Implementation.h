@@ -49,6 +49,8 @@ struct InputSupply {
 };
 
 struct ContractionTile {
+  // Output is the actual mCount-by-nCount tile, indexed from zero. Input
+  // windows and supplied representations retain the logical m/n/k origins.
   mlir::Value lhs, rhs, output, initial;
   mlir::Value mBegin, mCount, nBegin, nCount, kBegin, depth;
   bool first;

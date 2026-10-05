@@ -113,7 +113,8 @@ LogicalResult formIntegerTile(OpBuilder &b, linalg::GenericOp operation,
           [&](Value k) { issue(add(b, loc, tile.kBegin, k), step); });
     for (int64_t k = full; k < *depth; ++k)
       issue(add(b, loc, tile.kBegin, index(b, loc, k)), 1);
-    Value out = view(tile.output, m, n, rows, columns);
+    Value out = view(tile.output, b.create<arith::SubIOp>(loc, m, tile.mBegin),
+        b.create<arith::SubIOp>(loc, n, tile.nBegin), rows, columns);
     pointwise(accumulator, tile.first ? Value() : out, out);
   };
   auto panels = [&](Value begin, int64_t extent, int64_t panel,
@@ -153,7 +154,9 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     Value lhs = suppliedLhs ? suppliedLhs
         : view(tile.lhs, m, kBegin, b.getIndexAttr(rows), depth);
     Value rhs = view(tile.rhs, kBegin, n, depth, b.getIndexAttr(columns));
-    Value out = view(tile.output, m, n, b.getIndexAttr(rows), b.getIndexAttr(columns));
+    Value out = view(tile.output, b.create<arith::SubIOp>(loc, m, tile.mBegin),
+        b.create<arith::SubIOp>(loc, n, tile.nBegin),
+        b.getIndexAttr(rows), b.getIndexAttr(columns));
     auto partial = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, columns}, b.getF32Type()));
     b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
     auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},

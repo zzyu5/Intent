@@ -18,8 +18,15 @@ std::optional<ContractionEpilogue> queryContractionEpilogue(
     mlir::linalg::GenericOp contraction, mlir::Operation *initialization,
     StorageAnalysis &storage);
 
+// Narrower than moving the observation: the entire old allocation must be
+// removable, with only logical dimension queries left after computation moves.
+bool canCompactContractionAccumulator(mlir::linalg::GenericOp contraction,
+    mlir::Operation *initialization, ContractionEpilogue &epilogue,
+    StorageAnalysis &storage);
+mlir::LogicalResult eraseContractionAccumulator(mlir::Value accumulator);
+
 mlir::LogicalResult emitContractionEpilogue(mlir::OpBuilder &builder,
     ContractionEpilogue &epilogue, mlir::ValueRange offsets,
-    mlir::ValueRange sizes);
+    mlir::ValueRange sizes, mlir::Value completedTile = {});
 
 } // namespace intent::cpu
