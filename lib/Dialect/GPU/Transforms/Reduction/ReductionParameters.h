@@ -13,6 +13,10 @@ mlir::FailureOr<ParameterAttr> selectReductionChunk(
     ParameterRole role, unsigned elementBitWidth, llvm::StringRef name,
     llvm::ArrayRef<int64_t> candidates);
 
+mlir::FailureOr<ParameterAttr> selectReductionTraversalChunk(
+    ReduceOp reduce, mlir::Value source, unsigned axis, MakeRangeOp range,
+    bool tileProducerFreeAxis = false);
+
 mlir::Value parameterValue(mlir::func::FuncOp kernel, ParameterAttr declaration);
 
 mlir::FailureOr<ParameterAttr>

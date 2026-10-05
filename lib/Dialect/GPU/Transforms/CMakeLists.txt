@@ -22,6 +22,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Pointwise/PointwiseCoverage.cpp
   Pointwise/PointwiseLifting.cpp
   Pointwise/PointwiseOwnership.cpp
+  Pointwise/PointwiseReuse.cpp
   Pointwise/PointwiseTraversal.cpp
   Pointwise/PointwiseWorksets.cpp
   Pointwise/RealizePointwiseBlocking.cpp

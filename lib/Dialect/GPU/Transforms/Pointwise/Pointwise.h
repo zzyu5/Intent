@@ -118,7 +118,7 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
                                 FragmentType valueType, Value existing);
 bool hasFullRangeReductionCapture(Value value, MakeRangeOp range,
                                   Operation *anchor);
-LogicalResult addTailValidity(func::FuncOp kernel,
+LogicalResult addTailValidity(func::FuncOp kernel, Operation *scope,
                               llvm::DenseMap<Value, Value> &rangePredicates,
                               bool includeStores);
 void collectProducerRanges(Value value, PhysicalSourceAxis source,
@@ -158,6 +158,9 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
                                              bool effectLocal,
                                              ArrayRef<LoadOp> retainedReads,
                                              llvm::function_ref<void(StoreOp, StoreOp)> replaceStore);
+FailureOr<bool> retainCoveredPointwiseGraph(func::FuncOp kernel,
+                                           MakeRangeOp range,
+                                           ArrayRef<StoreOp> stores);
 void collectCoordinateRanges(Value coordinate,
                              llvm::SmallPtrSetImpl<Operation *> &ranges);
 void collectStoreRanges(Value value, llvm::SmallPtrSetImpl<Operation *> &ranges,

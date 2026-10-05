@@ -283,6 +283,61 @@ FragmentResourceAnalysis::materializedTypesUsing(StringAttr name) const {
                                 : ArrayRef<FragmentType>(found->second);
 }
 
+namespace {
+
+bool dependsOnInvocation(ConfigurationRequirementAttr requirement,
+                         func::FuncOp kernel) {
+  // Sampling the nondeferred domains only asks whether all leaves are known;
+  // it does not establish a bound for the other candidates.
+  auto known = evaluateConfigurationRequirement(requirement,
+      [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
+        if (expression.getKind() != PhysicalExprKind::Parameter) return std::nullopt;
+        auto parameter = lookupParameter(kernel, expression.getParameterReference());
+        if (!parameter || parameter.isDeferred() ||
+            parameter.getCategory() == ParameterCategory::Coverage)
+          return std::nullopt;
+        return parameter.getCandidates().asArrayRef().front();
+      });
+  return !known.usage;
+}
+
+} // namespace
+
+bool isPointwiseTraversalParameter(ParameterAttr parameter) {
+  return parameter.getBinding().getPointwiseChunk() ||
+      (parameter.getCategory() == ParameterCategory::Pointwise &&
+       (parameter.getRole() == ParameterRole::OwnershipM ||
+        parameter.getRole() == ParameterRole::OwnershipN));
+}
+
+SmallVector<ConfigurationRequirementAttr> collectPointwiseRequirements(
+    func::FuncOp kernel, const FragmentResourceAnalysis &resources) {
+  SmallVector<ConfigurationRequirementAttr> requirements;
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0) return requirements;
+  Builder builder(kernel.getContext());
+  auto limit = PhysicalExprAttr::get(kernel.getContext(), PhysicalExprKind::Constant,
+      capabilities.getRegistersPerUnit() - 1, builder.getStringAttr(""), builder.getArrayAttr({}));
+  llvm::DenseSet<FragmentType> seen;
+  for (Attribute attribute : getParameterDeclarations(kernel)) {
+    auto parameter = cast<ParameterAttr>(attribute);
+    if (!isPointwiseTraversalParameter(parameter)) continue;
+    for (FragmentType fragment : resources.materializedTypesUsing(parameter.getName())) {
+      if (!seen.insert(fragment).second) continue;
+      auto requirement = ConfigurationRequirementAttr::get(kernel.getContext(),
+          ConfigurationRequirementKind::NominalBudget,
+          ConfigurationRequirementMetric::FragmentRegisterWords,
+          ConfigurationRequirementPredicate::LessEqual,
+          fragmentRegisterFootprint(fragment), limit, ParameterRefAttr(),
+          builder.getStringAttr("pointwise payload exceeds the candidate register budget"));
+      if (dependsOnInvocation(requirement, kernel) &&
+          !llvm::is_contained(requirements, requirement))
+        requirements.push_back(requirement);
+    }
+  }
+  return requirements;
+}
+
 SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
     func::FuncOp kernel, ArrayRef<ValueRange> sourceGroups,
     ReductionRequirementScope scope) {
@@ -302,21 +357,8 @@ SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
         ConfigurationRequirementPredicate::LessEqual, footprint, limit,
         ParameterRefAttr(),
         builder.getStringAttr("reduction source exceeds the candidate register budget"));
-    if (scope == ReductionRequirementScope::InvocationDependent) {
-      // Preserve the provider's specialization-only policy. A concrete sample
-      // from each nondeferred domain tests evaluability, not a resource bound.
-      // Unknown arithmetic and host metadata remain for specialization too.
-      auto known = evaluateConfigurationRequirement(requirement,
-          [&](PhysicalExprAttr expression) -> std::optional<int64_t> {
-            if (expression.getKind() != PhysicalExprKind::Parameter) return std::nullopt;
-            auto parameter = lookupParameter(kernel, expression.getParameterReference());
-            if (!parameter || parameter.isDeferred() ||
-                parameter.getCategory() == ParameterCategory::Coverage)
-              return std::nullopt;
-            return parameter.getCandidates().asArrayRef().front();
-          });
-      if (known.usage) continue;
-    }
+    if (scope == ReductionRequirementScope::InvocationDependent &&
+        !dependsOnInvocation(requirement, kernel)) continue;
     if (!llvm::is_contained(requirements, requirement)) requirements.push_back(requirement);
   }
   return requirements;

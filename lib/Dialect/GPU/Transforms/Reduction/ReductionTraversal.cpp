@@ -98,61 +98,11 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
       return reduce.emitOpError(
           "runtime reduction components require one lockstep logical range");
   }
-  auto firstSource = cast<FragmentType>(sourcePlans.front().source.getType());
-  PhysicalExprAttr sourceExtent = cast<PhysicalExprAttr>(
-      firstSource.getShape()[sourcePlans.front().reductionAxis]);
-  FailureOr<ParameterAttr> fullCoverage = failure();
-  if (!tileProducerFreeAxis && !hasNonUnitFreeAxis(reduce))
-    fullCoverage = fullCoverageParameter(kernel, sourceExtent);
-  FailureOr<ParameterAttr> selectedChunk =
-      parameterForExtent(kernel, sourceExtent);
-  ParameterRole reductionRole = tileProducerFreeAxis
-                                    ? ParameterRole::ReductionOuter
-                                    : ParameterRole::Reduction;
-  if (auto parent = reduce->getParentOfType<scf::ForOp>())
-    if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
-        outer && outer.getDeclaration().getRole() ==
-                     ParameterRole::ReductionOuter)
-      reductionRole = ParameterRole::ReductionInner;
-  ParameterAttr chunk;
-  if (reduce.getSources().size() == 1 &&
-      !firstRange->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage)) {
-    chunk = *fullCoverage;
-  } else if (succeeded(selectedChunk) &&
-             !selectedChunk->isDeferred() &&
-             selectedChunk->getRole() ==
-                 reductionRole) {
-    chunk = *selectedChunk;
-  } else {
-    std::string name =
-        ("REDUCE_CHUNK_" + Twine(sourcePlans.front().sourceIdentity.sourceId) +
-         "_A" + Twine(sourcePlans.front().sourceIdentity.sourceAxis) +
-         (sourcePlans.front().sourceIdentity.derived ? "_DERIVED" : ""))
-            .str();
-    if (queryFragmentAxes(firstSource,
-                          sourcePlans.front().sourceIdentity).size() > 1)
-      name += ("_F" + Twine(sourcePlans.front().reductionAxis)).str();
-    if (reductionRole == ParameterRole::ReductionInner)
-      name += "_INNER";
-    else if (reductionRole == ParameterRole::ReductionOuter)
-      name += "_OUTER";
-    SmallVector<int64_t> candidates{4,   8,    16,   32,   64,   128, 256,
-                                    512, 1024, 2048, 4096, 8192};
-    if (auto capacity = queryLogicalRangeCapacity(firstRange))
-      if (auto constant = constantPhysicalExpression(capacity)) {
-        uint64_t padded = llvm::PowerOf2Ceil(
-            static_cast<uint64_t>(std::max<int64_t>(*constant, candidates.front())));
-        llvm::erase_if(candidates, [&](int64_t candidate) {
-          return static_cast<uint64_t>(candidate) > padded;
-        });
-        name += ("_E" + Twine(padded)).str();
-      }
-    auto selected = selectReductionChunk(
-        kernel, sourcePlans.front().sourceIdentity, firstRange, reductionRole,
-        firstSource.getElementType().getIntOrFloatBitWidth(), name, candidates);
-    if (failed(selected)) return failure();
-    chunk = *selected;
-  }
+  auto selectedChunk = selectReductionTraversalChunk(
+      reduce, sourcePlans.front().source, sourcePlans.front().reductionAxis,
+      firstRange, tileProducerFreeAxis);
+  if (failed(selectedChunk)) return failure();
+  ParameterAttr chunk = *selectedChunk;
   if (!chunk)
     return reduce.emitOpError(
                "reduction blocking has no unique physical parameter relation")

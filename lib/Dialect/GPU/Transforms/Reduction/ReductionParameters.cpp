@@ -2,11 +2,14 @@
 #include "ReductionAnalysis.h"
 #include "ReductionValues.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <tuple>
 
@@ -54,6 +57,50 @@ FailureOr<ParameterAttr> selectReductionChunk(
     if (failed(updateParameter(kernel, declaration))) return failure();
   }
   return declaration;
+}
+
+FailureOr<ParameterAttr> selectReductionTraversalChunk(
+    ReduceOp reduce, Value source, unsigned axis, MakeRangeOp range,
+    bool tileProducerFreeAxis) {
+  auto kernel = reduce->getParentOfType<func::FuncOp>();
+  auto type = cast<FragmentType>(source.getType());
+  auto identity = sourceAxisIdentity(cast<AxisMapAttr>(type.getAxisMaps()[axis]));
+  auto extent = cast<PhysicalExprAttr>(type.getShape()[axis]);
+  FailureOr<ParameterAttr> fullCoverage = failure();
+  if (!tileProducerFreeAxis && !hasNonUnitFreeAxis(reduce))
+    fullCoverage = fullCoverageParameter(kernel, extent);
+  auto selected = parameterForExtent(kernel, extent);
+  ParameterRole role = tileProducerFreeAxis ? ParameterRole::ReductionOuter
+                                            : ParameterRole::Reduction;
+  if (auto parent = reduce->getParentOfType<scf::ForOp>())
+    if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
+        outer && outer.getDeclaration().getRole() == ParameterRole::ReductionOuter)
+      role = ParameterRole::ReductionInner;
+  if (reduce.getSources().size() == 1 &&
+      !range->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage))
+    return *fullCoverage;
+  if (succeeded(selected) && !selected->isDeferred() && selected->getRole() == role)
+    return *selected;
+
+  std::string name = ("REDUCE_CHUNK_" + Twine(identity.sourceId) + "_A" +
+                     Twine(identity.sourceAxis) + (identity.derived ? "_DERIVED" : "")).str();
+  if (queryFragmentAxes(type, identity).size() > 1)
+    name += ("_F" + Twine(axis)).str();
+  if (role == ParameterRole::ReductionInner) name += "_INNER";
+  else if (role == ParameterRole::ReductionOuter) name += "_OUTER";
+  SmallVector<int64_t> candidates{4, 8, 16, 32, 64, 128, 256,
+                                  512, 1024, 2048, 4096, 8192};
+  if (auto capacity = queryLogicalRangeCapacity(range))
+    if (auto constant = constantPhysicalExpression(capacity)) {
+      uint64_t padded = llvm::PowerOf2Ceil(
+          static_cast<uint64_t>(std::max<int64_t>(*constant, candidates.front())));
+      llvm::erase_if(candidates, [&](int64_t candidate) {
+        return static_cast<uint64_t>(candidate) > padded;
+      });
+      name += ("_E" + Twine(padded)).str();
+    }
+  return selectReductionChunk(kernel, identity, range, role,
+      type.getElementType().getIntOrFloatBitWidth(), name, candidates);
 }
 
 Value parameterValue(func::FuncOp kernel, ParameterAttr declaration) {

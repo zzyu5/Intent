@@ -11,6 +11,10 @@ namespace intent::gpu {
 
 enum class ReductionRequirementScope { AllCandidates, InvocationDependent };
 
+// The same tunable traversal domain is budgeted during row construction and
+// after deferred coverage has been bound for an invocation.
+bool isPointwiseTraversalParameter(ParameterAttr parameter);
+
 // Collect from current IR for candidate filtering and invocation specialization.
 llvm::SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
     mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::ValueRange> sourceGroups,
@@ -73,6 +77,9 @@ private:
   llvm::SmallVector<FragmentType> values;
   llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<FragmentType>> payloads;
 };
+
+llvm::SmallVector<ConfigurationRequirementAttr> collectPointwiseRequirements(
+    mlir::func::FuncOp kernel, const FragmentResourceAnalysis &resources);
 
 } // namespace intent::gpu
 

@@ -583,7 +583,7 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
           if (walked.wasInterrupted())
             return failure();
         }
-    if (!controlTails.empty() && failed(addTailValidity(kernel, controlTails,
+    if (!controlTails.empty() && failed(addTailValidity(kernel, kernel, controlTails,
                                                        /*includeStores=*/false)))
       return failure();
   }
@@ -699,6 +699,10 @@ LogicalResult realizeReusePointwiseTraversal(func::FuncOp kernel,
       ArrayAttr::get(kernel.getContext(), blockedMappings),
       originalType.getValidity(),
       originalType.getOwner());
+  if (!effectLocal && retainedReads.empty()) {
+    auto retained = retainCoveredPointwiseGraph(kernel, range, stores);
+    if (failed(retained)) return failure();
+  }
   // The original range remains the authority for the full reduction
   // traversal.  The internal writeback loop below owns a distinct blocked
   // range and replays only the store-side value graph against it.

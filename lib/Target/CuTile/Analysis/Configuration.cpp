@@ -19,6 +19,8 @@ collectConfigurationRequirements(func::FuncOp kernel) {
   auto requirements = gpu::collectReductionRequirements(
       kernel, reductionSources,
       gpu::ReductionRequirementScope::InvocationDependent);
+  const gpu::FragmentResourceAnalysis resources(kernel);
+  llvm::append_range(requirements, gpu::collectPointwiseRequirements(kernel, resources));
   auto resident = parameters->find(gpu::ParameterRole::ResidentWorkers);
   auto ctas = parameters->find(gpu::ParameterRole::ProviderCTAs);
   auto occupancy = parameters->find(gpu::ParameterRole::ProviderOccupancy);

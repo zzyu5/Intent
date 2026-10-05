@@ -485,26 +485,28 @@ FailureOr<Value> accessValidity(OpBuilder &builder, Location location,
   return result ? FailureOr<Value>(result) : FailureOr<Value>(failure());
 }
 
-LogicalResult addTailValidity(func::FuncOp kernel,
+LogicalResult addTailValidity(func::FuncOp kernel, Operation *scope,
                               llvm::DenseMap<Value, Value> &rangePredicates,
                               bool includeStores) {
-  SmallVector<LoadOp> loads;
+  SmallVector<Operation *> reads;
   SmallVector<StoreOp> stores;
   SmallVector<HistogramOp> histograms;
-  kernel.walk([&](LoadOp load) { loads.push_back(load); });
-  kernel.walk([&](StoreOp store) { stores.push_back(store); });
-  kernel.walk([&](HistogramOp histogram) { histograms.push_back(histogram); });
+  scope->walk([&](Operation *operation) {
+    if (isa<LoadOp, GatherOp>(operation)) reads.push_back(operation);
+  });
+  scope->walk([&](StoreOp store) { stores.push_back(store); });
+  scope->walk([&](HistogramOp histogram) { histograms.push_back(histogram); });
 
-  for (LoadOp load : loads) {
+  auto updateRead = [&](auto load) -> LogicalResult {
     bool affected = llvm::any_of(load.getCoordinates(), [&](Value coordinate) {
       return hasTailPredicate(coordinate, rangePredicates);
     });
     if (!affected)
-      continue;
+      return success();
     auto valueType = dyn_cast<FragmentType>(load.getResult().getType());
     if (!valueType)
       return load.emitOpError(
-          "pointwise blocked load must produce a physical fragment");
+          "pointwise blocked read must produce a physical fragment");
     OpBuilder builder(load);
     FailureOr<Value> valid = accessValidity(
         builder, load.getLoc(), load.getCoordinates(), rangePredicates, valueType,
@@ -534,6 +536,12 @@ LogicalResult addTailValidity(func::FuncOp kernel,
     }
     load.getValidMutable().assign(*valid);
     load.getFillMutable().assign(fill);
+    return success();
+  };
+  for (Operation *read : reads) {
+    LogicalResult updated = isa<LoadOp>(read) ? updateRead(cast<LoadOp>(read))
+                                             : updateRead(cast<GatherOp>(read));
+    if (failed(updated)) return failure();
   }
 
   for (HistogramOp histogram : histograms) {
@@ -957,7 +965,7 @@ LogicalResult PointwiseRewrite::materializeFixedRanges() {
   // without an IR use and lets dead-value cleanup invalidate the fact.
   if (!fixedRangePredicates.empty()) {
     if (failed(closeValueRelations(kernel, ValueRelationScope::AccessResults)) ||
-        failed(addTailValidity(kernel, fixedRangePredicates,
+        failed(addTailValidity(kernel, kernel, fixedRangePredicates,
                                /*includeStores=*/true)))
       return failure();
     fixedRangePredicates.clear();

@@ -525,7 +525,7 @@ LogicalResult PointwiseRewrite::materializeRanges() {
   // dead-value cleanup would otherwise erase the unused comparisons and leave
   // dangling Values in rangePredicates.
   if (failed(closeValueRelations(kernel, ValueRelationScope::AccessResults)) ||
-      failed(addTailValidity(kernel, rangePredicates,
+      failed(addTailValidity(kernel, kernel, rangePredicates,
                              /*includeStores=*/true)))
     return failure();
   return success();

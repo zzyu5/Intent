@@ -124,10 +124,7 @@ LogicalResult bindTraversalFragmentFootprints(
                      (role == ParameterRole::Reduction ||
                       role == ParameterRole::ReductionInner ||
                       role == ParameterRole::ReductionOuter);
-    bool pointwise =
-        category == ParameterCategory::Pointwise &&
-        (role == ParameterRole::OwnershipM || role == ParameterRole::OwnershipN);
-    if (!parameter.getBinding().getPointwiseChunk() && !reduction && !pointwise)
+    if (!reduction && !isPointwiseTraversalParameter(parameter))
       continue;
     auto fragments = resources.materializedTypesUsing(schema.getName());
     auto fits = [&](int64_t candidate) {

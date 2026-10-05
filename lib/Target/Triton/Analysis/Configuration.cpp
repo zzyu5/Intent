@@ -142,6 +142,7 @@ collectConfigurationRequirements(func::FuncOp kernel) {
   });
   auto requirements = gpu::collectReductionRequirements(
       kernel, reductionSources, gpu::ReductionRequirementScope::AllCandidates);
+  llvm::append_range(requirements, gpu::collectPointwiseRequirements(kernel, resources));
   auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
                         ArrayRef<Attribute> operands) {
     return gpu::PhysicalExprAttr::get(kernel.getContext(), kind, value,
