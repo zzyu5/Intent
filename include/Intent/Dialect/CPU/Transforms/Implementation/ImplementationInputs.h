@@ -26,14 +26,24 @@ public:
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepare(
       mlir::linalg::GenericOp operation,
       llvm::ArrayRef<InputRequirement> requirements);
+  // Query actual prepared storage after prepare(): every complete allocation
+  // must be outside concurrent work items and live at this future workset.
+  bool preparedOutsideWorkset(mlir::Operation *point,
+                             llvm::ArrayRef<InputSupply> supplies);
   mlir::FailureOr<InputSupply> prepareCaptured(
       mlir::linalg::GenericOp operation, mlir::memref::LoadOp input,
       const InputRequirement &requirement);
-  // Prepare this actual descriptor at its selected owner, without widening
-  // the window or moving it to a different traversal. Begins use source axes.
+  // Allocate one private slot from the caller's checked source-axis capacities.
+  // Its lexical owner must enclose the synchronous preparations and consumers.
+  mlir::Value createPrivateStorage(mlir::OpBuilder &builder, mlir::Location loc,
+      const InputRequirement &requirement, llvm::ArrayRef<int64_t> capacities);
+  // Prepare this actual descriptor in that slot at its original read point.
+  // The caller completes every prior consumer before reusing the slot; only the
+  // actual window is read or initialized. Begins use source axes.
   mlir::FailureOr<InputSupply> prepareAt(
       mlir::Value window, mlir::ValueRange begins,
-      const InputRequirement &requirement, mlir::Operation *scope);
+      const InputRequirement &requirement, llvm::ArrayRef<int64_t> capacities,
+      mlir::Value storage, mlir::Operation *scope);
   mlir::FailureOr<llvm::SmallVector<InputSupply>> prepareGroup(
       mlir::OpBuilder &builder, mlir::linalg::GenericOp operation,
       const ContractionTile &tile, ConfigurationAttr configuration,

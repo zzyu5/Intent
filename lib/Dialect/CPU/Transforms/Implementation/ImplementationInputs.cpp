@@ -120,6 +120,17 @@ memref::AllocOp allocateRepresentation(OpBuilder &b, Location loc,
   return storage;
 }
 
+MemRefType privateRepresentationType(const InputRequirement &requirement,
+                                    ArrayRef<int64_t> capacities) {
+  int64_t extent = capacities[requirement.panelAxis];
+  SmallVector<int64_t> shape{
+      extent / requirement.panelSize + (extent % requirement.panelSize != 0)};
+  for (auto [axis, capacity] : llvm::enumerate(capacities))
+    if (axis != requirement.panelAxis) shape.push_back(capacity);
+  shape.push_back(requirement.panelSize);
+  return MemRefType::get(shape, requirement.elementType);
+}
+
 bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
     Value storage, const InputRequirement &requirement, Operation *point) {
   auto type = cast<MemRefType>(source.getType());
@@ -286,28 +297,69 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepare(
   return impl->prepare(operation, requirements);
 }
 
+bool ImplementationInputs::preparedOutsideWorkset(
+    Operation *point, ArrayRef<InputSupply> supplies) {
+  if (supplies.empty() || !hasInvocationInputScope(point)) return false;
+  StorageAnalysis storage(impl->function);
+  DominanceInfo dominance(impl->function);
+  for (const InputSupply &supply : supplies) {
+    if (!dominance.properlyDominates(supply.storage, point)) return false;
+    auto origins = storage.origins(supply.storage);
+    if (!origins.complete || origins.values.empty()) return false;
+    for (Value origin : origins.values) {
+      auto allocation = origin.getDefiningOp<memref::AllocOp>();
+      if (!allocation || !hasInvocationInputScope(allocation) ||
+          !dominance.properlyDominates(origin, point)) return false;
+      auto lifetime = storage.lifetime(allocation);
+      if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(point))
+        return false;
+    }
+    if (!storage.preserves(point, supply.storage)) return false;
+  }
+  return true;
+}
+
 FailureOr<InputSupply> ImplementationInputs::prepareCaptured(
     linalg::GenericOp operation, memref::LoadOp input,
     const InputRequirement &requirement) {
   return impl->prepareCaptured(operation, input, requirement);
 }
 
+Value ImplementationInputs::createPrivateStorage(OpBuilder &builder, Location loc,
+    const InputRequirement &requirement, ArrayRef<int64_t> capacities) {
+  auto storage = builder.create<memref::AllocaOp>(loc,
+      privateRepresentationType(requirement, capacities));
+  storage.setAlignment(requirement.alignment);
+  return storage;
+}
+
 FailureOr<InputSupply> ImplementationInputs::prepareAt(Value window,
-    ValueRange begins, const InputRequirement &requirement, Operation *scope) {
-  if (requirement.storageScope == InputStorageScope::Invocation &&
-      !hasInvocationInputScope(scope))
-    return scope->emitError("invocation input preparation must precede its concurrent work items"), failure();
+    ValueRange begins, const InputRequirement &requirement,
+    ArrayRef<int64_t> capacities, Value storage, Operation *scope) {
+  if (requirement.storageScope != InputStorageScope::Consumer)
+    return scope->emitError("bounded private preparation requires consumer-owned storage"), failure();
   auto type = dyn_cast<MemRefType>(window.getType());
   DominanceInfo dominance(impl->function);
-  if (!type || begins.size() != static_cast<size_t>(type.getRank()) ||
+  if (!type || capacities.size() != static_cast<size_t>(type.getRank()) ||
+      begins.size() != capacities.size() || requirement.panelAxis >= capacities.size() ||
+      requirement.panelSize <= 0 ||
+      llvm::any_of(capacities, [](int64_t extent) { return extent <= 0; }) ||
       !dominance.properlyDominates(window, scope) ||
+      !dominance.properlyDominates(storage, scope) ||
       llvm::any_of(begins, [&](Value begin) {
         return !dominance.properlyDominates(begin, scope);
       }))
     return scope->emitError("selected input window and origins must dominate its preparation scope"), failure();
-  InputSupply supply = impl->materialize(window, requirement, scope);
-  supply.begins.assign(begins.begin(), begins.end());
-  return supply;
+  if (storage.getType() != privateRepresentationType(requirement, capacities))
+    return scope->emitError("prepared input slot does not match its proved capacity"), failure();
+  for (auto [axis, capacity] : llvm::enumerate(capacities)) {
+    if (!type.isDynamicDim(axis) && type.getDimSize(axis) > capacity)
+      return scope->emitError("prepared input window exceeds its proved capacity"), failure();
+  }
+  OpBuilder builder(scope);
+  copyRepresentation(builder, scope->getLoc(), window, storage, requirement, scope);
+  return InputSupply{requirement.operand, requirement.panelAxis, requirement.panelSize,
+                     storage, SmallVector<Value>(begins.begin(), begins.end())};
 }
 
 FailureOr<SmallVector<InputSupply>> ImplementationInputs::prepareGroup(

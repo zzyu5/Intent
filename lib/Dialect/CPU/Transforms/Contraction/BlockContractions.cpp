@@ -32,6 +32,8 @@ Value subview(OpBuilder &b, Location loc, Value source,
 struct InputCohort {
   InputRequirement requirement;
   unsigned freeAxis;
+  SmallVector<int64_t, 2> capacities;
+  int64_t preparedBytes;
 };
 
 std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
@@ -49,7 +51,7 @@ std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
   if (type.getRank() != 2 || !map.isProjectedPermutation() ||
       map.getNumResults() != 2 || requirement.panelAxis >= 2)
     return std::nullopt;
-  SmallVector<int64_t> capacities;
+  SmallVector<int64_t, 2> capacities;
   std::optional<unsigned> freeAxis;
   bool reduction = false;
   for (AffineExpr expression : map.getResults()) {
@@ -65,8 +67,8 @@ std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
       llvm::any_of(operation.getInputs(), [&](Value input) {
         return !storage.disjoint(input, operation.getOutputs()[0]);
       })) return std::nullopt;
-  // Bound this one preparation, including panel padding. Other local storage
-  // remains subject to the existing implementation/resource checks.
+  // This is the fixed slot used by prepareAt, including panel padding and
+  // alignment. A bounded accumulator cohort accounts for it at the same time.
   int64_t bits = requirement.elementType.isIndex()
       ? 64 : requirement.elementType.getIntOrFloatBitWidth();
   int64_t bytes = (bits + 7) / 8;
@@ -78,15 +80,41 @@ std::optional<InputCohort> inputCohort(linalg::GenericOp operation,
   int64_t packed = panels * requirement.panelSize;
   if (packed <= 0 || capacities[1 - requirement.panelAxis] > elements / packed)
     return std::nullopt;
-  return InputCohort{requirement, *freeAxis};
+  int64_t preparedBytes = packed * capacities[1 - requirement.panelAxis] * bytes;
+  if (requirement.alignment <= 0) return std::nullopt;
+  int64_t padding = preparedBytes % requirement.alignment
+      ? requirement.alignment - preparedBytes % requirement.alignment : 0;
+  if (padding > capabilities.getPrivateBytes() - preparedBytes) return std::nullopt;
+  return InputCohort{requirement, *freeAxis, std::move(capacities), preparedBytes + padding};
+}
+
+int64_t accumulatorCohortCapacity(linalg::GenericOp operation,
+    const Configuration &configuration, const InputCohort &cohort,
+    CapabilitiesAttr capabilities) {
+  Value output = operation.getOutputs()[0];
+  auto type = cast<MemRefType>(output.getType());
+  int64_t bytes = (type.getElementTypeBitWidth() + 7) / 8;
+  int64_t available = capabilities.getPrivateBytes() - cohort.preparedBytes;
+  int64_t rows = configuration.tileM, columns = configuration.tileN;
+  if (available <= 0 || bytes <= 0 || rows <= 0 || columns <= 0 ||
+      rows > available / bytes / columns) return 0;
+  int64_t size = rows * columns * bytes;
+  auto attr = output.getDefiningOp()->getAttrOfType<IntegerAttr>("alignment");
+  int64_t alignment = attr ? attr.getInt() : 1;
+  if (alignment <= 0) return 0;
+  int64_t padding = size % alignment ? alignment - size % alignment : 0;
+  if (padding > available - size) return 0;
+  int64_t capacity = available / (size + padding);
+  // A single output has no consumer reuse. Keep the existing supply order and
+  // backing unless at least two complete accumulator slots fit with the input.
+  return capacity >= 2 ? capacity : 0;
 }
 
 std::optional<std::array<int64_t, 2>> compactAccumulatorShape(
     linalg::GenericOp operation, const Configuration &configuration,
     ArrayRef<InputRequirement> requirements, CapabilitiesAttr capabilities) {
-  // A consumer cohort carries several outputs across K to share preparation.
-  // Keep that scope intact. Only the bounded per-group preparations below are
-  // budgeted alongside this output tile; both input reuse orders stay intact.
+  // Only preparations allocated in this workset belong in its private budget.
+  // Callers omit external supplies only after proving their actual owners.
   if (llvm::any_of(requirements, [](const InputRequirement &requirement) {
         return requirement.reuse != InputReuse::Group ||
                requirement.storageScope != InputStorageScope::Consumer;
@@ -217,6 +245,17 @@ Value blockedAccumulatorTile(OpBuilder &b, Location loc, Value backing,
   return b.create<memref::SubViewOp>(loc, selected, backing, offsets, sizes, strides);
 }
 
+Value privateAccumulator(OpBuilder &b, Location loc, Value original,
+                         ArrayRef<int64_t> shape) {
+  auto type = cast<MemRefType>(original.getType());
+  auto workspace = b.create<memref::AllocaOp>(loc,
+      MemRefType::get(shape, type.getElementType(), MemRefLayoutAttrInterface{},
+                     type.getMemorySpace()));
+  if (Attribute alignment = original.getDefiningOp()->getAttr("alignment"))
+    workspace->setAttr("alignment", alignment);
+  return workspace;
+}
+
 LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                     const ImplementationRegistry &implementations, ImplementationInputs &inputs,
                     bool parallelTiles = false) {
@@ -267,19 +306,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   if (compactVersion)
     compact = compactAccumulatorShape(operation, config, requirements,
                                       capabilities);
+  bool earlyCompact = compact.has_value();
   if (compact) keepInitialization = false;
-  bool blocked = compactVersion && !compact && canBlockAccumulator(operation, config);
-  bool initializeBacking = blocked && keepInitialization;
-  Value backing;
-  if (blocked) {
-    backing = createBlockedAccumulator(output, config);
-    if (initializeBacking) {
-      OpBuilder initialize(initialization->operation);
-      initialize.create<linalg::FillOp>(initialization->operation->getLoc(),
-          ValueRange{initial}, ValueRange{backing});
-    }
-    keepInitialization = false;
-  }
   if (epilogue)
     for (Operation *dependency : epilogue->dependencies)
       dependency->moveBefore(operation);
@@ -304,7 +332,6 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       nTasks = add(b, loc, fullN, b.create<arith::RemSIOp>(loc, nSize, bn));
     }
   };
-  if (blocked) materializeGeometry();
   Value nonempty = b.create<arith::AndIOp>(loc,
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, mSize, zero),
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, nSize, zero));
@@ -319,25 +346,62 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     b.setInsertionPointToStart(active.elseBlock());
     emptyReduction = b.create<scf::IfOp>(loc,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero), false);
-    b.setInsertionPointToStart(emptyReduction.thenBlock());
-    if (!blocked) {
-      if (!keepInitialization)
-        b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
-      if (epilogue) b.clone(*epilogue->consumer);
-    }
   }
   operation->moveBefore(active.thenBlock()->getTerminator());
   b.setInsertionPoint(operation);
-  StorageAnalysis activeStorage(operation->getParentOfType<func::FuncOp>());
-  auto cohort = inputs.hasReusableScope(operation, requirements)
-      ? std::nullopt : inputCohort(operation, requirements, config, capabilities, activeStorage);
+  std::optional<InputCohort> cohort;
+  if (!inputs.hasReusableScope(operation, requirements)) {
+    StorageAnalysis activeStorage(operation->getParentOfType<func::FuncOp>());
+    cohort = inputCohort(operation, requirements, config, capabilities, activeStorage);
+  }
   SmallVector<InputSupply> supplies;
   if (!cohort) {
     auto prepared = inputs.prepare(operation, requirements);
     if (failed(prepared)) return failure();
     supplies = std::move(*prepared);
   }
-  if (!blocked) materializeGeometry();
+  // Consumers already prepared outside the future workset do not require a
+  // K-outer cohort here. Preserve those snapshots and their preparation count;
+  // only Group scratch remains live alongside this macro accumulator.
+  if (compactVersion && !compact && !cohort &&
+      inputs.preparedOutsideWorkset(operation, supplies)) {
+    SmallVector<InputRequirement> localRequirements;
+    for (const InputRequirement &requirement : requirements)
+      if (requirement.reuse == InputReuse::Group)
+        localRequirements.push_back(requirement);
+    compact = compactAccumulatorShape(operation, config, localRequirements,
+                                      capabilities);
+  }
+  int64_t cohortCapacity = compactVersion && cohort
+      ? accumulatorCohortCapacity(operation, config, *cohort, capabilities) : 0;
+  bool blocked = compactVersion && !compact && !cohortCapacity &&
+                 canBlockAccumulator(operation, config);
+  bool initializeBacking = blocked && keepInitialization;
+  Value backing;
+  if (blocked) {
+    backing = createBlockedAccumulator(output, config);
+    if (initializeBacking) {
+      OpBuilder initialize(initialization->operation);
+      initialize.create<linalg::FillOp>(initialization->operation->getLoc(),
+          ValueRange{initial}, ValueRange{backing});
+    }
+  }
+  if (compact || cohortCapacity || blocked) keepInitialization = false;
+  bool tiledEmptyReduction = !earlyCompact && (compact || cohortCapacity || blocked);
+  if (tiledEmptyReduction) {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPoint(active);
+    materializeGeometry();
+  } else {
+    materializeGeometry();
+  }
+  if (emptyReduction && !tiledEmptyReduction) {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(emptyReduction.thenBlock());
+    if (!keepInitialization)
+      b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
+    if (epilogue) b.clone(*epilogue->consumer);
+  }
   LogicalResult status = success();
   auto group = [&](Value begin, Value extent, int64_t size,
                    const std::function<void(Value, Value)> &body) {
@@ -420,18 +484,12 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       coordinate(1, n, [&](Value nBegin, Value nCount) {
         Value destination;
         if (compact) {
-          auto workspace = b.create<memref::AllocaOp>(loc,
-              MemRefType::get(ArrayRef<int64_t>(*compact),
-                  cast<MemRefType>(output.getType()).getElementType(),
-                  MemRefLayoutAttrInterface{},
-                  cast<MemRefType>(output.getType()).getMemorySpace()));
-          if (Attribute alignment = output.getDefiningOp()->getAttr("alignment"))
-            workspace->setAttr("alignment", alignment);
+          Value workspace = privateAccumulator(b, loc, output, *compact);
           destination = subview(b, loc, workspace,
               {b.getIndexAttr(0), b.getIndexAttr(0)}, {mCount, nCount});
           if ((*implementation)->contraction.completePrivateInitialization) {
             b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{workspace});
-          } else {
+          } else if (earlyCompact) {
             auto empty = b.create<scf::IfOp>(loc,
                 b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero), false);
             OpBuilder::InsertionGuard guard(b);
@@ -468,6 +526,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       span = b.create<arith::MaxSIOp>(loc, one,
           b.create<arith::DivSIOp>(loc, reuseTasks, needed));
     }
+    if (cohortCapacity)
+      span = b.create<arith::MinSIOp>(loc, span, index(b, loc, cohortCapacity));
     Value groups = b.create<arith::CeilDivSIOp>(loc, reuseTasks, span);
     auto emitCohort = [&](Value free, Value group) {
       Value groupBegin = multiply(b, loc, group, span);
@@ -475,8 +535,19 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
           b.create<arith::SubIOp>(loc, reuseTasks, groupBegin));
       Value groupEnd = add(b, loc, groupBegin, groupCount);
       coordinate(freeAxis, free, [&](Value freeBegin, Value freeCount) {
+        Value accumulators;
+        if (cohortCapacity) {
+          accumulators = privateAccumulator(b, loc, output,
+              {cohortCapacity, config.tileM, config.tileN});
+          if ((*implementation)->contraction.completePrivateInitialization)
+            b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{accumulators});
+        }
+        Value preparedStorage = inputs.createPrivateStorage(b, loc,
+            cohort->requirement, cohort->capacities);
         // Every output tile sees the same ascending K chunks and first flag.
         // Only independent output tiles are interleaved to share preparation.
+        // A K chunk's synchronous consumers finish before the next copy reuses
+        // this cohort's slot; the source reads remain at each original K point.
         reduction([&](Value kBegin, Value depth, bool first) {
           Value last;
           if (epilogue)
@@ -494,7 +565,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
               SmallVector<OpFoldResult>(begins.begin(), begins.end()),
               SmallVector<OpFoldResult>(counts.begin(), counts.end()));
           auto consumers = b.create<scf::ForOp>(loc, groupBegin, groupEnd, one);
-          auto supply = inputs.prepareAt(window, begins, cohort->requirement, consumers);
+          auto supply = inputs.prepareAt(window, begins, cohort->requirement,
+                                         cohort->capacities, preparedStorage, consumers);
           if (failed(supply)) { status = failure(); return; }
           supplies.assign(1, *supply);
           OpBuilder::InsertionGuard guard(b);
@@ -504,10 +576,27 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
             Value nBegin = freeAxis == 1 ? freeBegin : reuseBegin;
             Value mCount = freeAxis == 0 ? freeCount : reuseCount;
             Value nCount = freeAxis == 1 ? freeCount : reuseCount;
-            Value destination = blocked
-                ? blockedAccumulatorTile(b, loc, backing, config,
-                    mBegin, nBegin, mCount, nCount)
-                : subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
+            Value destination;
+            if (cohortCapacity) {
+              SmallVector<OpFoldResult> offsets{
+                  b.create<arith::SubIOp>(loc, consumers.getInductionVar(), groupBegin).getResult(),
+                  b.getIndexAttr(0), b.getIndexAttr(0)};
+              SmallVector<OpFoldResult> sizes{
+                  b.getIndexAttr(1), getAsOpFoldResult(mCount), getAsOpFoldResult(nCount)};
+              SmallVector<OpFoldResult> strides(3, b.getIndexAttr(1));
+              const int64_t shape[] = {
+                  getConstantIntValue(mCount).value_or(ShapedType::kDynamic),
+                  getConstantIntValue(nCount).value_or(ShapedType::kDynamic)};
+              auto selected = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+                  shape, cast<MemRefType>(accumulators.getType()), offsets, sizes, strides));
+              destination = b.create<memref::SubViewOp>(loc, selected, accumulators,
+                                                       offsets, sizes, strides);
+            } else if (blocked) {
+              destination = blockedAccumulatorTile(b, loc, backing, config,
+                  mBegin, nBegin, mCount, nCount);
+            } else {
+              destination = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
+            }
             tileBlock(freeAxis == 0 ? freeBegin : reuseBegin,
                       freeAxis == 1 ? freeBegin : reuseBegin,
                       freeAxis == 0 ? freeCount : reuseCount,
@@ -522,7 +611,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                              freeAxis == 1 ? freeBegin : reuseBegin},
                   ValueRange{freeAxis == 0 ? freeCount : reuseCount,
                              freeAxis == 1 ? freeCount : reuseCount},
-                  blocked ? destination : Value{})))
+                  blocked || cohortCapacity ? destination : Value{})))
                 status = failure();
             }
           });
@@ -530,7 +619,12 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       });
     };
     if (serialTiles) {
-      loop(b, loc, zero, freeTasks, 1, [&](Value free) { emitCohort(free, zero); });
+      loop(b, loc, zero, freeTasks, 1, [&](Value free) {
+        if (cohortCapacity)
+          loop(b, loc, zero, groups, 1, [&](Value group) { emitCohort(free, group); });
+        else
+          emitCohort(free, zero);
+      });
     } else {
       auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
           ValueRange{freeTasks, groups}, ValueRange{one, one});
@@ -549,7 +643,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     b.setInsertionPointToStart(parallel.getBody());
     emitTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
-  if (blocked) {
+  if (tiledEmptyReduction) {
     // No source preparation or contraction executes for K=0. Complete exactly
     // the logical output tiles using the original scalar initializer/epilogue.
     OpBuilder::InsertionGuard guard(b);
@@ -557,8 +651,16 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     auto emptyTile = [&](Value m, Value n) {
       coordinate(0, m, [&](Value mBegin, Value mCount) {
         coordinate(1, n, [&](Value nBegin, Value nCount) {
-          Value destination = blockedAccumulatorTile(b, loc, backing, config,
-              mBegin, nBegin, mCount, nCount);
+          Value destination;
+          if (blocked) {
+            destination = blockedAccumulatorTile(b, loc, backing, config,
+                mBegin, nBegin, mCount, nCount);
+          } else {
+            Value workspace = privateAccumulator(b, loc, output,
+                {config.tileM, config.tileN});
+            destination = subview(b, loc, workspace,
+                {b.getIndexAttr(0), b.getIndexAttr(0)}, {mCount, nCount});
+          }
           if (!initializeBacking)
             b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{destination});
           if (failed(emitContractionEpilogue(b, *epilogue,
@@ -582,7 +684,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   if (epilogue) epilogue->consumer.erase();
   if (!keepInitialization) initialization->operation->erase();
   operation.erase();
-  if ((compact || blocked) && failed(eraseContractionAccumulator(output, backing)))
+  if ((compact || cohortCapacity || blocked) &&
+      failed(eraseContractionAccumulator(output, backing)))
     return failure();
   return success();
 }
