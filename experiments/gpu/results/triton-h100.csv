@@ -33,8 +33,8 @@ mamba_chunk_state,B1-S2048-H32-G8-P64-N128-C256-bf16,0.015024,0.014688,0.021288,
 mamba_state_passing,B1-C8-H32-state8192-fp32,0.013488,0.012176,0.011648,0.902728,0.863582,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba_chunk_scan,B1-S2048-H32-G8-P64-N128-C256-bf16,0.045328,0.035768,0.049648,0.789093,1.095305,pass,pass,,Intent target=cutile; source corpus=triton.
 mamba3_siso_forward,B1-S2048-HQK4-H16-DQK32-DV64-bf16,0.181536,0.266872,0.213160,1.470078,1.174202,pass,pass,同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲,Intent target=cutile; source corpus=triton. 同算法；source 使用近似 sin/cos；完整调用计时包含其输出及 workspace 分配，generated 使用预分配缓冲
-paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.303072,0.208208,0.218592,0.686992,0.721254,pass,pass,,Intent target=cutile; source corpus=triton.
-splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.813296,0.379112,0.215888,0.466143,0.265448,pass,pass,,Intent target=cutile; source corpus=triton.
+paged_gqa_decode,B16-QH32-KVH8-S8192-D128-page16-fp16,0.308848,0.203664,0.218800,0.659431,0.708439,pass,pass,,Intent target=cutile; source corpus=triton.
+splitk_paged_attention,B16-QH32-KVH8-S8192-D128-page16-split8-fp16,0.811960,0.202776,0.216448,0.249736,0.266575,pass,pass,,Intent target=cutile; source corpus=triton.
 paged_mla_decode,B8-QH128-KVH1-S8192-C512-R64-page16-fp16,0.370520,0.384048,0.226072,1.036511,0.610148,pass,pass,同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/page-table ABI 并写辅助 LSE；输入布局适配在计时前完成，完整 source 调用含 scale 分配
 block_sparse_gqa_decode,B8-QH32-KVH8-S8192-D128-blocks32x128,0.061800,0.063128,0.101984,1.021489,1.650227,pass,pass,同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配,Intent target=cutile; source corpus=triton. 同算法；source 使用 packed KV/topk ABI；输入布局适配在计时前完成，完整 source 调用含 partial buffer 分配
 flaggems_conv1d,B64-L16384-K5-fp16-same,0.099584,0.014896,0.014800,0.149582,0.148618,pass,pass,,Intent target=cutile; source corpus=triton.

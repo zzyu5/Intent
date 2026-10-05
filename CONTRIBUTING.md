@@ -907,6 +907,14 @@ Copy、同步 load 和 transpose 沿各自原读点追踪；partial counts 只�
 output 完整写入事实供相同存储闭合消费；scratch 的独立 Write effect 不代表完整输出。
 统一查询不删除 writer，copy/dead-write 清理由原 storage fixed point 完成。
 
+DSA 的 [LocalTransfers.h](lib/Dialect/DSA/Transforms/LocalTransfers.h) 查询同步本地
+transfer 的完整目标版本及 active rectangle；[LocalCopies.cpp](lib/Dialect/DSA/Transforms/LocalCopies.cpp)
+用同一版本读取闭包实现完整 forwarding、write-through 和矩形供数组合。矩形读取
+保留两轴有效前缀的交集、broadcast 与零 padding，新增 offset 运算必须证明不回绕。
+只有全部观察都能迁移、原 source 保持稳定且不会增加存活工作集时才删除中间 writer。
+扩展几何规则复用 `LocalSupplyRelations`；完成点和 native primitive 继续由原调度及
+目标 lowering 负责，不在此组件中改同步语义。
+
 `foldIntegerDifference` 只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
 
 需要整数值范围时，复用 [IntegerRangeAnalysis](include/Intent/Analysis/IntegerRanges.h)：它按实际位宽消费 MLIR `ConstantIntRanges` / `InferIntRangeInterface`，并查询标准控制流和 shaped-value dimensions。CPU、DSA、GPU 适配层只补自己的参数、执行域与类型事实；未知整数保留完整位宽范围，IR 改写后重建查询。`provesSignedNoWrap` 与 `isValuePreservingIntegerCast` 分别证明有符号数学运算不回绕、cast 保持数值，不能以结果非负或两个整数类型代替这些条件，也不向 IR 添加 `nsw/nuw` 假设。
@@ -1099,6 +1107,13 @@ producer 计算后的整体 source tail、consumer 的 neutral padding 是不同
 Contraction 仍在完整 operand 上中和 inactive members。保留片段按遍历坐标索引原
 SSA 快照，资源地址上的基址偏移不能用作快照 ordinal。原 ReductionReads 与
 contraction 的独立 replay 实现已经由共同入口取代。
+
+[AccessCoordinates.cpp](lib/Dialect/GPU/Transforms/Access/AccessCoordinates.cpp) 的
+`bindUnchangedAccessValues` 为 access composition 捕获未变化轴上的当前 SSA。
+它同时验证原 source 与新 fragment 的 broadcast 投影、被切轴不参与该值及实际
+插入点支配关系，然后完整重建剩余坐标、valid 和 fill。间接索引读取可以作为原
+快照保留，不因其它轴被切分就重读索引表；数据读取的 epoch 合法性仍由
+`canReplayReadAt` 决定。未知投影保留原有读取结构。
 
 资源查询的职责可对照本地 Triton `lib/Analysis/Alias.cpp:36–45`：真实 allocation
 建立根，view 与 select 传播可能来源。Intent 的
@@ -1385,6 +1400,16 @@ index、算术与 loop 构造放在 [LoopBuilders.h](include/Intent/Dialect/CPU/
 provider 通过公开 include 使用它们，不跨层包含 CPU 的私有源码路径。
 
 [ImplementationInputs.cpp](lib/Dialect/CPU/Transforms/Implementation/ImplementationInputs.cpp) 的 group supply 将配置容量与当前 source 维度的已证明上界取小，只收缩未拆成 panel 的维度；panel 宽度、对齐、有效写入窗口及生命周期保持原合同。Mojo 的 group panel 预算检查使用同一上界查询。配置容量是分块上限，不能代替当前 IR 已有的更紧界；有效窗口宽度也不能代替实现要求的固定 panel pitch。Weft 当前不请求这类 group preparation，不因此宣称它使用了同一 packing 路径。
+
+相邻私有 [InputProducers.h](lib/Dialect/CPU/Transforms/Implementation/InputProducers.h)
+记录实际准备读取；`BlockContractions` 完成消费者展开后，通过同一上下文的
+`fuseProducerCopies` 将当前 producer 直接写入既有供数表示。坐标先沿实际 descriptor
+回到 producer，再复用 `ProducerReplay` 与 `ProducerVersions`；不改变 packing、
+alignment 或 dtype 舍入边界。数值 producer 只接受一次完整准备，访问替换仍须证明
+每次原读取稳定。间接 gather 还需沿实际 descriptor 运输准备 lane，证明原连续
+向量读取不会变成跨行标量访问；布局物化有用途时保留。全部观察替换后重建版本
+查询，再删除整域物化。此状态只存在于
+该变换组内，不能跨删除已记录读取的规范化或其它 pass 沿用。
 
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
