@@ -40,6 +40,7 @@ namespace intent::gpu {
 #define GEN_PASS_DEF_REALIZESHAREDPROGRAMPASS
 #define GEN_PASS_DEF_MATERIALIZECONFIGURATIONSPASS
 #define GEN_PASS_DEF_FUSEINDEPENDENTTRAVERSALSPASS
+#define GEN_PASS_DEF_NORMALIZECOMPLETEDREDUCTIONSPASS
 #include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
 
 namespace {
@@ -335,6 +336,23 @@ public:
         return failure();
       auto kernel = getPhysicalKernel(module);
       if (failed(kernel)) return failure();
+      return verifySharedConfigTuples(*kernel);
+    };
+    if (failed(finishTransformation(module, getArgument(), transform())))
+      signalPassFailure();
+  }
+};
+
+class NormalizeCompletedReductionsPass
+    : public impl::NormalizeCompletedReductionsPassBase<NormalizeCompletedReductionsPass> {
+public:
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (failed(verifyGPUProgram(module))) return failure();
+      auto kernel = getPhysicalKernel(module);
+      if (failed(kernel) || failed(verifySharedConfigTuples(*kernel)))
+        return failure();
       if (reduction::normalizeCompletedReductions(*kernel)) {
         eraseDeadPhysicalValues(*kernel);
         if (failed(closeValueRelations(*kernel))) return failure();
@@ -370,6 +388,7 @@ void buildSharedGPUPipeline(OpPassManager &manager) {
   manager.addPass(createRealizeSharedProgramPass());
   manager.addPass(createMaterializeConfigurationsPass());
   manager.addPass(createFuseIndependentTraversalsPass());
+  manager.addPass(createNormalizeCompletedReductionsPass());
 }
 
 } // namespace intent::gpu

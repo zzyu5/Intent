@@ -1145,8 +1145,21 @@ Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/Mapping/ProgramGrid.cpp) �
 | [ReductionCoverage.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionCoverage.cpp) | static padding、完整 coverage 与 tail neutralization |
 | [ReductionDecomposition.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionDecomposition.cpp) | 多轴归约的分解和关系维护 |
 | [ReductionTraversal.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionTraversal.cpp) | runtime chunk loop、nested hoist 与条件内归约 |
+| [ReductionNormalization.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionNormalization.cpp) | 已完成普通归约链的坐标合并与树正规化；消费 coverage 和完整 combine 合同 |
 
-这些机制由同一公开 driver 调用，不是新 pass；driver 保留策略选择和改写后的 worklist 刷新。`SourcePlan` 只是一次改写读取的当前 SSA 事实，不能成为独立持久计划。跨变换需要复用的范围证明、replay 和参数生命周期仍使用上表中的共同接口。
+分块机制由同一公开 driver 调用；driver 保留策略选择和改写后的 worklist 刷新，内部查询不各自注册 pass。`SourcePlan` 只是一次改写读取的当前 SSA 事实，不能成为独立持久计划。跨变换需要复用的范围证明、replay 和参数生命周期仍使用上表中的共同接口。
+
+已完成归约链还有独立完整入口 `intent-gpu-normalize-completed-reductions`，输入为
+realized shared GPU IR 和已绑定的有限配置。默认 shared pipeline 在 traversal fusion
+之后运行它；显式 pipeline 可以省略，或用同一入口单独运行。该组自己删除死值、闭合
+value relations 并检查配置，不要求调用者追加 repair。新增规则应在当前 tuple schema、
+combine、identity 和物理成员覆盖上成立；不能借此改变 ordered loop 或 scan。
+
+职责对照是本地 Triton `python/triton/language/semantic.py:1679–1695`：全轴归约先
+把各 component reshape，再创建携带 scalar callback 的原生 reduce；callback 构造见
+`python/triton/language/core.py:2931–2944`。Intent 在自己的 pass 中证明哪些已完成的
+归约可以合流并写入真实 reshape/reduce，目标内部的归约树、通信和 layout 仍由
+Triton/cuTile 编译器处理。
 
 Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/Pointwise/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise/Pointwise.h) 使用以下机制：
 

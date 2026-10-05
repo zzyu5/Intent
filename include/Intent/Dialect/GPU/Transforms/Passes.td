@@ -257,8 +257,8 @@ def FuseIndependentTraversalsPass : IntentGPUTransformPass<
     Consumes realized traversals after finite configuration binding. Optionally
     fuses independent loops using current domains, captures, storage effects
     and all selected tuples, reuses stable loads and sinks their legal chains.
-    Normalizes completed reductions and closes their value relations, then
-    verifies the unchanged configuration contract.
+    Closes fused traversal relations and verifies the unchanged configuration
+    contract. Completed reduction normalization is a separate optional group.
 
     hoist-loop-invariants controls only invariant placement in cleanup after
     fusion and, when changed, after stable-load reuse. False preserves fusion,
@@ -268,3 +268,22 @@ def FuseIndependentTraversalsPass : IntentGPUTransformPass<
   }]> {
   let options = [HoistLoopInvariants];
 }
+
+def NormalizeCompletedReductionsPass : IntentGPUTransformPass<
+    "intent-gpu-normalize-completed-reductions",
+    "Combine completed GPU reduction trees", [{
+    Consumes verified, realized shared GPU IR after finite configuration
+    binding. Combines eligible ordinary reduction chains using their current
+    component schemas, combine bodies, identities, physical axes and complete
+    member coverage. Keeps source computations and reads at their original
+    points; only the collective trees and intermediate values change.
+
+    This optional group preserves the declared dtypes, numerical attributes,
+    logical members, effects and configuration domain. Unknown coverage or
+    incompatible combine contracts leave the existing legal program in place.
+    It owns dead-value cleanup, dependent value-relation closure and shared
+    configuration verification. Provider reductions and machine layouts remain
+    owned by the selected native compiler. The default shared pipeline runs it
+    after independent traversal fusion; explicit pipelines can omit or invoke
+    this group without requiring a separate relation-repair pass.
+  }]>;
