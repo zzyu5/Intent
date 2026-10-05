@@ -23,7 +23,10 @@ std::optional<ContractionEpilogue> queryContractionEpilogue(
 bool canCompactContractionAccumulator(mlir::linalg::GenericOp contraction,
     mlir::Operation *initialization, ContractionEpilogue &epilogue,
     StorageAnalysis &storage);
-mlir::LogicalResult eraseContractionAccumulator(mlir::Value accumulator);
+// Logical dimensions retain their old values; a replacement allocation keeps
+// the old release points instead of inheriting a new lifetime.
+mlir::LogicalResult eraseContractionAccumulator(
+    mlir::Value accumulator, mlir::Value replacementStorage = {});
 
 mlir::LogicalResult emitContractionEpilogue(mlir::OpBuilder &builder,
     ContractionEpilogue &epilogue, mlir::ValueRange offsets,

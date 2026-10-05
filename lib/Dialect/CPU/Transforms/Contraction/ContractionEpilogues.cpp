@@ -167,7 +167,8 @@ bool canCompactContractionAccumulator(linalg::GenericOp contraction,
   return true;
 }
 
-LogicalResult eraseContractionAccumulator(Value accumulator) {
+LogicalResult eraseContractionAccumulator(Value accumulator,
+                                          Value replacementStorage) {
   Operation *allocation = accumulator.getDefiningOp();
   auto type = cast<MemRefType>(accumulator.getType());
   SmallVector<Value> dynamicSizes;
@@ -178,7 +179,10 @@ LogicalResult eraseContractionAccumulator(Value accumulator) {
   SmallVector<Operation *> users(accumulator.getUsers());
   for (Operation *user : users) {
     if (auto release = dyn_cast<memref::DeallocOp>(user)) {
-      release.erase();
+      if (replacementStorage)
+        release.getMemrefMutable().assign(replacementStorage);
+      else
+        release.erase();
       continue;
     }
     auto dimension = dyn_cast<memref::DimOp>(user);

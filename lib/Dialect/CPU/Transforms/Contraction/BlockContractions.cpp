@@ -13,7 +13,9 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
+#include <limits>
 
 using namespace mlir;
 
@@ -126,6 +128,95 @@ std::optional<std::array<int64_t, 2>> compactAccumulatorShape(
   return shape;
 }
 
+bool canBlockAccumulator(linalg::GenericOp operation,
+                         const Configuration &configuration) {
+  Value output = operation.getOutputs()[0];
+  // Addressable storage retains its original lexical owner. A task-local
+  // allocation may instead be a provider's whole numeric value; do not enlarge
+  // that value's live representation by changing its allocation layout.
+  if (!isa_and_nonnull<memref::AllocOp>(output.getDefiningOp()) ||
+      !hasInvocationInputScope(operation)) return false;
+  auto type = cast<MemRefType>(output.getType());
+  int64_t bytes = (type.getElementTypeBitWidth() + 7) / 8;
+  int64_t limit = std::numeric_limits<int64_t>::max();
+  if (bytes <= 0 || configuration.tileM <= 0 || configuration.tileN <= 0 ||
+      configuration.tileM > limit / bytes / configuration.tileN) return false;
+  if (type.hasStaticShape()) {
+    int64_t elements = 1;
+    const int64_t tiles[] = {configuration.tileM, configuration.tileN};
+    for (auto [extent, tile] : llvm::zip(type.getShape(), tiles)) {
+      int64_t count = extent / tile + (extent % tile != 0);
+      int64_t capacity = std::min(extent, tile);
+      if (capacity && count > limit / bytes / capacity) return false;
+      int64_t padded = count * capacity;
+      if (padded && elements > limit / bytes / padded) return false;
+      elements *= padded;
+    }
+  }
+  return true;
+}
+
+Value createBlockedAccumulator(Value original,
+                               const Configuration &configuration) {
+  auto allocation = original.getDefiningOp<memref::AllocOp>();
+  auto type = allocation.getType();
+  OpBuilder b(allocation);
+  Location loc = allocation.getLoc();
+  Value zero = index(b, loc, 0), one = index(b, loc, 1);
+  SmallVector<int64_t, 4> shape(4, ShapedType::kDynamic);
+  SmallVector<Value, 4> extents(4), dynamicSizes;
+  const int64_t tiles[] = {configuration.tileM, configuration.tileN};
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    int64_t tile = tiles[axis];
+    if (!type.isDynamicDim(axis)) {
+      int64_t extent = type.getDimSize(axis);
+      shape[axis] = extent / tile + (extent % tile != 0);
+      shape[axis + 2] = std::min(extent, tile);
+      continue;
+    }
+    // Read the original allocation operands, not a descriptor defined later
+    // at the contraction. The replacement stays at the same lifetime boundary.
+    Value extent = allocation.getDynamicSizes()[type.getDynamicDimIndex(axis)];
+    Value width = index(b, loc, tile);
+    Value remainder = b.create<arith::RemSIOp>(loc, extent, width);
+    Value extra = b.create<arith::SelectOp>(loc,
+        b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, remainder, zero),
+        one, zero);
+    extents[axis] = add(b, loc,
+        b.create<arith::DivSIOp>(loc, extent, width), extra);
+    extents[axis + 2] = b.create<arith::MinSIOp>(loc, extent, width);
+  }
+  for (unsigned axis = 0; axis < 4; ++axis)
+    if (ShapedType::isDynamic(shape[axis])) dynamicSizes.push_back(extents[axis]);
+  auto backing = b.create<memref::AllocOp>(loc,
+      MemRefType::get(shape, type.getElementType(), MemRefLayoutAttrInterface{},
+                     type.getMemorySpace()), dynamicSizes);
+  if (Attribute alignment = allocation->getAttr("alignment"))
+    backing->setAttr("alignment", alignment);
+  return backing;
+}
+
+Value blockedAccumulatorTile(OpBuilder &b, Location loc, Value backing,
+                             const Configuration &configuration,
+                             Value m, Value n, Value rows, Value columns) {
+  Value bm = index(b, loc, configuration.tileM);
+  Value bn = index(b, loc, configuration.tileN);
+  SmallVector<OpFoldResult> offsets{
+      b.create<arith::DivSIOp>(loc, m, bm).getResult(),
+      b.create<arith::DivSIOp>(loc, n, bn).getResult(),
+      b.create<arith::RemSIOp>(loc, m, bm).getResult(),
+      b.create<arith::RemSIOp>(loc, n, bn).getResult()};
+  SmallVector<OpFoldResult> sizes{b.getIndexAttr(1), b.getIndexAttr(1),
+                                getAsOpFoldResult(rows), getAsOpFoldResult(columns)};
+  SmallVector<OpFoldResult> strides(4, b.getIndexAttr(1));
+  const int64_t shape[] = {
+      getConstantIntValue(rows).value_or(ShapedType::kDynamic),
+      getConstantIntValue(columns).value_or(ShapedType::kDynamic)};
+  auto selected = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+      shape, cast<MemRefType>(backing.getType()), offsets, sizes, strides));
+  return b.create<memref::SubViewOp>(loc, selected, backing, offsets, sizes, strides);
+}
+
 LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                     const ImplementationRegistry &implementations, ImplementationInputs &inputs,
                     bool parallelTiles = false) {
@@ -177,6 +268,18 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     compact = compactAccumulatorShape(operation, config, requirements,
                                       capabilities);
   if (compact) keepInitialization = false;
+  bool blocked = compactVersion && !compact && canBlockAccumulator(operation, config);
+  bool initializeBacking = blocked && keepInitialization;
+  Value backing;
+  if (blocked) {
+    backing = createBlockedAccumulator(output, config);
+    if (initializeBacking) {
+      OpBuilder initialize(initialization->operation);
+      initialize.create<linalg::FillOp>(initialization->operation->getLoc(),
+          ValueRange{initial}, ValueRange{backing});
+    }
+    keepInitialization = false;
+  }
   if (epilogue)
     for (Operation *dependency : epilogue->dependencies)
       dependency->moveBefore(operation);
@@ -186,6 +289,22 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   Value mSize = b.create<memref::DimOp>(loc, lhs, 0);
   Value nSize = b.create<memref::DimOp>(loc, rhs, 1);
   Value kSize = b.create<memref::DimOp>(loc, lhs, 1);
+  bool staticParallel = (*implementation)->contraction.staticParallelExtent;
+  Value bm, bn, bk, mTasks, nTasks, fullM, fullN;
+  auto materializeGeometry = [&] {
+    bm = index(b, loc, config.tileM);
+    bn = index(b, loc, config.tileN);
+    bk = index(b, loc, config.tileK);
+    mTasks = b.create<arith::CeilDivSIOp>(loc, mSize, bm);
+    nTasks = b.create<arith::CeilDivSIOp>(loc, nSize, bn);
+    if (staticParallel) {
+      fullM = b.create<arith::DivSIOp>(loc, mSize, bm);
+      fullN = b.create<arith::DivSIOp>(loc, nSize, bn);
+      mTasks = add(b, loc, fullM, b.create<arith::RemSIOp>(loc, mSize, bm));
+      nTasks = add(b, loc, fullN, b.create<arith::RemSIOp>(loc, nSize, bn));
+    }
+  };
+  if (blocked) materializeGeometry();
   Value nonempty = b.create<arith::AndIOp>(loc,
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, mSize, zero),
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, nSize, zero));
@@ -194,15 +313,18 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, kSize, zero));
   auto active = b.create<scf::IfOp>(loc, nonempty,
       !compact && (!keepInitialization || epilogue.has_value()));
+  scf::IfOp emptyReduction;
   if (!compact && (!keepInitialization || epilogue)) {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(active.elseBlock());
-    auto emptyReduction = b.create<scf::IfOp>(loc,
+    emptyReduction = b.create<scf::IfOp>(loc,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero), false);
     b.setInsertionPointToStart(emptyReduction.thenBlock());
-    if (!keepInitialization)
-      b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
-    if (epilogue) b.clone(*epilogue->consumer);
+    if (!blocked) {
+      if (!keepInitialization)
+        b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
+      if (epilogue) b.clone(*epilogue->consumer);
+    }
   }
   operation->moveBefore(active.thenBlock()->getTerminator());
   b.setInsertionPoint(operation);
@@ -215,18 +337,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     if (failed(prepared)) return failure();
     supplies = std::move(*prepared);
   }
-  Value bm = index(b, loc, config.tileM), bn = index(b, loc, config.tileN);
-  Value bk = index(b, loc, config.tileK);
-  Value mTasks = b.create<arith::CeilDivSIOp>(loc, mSize, bm);
-  Value nTasks = b.create<arith::CeilDivSIOp>(loc, nSize, bn);
-  bool staticParallel = (*implementation)->contraction.staticParallelExtent;
-  Value fullM, fullN;
-  if (staticParallel) {
-    fullM = b.create<arith::DivSIOp>(loc, mSize, bm);
-    fullN = b.create<arith::DivSIOp>(loc, nSize, bn);
-    mTasks = add(b, loc, fullM, b.create<arith::RemSIOp>(loc, mSize, bm));
-    nTasks = add(b, loc, fullN, b.create<arith::RemSIOp>(loc, nSize, bn));
-  }
+  if (!blocked) materializeGeometry();
   LogicalResult status = success();
   auto group = [&](Value begin, Value extent, int64_t size,
                    const std::function<void(Value, Value)> &body) {
@@ -327,6 +438,9 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
             b.setInsertionPointToStart(empty.thenBlock());
             b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{destination});
           }
+        } else if (blocked) {
+          destination = blockedAccumulatorTile(b, loc, backing, config,
+              mBegin, nBegin, mCount, nCount);
         } else {
           destination = subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
         }
@@ -335,7 +449,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
         });
         if (epilogue && failed(emitContractionEpilogue(
                 b, *epilogue, ValueRange{mBegin, nBegin}, ValueRange{mCount, nCount},
-                compact ? destination : Value{})))
+                compact || blocked ? destination : Value{})))
           status = failure();
       });
     });
@@ -386,11 +500,14 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
           OpBuilder::InsertionGuard guard(b);
           b.setInsertionPointToStart(consumers.getBody());
           coordinate(reuseAxis, consumers.getInductionVar(), [&](Value reuseBegin, Value reuseCount) {
-            Value destination = subview(b, loc, output,
-                {freeAxis == 0 ? freeBegin : reuseBegin,
-                 freeAxis == 1 ? freeBegin : reuseBegin},
-                {freeAxis == 0 ? freeCount : reuseCount,
-                 freeAxis == 1 ? freeCount : reuseCount});
+            Value mBegin = freeAxis == 0 ? freeBegin : reuseBegin;
+            Value nBegin = freeAxis == 1 ? freeBegin : reuseBegin;
+            Value mCount = freeAxis == 0 ? freeCount : reuseCount;
+            Value nCount = freeAxis == 1 ? freeCount : reuseCount;
+            Value destination = blocked
+                ? blockedAccumulatorTile(b, loc, backing, config,
+                    mBegin, nBegin, mCount, nCount)
+                : subview(b, loc, output, {mBegin, nBegin}, {mCount, nCount});
             tileBlock(freeAxis == 0 ? freeBegin : reuseBegin,
                       freeAxis == 1 ? freeBegin : reuseBegin,
                       freeAxis == 0 ? freeCount : reuseCount,
@@ -404,7 +521,8 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                   ValueRange{freeAxis == 0 ? freeBegin : reuseBegin,
                              freeAxis == 1 ? freeBegin : reuseBegin},
                   ValueRange{freeAxis == 0 ? freeCount : reuseCount,
-                             freeAxis == 1 ? freeCount : reuseCount})))
+                             freeAxis == 1 ? freeCount : reuseCount},
+                  blocked ? destination : Value{})))
                 status = failure();
             }
           });
@@ -431,11 +549,41 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     b.setInsertionPointToStart(parallel.getBody());
     emitTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
+  if (blocked) {
+    // No source preparation or contraction executes for K=0. Complete exactly
+    // the logical output tiles using the original scalar initializer/epilogue.
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(emptyReduction.thenBlock());
+    auto emptyTile = [&](Value m, Value n) {
+      coordinate(0, m, [&](Value mBegin, Value mCount) {
+        coordinate(1, n, [&](Value nBegin, Value nCount) {
+          Value destination = blockedAccumulatorTile(b, loc, backing, config,
+              mBegin, nBegin, mCount, nCount);
+          if (!initializeBacking)
+            b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{destination});
+          if (failed(emitContractionEpilogue(b, *epilogue,
+                  ValueRange{mBegin, nBegin}, ValueRange{mCount, nCount},
+                  destination))) status = failure();
+        });
+      });
+    };
+    if (serialTiles) {
+      loop(b, loc, zero, mTasks, 1, [&](Value m) {
+        loop(b, loc, zero, nTasks, 1, [&](Value n) { emptyTile(m, n); });
+      });
+    } else {
+      auto parallel = b.create<scf::ParallelOp>(loc, ValueRange{zero, zero},
+          ValueRange{mTasks, nTasks}, ValueRange{one, one});
+      b.setInsertionPointToStart(parallel.getBody());
+      emptyTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
+    }
+  }
   if (failed(status)) return failure();
   if (epilogue) epilogue->consumer.erase();
   if (!keepInitialization) initialization->operation->erase();
   operation.erase();
-  if (compact && failed(eraseContractionAccumulator(output))) return failure();
+  if ((compact || blocked) && failed(eraseContractionAccumulator(output, backing)))
+    return failure();
   return success();
 }
 
