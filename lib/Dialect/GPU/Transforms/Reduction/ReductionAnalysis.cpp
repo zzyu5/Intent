@@ -1,6 +1,8 @@
 #include "ReductionAnalysis.h"
+#include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
+#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -40,6 +42,58 @@ bool exceedsRegisterFile(Value source, func::FuncOp kernel) {
   // Even the smallest source must leave space for the reduction state.
   // Larger concrete tuples are filtered after all parameters are bound.
   return registers && *registers >= budget;
+}
+
+bool shouldTileReductionSources(ReduceOp reduce, func::FuncOp kernel) {
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!capabilities || capabilities.getRegistersPerUnit() <= 0 ||
+      reduce.getAxes().empty()) return false;
+  int64_t budget = capabilities.getRegistersPerUnit();
+  __int128 footprint = 0;
+  llvm::DenseSet<Value> sources;
+  for (Value source : reduce.getSources()) {
+    // A full/splat scalar is not another fragment-sized materialization. Nor
+    // do repeated tuple operands require independent physical payloads.
+    if (uniformScalarSource(source)) {
+      // The optional schedule must use the same scalar frontier supported by
+      // the realizer, even when uniform analysis can see through more views.
+      if (failed(scalarSource(source))) return false;
+      continue;
+    }
+    if (!sources.insert(source).second) continue;
+    auto words = minimumFragmentRegisterFootprint(
+        kernel, source, budget, FragmentFootprintScope::PhysicalShape);
+    if (!words) return false;
+    footprint += *words;
+  }
+  if (sources.size() < 2 || footprint < budget) return false;
+
+  ReplayPolicy reuse(kernel, reduce.getSources(), {reduce.getOperation()});
+  PhysicalProgramAnalysis analysis(kernel);
+  for (Value source : sources) {
+    if (!reuse.removesProducer(source) || reuse.duplicatesExpensiveWork(source))
+      return false;
+    auto type = dyn_cast<FragmentType>(source.getType());
+    if (!type) return false;
+    for (int64_t axis : reduce.getAxes()) {
+      if (axis < 0 || axis >= static_cast<int64_t>(type.getShape().size()))
+        return false;
+      auto relation = queryAxisMap(type, axis);
+      auto plan = analyzeSource(source, axis, /*diagnose=*/false);
+      if (failed(relation) || failed(plan) || plan->roots.empty() ||
+          !analysis.replayAt(source, sourceAxisIdentity(*relation),
+              PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true,
+              reduce, IRMapping{}, relation->getDimensionId()).isReplayable())
+        return false;
+      for (LoadOp load : plan->roots) {
+        auto access = analyzeRoot(load, plan->ranges, plan->reductionAxis,
+                                  /*diagnose=*/false);
+        if (failed(access) || !*access || !reuse.removesProducer(load.getResult()))
+          return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool requiresPhysicalRealization(ReduceOp reduce) {
@@ -177,7 +231,7 @@ bool isUnitStep(Value value) {
 
 FailureOr<std::optional<RootAccess>>
 analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
-            unsigned preferredAxis) {
+            unsigned preferredAxis, bool diagnose) {
   auto fragment = dyn_cast<FragmentType>(load.getResult().getType());
   if (!fragment || reductionRanges.empty())
     return std::optional<RootAccess>();
@@ -216,10 +270,11 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
                      return relation.axis != preferredAxis;
                    });
   }
-  if (resultAxes.size() != 1)
-    return load.emitOpError(
-               "reduction traversal has no unique root-load fragment axis"),
-           failure();
+  if (resultAxes.size() != 1) {
+    if (diagnose)
+      load.emitOpError("reduction traversal has no unique root-load fragment axis");
+    return failure();
+  }
   unsigned reductionAxis = resultAxes.front().axis;
   MakeRangeOp resultAuthority = resultAxes.front().authority;
   SmallVector<std::pair<unsigned, unsigned>, 2> occurrences;
@@ -257,6 +312,7 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
            projection.targetToSource[reductionAxis] == occurrence.second;
   });
   if (occurrences.empty() || !projectsToReductionAxis) {
+    if (!diagnose) return failure();
     InFlightDiagnostic diagnostic = load.emitOpError(
         "reduction source provenance is absent from load coordinates");
     diagnostic << "; reduction_range=" << resultAuthority.getResult().getType()
@@ -266,13 +322,16 @@ analyzeRoot(LoadOp load, ArrayRef<MakeRangeOp> reductionRanges,
       diagnostic << ", coordinate=" << value.getType();
     return failure();
   }
-  if (!isUnitStep(resultAuthority.getStep()))
-    return load.emitOpError("reduction load range is not unit-step");
+  if (!isUnitStep(resultAuthority.getStep())) {
+    if (diagnose) load.emitOpError("reduction load range is not unit-step");
+    return failure();
+  }
   return std::optional<RootAccess>(RootAccess{
       load, resultAuthority, occurrences.front().first, reductionAxis});
 }
 
-FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
+FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis,
+                                  bool diagnose) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || reductionAxis >= fragment.getShape().size())
     return failure();
@@ -324,7 +383,7 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned reductionAxis) {
     if (!load || llvm::is_contained(plan.roots, load))
       continue;
     FailureOr<std::optional<RootAccess>> root =
-        analyzeRoot(load, plan.ranges, reductionAxis);
+        analyzeRoot(load, plan.ranges, reductionAxis, diagnose);
     if (failed(root))
       return failure();
     if (*root)

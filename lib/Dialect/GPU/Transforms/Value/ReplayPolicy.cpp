@@ -313,6 +313,13 @@ bool ReplayPolicy::duplicatesExpensiveWork(Value root,
   return false;
 }
 
+bool ReplayPolicy::removesProducer(Value value) const {
+  Operation *producer = value.getDefiningOp();
+  if (!producer || !slice.contains(producer)) return false;
+  llvm::DenseSet<Operation *> active;
+  return !survives(producer, active);
+}
+
 bool ReplayPolicy::retains(Value value, Operation *anchor,
                            const IRMapping *bindings) const {
   auto fragment = dyn_cast<FragmentType>(value.getType());

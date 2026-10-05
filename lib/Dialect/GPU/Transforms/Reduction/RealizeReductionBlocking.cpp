@@ -24,6 +24,8 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       reduce.getSources(),
       [&](Value source) { return exceedsRegisterFile(source, kernel); });
   const bool needsRealization = requiresPhysicalRealization(reduce);
+  const bool boundedSources = !needsRealization &&
+      shouldTileReductionSources(reduce, kernel);
   if (!needsRealization && oversized && reduce.getAxes().size() == 1) {
     PhysicalProgramAnalysis analysis(kernel);
     const unsigned axis = reduce.getAxes().front();
@@ -68,10 +70,10 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
     if (*fullCoverage)
       return success();
   }
-  // A fixed fragment already gives the first-class reduction a complete
-  // physical axis. Replaying its producer graph into another chunk loop would
-  // duplicate structured loop carries without adding a physical decision.
-  if (!required)
+  // A fixed physical axis alone does not require replay. The optional working
+  // set schedule proves that existing producers disappear instead of retaining
+  // them alongside newly supplied chunks.
+  if (!required && !boundedSources)
     return success();
   int64_t reductionAxis = reduce.getAxes().front();
   SmallVector<SourcePlan> sourcePlans;
@@ -200,7 +202,7 @@ LogicalResult realizeReduce(ReduceOp reduce, func::FuncOp kernel) {
       if (needsPairedTraversal(plan))
         plan.ranges.push_back(traversal.authority);
   }
-  if (oversized || !isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
+  if (oversized || boundedSources || !isCompileTimeExtent(sourceExtent) || hasDerivedSource ||
       hasRuntimeSourceRange || hasConstructionScalarSource)
     return realizeRuntimeReduce(reduce, sourcePlans, kernel,
                                 /*tileProducerFreeAxis=*/false);

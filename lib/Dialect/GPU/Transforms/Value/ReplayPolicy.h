@@ -26,6 +26,10 @@ public:
   bool duplicatesExpensiveWork(mlir::Value root,
                               const mlir::IRMapping *bindings = nullptr) const;
 
+  // The current producer has no surviving use outside this rewrite's slice.
+  // Replay legality and actual removal remain obligations of the caller.
+  bool removesProducer(mlir::Value value) const;
+
   bool retains(mlir::Value value, mlir::Operation *anchor,
                const mlir::IRMapping *bindings = nullptr) const;
 

@@ -208,8 +208,9 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         "multi-axis reduction decomposition requires at least one source");
 
   unsigned outerAxis = static_cast<unsigned>(reduce.getAxes().front());
-  FailureOr<bool> fullCoverage =
-      decomposeFullCoverageMultiAxisReduce(reduce, kernel, outerAxis);
+  FailureOr<bool> fullCoverage = shouldTileReductionSources(reduce, kernel)
+      ? FailureOr<bool>(false)
+      : decomposeFullCoverageMultiAxisReduce(reduce, kernel, outerAxis);
   if (failed(fullCoverage))
     return failure();
   if (*fullCoverage)

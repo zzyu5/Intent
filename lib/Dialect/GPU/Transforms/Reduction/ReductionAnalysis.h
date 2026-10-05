@@ -30,6 +30,10 @@ bool isCompileTimeValue(mlir::Value value);
 
 bool exceedsRegisterFile(mlir::Value source, mlir::func::FuncOp kernel);
 
+// Optional bounded supply for a large tuple whose current full producers can
+// actually be removed. This nominal footprint is not a native resource limit.
+bool shouldTileReductionSources(ReduceOp reduce, mlir::func::FuncOp kernel);
+
 bool requiresPhysicalRealization(ReduceOp reduce);
 
 mlir::ArrayAttr reductionSources(ReduceOp reduce);
@@ -44,10 +48,10 @@ bool isReplayableWithoutLoad(mlir::Value value, PhysicalSourceAxis source);
 
 mlir::FailureOr<std::optional<RootAccess>>
 analyzeRoot(LoadOp load, llvm::ArrayRef<MakeRangeOp> reductionRanges,
-            unsigned preferredAxis);
+            unsigned preferredAxis, bool diagnose = true);
 
 mlir::FailureOr<SourcePlan>
-analyzeSource(mlir::Value source, unsigned reductionAxis);
+analyzeSource(mlir::Value source, unsigned reductionAxis, bool diagnose = true);
 
 mlir::FailureOr<ParameterAttr>
 parameterForExtent(mlir::func::FuncOp kernel, PhysicalExprAttr extent);
