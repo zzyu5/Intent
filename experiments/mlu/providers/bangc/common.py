@@ -121,8 +121,8 @@ class RemoteSequence:
 
         output_tree = _tree(output_spec, outputs)
         if source is not None:
-            operation, tensor = source
-            manifest["source"] = {"operation": operation, "input": describe(tensor)}
+            operation, inputs = source
+            manifest["source"] = {"operation": operation, "inputs": [describe(value) for value in inputs]}
             shutil.copytree(self.context.project_root / "experiments/mlu/baselines/cnnl", path / "source")
         (path / "manifest.json").write_text(json.dumps(manifest, indent=2))
         report_stage("source_launch")
@@ -171,6 +171,7 @@ class RemoteSequence:
             native_comparison=measure,
             note="MLU CNRT notifier timing; supplied tensor shapes and element strides specialize the compiled variant; "
                  + (f"CNNL same-device {source[0]} source; both results checked against the original numerical reference; "
-                    + ("accurate last-axis softmax; " if source[0] == "softmax" else "NaN-propagating ReLU; ") +
-                    "descriptor setup and host transfers excluded" if source is not None else
+                    + {"softmax": "accurate last-axis softmax; ", "relu": "NaN-propagating ReLU; ",
+                       "matmul": "f16 inputs/output, f32 accumulation, alpha=1/beta=0, NN; "}[source[0]] +
+                    "descriptor setup, workspace allocation and host transfers excluded" if source is not None else
                     "original native source is a numerical reference; no cross-device latency ratio"))

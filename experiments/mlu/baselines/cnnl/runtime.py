@@ -14,10 +14,11 @@ from intent.runtime.bangc.program import benchmark_calls, launch_calls
 class CNNLCall:
     """A source callable using the same CNRT queue/notifier timing as generated code."""
 
-    def __init__(self, library, operation, source, output, rows, columns):
+    def __init__(self, library, operation, inputs, output, rows, columns, depth):
         self.program = self
         self.library = library
-        self.source, self.output = source, output
+        self.inputs, self.output = inputs, output
+        source = inputs[0]
         self.runtime = source.runtime
         self.target = SimpleNamespace(device=source.device)
         self.queue, self.context = ctypes.c_void_p(), ctypes.c_void_p()
@@ -25,7 +26,7 @@ class CNNLCall:
         self.runtime.invoke("cnrtQueueCreate", ctypes.byref(self.queue))
         try:
             self.check(library.source_create(ctypes.byref(self.context), self.queue,
-                {"relu": 0, "softmax": 1}[operation], rows, columns))
+                {"relu": 0, "softmax": 1, "matmul": 2}[operation], rows, columns, depth))
         except Exception:
             self.close()
             raise
@@ -47,14 +48,15 @@ class CNNLCall:
 
     def _validate(self):
         self.check_open()
-        if not self.source.pointer or not self.output.pointer:
+        if any(not value.pointer for value in (*self.inputs, self.output)):
             raise ValueError("CNNL source refers to a closed device allocation")
         self.runtime.select(self.target.device)
 
     def _submit(self, queue):
         if queue.value != self.queue.value:
             raise ValueError("CNNL source must use its bound CNRT queue")
-        self.check(self.library.source_run(self.context, self.source.pointer, self.output.pointer))
+        rhs = self.inputs[1].pointer if len(self.inputs) == 2 else None
+        self.check(self.library.source_run(self.context, self.inputs[0].pointer, rhs, self.output.pointer))
 
     def enqueue(self, queue):
         self._validate()
@@ -80,9 +82,9 @@ def load_source(root: Path, neuware: str):
         "-lcnnl", "-lcnrt", "-o", str(library)], check=True)
     result = ctypes.CDLL(str(library))
     pointer = ctypes.c_void_p
-    result.source_create.argtypes = [ctypes.POINTER(pointer), pointer, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    result.source_create.argtypes = [ctypes.POINTER(pointer), pointer, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     result.source_create.restype = ctypes.c_int
-    result.source_run.argtypes = [pointer, pointer, pointer]
+    result.source_run.argtypes = [pointer, pointer, pointer, pointer]
     result.source_run.restype = ctypes.c_int
     result.source_destroy.argtypes = [pointer]
     result.source_destroy.restype = None
@@ -94,20 +96,33 @@ def load_source(root: Path, neuware: str):
 def run(manifest: Path, output: Path, *, device: int, neuware: str):
     request = json.loads(manifest.read_text())
     specification = request["source"]
-    view = specification["input"]
-    rows, columns = view["shape"]
-    buffer = request["buffers"][view["buffer"]]
-    if buffer["dtype"] != "f16" or view["strides"] != [columns, 1] or view["offset"]:
-        raise NotImplementedError("CNNL production baselines require contiguous rank-2 f16 inputs")
+    views = specification["inputs"]
+    arity = {"relu": 1, "softmax": 1, "matmul": 2}[specification["operation"]]
+    if len(views) != arity:
+        raise ValueError("CNNL source input arity does not match its operation")
+    for view in views:
+        if len(view["shape"]) != 2 or request["buffers"][view["buffer"]]["dtype"] != "f16" or \
+                view["strides"] != [view["shape"][1], 1] or view["offset"]:
+            raise NotImplementedError("CNNL production baselines require contiguous rank-2 f16 inputs")
+    rows, columns = views[0]["shape"]
+    depth = 0
+    if arity == 2:
+        depth, columns = columns, views[1]["shape"][1]
+        if views[1]["shape"][0] != depth:
+            raise ValueError("CNNL matrix source contraction extents differ")
     library = load_source(manifest.parent, neuware)
     output.mkdir(parents=True, exist_ok=True)
-    source = DeviceBuffer((rows, columns), "f16", device=device, neuware=neuware)
+    inputs = []
     result = None
     call = None
     try:
-        source.copy_from_host((manifest.parent / buffer["file"]).read_bytes())
+        for view in views:
+            value = DeviceBuffer(tuple(view["shape"]), "f16", device=device, neuware=neuware)
+            inputs.append(value)
+            buffer = request["buffers"][view["buffer"]]
+            value.copy_from_host((manifest.parent / buffer["file"]).read_bytes())
         result = DeviceBuffer((rows, columns), "f16", device=device, neuware=neuware)
-        call = CNNLCall(library, specification["operation"], source, result, rows, columns)
+        call = CNNLCall(library, specification["operation"], inputs, result, rows, columns, depth)
         launch_calls((call,))
         (output / "source.bin").write_bytes(result.to_host())
         milliseconds = benchmark_calls((call,))
@@ -120,7 +135,8 @@ def run(manifest: Path, output: Path, *, device: int, neuware: str):
             call.close()
         if result is not None:
             result.close()
-        source.close()
+        for value in reversed(inputs):
+            value.close()
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ def relu(context):
     sequence = RemoteSequence(context)
     output = sequence.add(relu_forward, {"x": x})["output"]
     source = tilegym_source(context, "experiments/gpu/baselines/cutile/tilegym/activation/relu/relu.py", "relu")
-    return sequence.comparison(output, lambda: source.relu(x), Tolerance(atol=0.0), source=("relu", x))
+    return sequence.comparison(output, lambda: source.relu(x), Tolerance(atol=0.0), source=("relu", (x,)))
 
 
 def fused_softmax(context):
@@ -29,7 +29,7 @@ def fused_softmax(context):
     runtime = load_module(context.project_root / "experiments/gpu/baselines/triton/triton/normalization/softmax/02-fused-softmax_runtime.py",
         "intent_bangc_source_softmax")
     source = runtime.load_softmax()
-    return sequence.comparison(output, lambda: source(x), Tolerance(atol=1e-2, rtol=1e-2), source=("softmax", x))
+    return sequence.comparison(output, lambda: source(x), Tolerance(atol=1e-2, rtol=1e-2), source=("softmax", (x,)))
 
 
 def dense_gemm(context):
@@ -40,7 +40,7 @@ def dense_gemm(context):
     runtime = load_module(context.project_root / "experiments/gpu/baselines/triton/triton/gemm/dense/03-matrix-multiplication_runtime.py",
         "intent_bangc_source_gemm")
     source = runtime.load_matmul()
-    return sequence.comparison(output, lambda: source(a, b), Tolerance(atol=1e-2, rtol=1e-2))
+    return sequence.comparison(output, lambda: source(a, b), Tolerance(atol=1e-2, rtol=1e-2), source=("matmul", (a, b)))
 
 
 CASES = {"relu": relu, "fused_softmax": fused_softmax, "dense_gemm": dense_gemm,
