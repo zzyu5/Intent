@@ -2,6 +2,7 @@ add_mlir_library(MLIRIntentDSATransforms
   Passes.cpp
   MatrixSupply.cpp
   MatrixSupplyRelations.cpp
+  MatrixPanels.cpp
   CollectiveGather.cpp
   IndexPrograms.cpp
   LocalSupplyRelations.cpp

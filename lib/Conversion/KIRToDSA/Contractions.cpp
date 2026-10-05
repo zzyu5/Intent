@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Dialect/DSA/Transforms/MatrixPanels.h"
 
 namespace intent::kir_to_dsa {
 
@@ -91,7 +92,40 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
       roots = {{matrix.getLhs(), leftReduce}, {matrix.getRhs(), rightReduce}};
       plan = planExecutionSlices(*matrix->getBlock(), 0, roots);
     }
-    auto domain = plan ? sliceDomain(*plan, config.getTileK(), !distributedTiles) : std::nullopt;
+    int64_t capacity = config.getTileK();
+    // Existing complete snapshots already pay for their full reduction axis.
+    // Inspect their actual descriptors without materializing another source or
+    // changing a surrounding ordered loop's state transitions.
+    auto snapshotDepth = [&](Value source, unsigned axis) -> std::optional<int64_t> {
+      while (!values.lookupOrNull(source)) {
+        auto transpose = source.getDefiningOp<TransposeOp>();
+        if (!transpose) return std::nullopt;
+        axis = cast<IntegerAttr>(transpose.getPermutation()[axis]).getInt();
+        source = transpose.getInput();
+      }
+      Value actual = values.lookup(source);
+      auto found = localShapes.find(actual);
+      if (found == localShapes.end() || axis >= found->second.size()) return std::nullopt;
+      const LocalAxis &selected = found->second[axis];
+      APInt count;
+      if (!matchPattern(selected.begin, m_Zero()) ||
+          !sameIndex(selected.count, selected.extent) ||
+          !matchPattern(selected.extent, m_ConstantInt(&count)) ||
+          count.getSExtValue() != selected.capacity)
+        return std::nullopt;
+      return selected.capacity;
+    };
+    if (plan) {
+      auto available = snapshotDepth(matrix.getLhs(), leftReduce);
+      for (ContractOp product : group) {
+        auto rhs = snapshotDepth(product.getRhs(), rightReduce);
+        if (!rhs || !available || *rhs != *available) { available.reset(); break; }
+      }
+      if (available)
+        capacity = dsa::selectMatrixPanelDepth(function, config, leftType.getElementType(),
+            shape[0].capacity, shape[1].capacity, *available, capacity, group.size());
+    }
+    auto domain = plan ? sliceDomain(*plan, capacity, !distributedTiles) : std::nullopt;
     APInt extent;
     bool needsSlicing = domain && (distributedTiles ||
         !matchPattern(domain->extent, m_ConstantInt(&extent)) || extent.getSExtValue() > domain->capacity);

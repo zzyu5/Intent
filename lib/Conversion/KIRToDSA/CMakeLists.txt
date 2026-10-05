@@ -12,6 +12,6 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   Worksets.cpp
 
   LINK_LIBS PUBLIC MLIRIntentAnalysis MLIRIntentConversionSupport MLIRIntentDialect MLIRIntentDSADialect
-    MLIRIntentDSAAnalysis
+    MLIRIntentDSAAnalysis MLIRIntentDSATransforms
     MLIRArithDialect MLIRFuncDialect MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect
     MLIRIR MLIRSupport MLIRTransformUtils)

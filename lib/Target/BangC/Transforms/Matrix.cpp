@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "Intent/Dialect/DSA/Transforms/MatrixPanels.h"
 
 using namespace mlir;
 namespace intent::bangc {
@@ -111,14 +112,17 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
     }
     while (matrix->getPrevNode() != previous) matrix->getPrevNode()->erase();
   }
-  if (lhsType.getShape() == ArrayRef<int64_t>({bm, bk}) &&
-      rhsType.getShape() == (rhsTransposed ? ArrayRef<int64_t>({bn, bk}) : ArrayRef<int64_t>({bk, bn})) &&
+  int64_t panelDepth = lhsType.getDimSize(1);
+  if (dsa::matrixPanelStorage(element, bm, bn, panelDepth) &&
+      lhsType.getShape() == ArrayRef<int64_t>({bm, panelDepth}) &&
+      rhsType.getShape() == (rhsTransposed ? ArrayRef<int64_t>({bn, panelDepth}) : ArrayRef<int64_t>({panelDepth, bn})) &&
       accType.getShape() == ArrayRef<int64_t>({bm, bn}) &&
       matrix.getAccumulator().getDefiningOp<memref::AllocaOp>() &&
       matrix.getAccumulator() != matrix.getLhs() && matrix.getAccumulator() != matrix.getRhs() &&
       paddedInput(matrix, matrix.getLhs(), matrix.getRows(), matrix.getDepth()) &&
       paddedInput(matrix, matrix.getRhs(), rhsTransposed ? matrix.getColumns() : matrix.getDepth(),
                   rhsTransposed ? matrix.getDepth() : matrix.getColumns())) {
+    Operation *previous = matrix->getPrevNode();
     Value active = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getDepth(), index(0));
     active = b.create<arith::AndIOp>(loc, active,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getRows(), index(0)));
@@ -126,14 +130,20 @@ LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config)
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, matrix.getColumns(), index(0)));
     auto guard = b.create<scf::IfOp>(loc, active, false);
     b.setInsertionPointToStart(&guard.getThenRegion().front());
-    Value transpose = rhsTransposed ? Value{} : allocate(b, loc, element, {bn, bk}, dsa::nramSpace);
-    Value reshaped = rhsTransposed ? (bn == 64 ? Value{} : allocate(b, loc, element, {bn, bk}, dsa::nramSpace))
+    Value transpose = rhsTransposed ? Value{} : allocate(b, loc, element, {bn, panelDepth}, dsa::nramSpace);
+    Value reshaped = rhsTransposed ? (bn == 64 ? Value{} : allocate(b, loc, element, {bn, panelDepth}, dsa::nramSpace))
                                   : matrixReshapeWorkspace(b, loc, matrix.getRhs(), transpose, consumesMatrixRhs(matrix));
-    Value packed = allocate(b, loc, element, {bk, bn}, dsa::matrixSpace);
+    Value packed = allocate(b, loc, element, {panelDepth, bn}, dsa::matrixSpace);
     b.create<dsa::PrepareMatrixOp>(loc, matrix.getRhs(), packed, transpose, reshaped, b.getBoolAttr(rhsTransposed));
     b.create<dsa::MatrixTileOp>(loc, matrix.getLhs(), packed, matrix.getAccumulator());
-    matrix.erase();
-    return success();
+    if (storageFitsBudget(function, config, measureStorage(function))) {
+      matrix.erase();
+      return success();
+    }
+    // The typed panel remains valid, but its full native preparation does not
+    // fit beside current live storage. Retain the original bounded tiling.
+    b.setInsertionPoint(matrix);
+    while (matrix->getPrevNode() != previous) matrix->getPrevNode()->erase();
   }
   auto rows = b.create<scf::ForOp>(loc, index(0), matrix.getRows(), index(bm));
   b.setInsertionPointToStart(rows.getBody());

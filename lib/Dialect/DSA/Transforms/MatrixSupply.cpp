@@ -1,5 +1,6 @@
 #include "PassSupport.h"
 #include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
+#include "Intent/Dialect/DSA/Transforms/MatrixPanels.h"
 #include "MatrixSupplyRelations.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
@@ -182,18 +183,18 @@ class MatrixSupplyRewrite {
 public:
   explicit MatrixSupplyRewrite(MatrixSupplyMatch match, ConfigurationAttr config)
       : match(match), config(config), function(match.work->getParentOfType<func::FuncOp>()), b(match.work) {}
-  LogicalResult run(bool resident) {
+  LogicalResult run(std::optional<StreamedMatrixPanel> resident) {
     auto matrix = match.matrix;
     Location loc = matrix.getLoc();
     Value lhsSource = match.lhs.getSource(), rhsSource = match.rhs.getSource();
     Value M = b.createOrFold<memref::DimOp>(loc, lhsSource, 0);
     Value N = b.createOrFold<memref::DimOp>(loc, rhsSource, 1);
     Value K = b.createOrFold<memref::DimOp>(loc, lhsSource, 1);
-    Value tm = index(loc, config.getTileM()), tn = index(loc, config.getTileN()), tk = index(loc, config.getTileK());
+    int64_t matrixDepth = resident ? resident->depth : config.getTileK();
+    Value tm = index(loc, config.getTileM()), tn = index(loc, config.getTileN()), tk = index(loc, matrixDepth);
     Value gridM = b.create<arith::CeilDivSIOp>(loc, M, tm), gridN = b.create<arith::CeilDivSIOp>(loc, N, tn);
     auto aType = cast<MemRefType>(lhsSource.getType());
     Type matrixElement = aType.getElementType();
-    int64_t elementBytes = matrixElement.getIntOrFloatBitWidth() / 8;
     auto emitOutput = [&](Value accumulator, Value m, Value n, Value, Value) {
       IRMapping mapping;
       mapping.map(match.matrix.getAccumulator(), accumulator);
@@ -225,7 +226,7 @@ public:
       Value memoryCore = b.create<dsa::IsMemoryCoreOp>(loc, b.getI1Type());
       Value computeCore = b.create<arith::XOrIOp>(loc, memoryCore, b.create<arith::ConstantIntOp>(loc, 1, 1));
       Value groupsN = b.create<arith::CeilDivSIOp>(loc, gridN, index(loc, 4));
-      auto sharedType = MemRefType::get({config.getTileM(), config.getTileK()}, matrixElement,
+      auto sharedType = MemRefType::get({config.getTileM(), matrixDepth}, matrixElement,
           MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::sharedSpace));
       auto shared = b.create<memref::AllocaOp>(loc, sharedType);
       shared.setAlignment(128);
@@ -237,18 +238,14 @@ public:
         b.setInsertionPointToStart(branch.thenBlock());
         return body();
       };
-      int64_t sliceN = 256;
-      while (config.getTileN() % sliceN) sliceN /= 2;
-      int64_t sliceK = 2048;
-      while (sliceK > config.getTileK() || config.getTileK() % sliceK ||
-             2 * sliceK * sliceN * elementBytes > config.getLocalBytes()) sliceK /= 2;
+      int64_t sliceN = resident->sliceColumns, sliceK = resident->sliceDepth;
       return loop(loc, groupId, groupsN, groupCount, [&](Value group) -> LogicalResult {
         Value ni = add(loc, mul(loc, group, index(loc, 4)), localId);
         Value n0 = mul(loc, ni, tn);
         Value cols = b.create<arith::MaxSIOp>(loc, index(loc, 0), b.create<arith::MinSIOp>(loc, sub(loc, N, n0), tn));
         Value active = b.create<arith::AndIOp>(loc, computeCore,
             b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ni, gridN));
-        auto packedType = MemRefType::get({config.getTileK(), config.getTileN()}, matrixElement,
+        auto packedType = MemRefType::get({matrixDepth, config.getTileN()}, matrixElement,
             MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::matrixSpace));
         auto packed = b.create<memref::AllocaOp>(loc, packedType);
         packed.setAlignment(128);
@@ -267,19 +264,18 @@ public:
             return success();
           });
         };
-        const bool pipelineLocal = config.getTileM() *
-            (2 * config.getTileK() * elementBytes + config.getTileN() * 4) <= config.getLocalBytes();
+        const bool pipelineLocal = resident->pipeline;
         Value local0, local1;
         if (pipelineLocal) {
-          local0 = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
-          local1 = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
+          local0 = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
+          local1 = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
         }
         auto compute = [&](Value m0, Value slot, Value nextShared = Value{}, Value nextLocal = Value{}, Value nextRow = Value{}) -> LogicalResult {
           return when(active, [&]() -> LogicalResult {
             Value rows = b.create<arith::MinSIOp>(loc, sub(loc, M, m0), tm);
             Value lhs = slot;
             if (!pipelineLocal) {
-              lhs = allocate(loc, matrixElement, config.getTileM(), config.getTileK());
+              lhs = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
               b.create<dsa::LoadTileOp>(loc, slot, lhs, index(loc, 0), tk, index(loc, 1), rows, K);
             }
             Value accumulator = allocate(loc, b.getF32Type(), config.getTileM(), config.getTileN());
@@ -367,6 +363,12 @@ public:
         b.setInsertionPointToStart(branch.thenBlock());
         return body();
       };
+      int64_t localDepth = config.getTileK();
+      if (aType.hasStaticShape() && aType.getDimSize(1) > 0 &&
+          aType.getDimSize(1) % stageRows == 0)
+        localDepth = selectMatrixPanelDepth(function, config, element,
+            config.getTileM(), config.getTileN(), stageRows, localDepth);
+      Value localStep = index(loc, localDepth);
       return loop(loc, groupId, mul(loc, groupsM, gridN), groupCount, [&](Value group) -> LogicalResult {
         Value mi = add(loc, mul(loc, b.create<arith::DivSIOp>(loc, group, gridN), index(loc, 4)), localId);
         Value ni = b.create<arith::RemSIOp>(loc, group, gridN);
@@ -393,11 +395,11 @@ public:
         auto compute = [&](Value stage, Value slot) -> LogicalResult {
           return when(active, [&]() {
             Value stageDepth = b.create<arith::MinSIOp>(loc, sub(loc, K, stage), index(loc, stageRows));
-            Value lhs = allocate(loc, element, config.getTileM(), config.getTileK());
-            Value rhs = allocate(loc, element, config.getTileK(), config.getTileN());
-            return loop(loc, index(loc, 0), stageDepth, tk, [&](Value within) -> LogicalResult {
+            Value lhs = allocate(loc, element, config.getTileM(), localDepth);
+            Value rhs = allocate(loc, element, localDepth, config.getTileN());
+            return loop(loc, index(loc, 0), stageDepth, localStep, [&](Value within) -> LogicalResult {
               Value depth = b.create<arith::MaxSIOp>(loc, index(loc, 0),
-                  b.create<arith::MinSIOp>(loc, sub(loc, stageDepth, within), tk));
+                  b.create<arith::MinSIOp>(loc, sub(loc, stageDepth, within), localStep));
               Value k0 = add(loc, stage, within);
               Value ar = stride(loc, lhsSource, 0), ac = stride(loc, lhsSource, 1);
               b.create<dsa::LoadTileOp>(loc, lhsSource, lhs, add(loc, mul(loc, m0, ar), mul(loc, k0, ac)), ar, ac, rows, depth);
@@ -472,14 +474,12 @@ LogicalResult realizeMatrixSupply(func::FuncOp function) {
     auto a = cast<MemRefType>(match->lhs.getSource().getType());
     auto c = cast<MemRefType>(match->rhs.getSource().getType());
     Type element = a.getElementType();
-    int64_t bytes = element.getIntOrFloatBitWidth() / 8;
-    bool resident = a.hasStaticShape() && c.hasStaticShape() && a.getDimSize(1) == config.getTileK() &&
-        (element.isF16() || element.isBF16() || element.isF32()) && config.getLocalBytes() >= 8192 &&
-        config.getTileN() % 64 == 0 && config.getTileK() * bytes % 64 == 0 &&
-        config.getTileK() * config.getTileN() * bytes <= 1024 * 1024 &&
-        config.getTileM() * (config.getTileK() * bytes + config.getTileN() * 4) <= config.getLocalBytes() &&
+    std::optional<StreamedMatrixPanel> resident;
+    if (a.hasStaticShape() && c.hasStaticShape() &&
         config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
-        c.getDimSize(1) / config.getTileN() >= config.getTasks();
+        c.getDimSize(1) / config.getTileN() >= config.getTasks())
+      resident = selectStreamedMatrixPanel(function, config, element,
+          config.getTileM(), config.getTileN(), a.getDimSize(1));
     bool shared = config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
         a.getDimSize(0) / config.getTileM() >= 4;
     if (!resident && !shared) continue;
