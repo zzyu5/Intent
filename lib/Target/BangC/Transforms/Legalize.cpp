@@ -11,6 +11,7 @@ namespace intent::bangc {
 #define GEN_PASS_DEF_BANGCNATIVEWORKSPACE
 #define GEN_PASS_DEF_BANGCNATIVEIMPLEMENTATIONS
 #define GEN_PASS_DEF_BANGCLOCALCOMPOSITION
+#define GEN_PASS_DEF_BANGCSTORAGEREUSE
 #define GEN_PASS_DEF_BANGCSUPPLYSYNCHRONIZATION
 #define GEN_PASS_DEF_BANGCSTORAGEBINDING
 #include "Intent/Target/BangC/Passes.h.inc"
@@ -98,6 +99,20 @@ struct LocalCompositionPass : impl::BangCLocalCompositionBase<LocalCompositionPa
   }
 };
 
+struct StorageReusePass : impl::BangCStorageReuseBase<StorageReusePass> {
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyUnboundNativeProgram(module))) return signalPassFailure();
+    auto cleanup = cleanupPipeline();
+    auto result = reuseStorageScopes(module, [&] { return runPipeline(cleanup, module); });
+    if (failed(finishGroup(module, getArgument(), result))) return signalPassFailure();
+    if (failed(verifyUnboundNativeProgram(module))) {
+      module.emitError() << "BANG C native postcondition failed: " << getArgument();
+      signalPassFailure();
+    }
+  }
+};
+
 struct SupplySynchronizationPass : impl::BangCSupplySynchronizationBase<SupplySynchronizationPass> {
   void runOnOperation() final {
     auto module = getOperation();
@@ -134,6 +149,7 @@ void buildBangCPipeline(OpPassManager &manager, StringRef architecture) {
   manager.addPass(createBangCNativeWorkspace());
   manager.addPass(createBangCNativeImplementations());
   manager.addPass(createBangCLocalComposition());
+  manager.addPass(createBangCStorageReuse());
   manager.addPass(createBangCSupplySynchronization());
   manager.addPass(createBangCStorageBinding());
 }

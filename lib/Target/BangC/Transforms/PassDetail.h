@@ -53,8 +53,12 @@ LogicalResult composeLocalStorage(func::FuncOp function,
     llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult composeLocalProgram(ModuleOp module,
     llvm::function_ref<LogicalResult()> cleanup);
+LogicalResult reuseStorageScopes(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup);
 LogicalResult scheduleProgramSupply(ModuleOp module);
 LogicalResult bindProgramStorage(ModuleOp module);
 LogicalResult verifySurfaceOperations(func::FuncOp function);
+LogicalResult verifyNativeProgram(ModuleOp module);
+LogicalResult verifyUnboundNativeProgram(ModuleOp module);
 } // namespace intent::bangc
 #endif

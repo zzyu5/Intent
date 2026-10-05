@@ -613,6 +613,14 @@ LogicalResult composeLocalProgram(ModuleOp module,
   realizeGatherWorkspace(function, config);
   if (dsa::batchPointwiseTasks(function) && failed(cleanup())) return failure();
   if (coarsenLocalPrograms(function, config) && failed(cleanup())) return failure();
+  return success();
+}
+
+LogicalResult reuseStorageScopes(ModuleOp module,
+    llvm::function_ref<LogicalResult()> cleanup) {
+  auto function = *module.getOps<func::FuncOp>().begin();
+  auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
+  if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
   while (placeInvariantSupply(function, config)) {
     if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
   }

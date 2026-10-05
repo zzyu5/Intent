@@ -8,6 +8,8 @@
 namespace intent::bangc {
 std::optional<mlir::LogicalResult>
 verifyNativeSourceOperation(mlir::Operation *operation);
+std::optional<mlir::LogicalResult>
+verifyUnboundNativeSourceOperation(mlir::Operation *operation);
 } // namespace intent::bangc
 
 #endif

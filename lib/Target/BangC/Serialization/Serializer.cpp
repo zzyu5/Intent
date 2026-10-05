@@ -19,6 +19,13 @@ namespace intent::bangc {
 namespace {
 #include "../Runtime/TileImplementations.inc"
 std::string ctype(Type type) { return scalarType(type)->name; }
+LogicalResult verifyAllocationGeometry(memref::AllocaOp allocation) {
+  if (mlir::failed(verifyNativeAllocation(allocation, true))) return failure();
+  auto space = allocation.getType().getMemorySpaceAsInt();
+  if (space != dsa::nramSpace && space != dsa::matrixSpace && space != dsa::sharedSpace)
+    return allocation.emitOpError("BANG C allocation requires NRAM, WRAM, or SRAM storage");
+  return success();
+}
 class Serializer : public NativeSourceEmitter {
 public:
   Serializer(func::FuncOp function, llvm::raw_ostream &output)
@@ -514,10 +521,7 @@ const OperationEmitters<Serializer> &Serializer::nativeEmitters() {
     table.add<scf::IfOp>(controlCheck, controlEmit);
     table.add<scf::WhileOp>(controlCheck, controlEmit);
     table.add<memref::AllocaOp>([](memref::AllocaOp allocation) -> LogicalResult {
-      if (mlir::failed(verifyNativeAllocation(allocation, true))) return failure();
-      auto space = allocation.getType().getMemorySpaceAsInt();
-      if (space != dsa::nramSpace && space != dsa::matrixSpace && space != dsa::sharedSpace)
-        return allocation.emitOpError("BANG C allocation requires bound NRAM, WRAM, or SRAM storage");
+      if (mlir::failed(verifyAllocationGeometry(allocation))) return failure();
       if (!allocation->getAttrOfType<IntegerAttr>("bangc.offset") ||
           !allocation->getAttrOfType<IntegerAttr>("bangc.allocation_bytes"))
         return allocation.emitOpError("BANG C allocation requires completed storage binding");
@@ -584,6 +588,12 @@ std::optional<LogicalResult> verifyNativeSourceOperation(Operation *operation) {
   const auto &table = Serializer::nativeEmitters();
   if (!table.contains(operation)) return std::nullopt;
   return table.verify(operation);
+}
+
+std::optional<LogicalResult> verifyUnboundNativeSourceOperation(Operation *operation) {
+  if (auto allocation = dyn_cast<memref::AllocaOp>(operation))
+    return verifyAllocationGeometry(allocation);
+  return verifyNativeSourceOperation(operation);
 }
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
