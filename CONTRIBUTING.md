@@ -897,6 +897,16 @@ KIR 的验证入口直接属于 operation，按合同分布在
 不形成 IR 库对 family transform/analysis 库的反向依赖。四参与者选型、SRAM/WRAM
 供数和 stride/grid 匹配仍由各 pass 负责。
 
+[DSA UniformValues](include/Intent/Dialect/DSA/Analysis/UniformValues.h) 查询实际读取点的
+完整 NRAM uniform snapshot，使用同一 `StorageAnalysis` 的 writer、alias 与完成事实。
+Copy、同步 load 和 transpose 沿各自原读点追踪；partial counts 只有在 padding 与
+完整 stored value 相同，或实际覆盖完整 tile 时才能保 uniform。返回 scalar 必须
+支配 reader，且保持 storage element dtype；跨 mutable 回环或未完成 transfer 不
+把初始化值当成当前值。LocalValues、collective 初始化、矩阵首写与 BANG C 数值/
+供数共同消费此查询，各自保留 primitive、数值及 scope 资格。Native Reduce 的
+output 完整写入事实供相同存储闭合消费；scratch 的独立 Write effect 不代表完整输出。
+统一查询不删除 writer，copy/dead-write 清理由原 storage fixed point 完成。
+
 `foldIntegerDifference` 只接受 i64 或调用方明确绑定为 64 位的 index；两个适配层依据 Intent 的逻辑 index 合同传入位宽，不假定任意 MLIR index 都是 64 位。值运算仍遵守模整数语义，系数的加减乘另外检查是否能用 `int64_t` 表示；失败返回 `Unknown`，不能当作系数零。窄整数回绕后的扩宽需要独立范围证明，地址有效性、memory effects 与拓扑也不由系数证明。GPU 的按位宽模运算规范化和 source-axis 关系分析有不同合同，不应仅因都有 Add/Mul 就接到这一接口。
 
 需要整数值范围时，复用 [IntegerRangeAnalysis](include/Intent/Analysis/IntegerRanges.h)：它按实际位宽消费 MLIR `ConstantIntRanges` / `InferIntRangeInterface`，并查询标准控制流和 shaped-value dimensions。CPU、DSA、GPU 适配层只补自己的参数、执行域与类型事实；未知整数保留完整位宽范围，IR 改写后重建查询。`provesSignedNoWrap` 与 `isValuePreservingIntegerCast` 分别证明有符号数学运算不回绕、cast 保持数值，不能以结果非负或两个整数类型代替这些条件，也不向 IR 添加 `nsw/nuw` 假设。
@@ -1072,16 +1082,23 @@ effect，而不是可由 DCE 丢弃的普通零结果纯操作。
 
 [ReplayMaterialization.cpp](lib/Dialect/GPU/Transforms/Value/ReplayMaterialization.cpp) 集中执行按
 source occurrence 或按 ranges 的重放，复用上述证明并检查替代值在实际 builder 插入点
-可用；不同轴投影保留各自规则。Contraction 的 `ContractionValues` 保留重算或保留快照的
-选择，不再另持一套克隆器。`createTraversalLoop`（[Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)）
+可用；不同轴投影保留各自规则。相邻私有 [SourceReplay.h](lib/Dialect/GPU/Transforms/Value/SourceReplay.h)
+提供完整的 source 准备和供数入口：可重新读取的部分使用当前 replay 证明，不能重新
+读取的部分绑定原 SSA snapshot，再构造其后的纯 producer。Region、contraction 与
+普通/多轴 reduction 共用这一实现，不各自决定保留整 source 或复制部分表达式。
+已有 snapshot 的完整覆盖、坐标投影、存活成本和实际插入点都必须成立；未知事实
+保留原完整快照。`createTraversalLoop`（[Traversal.h](include/Intent/Dialect/GPU/Transforms/Control/Traversal.h)）
 先将循环接入当前 IR 再构造 body，供 contraction、region 与 scan 的位置分析使用。
 这个边界可对照本地 Triton `FuseNestedLoops.cpp:246–274` 中分开的节点资格、dominance
 和 hoist 集合；Intent 还需要证明逻辑 source 分块后的读取快照，不能仅以 pure 或只读 view 名称代替。
 
-Fold/scan 共用私有 [RegionSources.cpp](lib/Dialect/GPU/Transforms/Region/RegionSources.cpp)：先保存
-无法在新位置重新读取的 source，再从当前 IR 重算 source facts，最后形成片段和 tail。
-普通与多轴归约共用 [ReductionReads.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionReads.cpp) 的相同
-准备/物化边界。保留片段按遍历坐标索引原 SSA 快照，资源地址上的基址偏移不能再用作快照 ordinal。
+Fold/scan 的 [RegionSources.cpp](lib/Dialect/GPU/Transforms/Region/RegionSources.cpp) 负责
+source 的完整 tail facts 与 region 合同，供数委托同一组件。叶 load 的 fill、纯
+producer 计算后的整体 source tail、consumer 的 neutral padding 是不同的值：
+例如 load 的 padding 为零，经过 exp 后为一，不能据此声称对归约是 identity。
+Contraction 仍在完整 operand 上中和 inactive members。保留片段按遍历坐标索引原
+SSA 快照，资源地址上的基址偏移不能用作快照 ordinal。原 ReductionReads 与
+contraction 的独立 replay 实现已经由共同入口取代。
 
 资源查询的职责可对照本地 Triton `lib/Analysis/Alias.cpp:36–45`：真实 allocation
 建立根，view 与 select 传播可能来源。Intent 的
@@ -1301,6 +1318,16 @@ SSA、product、domain 与 dimension 映射只有一份，完成后由独立 phy
 
 [NormalizeReductions.cpp](lib/Dialect/CPU/Transforms/Collective/NormalizeReductions.cpp) 随后从当前单轴 generic 和私有 rank-zero 结果槽形成标量 SSA `cpu.reduce`：初始化、全部使用与生命周期必须闭合，才删除结果槽。Weft 的 [Reductions.cpp](lib/Target/Weft/Transforms/Reductions.cpp) 为 scalar SSA 与 shaped DPS 提供同一 native-combine 资格查询，NaN 规则、原初值与重排许可由当前运算确定；外层 scalar SSA 快照直接绑定，不重放其来源读取。
 
+[ProducerVersions.h](include/Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h)
+统一当前读取点的 reaching write 和一次完整写后的 observations。初始化、整数
+来源、归约 producer、contraction 双侧投影及连续坐标恢复都消费这些当前版本事实，
+不以 allocation 全生命周期只有一个 writer 代替当前版本。Copy 沿自己的原读取点
+查询输入；partial/conditional clobber、释放和回环各按真实 effects 截断。查询不移动
+或删除 IR，调用者仍证明完整覆盖、实际 coordinates、数值许可和 source-read stability；
+改写后重建事实。只有该版本的全部 observations 被替换，才可删除其 writer，后续
+版本继续保留 allocation。与私有版本确定 disjoint 的 ordered 操作不破坏其存储事实，
+但不会因此获得移动、replay 或提前发布的权限。
+
 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h) 统一当前 extent 的判等、表达式和常数上界查询；[IR ShapeRelations](include/Intent/Dialect/CPU/IR/ShapeRelations.h) 从公共接口取得同一 dimension 的代表及静态约束，也供入口 `memref.dim` 规范化使用。[registerExtentRelations](lib/Dialect/CPU/Analysis/ExtentRelations.cpp) 由 [Compiler Registration](lib/Compiler/Registration.cpp) 注册 CPU helper、ABI 与缺失的描述符 ValueBounds 模型，复用 MLIR 已有的 memref/SCF 模型。未知关系保留为 unknown，不把任意可能 wrap 的 index 算术当作无界整数；extent 相等不代表 offset、stride 或访问坐标相同。
 
 只读证明可以沿 helper formal 查询实际参数的尺寸，不能据此把外部 SSA 插入隔离 region。用于改写的 `queryExtentValue` 停在当前 block argument 和尺寸 SSA，只返回已有值或常量；消费者仍检查 dominance。共同查询在 IR 改写后重新执行，不维护独立 shape 表。
@@ -1317,7 +1344,7 @@ Region 展开后，模板参数变成具体 views，可以用同一存储证明�
 | 均匀存储内容 | [UniformValues.h](include/Intent/Dialect/CPU/Analysis/UniformValues.h) | `UniformMemoryAnalysis` 为普通折叠与 region predicate 共享读取、view 归一和 effect 失效；多输出先在同一输入快照求值，再同时发布结果 |
 | Descriptor 几何与轴投影 | [ViewRelations.h](include/Intent/Dialect/CPU/Analysis/ViewRelations.h) | 查询实际 SSA descriptor 的连续 strides、offset 保持和轴置换/unit 轴关系；不以 storage origin 替代视图，不证明 ownership 或 noalias |
 | 原生内存与控制流翻译 | [NativeSource.h](include/Intent/Serialization/NativeSource.h) | Mojo、Weft host 与 BANG C 共同处理标准 descriptor、视图、地址和 SCF 传递；目标保留分配与访存 API，serializer 不决定生命周期 |
-| Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contraction/Contractions.h) | 同一查询沿当前完整 `Copy → Fill` 取得初值及可删除性；初始化被其它消费者读取时保留，不在 blocking 中再写一套 Fill-only 扫描 |
+| Contraction 初值 | [Contractions.h](lib/Dialect/CPU/Transforms/Contraction/Contractions.h) | 使用 ProducerVersions 的当前完整 `Copy → Fill/Store` 版本链；初始化被其它消费者观察时保留，blocking 不再另扫描 writer |
 | Weft task 局部存储 | [TaskStorage.cpp](lib/Target/Weft/Transforms/TaskStorage.cpp) | 均匀值保留 scalar 与尺寸，按实际读取窗口形成值；窗口几何保存标量 offset，向量访问才形成 gather 坐标，标量填充直接更新选中的坐标；已物化状态的覆盖与控制流交接保留 native owner，分支完整写入后才发布结果 |
 | 外层与局部参数 | [Configuration.h](include/Intent/Dialect/CPU/Transforms/Configuration/Configuration.h) | 外层 task/block 参数与 implementation 的 local binding 分开，不通过完整 Passes.h 获取配置类型 |
 | 有限 profile 数据 | [TuningProfiles.cpp](lib/Dialect/CPU/Transforms/Configuration/TuningProfiles.cpp) | 读取后形成 typed rows；family 与 local 参数由 provider registry 声明，未知或缺失参数明确诊断，override 整族替换 |

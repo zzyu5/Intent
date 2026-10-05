@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import intent
 import torch
+from programs.composition import MoEAlignment
 
 from kernels.routing.mhc import mhc_apply_residual as mhc_apply_residual_definition
 from kernels.routing.mhc import mhc_gemm_rms_partial, mhc_gemm_rms_finalize
@@ -81,23 +82,11 @@ def moe_alignment(context: Context) -> PreparedComparison:
         tuning_config=context.tuning_config, options=context.compile_options,
     )
     generated_state: dict[str, tuple[torch.Tensor, ...]] = {}
-
-    def generated_prepare() -> None:
-        expert_counts.zero_()
-        expert_cursors.zero_()
-        sorted_routes.fill_(ROUTES)
+    program = MoEAlignment(count, prefix, scatter, mark)
 
     def generated_launch() -> None:
-        count.run(source_ids, expert_counts)
-        expert_offsets, total_padded = prefix.run(expert_counts)
-        scatter.run(
-            source_ids,
-            expert_offsets,
-            expert_cursors,
-            sorted_routes,
-        )
-        expert_blocks = mark.run(expert_offsets)
-        generated_state["output"] = (sorted_routes, expert_blocks, total_padded)
+        generated_state["output"] = program.run_into(
+            source_ids, expert_counts, expert_cursors, sorted_routes)
 
     runtime = load_module(
         context.project_root / "experiments/cpu/baselines/pytorch/cpu_runtime.py",
@@ -117,14 +106,13 @@ def moe_alignment(context: Context) -> PreparedComparison:
         PreparedLaunch(
             generated_launch,
             lambda: _canonical_alignment(*generated_state["output"]),
-            prepare=generated_prepare,
         ),
         PreparedLaunch(source_launch, lambda: _canonical_alignment(*source_state["output"])),
         tuple(Tolerance(atol=0.0) for _ in range(3)),
         cuda_graph=False,
         device_type="cpu",
         cpu_host_timing=True,
-        note="既有MoE alignment；T4096、top-k2、E64、block128；完整计数/前缀/散射/标记调用，辅助InOut每次恢复，输出为canonical三元组。",
+        note="既有MoE alignment；T4096、top-k2、E64、block128；完整计数/前缀/散射/标记调用，辅助workspace初始化计入调用，输出为canonical三元组。",
     )
 
 

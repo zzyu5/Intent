@@ -18,9 +18,11 @@ from kernels.streaming.paged_attention import splitk_paged_gqa_decode_partials
 from kernels.streaming.splitk_reduce import splitk_attention_weighted_sum_reduce
 from kernels.streaming.splitk_reduce import splitk_attention_f32_to_f16_reduce
 from kernels.routing.mqa_logits import fp8_mqa_logits
+from programs.composition import PagedDecode
 
 from experiments._common.loading import load_module
 from experiments._common.measurement import compile_single
+from experiments._common.measurement import compile_kernel, prepare_program
 from experiments._common.measurement import functional_launch
 from experiments._common.model import Context
 from experiments._common.model import ComparisonUnavailable
@@ -227,37 +229,18 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
     )
     scale = dimension**-0.5
 
-    _, partials = compile_single(
+    partials = compile_kernel(
         context,
         paged_gqa_decode_partials,
-        (
-            q,
-            key_cache,
-            value_cache,
-            page_offsets,
-            page_indices,
-            lengths,
-            split_offsets,
-            scale,
-        ),
         constexprs={
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
             "SPLITS": splits,
         },
     )
-    partial_lse, partial_output = partials.outputs()
-    _, reduction = compile_single(
-        context,
-        splitk_attention_f32_to_f16_reduce,
-        (partial_output, partial_lse),
-    )
-
-    def generated_launch():
-        partials.launch()
-        reduction.launch()
-
-    generated = PreparedLaunch(generated_launch, reduction.outputs)
+    reduction = compile_kernel(context, splitk_attention_f32_to_f16_reduce)
+    generated = prepare_program(PagedDecode(partials, reduction), (
+        q, key_cache, value_cache, page_offsets, page_indices, lengths, split_offsets, scale))
     runtime = load_module(
         context.project_root
         / "experiments/gpu/baselines/triton/vllm/attention/paged_decode/paged_gqa_decode_runtime.py",
@@ -338,37 +321,18 @@ def splitk_paged_attention(context: Context) -> PreparedComparison:
     )
     scale = dimension**-0.5
 
-    _, partials = compile_single(
+    partials = compile_kernel(
         context,
         splitk_paged_gqa_decode_partials,
-        (
-            q,
-            key_cache,
-            value_cache,
-            page_offsets,
-            page_indices,
-            lengths,
-            split_offsets,
-            scale,
-        ),
         constexprs={
             "PAGE_SIZE": page_size,
             "HEAD_GROUP": query_heads // kv_heads,
             "SPLITS": splits,
         },
     )
-    partial_lse, partial_output = partials.outputs()
-    _, reduction = compile_single(
-        context,
-        splitk_attention_weighted_sum_reduce,
-        (partial_output, partial_lse),
-    )
-
-    def generated_launch():
-        partials.launch()
-        reduction.launch()
-
-    generated = PreparedLaunch(generated_launch, reduction.outputs)
+    reduction = compile_kernel(context, splitk_attention_weighted_sum_reduce)
+    generated = prepare_program(PagedDecode(partials, reduction), (
+        q, key_cache, value_cache, page_offsets, page_indices, lengths, split_offsets, scale))
     runtime = load_module(
         context.project_root
         / "experiments/gpu/baselines/triton/xformers/attention/splitk/splitk_kernels_runtime.py",

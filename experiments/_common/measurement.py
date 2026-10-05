@@ -159,13 +159,12 @@ def initial_launch(function, *, side: str):
     return result
 
 
-def compile_single(
+def compile_kernel(
     context: Context,
     definition,
-    arguments: tuple[object, ...],
     *,
     constexprs: dict[str, object] | None = None,
-) -> tuple[object, PreparedLaunch]:
+):
     report_stage("generated_compilation")
     try:
         artifact = intent.compile(
@@ -178,9 +177,14 @@ def compile_single(
         )
     except intent.CompilationStageError as error:
         raise PipelineStageError(f"generated_{error.stage}", str(error)) from error
+    return artifact
+
+
+def prepare_program(program, arguments: tuple[object, ...]) -> PreparedLaunch:
+    """Compile and warm one complete author callable with its owned workspace."""
     report_stage("generated_launcher_preparation")
     try:
-        call = artifact.prepare(*arguments)
+        call = program.prepare(*arguments)
     except Exception as error:
         raise PipelineStageError("generated_launcher_preparation", str(error)) from error
     report_stage("generated_native_compilation")
@@ -192,13 +196,22 @@ def compile_single(
     initial_launch(call.launch, side="generated")
     report_stage("generated_launcher_preparation")
     try:
-        # Preserve the existing second preparation launch, now on the same
-        # bound call whose candidates were compiled and initially tuned.
         call.launch()
     except Exception as error:
         raise PipelineStageError("generated_launcher_preparation", str(error)) from error
     report_stage("adapter_preparation")
-    return artifact, PreparedLaunch(launch=call.launch, outputs=call.result)
+    return PreparedLaunch(launch=call.launch, outputs=call.result)
+
+
+def compile_single(
+    context: Context,
+    definition,
+    arguments: tuple[object, ...],
+    *,
+    constexprs: dict[str, object] | None = None,
+) -> tuple[object, PreparedLaunch]:
+    artifact = compile_kernel(context, definition, constexprs=constexprs)
+    return artifact, prepare_program(artifact, arguments)
 
 
 def functional_launch(function) -> PreparedLaunch:

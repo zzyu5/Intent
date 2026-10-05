@@ -14,7 +14,7 @@ mla_prefill,B1-QH128-KVH1-S2048-D128-R64-fp16,0.580944,0.658064,0.767632,1.13274
 batched_gemm,B32-M512-N512-K1024-bf16,0.044584,0.047680,0.066400,1.069442,1.489324,pass,pass,Intent target=triton; source corpus=cutile.,
 tilegym_dense_gemm,M8192-N11008-K4096-bf16,2.706056,1.924848,2.072520,0.711311,0.765882,pass,pass,Intent target=triton; source corpus=cutile.,
 grouped_gemm,rows256-512-1024-2048-K4096-N4096-bf16,0.487456,0.414952,0.444008,0.851260,0.910868,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 使用 host group shapes,同算法；source 使用 host group shapes
-moe_alignment,T4096-top2-E64,0.038552,0.022928,0.023472,0.594729,0.608840,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射；初始化与辅助输出计入调用,同算法计数/前缀和/散射；初始化与辅助输出计入调用
+moe_alignment,T4096-top2-E64,0.038720,0.022928,0.029144,0.592149,0.752686,pass,pass,Intent target=triton; source corpus=cutile. 同算法计数/前缀和/散射/标记；workspace初始化未计入该计时,同算法计数/前缀和/散射/标记；workspace初始化与辅助输出计入调用
 mhc_gemm_rms_scale,T2048-H4096-streams4-bf16,0.067736,0.042752,0.043848,0.631156,0.647337,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 用乘倒数实现归一化,同算法；source 用乘倒数实现归一化
 chunked_softmax,8192x32768-bf16,0.879136,0.576672,0.608296,0.655953,0.691925,pass,pass,Intent target=triton; source corpus=cutile.,
 rope_qk,B2-S4096-QH32-KVH8-D128-bf16,0.064408,0.063584,0.071096,0.987207,1.103838,pass,pass,Intent target=triton; source corpus=cutile. 同算法；source 保留 bf16 中间舍入,同算法；source 保留 bf16 中间舍入；Intent 通过 mutable custom op 与 torch.compile(fullgraph=True) 调用，计完整执行，含框架产生的状态处理

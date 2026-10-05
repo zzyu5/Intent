@@ -1,6 +1,7 @@
 
 import intent
 import torch
+from programs.composition import GroupNormBackward
 
 from kernels.backward.attention import (
     BATCH as ATTENTION_BATCH,
@@ -199,26 +200,12 @@ def group_norm_backward(context):
     grad_bias = torch.empty_like(weight)
     generated_state = {}
     source_state = {}
+    program = GroupNormBackward(dx_artifact, affine_artifact)
 
     def generated_launch():
-        dx_artifact(
-            x,
-            grad_y,
-            weight,
-            mean,
-            rstd,
-            grad_x,
-            inverse_group_elements,
-        )
-        affine_artifact(
-            x,
-            grad_y,
-            mean,
-            rstd,
-            grad_weight,
-            grad_bias,
-        )
-        generated_state["output"] = (grad_x, grad_weight, grad_bias)
+        generated_state["output"] = program.into(
+            x, grad_y, weight, mean, rstd, grad_x, grad_weight, grad_bias,
+            inverse_group_elements)
 
     def source_launch():
         source_state["output"] = runtime.group_norm_backward(

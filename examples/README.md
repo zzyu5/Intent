@@ -4,6 +4,104 @@
 
 安装说明见 [README](../README.md)。普通 host 示例直接复用 `kernels/` 中的定义：
 
+首批 30 个完整场景由 [use.py](use.py) 导航，host 输入与调用放在
+[programs/](programs/)，算法仍唯一保存在 `kernels/`。选择名称只决定使用示范，
+编译器接收原 kernel definition 和 target，不读取场景名称。
+
+```bash
+python examples/use.py --list
+python examples/use.py layer_norm --target triton
+python examples/use.py paged_decode --target cutile --prepared
+python examples/use.py group_norm_backward --target mojo
+```
+
+`--list` 不导入 Intent、PyTorch 或 provider。运行时可以用 `--compiler` 选择当前
+构建的编译器；GPU 可用 `--device` 选择设备。脚本输出结果的 shape、dtype 和
+每份 artifact 的产物目录。它不提供 reference、容差或计时循环。
+
+这些 PyTorch host 用法接受 Triton、cuTile、Mojo target；同一算法和输入不因
+target 改写。某个组合尚未 lowering 或不满足目标能力时，由当前编译器给出实际
+诊断。列表不是 30×3 已验证支持表；Weft/BANG C 使用各自 native buffer 接口，
+见下方对应实验入口，不能把它们当作 Torch tensor backend。
+
+| 场景名称 | Host 用法 | 输入及完整结果 |
+|---|---|---|
+| `relu` | [elementwise](programs/elementwise.py) | f16 matrix → 分配 `Out` |
+| `swiglu` | [elementwise](programs/elementwise.py) | 两份 bf16 matrix → bf16 输出 |
+| `rope` | [elementwise](programs/elementwise.py) | f16 Q/K `InOut`，固定 head 数与 f16 cosine/sine |
+| `transpose` | [elementwise](programs/elementwise.py) | f16 M×N → N×M |
+| `embedding` | [irregular](programs/irregular.py) | bf16 表与合法 i64 行索引 → lookup |
+| `csr_spmv` | [irregular](programs/irregular.py) | 完整 CSR offsets、indices、f32 values/vector |
+| `jagged_mean` | [irregular](programs/irregular.py) | 非空不等长 offsets、f32 values → 分段均值 |
+| `softmax` | [collectives](programs/collectives.py) | f16 matrix → f16 概率 |
+| `layer_norm` | [collectives](programs/collectives.py) | f32 x/weight/bias、逆维度和 epsilon |
+| `batch_norm` | [collectives](programs/collectives.py) | Welford；返回输出、保存统计及更新后的 running state |
+| `group_norm_backward` | [collectives](programs/collectives.py) | 两份 kernel；返回 dx/dweight/dbias |
+| `cumsum` | [collectives](programs/collectives.py) | f32 有序行 prefix |
+| `causal_linear_attention` | [collectives](programs/collectives.py) | f32 Q/K/V → 输出与最终矩阵状态 |
+| `nonzero` | [irregular](programs/irregular.py) | f32 values → 索引与每行有效数量 |
+| `moe_alignment` | [irregular](programs/irregular.py) | 四份 kernel；route IDs、expert blocks、有效 padded 数量 |
+| `gemm` | [matrix](programs/matrix.py) | f16 A/B，显式 `Activation.NONE` specialization |
+| `batched_gemm` | [matrix](programs/matrix.py) | bf16 batched NN contraction |
+| `ragged_gemm` | [matrix](programs/matrix.py) | 不等长 group offsets 与 f16 分组权重 |
+| `int8_gemm` | [matrix](programs/matrix.py) | i8 A/B、i32 bias → i32 输出 |
+| `q4_projection` | [matrix](programs/matrix.py) | N×G×144 字节 Q4_K records、G×256 f32 activation |
+| `fp8_gemm` | [matrix](programs/matrix.py) | E4M3 fragments、u8 E8M0 scales → f32 accumulator |
+| `attention` | [streaming](programs/streaming.py) | bf16 grouped Q/K/V，causal specialization 与 scale |
+| `paged_decode` | [streaming](programs/streaming.py) | page/split tables；显式 partials → f32-to-f16 merge |
+| `mamba_chunk_state` | [streaming](programs/streaming.py) | bf16 basis/x、f32 dt/decay → f32 chunk state |
+| `gated_delta` | [streaming](programs/streaming.py) | bf16 输入、有序 recurrence → 输出与 f32 final state |
+| `causal_convolution` | [structured](programs/structured.py) | f16 depthwise causal window 与 SiLU specialization |
+| `cholesky` | [structured](programs/structured.py) | 正定 f32 matrix `InOut` → lower factor |
+| `dropout` | [elementwise](programs/elementwise.py) | 作者整数混合、seed、drop 与 inverse-keep scalars |
+| `adamw` | [elementwise](programs/elementwise.py) | f32 gradient 与三个 mutable arrays、完整更新 scalars |
+| `histogram` | [collectives](programs/collectives.py) | f32 samples，包括 masked 越界值 → 256 i32 bins |
+
+动态 shape 的用法使用适合交互的输入大小；固定 shape 的算法沿用定义中的常量。
+这些输入用于展示调用，性能比较继续使用 experiments 中原规模、dtype 和完整
+callable。Q4_K 示例的全零 record 表示零权重，实际模型使用自身已有的 packed
+records；脚本不替模型转换权重格式。
+
+### 多 kernel 的唯一 host 编排
+
+[composition.py](programs/composition.py) 中的 `GroupNormBackward`、`PagedDecode`、
+`MoEAlignment` 组合调用者已编译的 artifacts。公开用法与 GPU/CPU 实验共同消费
+这些调用；reference、随机生产输入、计时和结果规范化仍属于 experiments。
+`run` 分配输出，`into`/`run_into` 使用调用者的输出和工作区，`prepare` 提前绑定实际输出与跨 kernel
+workspace。编译器仍逐个编译原定义，host 负责 kernel 次序和中间 tensor。
+
+例如，把同一 target 编译的 paged partials 与 merge 组成普通调用：
+在 `examples/` 下的脚本中使用这些 imports，或运行时设置 `PYTHONPATH=examples`。
+
+```python
+import intent
+
+from programs.composition import PagedDecode
+from kernels.streaming.paged_attention import paged_gqa_decode_partials
+from kernels.streaming.splitk_reduce import splitk_attention_f32_to_f16_reduce
+
+partials = intent.compile(paged_gqa_decode_partials, target=target,
+                          constexprs={"PAGE_SIZE": page_size,
+                                      "HEAD_GROUP": query_heads // kv_heads,
+                                      "SPLITS": splits})
+merge = intent.compile(splitk_attention_f32_to_f16_reduce, target=target)
+program = PagedDecode(partials, merge)
+call = program.prepare(q, key_cache, value_cache, page_offsets, page_indices,
+                       lengths, split_offsets, scale)
+call.launch()
+output = call.result()
+```
+
+`prepare` 只分配/绑定输出 handles，不读取中间结果、不执行 partials。真实 launch
+始终先 partials 再 merge。MoE 的 prepared call 持有 counts、cursors 与 padding
+workspace；每次 `launch()` 都先初始化这些 workspace，再运行四份 kernel。输出只有
+`total_padded` 指定的 route 前缀和对应 block 前缀有效，padding sentinel 沿用作者定义。
+该 host 组合使用作者固定的 top-k 2 和最多 4096 tokens 的 workspace；expert IDs
+必须位于 `[0, 64)`。其它 top-k 或超容量输入明确拒绝，改变规模需要作者调整相应
+算法常量和 host workspace。
+
+### 框架与产物调用示范
+
 | 入口 | 展示的完整调用 |
 |---|---|
 | `python examples/softmax.py --target triton` | 编译一次、传入 PyTorch tensor、分配声明的输出、定位编译产物 |

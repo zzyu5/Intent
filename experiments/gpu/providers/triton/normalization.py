@@ -13,9 +13,11 @@ from kernels.normalization.layer_norm import layer_norm_bf16
 from kernels.normalization.logsumexp import row_logsumexp
 from kernels.normalization.rms_norm import rms_norm_bf16
 from kernels.normalization.softmax import stable_softmax_f16
+from programs.composition import GroupNormBackward
 
 from experiments._common.loading import load_module
 from experiments._common.measurement import compile_single
+from experiments._common.measurement import compile_kernel, prepare_program
 from experiments._common.measurement import functional_launch
 from experiments._common.measurement import initial_launch
 from experiments._common.model import Context
@@ -260,20 +262,10 @@ def flaggems_group_norm_backward(context: Context) -> PreparedComparison:
     rstd = (
         torch.rand((batch, groups), device="cuda", dtype=torch.float16) + 0.5
     )
-    _, generated_dx = compile_single(
-        context,
-        group_norm_backward_dx,
-        (x, grad_y, weight, mean, rstd, 1.0 / ((channels // groups) * spatial)),
-    )
-    _, generated_weight_bias = compile_single(
-        context,
-        group_norm_backward_weight_bias,
-        (x, grad_y, mean, rstd),
-    )
-    generated = PreparedLaunch(
-        launch=lambda: (generated_dx.launch(), generated_weight_bias.launch()),
-        outputs=lambda: (generated_dx.outputs(), *generated_weight_bias.outputs()),
-    )
+    program = GroupNormBackward(compile_kernel(context, group_norm_backward_dx),
+                                compile_kernel(context, group_norm_backward_weight_bias))
+    generated = prepare_program(program, (
+        x, grad_y, weight, mean, rstd, 1.0 / ((channels // groups) * spatial)))
     runtime = _runtime(
         context,
         "experiments/gpu/baselines/triton/flag-gems/normalization/group_norm/groupnorm_runtime.py",

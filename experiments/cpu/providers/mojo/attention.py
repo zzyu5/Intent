@@ -2,6 +2,7 @@ import math
 
 import intent
 import torch
+from programs.composition import PagedDecode
 
 from kernels.streaming.attention_specialized import gemma_gqa_decode_partials
 from kernels.streaming.attention_specialized import attention_sink_prefill, attention_sink_decode_partials
@@ -246,21 +247,11 @@ def paged_gqa_decode(context: Context) -> PreparedComparison:
         (batch, query_heads, splits, dimension), dtype=torch.float32
     )
     output = torch.empty((batch, query_heads, dimension), dtype=torch.float16)
+    program = PagedDecode(partials, reduction)
 
     def generated_launch():
-        partials(
-            q,
-            key_cache,
-            value_cache,
-            page_offsets,
-            page_indices,
-            lengths,
-            split_offsets,
-            partial_lse,
-            partial_output,
-            scale,
-        )
-        reduction(partial_output, partial_lse, output)
+        program.into(q, key_cache, value_cache, page_offsets, page_indices,
+                     lengths, split_offsets, partial_lse, partial_output, output, scale)
 
     generated = PreparedLaunch(
         generated_launch,
