@@ -9,6 +9,7 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h"
 #include "Contractions.h"
+#include "ContractionEpilogues.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -93,11 +94,16 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
   auto initialization = findContractionInitialization(operation);
   if (!initialization)
     return operation.emitError("CPU contraction accumulator initialization is missing");
-  StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
-  Value root = storage.uniqueOrigin(output);
-  bool keepInitialization = !initialization->erasable ||
-      ((*implementation)->contraction.completePrivateInitialization && root &&
-       isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp()));
+  bool keepInitialization;
+  std::optional<ContractionEpilogue> epilogue;
+  {
+    StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+    Value root = storage.uniqueOrigin(output);
+    keepInitialization = !initialization->erasable ||
+        ((*implementation)->contraction.completePrivateInitialization && root &&
+         isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp()));
+    epilogue = queryContractionEpilogue(operation, initialization->operation, storage);
+  }
   Value initial = initialization->value;
   auto requirements = (*implementation)->inputRequirements(operation, shared, binding);
   if (auto reason = checkInputRequirements(operation, requirements))
@@ -115,6 +121,9 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     auto &group = axis.getPosition() == 0 ? groupM : groupN;
     group = group ? std::min(group, requirement.panelSize) : requirement.panelSize;
   }
+  if (epilogue)
+    for (Operation *dependency : epilogue->dependencies)
+      dependency->moveBefore(operation);
   OpBuilder b(operation);
   Location loc = operation.getLoc();
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
@@ -126,14 +135,16 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, nSize, zero));
   nonempty = b.create<arith::AndIOp>(loc, nonempty,
       b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, kSize, zero));
-  auto active = b.create<scf::IfOp>(loc, nonempty, !keepInitialization);
-  if (!keepInitialization) {
+  auto active = b.create<scf::IfOp>(loc, nonempty, !keepInitialization || epilogue.has_value());
+  if (!keepInitialization || epilogue) {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(active.elseBlock());
     auto emptyReduction = b.create<scf::IfOp>(loc,
         b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, kSize, zero), false);
     b.setInsertionPointToStart(emptyReduction.thenBlock());
-    b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
+    if (!keepInitialization)
+      b.create<linalg::FillOp>(loc, ValueRange{initial}, ValueRange{output});
+    if (epilogue) b.clone(*epilogue->consumer);
   }
   operation->moveBefore(active.thenBlock()->getTerminator());
   b.setInsertionPoint(operation);
@@ -233,6 +244,9 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
         reduction([&](Value kBegin, Value depth, bool first) {
           tileBlock(mBegin, nBegin, mCount, nCount, kBegin, depth, first);
         });
+        if (epilogue && failed(emitContractionEpilogue(
+                b, *epilogue, ValueRange{mBegin, nBegin}, ValueRange{mCount, nCount})))
+          status = failure();
       });
     });
   };
@@ -260,6 +274,10 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
         // Every output tile sees the same ascending K chunks and first flag.
         // Only independent output tiles are interleaved to share preparation.
         reduction([&](Value kBegin, Value depth, bool first) {
+          Value last;
+          if (epilogue)
+            last = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, depth,
+                b.create<arith::SubIOp>(loc, kSize, kBegin));
           SmallVector<Value> begins(2), counts(2);
           auto map = operation.getIndexingMapsArray()[cohort->requirement.operand];
           for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
@@ -283,6 +301,17 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
                       freeAxis == 0 ? freeCount : reuseCount,
                       freeAxis == 1 ? freeCount : reuseCount,
                       kBegin, depth, first);
+            if (epilogue) {
+              auto completed = b.create<scf::IfOp>(loc, last, false);
+              OpBuilder::InsertionGuard guard(b);
+              b.setInsertionPointToStart(completed.thenBlock());
+              if (failed(emitContractionEpilogue(b, *epilogue,
+                  ValueRange{freeAxis == 0 ? freeBegin : reuseBegin,
+                             freeAxis == 1 ? freeBegin : reuseBegin},
+                  ValueRange{freeAxis == 0 ? freeCount : reuseCount,
+                             freeAxis == 1 ? freeCount : reuseCount})))
+                status = failure();
+            }
           });
         });
       });
@@ -308,6 +337,7 @@ LogicalResult block(linalg::GenericOp operation, const Configuration &config,
     emitTile(parallel.getInductionVars()[0], parallel.getInductionVars()[1]);
   }
   if (failed(status)) return failure();
+  if (epilogue) epilogue->consumer.erase();
   if (!keepInitialization) initialization->operation->erase();
   operation.erase();
   return success();

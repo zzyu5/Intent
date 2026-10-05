@@ -12,6 +12,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Implementation/ReusePreparedInputs.cpp
 
   Contraction/BlockContractions.cpp
+  Contraction/ContractionEpilogues.cpp
   Contraction/ContractionSources.cpp
   Contraction/NormalizeContractions.cpp
   Contraction/Passes.cpp
