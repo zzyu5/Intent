@@ -92,6 +92,12 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
       if (!size || *size > *extent)
         return false;
     }
+    // A static full-ordinal workset can trade outer reduction width for more
+    // free output lanes. Replay legality alone does not justify replacing a
+    // deferred full-coverage dimension: its inner traversal already streams
+    // the source, while another outer carry would add a tuple combine per tile.
+    if (canChunkReductionOuter(reduce, kernel, outerAxis))
+      return false;
   }
 
   SmallVector<int64_t> innerAxes;
@@ -178,8 +184,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         "multi-axis reduction decomposition requires at least one source");
 
   unsigned outerAxis = static_cast<unsigned>(reduce.getAxes().front());
-  bool boundedOuter = prefersBoundedReductionOuter(reduce, kernel, outerAxis);
-  FailureOr<bool> fullCoverage = (boundedOuter || shouldTileReductionSources(reduce, kernel))
+  FailureOr<bool> fullCoverage = shouldTileReductionSources(reduce, kernel)
       ? FailureOr<bool>(false)
       : decomposeFullCoverageMultiAxisReduce(reduce, kernel, outerAxis);
   if (failed(fullCoverage))

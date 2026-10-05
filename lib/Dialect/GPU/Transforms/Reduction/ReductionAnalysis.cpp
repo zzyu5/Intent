@@ -99,8 +99,8 @@ bool shouldTileReductionSources(ReduceOp reduce, func::FuncOp kernel) {
   return true;
 }
 
-bool prefersBoundedReductionOuter(ReduceOp reduce, func::FuncOp kernel,
-                                  unsigned outerAxis) {
+bool canChunkReductionOuter(ReduceOp reduce, func::FuncOp kernel,
+                            unsigned outerAxis) {
   if (!hasNonUnitFreeAxis(reduce) || failed(proveLaneWiseHelper(reduce.getCombine())))
     return false;
   PhysicalProgramAnalysis analysis(kernel);

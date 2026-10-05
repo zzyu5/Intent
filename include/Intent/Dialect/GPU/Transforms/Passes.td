@@ -128,11 +128,13 @@ def ReductionsPass : IntentGPUTransformPass<
     retain the original structure. This uses the same callback-contract query
     as completed reduction normalization.
 
-    Load-rooted producers with independent output lanes may use bounded outer
-    and inner member traversals when current replay and producer-removal facts
-    permit it. Uniform tuple fields use their actual scalar values and the same
-    identity predicates, without fictitious load roots. Physical parameters
-    continue to come from the existing correlated profile and actual capacity.
+    A complete static outer axis with independent output lanes may use bounded
+    outer and inner member traversals when current replay and producer-removal
+    facts permit it. Deferred full-coverage axes retain their representation
+    unless current fragment resource pressure selects bounded supply. Uniform
+    tuple fields use their actual scalar values and the same identity predicates,
+    without fictitious load roots. Physical parameters continue to come from
+    the existing correlated profile and actual capacity.
     Required reduction realization remains even
     when a fusion or blocking opportunity is inapplicable; provider-native
     reduction trees and communication are not reconstructed here.
