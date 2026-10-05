@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "../Value/SourceReplay.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -113,7 +114,7 @@ LogicalResult decomposeMultiReductionContract(ContractOp contract) {
             IRMapping mapping;
             for (MakeRangeOp range : fact.roots)
               mapping.map(range.getResult(), selected);
-            FailureOr<Value> replayed = replaySourceValue(
+            FailureOr<Value> replayed = materializeSourceRanges(
                 nested, nestedLocation, value, unit, fact.roots, selected,
                 mapping, loop.getOperation());
             if (failed(replayed))
@@ -557,10 +558,10 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
           lhsReplay.map(range.getResult(), lhsK);
         for (MakeRangeOp range : rhsRanges)
           rhsReplay.map(range.getResult(), rhsK);
-        FailureOr<Value> lhs = replaySourceValue(
+        FailureOr<Value> lhs = materializeSourceRanges(
             nested, nestedLocation, contract.getLhs(), unitK, lhsRanges, lhsK,
             lhsReplay, contract.getOperation());
-        FailureOr<Value> rhs = replaySourceValue(
+        FailureOr<Value> rhs = materializeSourceRanges(
             nested, nestedLocation, contract.getRhs(), unitK, rhsRanges, rhsK,
             rhsReplay, contract.getOperation());
         if (failed(lhs) || failed(rhs)) {
@@ -1172,16 +1173,16 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
         IRMapping metadataReplay;
         for (MakeRangeOp range : metadataRanges)
           metadataReplay.map(range.getResult(), metadataK);
-        FailureOr<Value> compressed = replaySourceValue(
+        FailureOr<Value> compressed = materializeSourceRanges(
             nested, nestedLocation, contract.getCompressed(), unitCompressedK,
             compressedRanges, compressedK, compressedReplay,
             contract.getOperation());
-        FailureOr<Value> rhs = replaySourceValue(
+        FailureOr<Value> rhs = materializeSourceRanges(
             nested, nestedLocation, contract.getRhs(), unitDenseK, denseRanges,
             denseK, denseReplay, contract.getOperation());
         SmallVector<Value> replayedMetadata;
         for (Value component : metadataComponents) {
-          FailureOr<Value> replayed = replaySourceValue(
+          FailureOr<Value> replayed = materializeSourceRanges(
               nested, nestedLocation, component, unitMetadataK, metadataRanges,
               metadataK, metadataReplay, contract.getOperation());
           if (failed(replayed)) {

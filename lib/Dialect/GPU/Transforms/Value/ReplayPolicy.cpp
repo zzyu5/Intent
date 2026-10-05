@@ -1,4 +1,5 @@
 #include "ReplayPolicy.h"
+#include "ReplayInsertion.h"
 #include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -119,17 +120,6 @@ bool sharedReductionOutputs(Value value, unsigned minimumStores = 2,
     }
   }
   return reduction && stores.size() >= minimumStores;
-}
-
-bool available(Value value, OpBuilder &builder, DominanceInfo &dominance) {
-  if (!value || !builder.getInsertionBlock()) return false;
-  if (auto argument = dyn_cast<BlockArgument>(value))
-    return dominance.dominates(argument.getOwner(), builder.getInsertionBlock());
-  Operation *definition = value.getDefiningOp();
-  return definition && dominance.properlyDominates(
-      definition->getBlock(), definition->getIterator(),
-      builder.getInsertionBlock(), builder.getInsertionPoint(),
-      /*enclosingOk=*/false);
 }
 
 bool inactiveBeyondRange(Value predicate,
@@ -368,23 +358,38 @@ FailureOr<Value> ReplayPolicy::retainSlice(
     Value coordinates, Operation *anchor, AxisMapAttr resultMapping,
     const IRMapping *bindings) const {
   if (!retains(value, anchor, bindings)) return Value();
-  auto source = cast<FragmentType>(value.getType());
+  return materializeSnapshotSlice(builder, value, axis, extent, coordinates,
+                                  anchor, resultMapping);
+}
+
+FailureOr<Value> materializeSnapshotSlice(
+    OpBuilder &builder, Value value, unsigned axis, PhysicalExprAttr extent,
+    Value coordinates, Operation *anchor, AxisMapAttr resultMapping) {
+  auto source = dyn_cast<FragmentType>(value.getType());
+  auto kernel = anchor ? anchor->getParentOfType<func::FuncOp>() : func::FuncOp{};
+  if (!source || !kernel) return Value();
   auto coordinate = dyn_cast<FragmentType>(coordinates.getType());
   if (!coordinate || !coordinate.getElementType().isIndex() ||
       axis >= source.getShape().size()) return Value();
   DominanceInfo dominance(kernel);
-  if (!available(value, builder, dominance) || !available(coordinates, builder, dominance))
+  if (!availableAtInsertionPoint(value, builder, dominance) ||
+      !availableAtInsertionPoint(coordinates, builder, dominance))
     return Value();
   PhysicalProgramAnalysis analysis(kernel);
+  for (unsigned axis = 0; axis < source.getShape().size(); ++axis) {
+    auto realization = analysis.axisRealization(value, axis);
+    if (!realization.isExact() || !realization.physicalized ||
+        realization.constructionScalarSeed) return Value();
+  }
   auto ranges = analysis.axisRanges(value, axis);
   Attribute tail = tailValue(value, axis, analysis);
   if (!tail) return Value();
   auto authority = queryExactLogicalRange(ranges);
   if (failed(authority) || !isUnitStepRange(*authority) ||
       !analysis.lockstepRanges(ranges.roots).isExact() ||
-      !available((*authority).getStart(), builder, dominance) ||
-      !available((*authority).getExtent(), builder, dominance) ||
-      !available((*authority).getLogicalStop(), builder, dominance)) return Value();
+      !availableAtInsertionPoint((*authority).getStart(), builder, dominance) ||
+      !availableAtInsertionPoint((*authority).getExtent(), builder, dominance) ||
+      !availableAtInsertionPoint((*authority).getLogicalStop(), builder, dominance)) return Value();
   IndexRelations relations;
   auto capacity = cast<PhysicalExprAttr>(source.getShape()[axis]);
   bool complete = succeeded(completeSnapshotRange(value, axis, analysis));

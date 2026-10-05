@@ -15,7 +15,6 @@ struct SourcePlan {
   bool hasLoads;
   llvm::SmallVector<MakeRangeOp> ranges;
   mlir::Attribute tailConstant;
-  bool retainSnapshot = false;
 };
 
 PhysicalExprAttr parameterExtent(ParameterRefAttr parameter);

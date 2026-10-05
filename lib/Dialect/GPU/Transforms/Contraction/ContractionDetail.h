@@ -106,14 +106,6 @@ bool hasExplicitPairedReductionRanges(ContractOp contract);
 
 FailureOr<MakeRangeOp> producerRange(Value value, PhysicalSourceAxis source);
 
-FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value,
-                                   PhysicalExprAttr blockedExtent,
-                                   ArrayRef<MakeRangeOp> roots,
-                                   Value replacement,
-                                   IRMapping &mapping,
-                                   Operation *insertionAnchor);
-
 FailureOr<Value> buildRangeTailPredicate(OpBuilder &builder, Location location,
                                          Value range,
                                          MakeRangeOp authority);
@@ -122,14 +114,6 @@ LogicalResult appendTailValidity(Location location, Value source,
                                  ArrayRef<MakeRangeOp> ranges,
                                  Value tailPredicate,
                                  IRMapping &mapping);
-
-FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   func::FuncOp kernel, Value value,
-                                   PhysicalSourceAxis source,
-                                   PhysicalExprAttr blockedExtent,
-                                   MakeRangeOp root, Value replacement,
-                                   IRMapping &mapping,
-                                   Operation *insertionAnchor);
 
 bool isIntegerConstant(Value value, int64_t expected);
 

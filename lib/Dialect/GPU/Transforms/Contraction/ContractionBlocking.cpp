@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "../Value/SourceReplay.h"
 #include "../Value/ScopePlacement.h"
 #include "Intent/Dialect/GPU/Transforms/Mapping/ExecutionGroups.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -659,7 +660,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       rowReplay.map(rowRange.getResult(), rows);
     if (indirectRow) {
       for (AssumeInBoundsOp assumption : rowAssumptions) {
-        FailureOr<Value> index = replaySourceValue(
+        FailureOr<Value> index = materializeSourceRanges(
             rowBuilder, location, kernel, assumption.getIndex(),
             sourceAxisIdentity(*rowMap),
             unitM, rowRange, rows, rowReplay, contract.getOperation());
@@ -737,7 +738,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
               -> FailureOr<Value> {
             IRMapping freeReplay(freeSeeds);
             freeReplay.map(freeRange.getResult(), freeCoordinates);
-            auto freeValue = replaySourceValue(
+            auto freeValue = materializeSourceRanges(
                 nested, nestedLocation, source, freeExtent,
                 ArrayRef<MakeRangeOp>(freeRange), freeCoordinates, freeReplay,
                 contract.getOperation());
@@ -749,7 +750,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
             IRMapping reductionReplay;
             reductionReplay.map(reductionRange.getResult(),
                                 reductionCoordinates);
-            auto value = replaySourceValue(
+            auto value = materializeSourceRanges(
                 nested, nestedLocation, *freeValue, unitK,
                 ArrayRef<MakeRangeOp>(reductionRange), reductionCoordinates,
                 reductionReplay, loop.getBody()->getTerminator());
@@ -822,7 +823,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         IRMapping storeRowReplay;
         storeRowReplay.map(rowRange.getResult(), rows);
         for (Value &coordinate : coordinates) {
-          auto replayed = replaySourceValue(
+          auto replayed = materializeSourceRanges(
               rowBuilder, location, kernel, coordinate,
               sourceAxisIdentity(*rowMap), unitM, rowRange, rows,
               storeRowReplay, contract.getOperation());
@@ -832,7 +833,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
           coordinate = *replayed;
         }
         if (store.getValid()) {
-          auto replayed = replaySourceValue(
+          auto replayed = materializeSourceRanges(
               rowBuilder, location, kernel, store.getValid(),
               sourceAxisIdentity(*rowMap), unitM, rowRange, rows,
               storeRowReplay, contract.getOperation());
@@ -886,7 +887,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         } else {
           IRMapping columnReplay;
           columnReplay.map(columnRange.getResult(), columns);
-          FailureOr<Value> columnValidity = replaySourceValue(
+          FailureOr<Value> columnValidity = materializeSourceRanges(
               rowBuilder, location, kernel, replayed,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
               columnReplay, &*rowBuilder.getInsertionPoint());
@@ -907,7 +908,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         if (originalValidity) {
           IRMapping replay;
           replay.map(rowRange.getResult(), rows);
-          FailureOr<Value> replayed = replaySourceValue(
+          FailureOr<Value> replayed = materializeSourceRanges(
               rowBuilder, location, kernel, originalValidity,
               sourceAxisIdentity(*rowMap), unitM, rowRange, rows, replay,
               &*rowBuilder.getInsertionPoint());
@@ -919,7 +920,7 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         if (originalValidity) {
           IRMapping replay;
           replay.map(columnRange.getResult(), columns);
-          FailureOr<Value> replayed = replaySourceValue(
+          FailureOr<Value> replayed = materializeSourceRanges(
               rowBuilder, location, kernel, originalValidity,
               sourceAxisIdentity(*columnMap), unitN, columnRange, columns,
               replay, &*rowBuilder.getInsertionPoint());
@@ -1568,7 +1569,7 @@ LogicalResult realizeScaledContract(ScaledContractOp contract,
         rhsScaleCoordinates[*rhsScaleBlockCoordinate] = blocks;
         IRMapping rhsScaleReplay;
         rhsScaleReplay.map(rhsScaleColumnRange->getResult(), columns);
-        FailureOr<Value> rhsScaleColumn = replaySourceValue(
+        FailureOr<Value> rhsScaleColumn = materializeSourceRanges(
             nested, nestedLocation, kernel,
             rhsScaleLoad.getCoordinates()[*rhsScaleColumnCoordinate],
             sourceAxisIdentity(*columnMap),

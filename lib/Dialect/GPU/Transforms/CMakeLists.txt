@@ -36,7 +36,6 @@ add_mlir_library(MLIRIntentGPUTransforms
   Reduction/ReductionDecomposition.cpp
   Reduction/ReductionNormalization.cpp
   Reduction/ReductionParameters.cpp
-  Reduction/ReductionReads.cpp
   Reduction/ReductionTraversal.cpp
   Reduction/ReductionValues.cpp
 
@@ -61,6 +60,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Value/PhysicalCloning.cpp
   Value/ReplayMaterialization.cpp
   Value/ReplayPolicy.cpp
+  Value/SourceReplay.cpp
   Value/SchemaMutation.cpp
   Value/ScopePlacement.cpp
   Value/SimplifyRangePredicates.cpp

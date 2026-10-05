@@ -5,10 +5,10 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Storage.h"
+#include "ReplayInsertion.h"
 #include "ReplayPolicy.h"
 
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
-#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
 #include "llvm/ADT/APInt.h"
@@ -32,44 +32,6 @@ using namespace mlir;
 
 namespace intent::gpu {
 namespace {
-
-class ReplayInsertion {
-public:
-  explicit ReplayInsertion(OpBuilder &builder)
-      : builder(builder), insertion(builder.saveInsertionPoint()),
-        previous(insertion.getPoint() == insertion.getBlock()->begin()
-            ? nullptr : &*std::prev(insertion.getPoint())) {}
-  ~ReplayInsertion() {
-    if (committed) return;
-    auto end = insertion.getPoint();
-    while (end != insertion.getBlock()->begin()) {
-      Operation *operation = &*std::prev(end);
-      if (operation == previous) break;
-      operation->erase();
-    }
-    builder.restoreInsertionPoint(insertion);
-  }
-  void commit() { committed = true; }
-
-private:
-  OpBuilder &builder;
-  OpBuilder::InsertPoint insertion;
-  Operation *previous;
-  bool committed = false;
-};
-
-bool availableAtInsertionPoint(Value value, OpBuilder &builder,
-                               DominanceInfo &dominance) {
-  if (!value || !builder.getInsertionBlock())
-    return false;
-  if (auto argument = dyn_cast<BlockArgument>(value))
-    return dominance.dominates(argument.getOwner(), builder.getInsertionBlock());
-  Operation *definition = value.getDefiningOp();
-  return definition && dominance.properlyDominates(
-      definition->getBlock(), definition->getIterator(),
-      builder.getInsertionBlock(), builder.getInsertionPoint(),
-      /*enclosingOk=*/false);
-}
 
 // A source-slice replay owns its seeds, dominance scope and invariant-value
 // memoization. Only identical root selections reuse an invariant result.

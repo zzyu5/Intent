@@ -1,4 +1,6 @@
 #include "ReductionRealization.h"
+#include "../Value/SourceReplay.h"
+#include "../Value/ReplayPolicy.h"
 #include "ReductionParameters.h"
 #include "ReductionValues.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
@@ -70,8 +72,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
     traversalRanges.push_back(traversal.authority);
   }
   for (const auto &component : accesses)
-    if (failed(prepareReductionReads(component, reduce, kernel)))
-      return failure();
+    for (RootAccess access : component)
+      if (failed(prepareSourceReplay(access.load.getResult(), access.fragmentAxis,
+                                     reduce, PhysicalReplayScope::ValueGraph)))
+        return reduce.emitOpError("reduction could not preserve its source snapshot");
   for (Type result : reduce.getResultTypes())
     if (auto fragment = dyn_cast<FragmentType>(result))
       if (llvm::any_of(fragment.getShape(), [](Attribute extent) {
@@ -152,6 +156,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 
   bool bodyFailed = false;
   std::string bodyFailure = "unknown producer replay failure";
+  ReplayPolicy reuse(kernel, reduce.getSources(), {reduce.getOperation()});
   auto loop = builder.create<scf::ForOp>(
       location, firstRange.getStart(), stop, chunkSize, loopInitials,
       [](OpBuilder &, Location, Value, ValueRange) {});
@@ -234,8 +239,33 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                    *projected, BinaryOperator::LogicalAnd))
                              : *projected;
           }
+          auto sourceType = cast<FragmentType>(plan.source.getType());
+          auto relation = cast<AxisMapAttr>(sourceType.getAxisMaps()[plan.reductionAxis]);
+          Value sourceCoordinate = masterCoordinate;
+          if (!plan.ranges.empty()) {
+            MakeRangeOp range = plan.ranges.front();
+            sourceCoordinate = mapping.lookup(range.getResult());
+          }
+          if (failed(bindSourceReplay(nested, nestedLocation, plan.source,
+                  plan.sourceIdentity, relation.getDimensionId(), plan.reductionAxis,
+                  chunkExtent, sourceCoordinate, reduce,
+                  PhysicalReplayScope::ValueGraph, {}, mapping, &reuse))) {
+            bodyFailed = true;
+            bodyFailure = "could not bind the current source snapshot";
+            return;
+          }
+          auto remaining = PhysicalProgramAnalysis(kernel).replayAt(
+              plan.source, plan.sourceIdentity, PhysicalReplayScope::ValueGraph,
+              true, reduce, mapping, relation.getDimensionId());
+          if (!remaining.isReplayable()) {
+            bodyFailed = true;
+            bodyFailure = "bound source has no complete producer replay proof";
+            return;
+          }
           for (RootAccess access : accesses[component]) {
             LoadOp load = access.load;
+            if (mapping.lookupOrNull(load.getResult()) ||
+                !llvm::is_contained(remaining.accesses, load.getOperation())) continue;
             MakeRangeOp range = access.range;
             auto rootType = cast<FragmentType>(load.getResult().getType());
             FragmentType blockedRoot =
@@ -408,8 +438,8 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                 coordinate = *projected;
               }
             }
-            auto blockedLoad = materializeReductionRead(
-                nested, nestedLocation, access, blockedRoot, coordinates,
+            auto blockedLoad = materializeSourceRead(
+                nested, nestedLocation, access.load, access.fragmentAxis, blockedRoot, coordinates,
                 valid, fill, coordinate, reduce);
             if (failed(blockedLoad)) {
               bodyFailed = true;

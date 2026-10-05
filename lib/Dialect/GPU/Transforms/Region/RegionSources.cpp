@@ -1,4 +1,5 @@
 #include "RegionSources.h"
+#include "../Value/SourceReplay.h"
 #include "../Value/ReplayPolicy.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -53,8 +54,7 @@ bool isUnitExtent(Attribute attribute) {
 
 namespace {
 FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
-                                    PhysicalProgramAnalysis &analysis,
-                                    Operation *insertionAnchor) {
+                                    PhysicalProgramAnalysis &analysis) {
   auto fragment = dyn_cast<FragmentType>(source.getType());
   if (!fragment || sourceAxis >= fragment.getShape().size())
     return failure();
@@ -95,11 +95,6 @@ FailureOr<SourcePlan> analyzeSource(Value source, unsigned sourceAxis,
   if (plan.ranges.empty())
     return failure();
   plan.tailConstant = values.evaluate(source, tailValues);
-  IRMapping bindings;
-  plan.retainSnapshot = !analysis.replayAt(
-      source, plan.sourceIdentity, PhysicalReplayScope::Coordinate,
-      /*allowAccesses=*/true, insertionAnchor, bindings,
-      (*mapping).getDimensionId()).isReplayable();
   return plan;
 }
 } // namespace
@@ -108,13 +103,8 @@ FailureOr<SmallVector<SourcePlan>> prepareRegionSources(
     ValueRange sources, unsigned sourceAxis, Operation *insertionAnchor) {
   auto kernel = insertionAnchor->getParentOfType<func::FuncOp>();
   for (Value source : sources) {
-    PhysicalProgramAnalysis analysis(kernel);
-    auto plan = analyzeSource(source, sourceAxis, analysis, insertionAnchor);
-    if (failed(plan))
-      return failure();
-    if (plan->retainSnapshot &&
-        !analysis.axisRealization(source, sourceAxis).physicalized &&
-        failed(realizeFullCoverageDimension(kernel, source, sourceAxis)))
+    if (failed(prepareSourceReplay(source, sourceAxis, insertionAnchor,
+                                   PhysicalReplayScope::Coordinate)))
       return insertionAnchor->emitOpError(
                  "region source snapshot could not be fully materialized"),
              failure();
@@ -125,7 +115,7 @@ FailureOr<SmallVector<SourcePlan>> prepareRegionSources(
   PhysicalProgramAnalysis analysis(kernel);
   SmallVector<SourcePlan> plans;
   for (Value source : sources) {
-    auto plan = analyzeSource(source, sourceAxis, analysis, insertionAnchor);
+    auto plan = analyzeSource(source, sourceAxis, analysis);
     if (failed(plan))
       return failure();
     plans.push_back(std::move(*plan));
@@ -150,7 +140,8 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
     return llvm::any_of(plans, [&](const SourcePlan &plan) {
       auto type = cast<FragmentType>(plan.source.getType());
       auto axis = cast<AxisMapAttr>(type.getAxisMaps()[plan.sourceAxis]);
-      return queryFragmentAxis(current.getType(), plan.sourceIdentity, axis.getDimensionId()).isExact();
+      return queryFragmentAxis(current.getType(), plan.sourceIdentity,
+                               axis.getDimensionId()).isExact();
     });
   });
   for (auto [planIndex, plan] : llvm::enumerate(plans)) {
@@ -248,38 +239,10 @@ LogicalResult buildSourceSlices(OpBuilder &builder, Location location,
     replayOptions.segmentTail = tail;
     replayOptions.segmentMapping = segmentMapping;
     replayOptions.materializeZeroFill = true;
-    FailureOr<Value> replayed = failure();
-    if (Value bound = mapping.lookupOrNull(plan.source)) {
-      replayed = bound;
-    } else if (plan.retainSnapshot) {
-      MakeRangeOp retainedRange = plan.ranges.front();
-      replayed = materializeRetainedSlice(
-          builder, location, plan.source, plan.sourceAxis, sliceExtent,
-          mapping.lookup(retainedRange.getResult()), insertionAnchor,
-          segmentMapping);
-      if (succeeded(replayed) && !fullSegment && plan.tailConstant &&
-          plan.tailConstant != uniformZero(uniformElementType(plan.source.getType()))) {
-        auto type = cast<FragmentType>((*replayed).getType());
-        auto constant = materializeScalarConstant(
-            builder, location, plan.tailConstant, type.getElementType());
-        auto predicate = projectPredicateToFragmentAxis(
-            builder, location, tail, type, plan.sourceAxis);
-        if (failed(constant) || failed(predicate))
-          return failure();
-        Value fill = builder.create<SplatOp>(location, type, *constant);
-        replayed = Value(builder.create<SelectOp>(
-            location, type, *predicate, *replayed, fill));
-      }
-    } else {
-      auto dimension = cast<AxisMapAttr>(
-          cast<FragmentType>(plan.source.getType()).getAxisMaps()[plan.sourceAxis]).getDimensionId();
-      if (failed(reuse.bindSlices(builder, plan.source, plan.sourceIdentity, dimension,
-                                  sliceExtent, mapping.lookup(plan.ranges.front()->getResult(0)),
-                                  insertionAnchor, mapping, segmentMapping))) return failure();
-      replayed = materializeReplayedValue(
-          builder, location, plan.source, plan.sourceIdentity, sliceExtent,
-          mapping, insertionAnchor, replayOptions);
-    }
+    auto replayed = materializeSourceValue(
+        builder, location, plan.source, plan.sourceIdentity, sliceExtent,
+        mapping, insertionAnchor, replayOptions,
+        fullSegment ? Attribute() : plan.tailConstant, reuse);
     if (failed(replayed)) {
       reason = "source pure producer graph cannot be replayed";
       return failure();

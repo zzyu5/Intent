@@ -1,6 +1,7 @@
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "ContractionDetail.h"
 #include "../Value/ReplayPolicy.h"
+#include "../Value/SourceReplay.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
@@ -52,20 +53,15 @@ LogicalResult prepareRetainedContractionReads(func::FuncOp kernel) {
           std::pair{contract.getRhs(), contract.getRhsReductionAxes()}}) {
       for (int64_t axis : axes) {
         PhysicalProgramAnalysis analysis(kernel);
-        auto fragment = cast<FragmentType>(value.getType());
-        auto mapping = cast<AxisMapAttr>(fragment.getAxisMaps()[axis]);
-        PhysicalReplayFact replay = analysis.replayability(
-            value, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, mapping.getDimensionId());
-        if (!replay.isReplayable())
-          continue;
-        IRMapping bindings;
-        bool retain = !analysis.replayAt(
-            value, sourceAxisIdentity(mapping), PhysicalReplayScope::ValueGraph,
-            /*allowAccesses=*/true, contract, bindings,
-            mapping.getDimensionId()).isReplayable();
-        if (retain && !analysis.axisRealization(value, axis).physicalized &&
-            failed(realizeFullCoverageDimension(kernel, value, axis)))
+        auto type = cast<FragmentType>(value.getType());
+        auto relation = cast<AxisMapAttr>(type.getAxisMaps()[axis]);
+        // Operands already supplied as a native structured value need no
+        // producer replay. Preserve that existing contraction realization.
+        if (!analysis.replayability(value, sourceAxisIdentity(relation),
+                PhysicalReplayScope::ValueGraph, true,
+                relation.getDimensionId()).isReplayable()) continue;
+        if (failed(prepareSourceReplay(value, axis, contract,
+                                       PhysicalReplayScope::ValueGraph)))
           return WalkResult::interrupt();
       }
     }
@@ -149,64 +145,6 @@ LogicalResult refineOwnershipParameter(func::FuncOp kernel, MakeRangeOp range,
   replacement = replacement.withBinding(merged);
   if (failed(updateParameter(kernel, replacement))) return failure();
   return replaceParameter(kernel, previous->getReference(), replacement.getReference());
-}
-
-FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   Value value,
-                                   PhysicalExprAttr blockedExtent,
-                                   ArrayRef<MakeRangeOp> roots,
-                                   Value replacement,
-                                   IRMapping &mapping,
-                                   Operation *insertionAnchor) {
-  auto kernel = value.getParentRegion()->getParentOfType<func::FuncOp>();
-  if (!kernel || roots.empty())
-    return failure();
-  PhysicalSourceAxis source = sourceAxisIdentity(roots.front());
-  FailureOr<int64_t> dimension = queryRangeDimension(roots.front());
-  if (failed(dimension) ||
-      !llvm::all_of(roots, [&](MakeRangeOp root) {
-        FailureOr<int64_t> current = queryRangeDimension(root);
-        return sourceAxisIdentity(root) == source && succeeded(current) &&
-               *current == *dimension;
-      }))
-    return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
-      value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, insertionAnchor, mapping, *dimension);
-  if (!replay.isReplayable()) {
-    Operation *owner = value.getDefiningOp() ? value.getDefiningOp()
-                                           : kernel.getOperation();
-    PhysicalProgramAnalysis analysis(kernel);
-    PhysicalRangeAxisFact selected = analysis.rangeAxes(value, roots);
-    auto original = dyn_cast<FragmentType>(value.getType());
-    DominanceInfo dominance(kernel);
-    if (!original || !selected.isExact() || selected.fragmentAxes.size() != 1 ||
-        !dominance.dominates(value, insertionAnchor))
-      return owner->emitError("contraction blocking cannot slice the original value");
-    FailureOr<Value> sliced = materializeRetainedSlice(
-        builder, location, value, selected.fragmentAxes.front(), blockedExtent,
-        replacement, insertionAnchor);
-    if (failed(sliced))
-      return failure();
-    mapping.map(value, *sliced);
-    return sliced;
-  }
-  if (llvm::any_of(value.getUsers(), [&](Operation *user) {
-        return user == insertionAnchor || insertionAnchor->isAncestor(user);
-      })) {
-    ReplayPolicy reuse(kernel, ValueRange{value}, {insertionAnchor}, [&](Value current) {
-      return queryFragmentAxis(current.getType(), source, *dimension).isExact();
-    });
-    if (failed(reuse.bindSlices(builder, value, source, *dimension, blockedExtent,
-                                replacement, insertionAnchor, mapping))) return failure();
-  }
-  FailureOr<Value> result = materializeReplayedRanges(
-      builder, location, value, blockedExtent, roots, replacement, mapping,
-      insertionAnchor);
-  if (failed(result))
-    (value.getDefiningOp() ? value.getDefiningOp() : kernel.getOperation())
-        ->emitError("coordinate replay could not rebuild the current value graph");
-  return result;
 }
 
 FailureOr<Value> buildRangeTailPredicate(OpBuilder &builder, Location location,
@@ -295,44 +233,6 @@ LogicalResult appendTailValidity(Location location, Value source,
     pending.append(producer->operand_begin(), producer->operand_end());
   }
   return success();
-}
-
-FailureOr<Value> replaySourceValue(OpBuilder &builder, Location location,
-                                   func::FuncOp kernel, Value value,
-                                   PhysicalSourceAxis source,
-                                   PhysicalExprAttr blockedExtent,
-                                   MakeRangeOp root, Value replacement,
-                                   IRMapping &mapping,
-                                   Operation *insertionAnchor) {
-  FailureOr<int64_t> dimension = queryRangeDimension(root);
-  if (!kernel || !(sourceAxisIdentity(root) == source) || failed(dimension))
-    return failure();
-  PhysicalReplayFact replay = PhysicalProgramAnalysis(kernel).replayAt(
-      value, source, PhysicalReplayScope::ValueGraph,
-      /*allowAccesses=*/true, insertionAnchor, mapping, *dimension);
-  if (!replay.isReplayable()) {
-    InFlightDiagnostic diagnostic =
-        value.getDefiningOp()
-            ? value.getDefiningOp()->emitOpError(
-                  "contraction operand has no exact source-scoped replay fact")
-            : kernel.emitError(
-                  "contraction operand has no exact source-scoped replay fact");
-    for (Operation *blocker : replay.blockers)
-      diagnostic << "; blocker=" << blocker->getName();
-    return failure();
-  }
-  if (llvm::any_of(value.getUsers(), [&](Operation *user) {
-        return user == insertionAnchor || insertionAnchor->isAncestor(user);
-      })) {
-    ReplayPolicy reuse(kernel, ValueRange{value}, {insertionAnchor}, [&](Value current) {
-      return queryFragmentAxis(current.getType(), source, *dimension).isExact();
-    });
-    if (failed(reuse.bindSlices(builder, value, source, *dimension, blockedExtent,
-                                replacement, insertionAnchor, mapping))) return failure();
-  }
-  return materializeReplayedRanges(builder, location, value, blockedExtent,
-                                  ArrayRef<MakeRangeOp>(root), replacement,
-                                  mapping, insertionAnchor);
 }
 
 LogicalResult markNativeCoverage(func::FuncOp kernel, Value source,

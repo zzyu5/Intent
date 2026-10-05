@@ -1,4 +1,6 @@
 #include "ReductionRealization.h"
+#include "../Value/SourceReplay.h"
+#include "../Value/ReplayPolicy.h"
 #include "ReductionParameters.h"
 #include "ReductionValues.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
@@ -279,8 +281,10 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
           "multi-axis reduction sources do not share one exact outer traversal");
 
   for (const auto &component : accesses)
-    if (failed(prepareReductionReads(component, reduce, kernel)))
-      return failure();
+    for (RootAccess access : component)
+      if (failed(prepareSourceReplay(access.load.getResult(), access.fragmentAxis,
+                                     reduce, PhysicalReplayScope::ValueGraph)))
+        return reduce.emitOpError("reduction could not preserve its source snapshot");
 
   SmallVector<int64_t> retainedInnerAxes;
   SmallVector<int64_t> innerAxes;
@@ -390,6 +394,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
   };
   bool bodyFailed = false;
   std::string failureReason;
+  ReplayPolicy reuse(kernel, reduce.getSources(), {reduce.getOperation()});
   Value outerLoopStep =
       blockOuterAxis ? outerChunkValue : master->range.getStep();
   auto loop = builder.create<scf::ForOp>(
@@ -435,7 +440,30 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                   "outer reduction range could not be blocked";
               return;
             }
+          auto sourceType = cast<FragmentType>(plan.source.getType());
+          auto sourceAxis = cast<AxisMapAttr>(sourceType.getAxisMaps()[plan.reductionAxis]);
+          auto sourceCoordinate = mapOuterRange(plan.ranges.empty()
+              ? master->range : plan.ranges.front());
+          if (failed(sourceCoordinate) ||
+              failed(bindSourceReplay(nested, nestedLocation, plan.source,
+                  plan.sourceIdentity, sourceAxis.getDimensionId(), plan.reductionAxis,
+                  outerSliceExtent, *sourceCoordinate, reduce,
+                  PhysicalReplayScope::ValueGraph, {}, mapping, &reuse))) {
+            bodyFailed = true;
+            failureReason = "could not bind the current outer source snapshot";
+            return;
+          }
+          auto remaining = PhysicalProgramAnalysis(kernel).replayAt(
+              plan.source, plan.sourceIdentity, PhysicalReplayScope::ValueGraph,
+              true, reduce, mapping, sourceAxis.getDimensionId());
+          if (!remaining.isReplayable()) {
+            bodyFailed = true;
+            failureReason = "bound outer source has no complete producer replay proof";
+            return;
+          }
           for (RootAccess access : accesses[component]) {
+            if (mapping.lookupOrNull(access.load.getResult()) ||
+                !llvm::is_contained(remaining.accesses, access.load.getOperation())) continue;
             if (failed(mapOuterRange(access.range))) {
               bodyFailed = true;
               failureReason =
@@ -574,8 +602,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                 fill = *replayed;
               }
             }
-            auto slicedLoad = materializeReductionRead(
-                nested, nestedLocation, access, slicedType, coordinates,
+            auto slicedLoad = materializeSourceRead(
+                nested, nestedLocation, access.load, access.fragmentAxis, slicedType, coordinates,
                 valid, fill, mapping.lookupOrNull(access.range.getResult()),
                 reduce);
             if (failed(slicedLoad)) {

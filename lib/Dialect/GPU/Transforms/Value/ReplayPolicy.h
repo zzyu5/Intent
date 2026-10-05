@@ -12,6 +12,13 @@ namespace intent::gpu {
 mlir::FailureOr<MakeRangeOp> completeSnapshotRange(
     mlir::Value value, unsigned axis, PhysicalProgramAnalysis &analysis);
 
+// Slice an existing physical snapshot, preserving its own proven tail value.
+// An empty result is a normal nonmatch; this never grows source coverage.
+mlir::FailureOr<mlir::Value> materializeSnapshotSlice(
+    mlir::OpBuilder &builder, mlir::Value value, unsigned axis,
+    PhysicalExprAttr extent, mlir::Value coordinates, mlir::Operation *anchor,
+    AxisMapAttr resultMapping = {});
+
 // Profitability for one rewrite of the named consumers. Legality and coordinate
 // transport continue to belong to the existing replay and projection queries.
 class ReplayPolicy {

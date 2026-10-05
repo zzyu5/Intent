@@ -1,4 +1,5 @@
 #include "ContractionDetail.h"
+#include "../Value/SourceReplay.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -262,7 +263,7 @@ FailureOr<bool> collapseMultiReductionContract(ContractOp contract) {
           root.getSourceId(), root.getSourceAxis(), root.getDerived());
       inheritRangeAuthority(full, root);
       IRMapping mapping;
-      auto replayed = replaySourceValue(builder, contract.getLoc(), value,
+      auto replayed = materializeSourceRanges(builder, contract.getLoc(), value,
                                        extent, ranges.roots, full, mapping,
                                        contract.getOperation());
       if (failed(replayed))
