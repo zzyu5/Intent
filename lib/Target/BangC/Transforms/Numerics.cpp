@@ -300,7 +300,7 @@ void realizeApproximateReciprocals(func::FuncOp function, dsa::ConfigurationAttr
   }
 }
 
-bool specializeZeroMatrixTiles(func::FuncOp function) {
+bool specializeUniformTransposes(func::FuncOp function) {
   SmallVector<dsa::TransposeOp> transposes;
   function.walk([&](dsa::TransposeOp transpose) { transposes.push_back(transpose); });
   bool changed = false;
@@ -314,27 +314,6 @@ bool specializeZeroMatrixTiles(func::FuncOp function) {
     OpBuilder b(transpose);
     b.create<dsa::FillOp>(transpose.getLoc(), transpose.getOutput(), fill.getValue());
     transpose.erase(); changed = true;
-  }
-  SmallVector<dsa::MatrixTileOp> matrices;
-  function.walk([&](dsa::MatrixTileOp matrix) { matrices.push_back(matrix); });
-  for (auto matrix : matrices) {
-    auto fill = uniformFillBefore(matrix.getAccumulator(), matrix);
-    FloatAttr zero;
-    if (!matrix.getAccumulate() || !fill || !matchPattern(fill.getValue(), m_Constant(&zero)) ||
-        !zero.getValue().isZero() || zero.getValue().isNegative()) continue;
-    matrix.setAccumulate(false);
-    dsa::StorageAnalysis storage(function);
-    auto accesses = storage.accesses(matrix.getAccumulator());
-    bool observed = !accesses.complete || fill->getBlock() != matrix->getBlock();
-    for (const auto &entry : accesses.entries) {
-      if (!isa<MemoryEffects::Read>(entry.effect.getEffect())) continue;
-      Operation *scope = fill->getBlock()->findAncestorOpInBlock(*entry.operation);
-      if (scope && fill->getBlock() == matrix->getBlock() &&
-          fill->isBeforeInBlock(scope) && scope->isBeforeInBlock(matrix))
-        observed = true;
-    }
-    if (!observed) fill.erase();
-    changed = true;
   }
   return changed;
 }

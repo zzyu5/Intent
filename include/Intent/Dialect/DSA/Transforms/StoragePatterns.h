@@ -10,6 +10,8 @@ namespace intent::dsa::detail {
 // The operation defines every element of this operand, including padding.
 // An accumulator read/write (matrix or collective state) is not an overwrite.
 inline mlir::OpOperand *completeLocalOutput(mlir::Operation *operation) {
+  if (auto op = mlir::dyn_cast<MatrixTileOp>(operation))
+    return op.getAccumulate() ? nullptr : &op.getAccumulatorMutable();
   if (auto op = mlir::dyn_cast<FillOp>(operation)) return &op.getOutputMutable();
   if (auto op = mlir::dyn_cast<LoadTileOp>(operation))
     return op.getAsynchronous() ? nullptr : &op.getOutputMutable();

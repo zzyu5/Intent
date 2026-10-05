@@ -5,6 +5,7 @@ add_mlir_library(MLIRIntentBangCResources
 add_mlir_library(MLIRIntentBangC
   Transforms/Legalize.cpp
   Transforms/Matrix.cpp
+  Transforms/MatrixInitialization.cpp
   Transforms/Numerics.cpp
   Transforms/BroadcastOperands.cpp
   Transforms/TransposeSupply.cpp

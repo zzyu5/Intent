@@ -30,7 +30,8 @@ bool storageFitsBudget(func::FuncOp function, dsa::ConfigurationAttr config,
                        StorageUsage usage);
 LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config);
 bool supportedScalarBinary(BinaryOperator kind);
-bool specializeZeroMatrixTiles(func::FuncOp function);
+bool specializeUniformTransposes(func::FuncOp function);
+bool initializeMatrixStorage(func::FuncOp function);
 bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool bindBroadcastOperands(func::FuncOp function);
 bool propagateLocalTransposeSupply(func::FuncOp function, dsa::ConfigurationAttr config);

@@ -172,4 +172,11 @@ void DivideCastOp::getEffects(
   mixedStorageEffects(getOperation(), {2, 3, 4, 5, 6}, effects);
 }
 
+void MatrixTileOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  mixedStorageEffects(getOperation(), {2}, effects);
+  if (getAccumulate())
+    effects.emplace_back(MemoryEffects::Read::get(), &getAccumulatorMutable());
+}
+
 } // namespace intent::dsa

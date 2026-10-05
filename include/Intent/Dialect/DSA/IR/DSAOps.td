@@ -268,11 +268,12 @@ def IntentDSA_MatMulOp : IntentDSA_Op<"matmul"> {
     Index:$rows, Index:$depth, Index:$columns,
     DefaultValuedAttr<BoolAttr, "false">:$rhs_transposed);
 }
-def IntentDSA_MatrixTileOp : IntentDSA_Op<"matrix_tile"> {
+def IntentDSA_MatrixTileOp : IntentDSA_Op<"matrix_tile", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Compute one selected matrix tile, optionally accumulating into the existing result";
-  let arguments = (ins Arg<AnyMemRef, "", [MemRead]>:$lhs,
-    Arg<AnyMemRef, "", [MemRead]>:$rhs,
-    Arg<AnyMemRef, "", [MemRead, MemWrite]>:$accumulator,
+  let arguments = (ins AnyMemRef:$lhs,
+    AnyMemRef:$rhs,
+    AnyMemRef:$accumulator,
     DefaultValuedAttr<BoolAttr, "true">:$accumulate);
 }
 #endif

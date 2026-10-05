@@ -1,5 +1,6 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/IR/MemoryEffects.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -147,7 +148,10 @@ public:
       if (operation.hasTrait<OpTrait::IsTerminator>()) break;
       auto effects = storage.effects(&operation);
       if (!effects.complete || effects.ordered) {
-        available.clear(); pending.clear(); tiles.clear();
+        available.clear(); tiles.clear();
+        llvm::erase_if(pending, [&](const PendingWrite &write) {
+          return !preservesPendingWrite(write, &operation, effects);
+        });
         for (Region &region : operation.getRegions())
           for (Block &nested : region) analyze(nested);
         continue;
@@ -266,6 +270,41 @@ public:
   }
 
 private:
+  bool preservesPendingWrite(const PendingWrite &write, Operation *scope,
+                             const BufferStorageEffects &effects) {
+    Value origin = storage.uniqueOrigin(write.memory);
+    auto allocation = origin ? origin.getDefiningOp<memref::AllocaOp>()
+                             : memref::AllocaOp{};
+    auto output = detail::completeLocalOutput(write.operation);
+    if (!effects.complete || !allocation ||
+        allocation.getType().getMemorySpaceAsInt() != nramSpace || !output ||
+        !isCompleteStorageViewOf(output->get(), origin) ||
+        !isCompleteStorageViewOf(write.memory, origin)) return false;
+    if (llvm::any_of(effects.entries, [&](const auto &entry) {
+          return !storage.disjoint(origin, entry.effect.getValue());
+        })) return false;
+    // Group participation is not a private-work-unit ordering boundary.
+    bool group = false;
+    scope->walk([&](Operation *operation) {
+      group |= requiredCompletion(operation) == CompletionScope::ExecutionGroup ||
+               completesTransfers(operation, CompletionScope::ExecutionGroup);
+    });
+    if (group) return false;
+    auto accesses = storage.accesses(origin);
+    if (!accesses.complete) return false;
+    // A disjoint current prefetch says nothing about older outstanding uses.
+    // All asynchronous uses of this private storage must have completed before
+    // the pending write; an ambiguous use/backedge keeps the original write.
+    for (const auto &entry : accesses.entries) {
+      if (requiredCompletion(entry.operation) == CompletionScope::Immediate)
+        continue;
+      auto completion = storage.completionOfUse(entry.operation);
+      if (failed(completion) ||
+          !dominance.properlyDominates(*completion, write.operation)) return false;
+    }
+    return true;
+  }
+
   Value resolve(Value value) const {
     while (Value next = replacements.lookupOrNull(value)) value = next;
     return value;

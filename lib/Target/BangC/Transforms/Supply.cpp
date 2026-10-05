@@ -605,7 +605,7 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (failed(composeLocalStorage(function, cleanup))) return failure();
   while (propagateLocalTransposeSupply(function, config))
     if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
-  if (specializeZeroMatrixTiles(function) && failed(cleanup())) return failure();
+  if (specializeUniformTransposes(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();
   if (dsa::reuseGatherOffsets(function) && failed(cleanup())) return failure();
@@ -614,6 +614,9 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (dsa::batchPointwiseTasks(function) && failed(cleanup())) return failure();
   if (coarsenLocalPrograms(function, config) && failed(cleanup())) return failure();
   while (placeInvariantSupply(function, config)) {
+    if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
+  }
+  while (initializeMatrixStorage(function)) {
     if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
   }
   if (reuseConsumedBinaryInputs(function, config) && failed(cleanup())) return failure();
