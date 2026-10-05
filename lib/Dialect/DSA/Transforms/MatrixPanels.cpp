@@ -1,5 +1,6 @@
 #include "Intent/Dialect/DSA/Transforms/MatrixPanels.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include <algorithm>
 #include <limits>
 
@@ -92,6 +93,48 @@ matrixPanelStorage(Type element, int64_t rows, int64_t columns,
   for (int64_t size : {*lhs, *lhs, *rhs, *rhs, *rhs})
     if (!add(nram, size)) return std::nullopt;
   return MatrixPanelStorage{nram, *packed};
+}
+
+llvm::SmallVector<MatrixPanelShape> largerMatrixPanels(
+    ConfigurationAttr config, Type element, int64_t rows, int64_t columns,
+    int64_t depth, MatrixPanelShape baseline) {
+  llvm::SmallVector<MatrixPanelShape> result;
+  if (rows <= 0 || columns <= 0 || baseline.rows <= 0 || baseline.columns <= 0 ||
+      baseline.columns % 64 ||
+      columns > std::numeric_limits<int64_t>::max() - 63)
+    return result;
+  baseline.rows = std::min(baseline.rows, rows);
+  int64_t paddedColumns = ((columns + 63) / 64) * 64;
+  if (baseline.columns > paddedColumns) return result;
+  auto steps = [](int64_t first, int64_t last) {
+    llvm::SmallVector<int64_t> values{first};
+    while (first < last) {
+      first = first > last / 2 ? last : first * 2;
+      values.push_back(first);
+    }
+    return values;
+  };
+  auto rectangles = [&](MatrixPanelShape shape) -> __int128 {
+    return static_cast<__int128>((rows - 1) / shape.rows + 1) *
+        ((columns - 1) / shape.columns + 1);
+  };
+  struct Candidate { MatrixPanelShape shape; int64_t bytes; };
+  llvm::SmallVector<Candidate> candidates;
+  for (int64_t m : steps(baseline.rows, rows))
+    for (int64_t n : steps(baseline.columns, paddedColumns)) {
+      MatrixPanelShape shape{m, n};
+      if (rectangles(shape) >= rectangles(baseline)) continue;
+      auto storage = matrixPanelStorage(element, m, n, depth);
+      if (!storage || storage->nram > std::min<int64_t>(config.getLocalBytes(), 768 * 1024) ||
+          storage->wram > 1024 * 1024) continue;
+      candidates.push_back({shape, storage->nram});
+    }
+  llvm::stable_sort(candidates, [&](const Candidate &a, const Candidate &b) {
+    auto left = rectangles(a.shape), right = rectangles(b.shape);
+    return left != right ? left < right : a.bytes < b.bytes;
+  });
+  for (const Candidate &candidate : candidates) result.push_back(candidate.shape);
+  return result;
 }
 
 int64_t selectMatrixPanelDepth(func::FuncOp function, ConfigurationAttr config,

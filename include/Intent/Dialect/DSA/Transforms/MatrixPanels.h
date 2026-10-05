@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/ADT/SmallVector.h"
 #include <optional>
 
 namespace intent::dsa {
@@ -16,6 +17,15 @@ struct MatrixPanelStorage {
 std::optional<MatrixPanelStorage>
 matrixPanelStorage(mlir::Type element, int64_t rows, int64_t columns,
                    int64_t depth);
+
+struct MatrixPanelShape { int64_t rows, columns; };
+
+// Larger free-axis tiles for this already materialized matrix. Candidates
+// reduce the number of rectangles and pass a standalone storage bound; callers
+// must still measure the actual program before accepting one.
+llvm::SmallVector<MatrixPanelShape> largerMatrixPanels(
+    ConfigurationAttr config, mlir::Type element, int64_t rows, int64_t columns,
+    int64_t depth, MatrixPanelShape baseline);
 
 // Call only while forming one ordinary contraction. availableDepth is a
 // complete source panel; selection never authorizes merging ordered updates.
