@@ -2,6 +2,8 @@
 #include "IndexBounds.h"
 #include "PhysicalProgramDetail.h"
 #include "ScalarExpressions.h"
+#include "Intent/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -347,6 +349,37 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
     bool lowerComparison =
         comparison && comparison.getPredicate() == ComparePredicate::Ge &&
         integerConstant(comparison.getRhs()) == 0;
+    if (comparison && comparison.getPredicate() == ComparePredicate::Ge &&
+        !lowerComparison) {
+      Value lower = stripScalarIdentity(comparison.getRhs());
+      for (MakeRangeOp range : accessFact.ranges) {
+        if (!isUnitStepRange(range) || !lower.getType().isIndex() ||
+            !derivesFromAccessCoordinate(comparison.getLhs(), range.getResult()) ||
+            !samePhysicalScalarExpression(lower, range.getLogicalStart()) ||
+            !samePhysicalScalarExpression(range.getStart(), range.getLogicalStart()) ||
+            !IndexRelations().positive(range.getExtent()))
+          continue;
+        auto start = queryIntegerRange(range.getStart());
+        auto extent = queryIntegerRange(range.getExtent());
+        bool noWrap = start && extent && extent->smin().isStrictlyPositive() &&
+            provesSignedNoWrap(BinaryOperator::Add, *start,
+                ConstantIntRanges::fromSigned(APInt(64, 0),
+                                               extent->smax() - 1));
+        if (!noWrap && !allowRangeGuards)
+          continue;
+        if (!noWrap) {
+          // The native consumer must establish a complete nonnegative tile:
+          // stop - start >= extent, with both endpoints nonnegative. Then
+          // start + (extent - 1) < stop cannot wrap, so every physical member
+          // satisfies this lower predicate. Partial tiles keep their original
+          // predicated access; start == logicalStart alone is insufficient.
+          std::pair<MakeRangeOp, Value> bound{range, range.getLogicalStop()};
+          if (!llvm::is_contained(result.rangeBounds, bound))
+            result.rangeBounds.push_back(bound);
+        }
+        return PhysicalFactState::Exact;
+      }
+    }
     if (!upperComparison && !lowerComparison) {
       appendUnique(result.blockers, value.getDefiningOp());
       return PhysicalFactState::Unknown;

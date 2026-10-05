@@ -221,15 +221,20 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   }
 
   SmallVector<SmallVector<NamedAttribute>> providerConfigurations;
-  for (auto configuration : launches) {
-    configuration.append(memoryConfigurations.front());
-    providerConfigurations.push_back(std::move(configuration));
-  }
-  // Preserve access-form/load-latency interactions at the launch baseline.
-  for (const auto &memory : llvm::drop_begin(memoryConfigurations)) {
-    auto configuration = launches.front();
-    configuration.append(memory);
-    providerConfigurations.push_back(std::move(configuration));
+  for (const auto &memory : memoryConfigurations) {
+    ArrayRef<SmallVector<NamedAttribute>> selectedLaunches(launches);
+    // Every access form retains the correlated launch portfolio. An additional
+    // legal form must not remove launch choices from an existing primitive.
+    // Nonbaseline load policies still vary only at the launch baseline.
+    if (loadPolicy &&
+        cast<IntegerAttr>(NamedAttrList(memory).get(loadPolicy.getName())).getInt() !=
+            loadPolicy.getCandidates().asArrayRef().front())
+      selectedLaunches = selectedLaunches.take_front();
+    for (const auto &launch : selectedLaunches) {
+      auto configuration = launch;
+      configuration.append(memory);
+      providerConfigurations.push_back(std::move(configuration));
+    }
   }
   // Group only the resident alternatives introduced by preparation. Keep the
   // original shared-tuple/launch order after the equality requirement selects
