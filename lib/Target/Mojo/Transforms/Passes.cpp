@@ -30,6 +30,13 @@ namespace intent::mojo {
 
 namespace {
 
+LogicalResult verifyGroupInput(ModuleOp module, StringRef name) {
+  if (failed(cpu::verifyImplementationBindings(module, "mojo")) ||
+      failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers)))
+    return module.emitError() << "Mojo precondition failed: " << name;
+  return success();
+}
+
 LogicalResult finishGroup(ModuleOp module, StringRef name, LogicalResult result,
                           bool realized = false) {
   if (failed(result))
@@ -45,8 +52,7 @@ public:
   using MojoMaterializeProgramBase::MojoMaterializeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
-    if (failed(cpu::verifyCPUProgram(module, cpu::CPUProgramStage::Buffers))) return signalPassFailure();
+    if (failed(verifyGroupInput(module, getArgument()))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), prepareNativeProgram(module))))
       signalPassFailure();
   }
@@ -61,7 +67,7 @@ public:
   }
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
+    if (failed(verifyGroupInput(module, getArgument()))) return signalPassFailure();
     if (failed(finishGroup(module, getArgument(), fusePrivateComputations(module))))
       signalPassFailure();
   }
@@ -72,8 +78,9 @@ public:
   using MojoVectorizeProgramBase::MojoVectorizeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
-    if (failed(finishGroup(module, getArgument(), vectorizeNativeProgram(module))))
+    if (failed(verifyGroupInput(module, getArgument()))) return signalPassFailure();
+    if (failed(finishGroup(module, getArgument(),
+                          vectorizeNativeProgram(module, fuseSharedTraversals.getValue()))))
       signalPassFailure();
   }
 };
@@ -83,7 +90,7 @@ public:
   using MojoFinalizeProgramBase::MojoFinalizeProgramBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(cpu::verifyImplementationBindings(module, "mojo"))) return signalPassFailure();
+    if (failed(verifyGroupInput(module, getArgument()))) return signalPassFailure();
     auto result = finalizeNativeProgram(module);
     if (succeeded(result)) cpu::deduplicateFinalizedCandidates(module);
     if (failed(finishGroup(module, getArgument(), result, true))) signalPassFailure();

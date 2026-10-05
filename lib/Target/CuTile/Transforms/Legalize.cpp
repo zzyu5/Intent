@@ -37,7 +37,7 @@ LogicalResult prepareProgram(ModuleOp module) {
   return gpu::verifyGPUProgram(module);
 }
 
-LogicalResult finalizeProgram(ModuleOp module) {
+LogicalResult finalizeProgram(ModuleOp module, bool hoistLoopInvariants) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel)) return failure();
   if (failed(refineMMALoops(module)))
@@ -49,7 +49,8 @@ LogicalResult finalizeProgram(ModuleOp module) {
   preserveNativeIndexValues(*kernel);
   if (failed(collapseArrayViews(module)))
     return failure();
-  if (failed(gpu::eliminateCommonValues(module)))
+  if (failed(hoistLoopInvariants ? gpu::hoistLoopInvariantValues(module)
+                                : gpu::eliminateCommonValues(module)))
     return failure();
   if (auto bounds = arrayIndexTileBounds(*kernel)) {
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, UnitAttr::get(module.getContext()));

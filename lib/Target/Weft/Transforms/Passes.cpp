@@ -56,7 +56,8 @@ class VerifyProgramPass : public impl::WeftVerifyProgramBase<VerifyProgramPass> 
 public:
   using WeftVerifyProgramBase::WeftVerifyProgramBase;
   void runOnOperation() final {
-    if (failed(verifyProgram(getOperation()))) signalPassFailure();
+    if (failed(verifyProgram(getOperation()))) return signalPassFailure();
+    markAllAnalysesPreserved();
   }
 };
 

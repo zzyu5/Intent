@@ -366,7 +366,8 @@ LogicalResult fuseIndependentReductions(ModuleOp module) {
   return success();
 }
 
-LogicalResult fuseIndependentTraversals(ModuleOp module) {
+LogicalResult fuseIndependentTraversals(ModuleOp module,
+                                       bool hoistLoopInvariants) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -389,9 +390,13 @@ LogicalResult fuseIndependentTraversals(ModuleOp module) {
         break;
     }
   } while (changed);
-  if (failed(eliminateCommonValues(module)))
+  auto simplify = [&]() {
+    return hoistLoopInvariants ? hoistLoopInvariantValues(module)
+                               : eliminateCommonValues(module);
+  };
+  if (failed(simplify()))
     return failure();
-  if (access::reuseStableLoads(kernel) && failed(eliminateCommonValues(module)))
+  if (access::reuseStableLoads(kernel) && failed(simplify()))
     return failure();
   access::sinkStableLoadChains(kernel);
   return success();

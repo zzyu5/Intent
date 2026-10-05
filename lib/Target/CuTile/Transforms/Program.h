@@ -10,7 +10,8 @@ mlir::LogicalResult prepareProgram(mlir::ModuleOp module);
 // Consume current-GPU facts before committing native replacements.
 mlir::LogicalResult formNativeProgram(mlir::ModuleOp module);
 // Finish native forms and verify the complete provider program.
-mlir::LogicalResult finalizeProgram(mlir::ModuleOp module);
+mlir::LogicalResult finalizeProgram(mlir::ModuleOp module,
+                                   bool hoistLoopInvariants);
 
 } // namespace intent::cutile
 

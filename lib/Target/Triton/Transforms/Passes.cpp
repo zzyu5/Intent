@@ -59,9 +59,11 @@ public:
 
 class FinalizeProgramPass : public impl::FinalizeProgramPassBase<FinalizeProgramPass> {
 public:
+  using FinalizeProgramPassBase::FinalizeProgramPassBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishGroup(module, getArgument(), finalizeTritonProgram(module))))
+    if (failed(finishGroup(module, getArgument(),
+                          finalizeTritonProgram(module, hoistLoopInvariants))))
       signalPassFailure();
   }
 };

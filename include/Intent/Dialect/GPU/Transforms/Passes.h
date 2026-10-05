@@ -33,10 +33,15 @@ mlir::LogicalResult realizeReductionBlocking(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseOwnership(mlir::ModuleOp module);
 mlir::LogicalResult realizePointwiseBlocking(mlir::ModuleOp module);
 mlir::LogicalResult refineProgramMapping(mlir::ModuleOp module);
+// Value cleanup never changes the execution scope of a read. The optional
+// placement group owns canonicalization, bounded invariant motion and CSE in
+// that order. Shared/provider pass entries verify their respective surfaces.
 mlir::LogicalResult eliminateCommonValues(mlir::ModuleOp module);
+mlir::LogicalResult hoistLoopInvariantValues(mlir::ModuleOp module);
 mlir::LogicalResult simplifyRangePredicates(mlir::ModuleOp module);
 mlir::LogicalResult fuseIndependentReductions(mlir::ModuleOp module);
-mlir::LogicalResult fuseIndependentTraversals(mlir::ModuleOp module);
+mlir::LogicalResult fuseIndependentTraversals(mlir::ModuleOp module,
+                                             bool hoistLoopInvariants);
 mlir::LogicalResult completeGPUProgramConstruction(mlir::ModuleOp module);
 
 } // namespace intent::gpu

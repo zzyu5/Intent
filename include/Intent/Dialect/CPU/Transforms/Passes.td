@@ -70,17 +70,48 @@ def CPUFuseStructuredComputations : CPUTransform<"intent-cpu-fuse-structured-com
     "Fuse compatible structured computation traversals"> {
   let description = [{
     Requires and preserves the CPU Buffers contract. Fuses compatible
-    structured computations using their current indexing, storage and effect
-    relations. Candidate selection and target expansion remain separate.
+    structured computations using current indexing, storage and effect
+    relations. Complete stored versions are observed only until their next
+    proved overwrite or release; replay preserves the original input snapshot
+    and each consumer's coordinates. The group closes integer/access folding,
+    version forwarding, producer fusion and destination reuse. It does not
+    choose implementations or change numerical permissions. Storage, dominance
+    and producer facts are rebuilt after rewrites; the CPU verifier checks the
+    resulting buffer program.
   }];
 }
 
 def CPUNormalizeReductions : CPUTransform<"intent-cpu-normalize-reductions",
     "Normalize scalar reductions into structured CPU computations"> {
   let description = [{
-    Requires a CPU buffer program before implementation selection. Normalizes
-    eligible scalar reductions to closed structured computations while keeping
-    unsupported reduction forms intact for their existing realization path.
+    Requires and preserves a CPU buffer program before implementation selection.
+    Combines eligible completed ordinary reduction chains using their actual
+    members, combine, identity and private storage versions, then represents
+    rank-zero reductions as structured CPU Reduce operations. Unknown coverage,
+    layout, capacity or version relations keep the original legal form. It does
+    not combine ordered recurrences, cross numerical casts or select a native
+    reduction tree. Storage and extent facts are queried from the current IR
+    and invalidated by each rewrite; the complete result passes CPU verification.
+  }];
+}
+
+def CPUFuseSharedTraversals : CPUTransform<"intent-cpu-fuse-shared-traversals",
+    "Share proved sibling traversals and their same-coordinate memory values"> {
+  let description = [{
+    Requires and preserves the CPU Buffers contract, including programs with
+    explicit Tasks or TaskDispatch regions. Implementations need not have been
+    selected; any existing bindings and reduction-order permissions must be
+    compatible. Equal actual bounds, complete effects, storage independence and
+    injective same-coordinate accesses authorize sibling fusion. A pure
+    result-dependent suffix may move only when its uses remain dominated.
+
+    This is the complete traversal-reuse group: private access aliases, fusion,
+    memory forwarding, CSE, canonicalization and dead private storage removal
+    reach a fixed point. Storage, dominance and coordinate analyses are rebuilt
+    after mutation. The group checks the buffer-program postcondition; it does
+    not partition tasks, assign bindings or perform provider vectorization.
+    Running it before provider binding closure may retain separate traversals
+    whose existing bindings are not yet compatible.
   }];
 }
 

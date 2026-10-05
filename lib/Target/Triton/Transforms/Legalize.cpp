@@ -70,7 +70,7 @@ LogicalResult formTritonProgram(ModuleOp module) {
   return mlir::verify(module);
 }
 
-LogicalResult finalizeTritonProgram(ModuleOp module) {
+LogicalResult finalizeTritonProgram(ModuleOp module, bool hoistLoopInvariants) {
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
@@ -82,7 +82,8 @@ LogicalResult finalizeTritonProgram(ModuleOp module) {
   });
   for (gpu::AssumeInBoundsOp assumption : assumptions)
     assumption.erase();
-  if (failed(gpu::eliminateCommonValues(module)) ||
+  if (failed(hoistLoopInvariants ? gpu::hoistLoopInvariantValues(module)
+                                : gpu::eliminateCommonValues(module)) ||
       failed(detail::legalizeCollectiveCallbacks(*kernel)) ||
       failed(finalizeConfigurationRequirements(*kernel)))
     return failure();

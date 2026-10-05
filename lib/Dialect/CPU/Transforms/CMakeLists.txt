@@ -22,6 +22,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Collective/Passes.cpp
   Collective/SliceCollectives.cpp
 
+  Control/Passes.cpp
   Control/TraversalAccesses.cpp
   Control/TraversalFusion.cpp
 
@@ -75,6 +76,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRIntentAnalysis
   MLIRIntentCPUDialect
   MLIRAnalysis
+  MLIRAffineDialect
   MLIRAffineToStandard
   MLIRAffineUtils
   MLIRArithDialect

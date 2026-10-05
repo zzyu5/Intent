@@ -8,7 +8,8 @@ namespace intent::triton {
 // Complete provider phases consume and update the current executable program.
 mlir::LogicalResult prepareTritonMemory(mlir::ModuleOp module);
 mlir::LogicalResult formTritonProgram(mlir::ModuleOp module);
-mlir::LogicalResult finalizeTritonProgram(mlir::ModuleOp module);
+mlir::LogicalResult finalizeTritonProgram(mlir::ModuleOp module,
+                                        bool hoistLoopInvariants);
 
 } // namespace intent::triton
 

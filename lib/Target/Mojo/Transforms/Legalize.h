@@ -9,7 +9,8 @@ namespace intent::mojo {
 // candidate and implementation bindings are already materialized in that IR.
 mlir::LogicalResult prepareNativeProgram(mlir::ModuleOp module);
 mlir::LogicalResult fusePrivateComputations(mlir::ModuleOp module);
-mlir::LogicalResult vectorizeNativeProgram(mlir::ModuleOp module);
+mlir::LogicalResult vectorizeNativeProgram(mlir::ModuleOp module,
+                                         bool fuseSharedTraversals);
 mlir::LogicalResult finalizeNativeProgram(mlir::ModuleOp module);
 
 } // namespace intent::mojo

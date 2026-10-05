@@ -189,27 +189,47 @@ void foldExactConstantDivisions(func::FuncOp kernel) {
   });
 }
 
-LogicalResult eliminateCommonValues(ModuleOp module) {
-  FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
-  if (failed(kernel))
-    return failure();
-  foldScalarIntegerValues(*kernel);
+namespace {
+
+LogicalResult canonicalizeCommonValues(func::FuncOp kernel) {
+  foldScalarIntegerValues(kernel);
   // A custom fragment splat is uniform without being an IntegerAttr operand
   // for MLIR's SelectOp fold adaptor. Fold its selected SSA value everywhere,
   // including predicates that prove bounds for a separately reused coordinate.
   kernel->walk<WalkOrder::PostOrder>([](SelectOp select) {
     foldConstantSelection(select);
   });
-  RewritePatternSet patterns(module.getContext());
-  ReshapeOp::getCanonicalizationPatterns(patterns, module.getContext());
-  TransposeOp::getCanonicalizationPatterns(patterns, module.getContext());
-  SelectOp::getCanonicalizationPatterns(patterns, module.getContext());
-  if (failed(applyPatternsAndFoldGreedily(*kernel, std::move(patterns))))
+  RewritePatternSet patterns(kernel.getContext());
+  ReshapeOp::getCanonicalizationPatterns(patterns, kernel.getContext());
+  TransposeOp::getCanonicalizationPatterns(patterns, kernel.getContext());
+  SelectOp::getCanonicalizationPatterns(patterns, kernel.getContext());
+  if (failed(applyPatternsAndFoldGreedily(kernel, std::move(patterns))))
     return kernel->emitError("local value canonicalization did not converge");
-  if (failed(placement::hoistLoopInvariantValues(*kernel))) return failure();
-  IRRewriter rewriter(module.getContext());
-  DominanceInfo dominance(*kernel);
-  eliminateCommonSubExpressions(rewriter, dominance, kernel->getOperation());
+  return success();
+}
+
+void eliminateCommonSubExpressions(func::FuncOp kernel) {
+  IRRewriter rewriter(kernel.getContext());
+  DominanceInfo dominance(kernel);
+  mlir::eliminateCommonSubExpressions(rewriter, dominance, kernel.getOperation());
+}
+
+} // namespace
+
+LogicalResult eliminateCommonValues(ModuleOp module) {
+  auto kernel = getPhysicalKernel(module);
+  if (failed(kernel) || failed(canonicalizeCommonValues(*kernel)))
+    return failure();
+  eliminateCommonSubExpressions(*kernel);
+  return success();
+}
+
+LogicalResult hoistLoopInvariantValues(ModuleOp module) {
+  auto kernel = getPhysicalKernel(module);
+  if (failed(kernel) || failed(canonicalizeCommonValues(*kernel)) ||
+      failed(placement::hoistLoopInvariantValues(*kernel)))
+    return failure();
+  eliminateCommonSubExpressions(*kernel);
   return success();
 }
 

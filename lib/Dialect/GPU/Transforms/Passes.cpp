@@ -36,6 +36,7 @@ namespace intent::gpu {
 #define GEN_PASS_DEF_PROGRAMMAPPINGPASS
 #define GEN_PASS_DEF_RANGEPREDICATESPASS
 #define GEN_PASS_DEF_COMMONVALUESPASS
+#define GEN_PASS_DEF_HOISTLOOPINVARIANTVALUESPASS
 #define GEN_PASS_DEF_REALIZESHAREDPROGRAMPASS
 #define GEN_PASS_DEF_MATERIALIZECONFIGURATIONSPASS
 #define GEN_PASS_DEF_FUSEINDEPENDENTTRAVERSALSPASS
@@ -45,8 +46,10 @@ namespace {
 
 // Complete transformation entries own relation closure; the pipeline schedules
 // their semantic dependencies and verifies each finished group.
-LogicalResult normalizeStructuredSources(ModuleOp module) {
-  if (failed(eliminateCommonValues(module))) return failure();
+LogicalResult normalizeStructuredSources(ModuleOp module, bool hoist) {
+  if (failed(hoist ? hoistLoopInvariantValues(module)
+                   : eliminateCommonValues(module)))
+    return failure();
   return normalizeContractionSources(module);
 }
 
@@ -63,8 +66,9 @@ LogicalResult composeRealizedAccesses(ModuleOp module) {
   return orientLoopContractions(module);
 }
 
-LogicalResult simplifyValues(ModuleOp module) {
-  if (failed(eliminateCommonValues(module)))
+LogicalResult simplifyValues(ModuleOp module, bool hoist) {
+  if (failed(hoist ? hoistLoopInvariantValues(module)
+                   : eliminateCommonValues(module)))
     return failure();
   return simplifyMaskedAccessCoordinates(module);
 }
@@ -87,9 +91,11 @@ LogicalResult finishTransformation(ModuleOp module, StringRef name,
 
 class NormalizeStructuredSourcesPass : public impl::NormalizeStructuredSourcesPassBase<NormalizeStructuredSourcesPass> {
 public:
+  using NormalizeStructuredSourcesPassBase::NormalizeStructuredSourcesPassBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishTransformation(module, getArgument(), normalizeStructuredSources(module))))
+    if (failed(finishTransformation(module, getArgument(),
+                                   normalizeStructuredSources(module, hoistLoopInvariants))))
       signalPassFailure();
   }
 };
@@ -240,9 +246,23 @@ public:
 
 class CommonValuesPass : public impl::CommonValuesPassBase<CommonValuesPass> {
 public:
+  using CommonValuesPassBase::CommonValuesPassBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishTransformation(module, getArgument(), simplifyValues(module))))
+    if (failed(finishTransformation(module, getArgument(),
+                                   simplifyValues(module, hoistLoopInvariants))))
+      signalPassFailure();
+  }
+};
+
+class HoistLoopInvariantValuesPass
+    : public impl::HoistLoopInvariantValuesPassBase<HoistLoopInvariantValuesPass> {
+public:
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(verifyGPUProgram(module)) ||
+        failed(finishTransformation(module, getArgument(),
+                                    hoistLoopInvariantValues(module))))
       signalPassFailure();
   }
 };
@@ -307,10 +327,12 @@ public:
 class FuseIndependentTraversalsPass
     : public impl::FuseIndependentTraversalsPassBase<FuseIndependentTraversalsPass> {
 public:
+  using FuseIndependentTraversalsPassBase::FuseIndependentTraversalsPassBase;
   void runOnOperation() final {
     ModuleOp module = getOperation();
     auto transform = [&]() -> LogicalResult {
-      if (failed(fuseIndependentTraversals(module))) return failure();
+      if (failed(fuseIndependentTraversals(module, hoistLoopInvariants)))
+        return failure();
       auto kernel = getPhysicalKernel(module);
       if (failed(kernel)) return failure();
       if (reduction::normalizeCompletedReductions(*kernel)) {

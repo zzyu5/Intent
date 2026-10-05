@@ -242,7 +242,7 @@ LogicalResult fusePrivateComputations(ModuleOp module) {
   return success();
 }
 
-LogicalResult vectorizeNativeProgram(ModuleOp module) {
+LogicalResult vectorizeNativeProgram(ModuleOp module, bool fuseTraversals) {
   auto implementations = cpu::lookupImplementationProvider(module, "mojo");
   if (failed(implementations)) return failure();
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
@@ -254,7 +254,7 @@ LogicalResult vectorizeNativeProgram(ModuleOp module) {
       if (!loop->hasAttr("intent_cpu.implementation"))
         loop->setAttr("intent_cpu.implementation", programBinding);
     });
-    if (failed(cpu::fuseSharedTraversals(function))) return failure();
+    if (fuseTraversals && failed(cpu::fuseSharedTraversals(function))) return failure();
     SmallVector<scf::ForOp> loops;
     function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
     auto configuration = function->getAttrOfType<cpu::ConfigurationAttr>("intent_cpu.configuration");
