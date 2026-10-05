@@ -24,6 +24,11 @@ bool canMoveBefore(mlir::Operation *operation, mlir::Operation *before);
 bool moveInputsBefore(mlir::Operation *first, mlir::Operation *second,
                       mlir::func::FuncOp kernel);
 
+// Preserve ordinary read snapshots across a loop only under its actual memory
+// independence and nonempty conditions. Pure invariant dependencies share the
+// same bounded placement; provider layout and final resource checks remain.
+mlir::LogicalResult hoistLoopInvariantValues(mlir::func::FuncOp kernel);
+
 // An exact current control path, excluding the enclosing scope itself. Loops
 // and unknown regions are not interchangeable with conditional execution.
 mlir::FailureOr<llvm::SmallVector<mlir::Block *>>

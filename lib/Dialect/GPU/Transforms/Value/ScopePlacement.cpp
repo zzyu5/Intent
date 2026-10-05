@@ -1,13 +1,20 @@
 #include "ScopePlacement.h"
+#include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/MemoryEffects.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
@@ -29,7 +36,171 @@ bool hasUnorderedEffects(Operation *operation) {
   }).wasInterrupted();
 }
 
+bool shapeOnly(Operation *operation) {
+  return isa<BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
+             MakeRecordOp, ExtractOp, arith::ConstantOp>(operation);
+}
+
+std::optional<int64_t> retainedWords(Type type, func::FuncOp kernel) {
+  if (auto record = dyn_cast<RecordType>(type)) {
+    int64_t total = 0;
+    for (Attribute field : record.getFieldTypes()) {
+      auto words = retainedWords(cast<TypeAttr>(field).getValue(), kernel);
+      if (!words || *words > INT64_MAX - total) return std::nullopt;
+      total += *words;
+    }
+    return total;
+  }
+  if (isa<ViewType, BufferType>(type)) return 0;
+  auto fragment = dyn_cast<FragmentType>(type);
+  Type element = fragment ? fragment.getElementType() : type;
+  if (!element.isIntOrIndexOrFloat()) return std::nullopt;
+  int64_t words = std::max(1u, ((element.isIndex() ? 64u :
+      element.getIntOrFloatBitWidth()) + 31) / 32);
+  if (!fragment) return words;
+  for (Attribute dimension : fragment.getShape()) {
+    auto bounds = queryPositiveExtentBounds(cast<PhysicalExprAttr>(dimension), kernel);
+    if (!bounds || words > INT64_MAX / bounds->second) return std::nullopt;
+    words *= bounds->second;
+  }
+  return words;
+}
+
+// Shape views share their inputs; count each materialized capture and actual
+// carry once. This is a conservative nominal working set, not native allocation.
+std::optional<int64_t> loopLiveWords(scf::ForOp loop, func::FuncOp kernel) {
+  llvm::SetVector<Value> captures;
+  getUsedValuesDefinedAbove(loop.getRegion(), captures);
+  SmallVector<Value> pending(captures.begin(), captures.end());
+  llvm::append_range(pending, loop.getRegionIterArgs());
+  llvm::DenseSet<Value> visited;
+  int64_t total = 0;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!visited.insert(value).second) continue;
+    if (Operation *producer = value.getDefiningOp(); producer && shapeOnly(producer)) {
+      llvm::append_range(pending, producer->getOperands());
+      continue;
+    }
+    auto words = retainedWords(value.getType(), kernel);
+    if (!words || *words > INT64_MAX - total) return std::nullopt;
+    total += *words;
+  }
+  return total;
+}
+
+Value disjointCondition(OpBuilder &builder, Location location,
+                        func::FuncOp kernel, Value first, Value second) {
+  Value overlap;
+  for (ViewOverlapOp fact : kernel.getOps<ViewOverlapOp>())
+    if ((fact.getLhs() == first && fact.getRhs() == second) ||
+        (fact.getLhs() == second && fact.getRhs() == first)) {
+      overlap = fact.getResult();
+      break;
+    }
+  if (!overlap) {
+    OpBuilder entry(&kernel.front(), kernel.front().begin());
+    overlap = entry.create<ViewOverlapOp>(location, entry.getI1Type(), first, second);
+  }
+  Value zero = builder.create<arith::ConstantIntOp>(location, 0, 1);
+  return builder.create<CompareOp>(location, builder.getI1Type(), overlap, zero,
+                                    ComparePredicate::Eq);
+}
+
 } // namespace
+
+LogicalResult hoistLoopInvariantValues(func::FuncOp kernel) {
+  SmallVector<LoopLikeOpInterface> loops;
+  kernel.walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) { loops.push_back(loop); });
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  for (LoopLikeOpInterface loopLike : loops) {
+    auto loop = dyn_cast<scf::ForOp>(loopLike.getOperation());
+    auto live = loop ? loopLiveWords(loop, kernel) : std::nullopt;
+    int64_t budget = capabilities ? capabilities.getRegistersPerUnit() : 0;
+    auto reserve = [&](TypeRange types) {
+      if (!live || budget <= 0 || *live >= budget) return false;
+      int64_t extra = 0;
+      for (Type type : types) {
+        auto words = retainedWords(type, kernel);
+        if (!words || *words >= budget - *live - extra) return false;
+        extra += *words;
+      }
+      *live += extra;
+      return true;
+    };
+    moveLoopInvariantCode(loopLike.getLoopRegions(),
+        [&](Value value, Region *) { return loopLike.isDefinedOutsideOfLoop(value); },
+        [&](Operation *operation, Region *) {
+      if (!isMovableValueOperation(operation)) return false;
+      if (shapeOnly(operation)) return true;
+      return loop &&
+          llvm::all_of(operation->getOperands(), [&](Value value) {
+            return loopLike.isDefinedOutsideOfLoop(value);
+          }) &&
+          (isa<MakeRangeOp>(operation) ||
+           isPhysicalReplayNode(operation, PhysicalReplayScope::Coordinate, false) ||
+           operation->hasTrait<OpTrait::Elementwise>()) && reserve(operation->getResultTypes());
+    }, [&](Operation *operation, Region *) { loopLike.moveOutOfLoop(operation); });
+    if (!loop || !live || budget <= 0 || *live >= budget) continue;
+
+    SmallVector<LoadOp> loads;
+    for (LoadOp load : loop.getBody()->getOps<LoadOp>()) loads.push_back(load);
+    ResourceAliasAnalysis aliases;
+    for (LoadOp load : loads) {
+      if (!llvm::all_of(load->getOperands(), [&](Value operand) {
+            return loopLike.isDefinedOutsideOfLoop(operand);
+          })) continue;
+      SmallVector<std::pair<Value, Value>> guarded;
+      auto disjoint = [&](Value first, Value second) {
+        auto lhs = dyn_cast<BlockArgument>(first), rhs = dyn_cast<BlockArgument>(second);
+        if (!lhs || !rhs || lhs == rhs || lhs.getOwner() != &kernel.front() ||
+            rhs.getOwner() != &kernel.front() || !getPublicView(first) || !getPublicView(second))
+          return false;
+        if (lhs.getArgNumber() > rhs.getArgNumber()) std::swap(first, second);
+        std::pair<Value, Value> pair{first, second};
+        if (!llvm::is_contained(guarded, pair)) guarded.push_back(pair);
+        return true;
+      };
+      if (!preservesMemoryReads(load, loop, aliases, disjoint) ||
+          !reserve(load->getResultTypes())) continue;
+      bool nonempty = IndexRelations().lessThan(loop.getLowerBound(), loop.getUpperBound());
+      if (nonempty && guarded.empty()) {
+        load->moveBefore(loop);
+        continue;
+      }
+      OpBuilder builder(loop);
+      Location location = load.getLoc();
+      Value safe = builder.create<CompareOp>(location, builder.getI1Type(),
+          loop.getLowerBound(), loop.getUpperBound(), ComparePredicate::Lt);
+      for (auto [first, second] : guarded) {
+        Value condition = disjointCondition(builder, location, kernel, first, second);
+        safe = builder.create<BinaryOp>(location, builder.getI1Type(), safe, condition,
+                                         BinaryOperator::LogicalAnd);
+      }
+      auto zero = materializeZeroValue(builder, location, load.getType());
+      if (failed(zero)) return failure();
+      auto saved = builder.create<scf::IfOp>(location, load->getResultTypes(), safe, true);
+      builder.setInsertionPointToEnd(saved.thenBlock());
+      Operation *read = builder.clone(*load);
+      builder.create<scf::YieldOp>(location, read->getResults());
+      builder.setInsertionPointToEnd(saved.elseBlock());
+      builder.create<scf::YieldOp>(location, ValueRange{*zero});
+
+      // The original read stays at its original point on the aliasing path.
+      // Only a direct loop-body read is selected, so subsequent fixed-point
+      // invocations cannot wrap this conditional read again.
+      builder.setInsertionPoint(load);
+      auto selected = builder.create<scf::IfOp>(location, load->getResultTypes(), safe, true);
+      load.getResult().replaceAllUsesWith(selected.getResult(0));
+      builder.setInsertionPointToEnd(selected.thenBlock());
+      builder.create<scf::YieldOp>(location, saved.getResults());
+      load->moveBefore(selected.elseBlock(), selected.elseBlock()->end());
+      builder.setInsertionPointToEnd(selected.elseBlock());
+      builder.create<scf::YieldOp>(location, load->getResults());
+    }
+  }
+  return success();
+}
 
 bool independentMemoryEffects(Operation *first, Operation *second,
                               ResourceAliasAnalysis &aliases) {

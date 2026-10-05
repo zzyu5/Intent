@@ -40,7 +40,8 @@ bool hasOnlyReadEffects(Operation *operation) {
 }
 
 bool preservesMemoryReads(Operation *reads, Operation *intervening,
-                          ResourceAliasAnalysis &aliases) {
+                          ResourceAliasAnalysis &aliases,
+                          llvm::function_ref<bool(Value, Value)> disjointInContext) {
   if (hasOrderedAccess(reads) || hasOrderedAccess(intervening))
     return false;
   auto readEffects = getEffectsRecursively(reads);
@@ -58,8 +59,11 @@ bool preservesMemoryReads(Operation *reads, Operation *intervening,
     for (const auto &read : *readEffects) {
       if (read.getResource() != effect.getResource())
         continue;
-      if (!read.getValue() || !effect.getValue() ||
-          !aliases.alias(read.getValue(), effect.getValue()).isNo())
+      if (!read.getValue() || !effect.getValue())
+        return false;
+      if (!aliases.alias(read.getValue(), effect.getValue()).isNo() &&
+          !(disjointInContext &&
+            disjointInContext(read.getValue(), effect.getValue())))
         return false;
     }
   }

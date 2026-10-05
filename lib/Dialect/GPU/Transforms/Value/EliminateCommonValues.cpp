@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
+#include "ScopePlacement.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
 
@@ -11,7 +12,6 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/CSE.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
@@ -206,17 +206,7 @@ LogicalResult eliminateCommonValues(ModuleOp module) {
   SelectOp::getCanonicalizationPatterns(patterns, module.getContext());
   if (failed(applyPatternsAndFoldGreedily(*kernel, std::move(patterns))))
     return kernel->emitError("local value canonicalization did not converge");
-  kernel->walk<WalkOrder::PostOrder>([&](LoopLikeOpInterface loop) {
-    moveLoopInvariantCode(
-        loop.getLoopRegions(),
-        [&](Value value, Region *) { return loop.isDefinedOutsideOfLoop(value); },
-        [&](Operation *operation, Region *) {
-          return isa<BroadcastOp, SplatOp, ReshapeOp, TransposeOp, JoinOp,
-                     MakeRecordOp, ExtractOp, arith::ConstantOp>(operation) &&
-                 isSpeculatable(operation) && isMemoryEffectFree(operation);
-        },
-        [&](Operation *operation, Region *) { loop.moveOutOfLoop(operation); });
-  });
+  if (failed(placement::hoistLoopInvariantValues(*kernel))) return failure();
   IRRewriter rewriter(module.getContext());
   DominanceInfo dominance(*kernel);
   eliminateCommonSubExpressions(rewriter, dominance, kernel->getOperation());
