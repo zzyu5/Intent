@@ -54,55 +54,28 @@ bool collapseReductionChain(linalg::GenericOp outer, StorageAnalysis &storage) {
          combine->getOperand(0) == outerBody.getArgument(1)))) return false;
   auto neutral = arith::getNeutralElement(combine);
   if (!neutral) return false;
-  auto initializedBy = [&](Value buffer, Operation *before) -> Operation * {
-    for (Operation *operation = before->getPrevNode(); operation;
-         operation = operation->getPrevNode()) {
-      Value initial;
-      if (auto fill = dyn_cast<linalg::FillOp>(operation)) {
-        if (!fill.getNumResults() && fill.getOutputs().size() == 1 &&
-            fill.getOutputs().front() == buffer) initial = fill.getInputs().front();
-      } else if (auto store = dyn_cast<memref::StoreOp>(operation)) {
-        if (store.getMemref() == buffer && store.getIndices().empty())
-          initial = store.getValue();
-      }
-      if (initial) {
-        Attribute value;
-        return matchPattern(initial, m_Constant(&value)) && value == *neutral
-                   ? operation : nullptr;
-      }
-      if (!storage.preserves(operation, buffer)) return nullptr;
-    }
-    return nullptr;
+  auto initializedBy = [&](Value buffer, Operation *before) -> std::optional<UniformBufferValue> {
+    auto initial = queryUniformBufferValue(buffer, before, storage);
+    Attribute value;
+    if (!initial || initial->definition.operation->getBlock() != before->getBlock() ||
+        !matchPattern(initial->value, m_Constant(&value)) || value != *neutral)
+      return std::nullopt;
+    return initial;
   };
   if (!initializedBy(destination, outer)) return false;
-  linalg::GenericOp inner;
-  for (Operation *operation = outer->getPrevNode(); operation;
-       operation = operation->getPrevNode()) {
-    auto candidate = dyn_cast<linalg::GenericOp>(operation);
-    if (candidate && llvm::is_contained(candidate.getOutputs(), partial)) {
-      inner = candidate;
-      break;
-    }
-    if (!storage.preserves(operation, partial)) return false;
-  }
+  auto current = findCurrentBufferWrite(partial, outer, storage);
+  auto inner = current ? dyn_cast<linalg::GenericOp>(current->operation) : linalg::GenericOp{};
   if (!inner || inner.getNumResults() || inner.getOutputs().size() != 1 ||
+      inner->getBlock() != outer->getBlock() || inner.getOutputs().front() != partial ||
       !inner.getNumReductionLoops() || !inner.getNumParallelLoops() ||
       inner->hasAttr("intent_cpu.implementation") ||
       inner->getAttr("intent_cpu.reduction_order") != order) return false;
-  Operation *initialization = initializedBy(partial, inner);
-  if (!initialization || !isa<linalg::FillOp>(initialization)) return false;
+  auto initial = initializedBy(partial, inner);
+  if (!initial || !isa<linalg::FillOp>(initial->definition.operation)) return false;
+  Operation *initialization = initial->definition.operation;
   // Removing the seed write must not change an observation before the partial
   // reduction, even though such a read would preserve the buffer's contents.
-  for (Operation *operation = initialization->getNextNode(); operation != inner;
-       operation = operation->getNextNode()) {
-    auto effects = storage.effects(operation);
-    if (!effects.complete || effects.ordered) return false;
-    for (const StorageEffect &entry : effects.entries) {
-      Value memory = entry.effect.getValue();
-      if (!memory || (isa<BaseMemRefType>(memory.getType()) &&
-                      !storage.disjoint(memory, partial))) return false;
-    }
-  }
+  if (initial->definition.observed) return false;
   Block &innerBody = inner.getRegion().front();
   BlockArgument accumulator = innerBody.getArguments().back();
   Operation *update = innerBody.getTerminator()->getOperand(0).getDefiningOp();
@@ -225,10 +198,10 @@ void normalize(linalg::GenericOp operation) {
       llvm::is_contained(operation.getInputs(), destination))
     return;
   StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
-  auto lifetime = storage.lifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete ||
-      lifetime->aliases.values.size() != 1 || !lifetime->contains(operation))
-    return;
+  for (Value input : operation.getInputs())
+    if (isa<MemRefType>(input.getType()) && !storage.disjoint(input, destination)) return;
+  auto initialValue = queryUniformBufferValue(destination, operation, storage);
+  if (!initialValue || initialValue->definition.operation->getBlock() != operation->getBlock()) return;
 
   auto maps = operation.getIndexingMapsArray();
   if (maps.back().getNumResults())
@@ -264,15 +237,14 @@ void normalize(linalg::GenericOp operation) {
         !llvm::all_of(instruction.getResultTypes(), scalarType))
       return;
 
-  // The rank-zero destination is a private value slot. Keep the complete
-  // storage proof here: unrelated SSA roots or an unknown alias are not enough
-  // to replace its reads by one scalar result.
-  Operation *initialization = nullptr;
-  Value initial;
+  // Replace just the completed scalar version. Earlier or later versions may
+  // share this private slot without observing this reduction's result.
+  Operation *initialization = initialValue->definition.operation;
+  Value initial = initialValue->value;
+  auto observations = queryBufferVersionObservations(destination, operation, storage);
+  if (failed(observations)) return;
   SmallVector<memref::LoadOp> reads;
-  for (Operation *user : lifetime->aliases.users) {
-    if (user == operation || user == lifetime->end)
-      continue;
+  for (Operation *user : observations->reads) {
     if (user->getBlock() != operation->getBlock())
       return;
     if (auto load = dyn_cast<memref::LoadOp>(user)) {
@@ -282,19 +254,7 @@ void normalize(linalg::GenericOp operation) {
       reads.push_back(load);
       continue;
     }
-    Value value;
-    if (auto store = dyn_cast<memref::StoreOp>(user)) {
-      if (store.getMemref() == destination && store.getIndices().empty())
-        value = store.getValue();
-    } else if (auto fill = dyn_cast<linalg::FillOp>(user)) {
-      if (fill.getNumResults() == 0 && fill.getOutputs().size() == 1 &&
-          fill.getOutputs().front() == destination)
-        value = fill.getInputs().front();
-    }
-    if (!value || initialization || !user->isBeforeInBlock(operation))
-      return;
-    initialization = user;
-    initial = value;
+    return;
   }
   if (!initialization || initial.getType() != type.getElementType())
     return;
@@ -325,9 +285,12 @@ void normalize(linalg::GenericOp operation) {
     read.erase();
   }
   operation.erase();
-  initialization->erase();
-  lifetime->end.erase();
-  allocation.erase();
+  if (!initialValue->definition.observed) initialization->erase();
+  SmallVector<Operation *> remaining(destination.getUsers());
+  if (llvm::all_of(remaining, [](Operation *user) { return isa<memref::DeallocOp>(user); })) {
+    for (Operation *user : remaining) user->erase();
+    allocation.erase();
+  }
 }
 
 } // namespace

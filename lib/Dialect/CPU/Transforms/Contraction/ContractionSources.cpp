@@ -12,7 +12,6 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include <functional>
 
 using namespace mlir;
 
@@ -24,39 +23,20 @@ linalg::GenericOp bufferProducer(Value buffer, Operation *consumer, bool soleCon
   auto allocation = buffer.getDefiningOp<memref::AllocOp>();
   if (!allocation) return {};
   StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
-  auto lifetime = storage.lifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(consumer)) return {};
-  SmallVector<linalg::GenericOp, 2> writers;
-  for (Operation *user : lifetime->aliases.users) {
-    auto generic = dyn_cast<linalg::GenericOp>(user);
-    if (!generic || !llvm::is_contained(generic.getOutputs(), buffer)) continue;
-    writers.push_back(generic);
-  }
-  linalg::GenericOp producer;
-  bool completeVersion = writers.size() > 1;
-  if (!completeVersion) {
-    if (!writers.empty()) producer = writers.front();
-  } else {
-    if (!soleConsumer || !sameBlock) return {};
-    for (auto candidate : writers)
-      if (candidate->getBlock() == consumer->getBlock() && candidate->isBeforeInBlock(consumer) &&
-          (!producer || producer->isBeforeInBlock(candidate))) producer = candidate;
-    if (!producer) return {};
-    auto version = queryProducerVersion(producer, storage);
-    if (failed(version) || version->uses.size() != 1 || version->uses.front().operation != consumer)
-      return {};
-  }
+  auto current = findCurrentBufferWrite(buffer, consumer, storage);
+  auto producer = current ? dyn_cast<linalg::GenericOp>(current->operation) : linalg::GenericOp{};
   if (!producer || producer == consumer ||
       (sameBlock && (producer->getBlock() != consumer->getBlock() || !producer->isBeforeInBlock(consumer))) ||
       producer.getNumResults() ||
       producer.getOutputs().size() != 1 || producer.getNumReductionLoops() ||
-      !producer.getIndexingMapsArray().back().isIdentity()) return {};
-  if (!completeVersion)
-    for (Operation *user : lifetime->aliases.users) {
-      if (user == producer || user == lifetime->end || isa<memref::DimOp>(user) ||
-          isStorageAliasOperation(user)) continue;
-      if ((soleConsumer && user != consumer) || !storage.preserves(user, buffer)) return {};
-    }
+      !producer.getIndexingMapsArray().back().isIdentity() ||
+      !completelyWritesBuffer(producer, buffer) ||
+      !storage.preserves(consumer, buffer)) return {};
+  if (soleConsumer) {
+    auto observations = queryBufferVersionObservations(buffer, producer, storage);
+    if (failed(observations) || observations->reads.size() != 1 ||
+        observations->reads.front() != consumer) return {};
+  }
   return producer;
 }
 
@@ -378,43 +358,13 @@ Value foldContractionInput(Value input, linalg::GenericOp consumer,
 std::optional<ContractionInitialization>
 findContractionInitialization(linalg::GenericOp operation) {
   StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
-  std::function<std::optional<ContractionInitialization>(Value, Operation *)> find =
-      [&](Value memory, Operation *before) -> std::optional<ContractionInitialization> {
-    bool observed = false;
-    for (Operation *previous = before->getPrevNode(); previous; previous = previous->getPrevNode()) {
-      auto effects = storage.effects(previous);
-      if (!effects.complete || effects.ordered) return std::nullopt;
-      bool written = false;
-      for (const StorageEffect &entry : effects.entries) {
-        const auto &effect = entry.effect;
-        if (isa<MemoryEffects::Allocate>(effect.getEffect()) ||
-            storage.disjoint(memory, effect.getValue())) continue;
-        if (isa<MemoryEffects::Read>(effect.getEffect())) observed = true;
-        else if (isa<MemoryEffects::Write>(effect.getEffect())) written = true;
-        else return std::nullopt;
-      }
-      if (!written) continue;
-      Value value;
-      if (auto fill = dyn_cast<linalg::FillOp>(previous);
-          fill && fill.getOutputs().size() == 1 && fill.getOutputs()[0] == memory) {
-        value = fill.getInputs()[0];
-      } else if (auto store = dyn_cast<memref::StoreOp>(previous);
-                 store && store.getMemref() == memory && store.getIndices().empty() &&
-                 store.getMemRefType().getRank() == 0) {
-        value = store.getValue();
-      } else if (auto copy = dyn_cast<memref::CopyOp>(previous);
-                 copy && copy.getTarget() == memory) {
-        auto source = find(copy.getSource(), copy);
-        if (source) value = source->value;
-      }
-      if (!value || !(isa<FloatType>(value.getType()) ? matchPattern(value, m_PosZeroFloat())
-                                                     : matchPattern(value, m_Zero())))
-        return std::nullopt;
-      return ContractionInitialization{previous, value, !observed};
-    }
+  auto initial = queryUniformBufferValue(operation.getOutputs()[0], operation, storage);
+  if (!initial || initial->definition.operation->getBlock() != operation->getBlock() ||
+      !(isa<FloatType>(initial->value.getType()) ? matchPattern(initial->value, m_PosZeroFloat())
+                                               : matchPattern(initial->value, m_Zero())))
     return std::nullopt;
-  };
-  return find(operation.getOutputs()[0], operation);
+  return ContractionInitialization{initial->definition.operation, initial->value,
+                                   !initial->definition.observed};
 }
 
 LogicalResult normalizeContractionSources(func::FuncOp function) {

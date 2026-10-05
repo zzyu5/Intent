@@ -73,7 +73,7 @@ struct ReductionSources::Impl {
   }
 
   explicit Impl(linalg::GenericOp consumer)
-      : consumer(consumer), storage(consumer->getParentOfType<func::FuncOp>()) {
+      : consumer(consumer), function(consumer->getParentOfType<func::FuncOp>()), storage(function) {
     auto maps = consumer.getIndexingMapsArray();
     for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
       auto type = dyn_cast<MemRefType>(input.getType());
@@ -84,33 +84,22 @@ struct ReductionSources::Impl {
 
   Source *collect(Value memory, linalg::GenericOp reader, AffineMap coordinates,
                   std::optional<unsigned> lane) {
-    if (auto found = known.find(memory); found != known.end())
-      return found->second->lane == lane ? found->second : nullptr;
     auto allocation = memory.getDefiningOp<memref::AllocOp>();
     if (!allocation || !projected(coordinates)) return nullptr;
-    auto lifetime = storage.lifetime(allocation);
-    if (!lifetime || !lifetime->aliases.complete) return nullptr;
-    Operation *writer = nullptr;
-    for (Operation *user : lifetime->aliases.users) {
-      auto effects = storage.effects(user);
-      if (!effects.complete || effects.ordered) return nullptr;
-      for (const StorageEffect &entry : effects.entries) {
-        if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
-        Value target = entry.effect.getValue();
-        if (target && storage.disjoint(target, memory)) continue;
-        if (writer && writer != entry.operation) return nullptr;
-        writer = entry.operation;
-      }
-    }
-    auto producer = dyn_cast_or_null<linalg::GenericOp>(writer);
+    auto current = findCurrentBufferWrite(memory, reader, storage);
+    auto producer = current ? dyn_cast<linalg::GenericOp>(current->operation) : linalg::GenericOp{};
     if (!producer || producer == reader || producer->getBlock() != reader->getBlock() ||
         !producer->isBeforeInBlock(reader) || producer.getOutputs().size() != 1 ||
         !completelyWritesBuffer(producer, memory) ||
         !producer.getRegion().front().getArguments().back().use_empty()) return nullptr;
-    // No snapshot is duplicated: all element observations of this allocation
-    // belong to this one consumer and use the same actual coordinate map.
-    for (Operation *user : lifetime->aliases.users)
-      if (user != producer && user != reader && !isRemovableProducerMetadata(user)) return nullptr;
+    // No snapshot is duplicated: this completed version's observations belong
+    // to one consumer, even when another version later reuses the allocation.
+    auto observations = queryBufferVersionObservations(memory, producer, storage);
+    if (failed(observations) || observations->reads.size() != 1 ||
+        observations->reads.front() != reader || !storage.preserves(reader, memory)) return nullptr;
+    for (const auto &known : sources)
+      if (known->memory == memory && known->producer == producer)
+        return known->lane == lane ? known.get() : nullptr;
     auto readerMaps = reader.getIndexingMapsArray();
     for (auto [number, input] : llvm::enumerate(reader.getInputs()))
       if (input == memory && readerMaps[number] != coordinates) return nullptr;
@@ -165,7 +154,6 @@ struct ReductionSources::Impl {
     if (lane && !ProducerVectorization(source->payload, {}, source->varying).canWiden(result))
       return nullptr;
     Source *selected = source.get();
-    known[memory] = selected;
     sources.push_back(std::move(source));
     return selected;
   }
@@ -235,10 +223,10 @@ struct ReductionSources::Impl {
   };
 
   linalg::GenericOp consumer;
+  func::FuncOp function;
   StorageAnalysis storage;
   SmallVector<Source *> roots;
   SmallVector<std::unique_ptr<Source>> sources;
-  DenseMap<Value, Source *> known;
   SmallVector<Emitted> emitted;
 };
 
@@ -322,8 +310,14 @@ FailureOr<Value> ReductionSources::materialize(OpBuilder &builder, unsigned inpu
 void ReductionSources::eraseUnusedProducers() {
   // Children were planned before their parent. Delete consumers before their
   // sources, after the original reduction itself has been replaced.
-  for (auto &source : llvm::reverse(impl->sources))
-    eraseUnusedProducer(source->producer);
+  for (auto &source : llvm::reverse(impl->sources)) {
+    // Uniform-member folding may have replaced only some roots. Re-query the
+    // current observations rather than deleting other still-used versions.
+    StorageAnalysis current(impl->function);
+    auto observations = queryBufferVersionObservations(source->memory, source->producer, current);
+    if (succeeded(observations) && observations->reads.empty())
+      eraseReplayedProducerVersion(source->producer);
+  }
 }
 
 } // namespace intent::cpu

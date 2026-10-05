@@ -3,6 +3,7 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
+#include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
@@ -27,6 +28,8 @@ bool sameShape(Value lhs, Value rhs) {
 }
 
 bool completeWrite(Operation *operation, Value buffer) {
+  if (auto store = dyn_cast<memref::StoreOp>(operation))
+    return store.getMemref() == buffer && store.getMemRefType().getRank() == 0;
   if (auto copy = dyn_cast<memref::CopyOp>(operation))
     return copy.getTarget() == buffer && sameShape(copy.getSource(), buffer);
   auto writer = dyn_cast<linalg::LinalgOp>(operation);
@@ -58,6 +61,31 @@ bool completeWrite(Operation *operation, Value buffer) {
 bool disjointEffect(Value memory, Value buffer, StorageAnalysis &storage) {
   return memory && (!isa<BaseMemRefType>(memory.getType()) ||
                     storage.disjoint(memory, buffer));
+}
+
+bool knownVersionEffects(Operation *operation, Value buffer,
+                         const StorageEffects &effects, StorageAnalysis &storage) {
+  if (!effects.complete) return false;
+  if (!effects.ordered) return true;
+  Value origin = storage.uniqueOrigin(buffer);
+  if (!origin || !isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(origin.getDefiningOp()))
+    return false;
+  // This observes private contents; it does not move a memory access. Ordering
+  // on completely independent addressable storage cannot change this version.
+  // Replay and read placement still use the stronger readStable contract.
+  for (const StorageEffect &entry : effects.entries) {
+    Value memory = entry.effect.getValue();
+    if (!memory || !isa<BaseMemRefType>(memory.getType()) ||
+        !storage.disjoint(memory, buffer)) return false;
+  }
+  // An unaddressed ordering barrier is not explained by disjoint effects on
+  // another operation in the same enclosing region.
+  auto result = operation->walk([&](Operation *nested) {
+    auto current = storage.effects(nested);
+    return current.ordered && current.entries.empty()
+        ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  return !result.wasInterrupted();
 }
 
 std::optional<unsigned> readingInput(Operation *operation, Value buffer,
@@ -103,8 +131,89 @@ std::optional<unsigned> readingInput(Operation *operation, Value buffer,
 
 } // namespace
 
+std::optional<CurrentBufferWrite> findCurrentBufferWrite(
+    Value buffer, Operation *before, StorageAnalysis &storage) {
+  Value origin = storage.uniqueOrigin(buffer);
+  if (!origin || !storage.aliases(origin).complete)
+    return std::nullopt;
+  auto function = before->getParentOfType<func::FuncOp>();
+  DominanceInfo dominance(function);
+  if (!dominance.dominates(buffer, before)) return std::nullopt;
+  if (auto allocation = origin.getDefiningOp<memref::AllocOp>()) {
+    auto lifetime = storage.lifetime(allocation);
+    if (!lifetime || !lifetime->contains(before)) return std::nullopt;
+  } else if (auto allocation = origin.getDefiningOp<memref::AllocaOp>()) {
+    auto owner = allocation->getParentWithTrait<OpTrait::AutomaticAllocationScope>();
+    if (!owner || !owner->isAncestor(before)) return std::nullopt;
+  } else {
+    auto formal = dyn_cast<BlockArgument>(origin);
+    if (!formal || (formal.getOwner() != &function.front() &&
+        (!isCollectiveArgument(formal) ||
+         !formal.getOwner()->getParent()->isAncestor(before->getParentRegion()))))
+      return std::nullopt;
+  }
+  bool observed = false;
+  for (Operation *point = before; point && !isa<func::FuncOp>(point);) {
+    for (Operation *operation = point->getPrevNode(); operation;
+         operation = operation->getPrevNode()) {
+      auto effects = storage.effects(operation);
+      if (!knownVersionEffects(operation, buffer, effects, storage)) return std::nullopt;
+      bool written = false;
+      for (const StorageEffect &entry : effects.entries) {
+        const auto &effect = entry.effect;
+        if (disjointEffect(effect.getValue(), buffer, storage)) continue;
+        if (isa<MemoryEffects::Read>(effect.getEffect())) {
+          observed = true;
+          continue;
+        }
+        if (!isa<MemoryEffects::Write>(effect.getEffect())) return std::nullopt;
+        written = true;
+      }
+      if (written) return CurrentBufferWrite{operation, observed};
+    }
+    Operation *owner = point->getParentOp();
+    if (!owner || isa<func::FuncOp>(owner)) return std::nullopt;
+    auto ownerEffects = storage.effects(owner);
+    if (!knownVersionEffects(owner, buffer, ownerEffects, storage) ||
+        !storage.preservesContents(owner, buffer)) return std::nullopt;
+    for (const StorageEffect &entry : ownerEffects.entries)
+      if (isa<MemoryEffects::Read>(entry.effect.getEffect()) &&
+          !disjointEffect(entry.effect.getValue(), buffer, storage)) observed = true;
+    point = owner;
+  }
+  return std::nullopt;
+}
+
 bool completelyWritesBuffer(Operation *operation, Value buffer) {
   return completeWrite(operation, buffer);
+}
+
+std::optional<UniformBufferValue> queryUniformBufferValue(
+    Value buffer, Operation *before, StorageAnalysis &storage) {
+  auto current = findCurrentBufferWrite(buffer, before, storage);
+  if (!current || !completeWrite(current->operation, buffer)) return std::nullopt;
+  Value value;
+  if (auto fill = dyn_cast<linalg::FillOp>(current->operation))
+    value = fill.getInputs().front();
+  else if (auto store = dyn_cast<memref::StoreOp>(current->operation))
+    value = store.getValue();
+  else if (auto copy = dyn_cast<memref::CopyOp>(current->operation)) {
+    auto input = queryUniformBufferValue(copy.getSource(), copy, storage);
+    if (input) value = input->value;
+  }
+  if (!value) return std::nullopt;
+  return UniformBufferValue{*current, value};
+}
+
+void eraseReplayedProducerVersion(linalg::GenericOp producer) {
+  Value buffer = producer.getOutputs().front();
+  if (buffer.getDefiningOp<memref::AllocOp>() &&
+      llvm::all_of(buffer.getUsers(), [&](Operation *user) {
+        return user == producer || isRemovableProducerMetadata(user);
+      }))
+    eraseUnusedProducer(producer);
+  else
+    producer.erase();
 }
 
 FailureOr<ProducerVersion> queryProducerVersion(linalg::GenericOp producer,
@@ -128,35 +237,48 @@ FailureOr<ProducerVersion> queryProducerVersion(linalg::GenericOp producer,
 
 FailureOr<ProducerVersion> queryCompletedBufferVersion(
     Value buffer, Operation *completed, StorageAnalysis &storage) {
+  auto observations = queryBufferVersionObservations(buffer, completed, storage);
+  if (failed(observations)) return failure();
+  ProducerVersion result;
+  for (Operation *read : observations->reads) {
+    if (read->getBlock() != completed->getBlock()) return failure();
+    auto input = readingInput(read, buffer, storage);
+    if (!input) return failure();
+    result.uses.push_back({read, *input});
+  }
+  return result;
+}
+
+FailureOr<BufferVersionObservations> queryBufferVersionObservations(
+    Value buffer, Operation *completed, StorageAnalysis &storage) {
   Value origin = storage.uniqueOrigin(buffer);
   if (!origin || !storage.aliases(origin).complete) return failure();
-  ProducerVersion result;
+  BufferVersionObservations result;
   for (Operation *operation = completed->getNextNode(); operation;
        operation = operation->getNextNode()) {
     auto effects = storage.effects(operation);
-    if (!effects.complete || effects.ordered) return failure();
-    bool reads = false, writes = false, frees = false;
+    if (!knownVersionEffects(operation, buffer, effects, storage)) return failure();
+    bool writes = false, frees = false;
     for (const StorageEffect &entry : effects.entries) {
       const auto &effect = entry.effect;
       if (disjointEffect(effect.getValue(), buffer, storage)) continue;
-      if (isa<MemoryEffects::Read>(effect.getEffect())) reads = true;
-      else if (isa<MemoryEffects::Write>(effect.getEffect())) writes = true;
+      if (isa<MemoryEffects::Read>(effect.getEffect())) {
+        if (!llvm::is_contained(result.reads, entry.operation))
+          result.reads.push_back(entry.operation);
+      } else if (isa<MemoryEffects::Write>(effect.getEffect())) writes = true;
       else if (isa<MemoryEffects::Free>(effect.getEffect())) frees = true;
       else return failure();
     }
-    if (reads) {
-      auto input = readingInput(operation, buffer, storage);
-      if (!input) return failure();
-      result.uses.push_back({operation, *input});
-    }
     if (writes) {
       if (!completeWrite(operation, buffer)) return failure();
+      result.end = operation;
       return result;
     }
     if (frees) {
       auto release = dyn_cast<memref::DeallocOp>(operation);
       if (!release || release.getMemref() != buffer ||
           !buffer.getDefiningOp<memref::AllocOp>()) return failure();
+      result.end = operation;
       return result;
     }
   }

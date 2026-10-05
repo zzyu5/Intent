@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/Analysis/ProducerReplay.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AffineMap.h"
+#include <optional>
 
 namespace intent::cpu {
 
@@ -18,6 +19,43 @@ struct ProducerVersionUse {
 struct ProducerVersion {
   llvm::SmallVector<ProducerVersionUse> uses;
 };
+
+// The last possible write before this operation in its current execution
+// instance. This does not prove complete coverage or permit moving the write's
+// inputs. Crossing an enclosing region requires it to preserve the buffer,
+// including later iterations; a conditional or partial clobber is not skipped.
+struct CurrentBufferWrite {
+  mlir::Operation *operation;
+  // Potential reads between this write and the query, excluding the query op.
+  // An enclosing scope is conservatively counted as a whole observation.
+  bool observed;
+};
+std::optional<CurrentBufferWrite> findCurrentBufferWrite(mlir::Value buffer,
+    mlir::Operation *before, StorageAnalysis &storage);
+
+struct UniformBufferValue {
+  CurrentBufferWrite definition;
+  mlir::Value value;
+};
+// Follow complete scalar fills/stores and copies at each copy's original read
+// point. Later changes to a copy's input cannot change its stored snapshot.
+std::optional<UniformBufferValue> queryUniformBufferValue(mlir::Value buffer,
+    mlir::Operation *before, StorageAnalysis &storage);
+
+struct BufferVersionObservations {
+  llvm::SmallVector<mlir::Operation *> reads;
+  mlir::Operation *end = nullptr;
+};
+
+// Observe one completed version until its next complete overwrite or release.
+// Readers are actual effect owners, including nested scalar reads. The caller
+// proves the defining write's coverage and each reader's transport relation.
+mlir::FailureOr<BufferVersionObservations> queryBufferVersionObservations(
+    mlir::Value buffer, mlir::Operation *completed, StorageAnalysis &storage);
+
+// All observations of this version have been replaced. Later versions retain
+// the allocation; otherwise remove the now unused private allocation as well.
+void eraseReplayedProducerVersion(mlir::linalg::GenericOp producer);
 
 bool completelyWritesBuffer(mlir::Operation *operation, mlir::Value buffer);
 

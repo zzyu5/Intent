@@ -51,29 +51,14 @@ bool fusionConsumer(Operation *operation, StorageAnalysis &storage) {
 
 std::optional<PointwiseProducer> pointwiseProducer(Value buffer, Operation *consumer,
                                                   StorageAnalysis &storage) {
-  auto privateProducer = [&]() -> linalg::GenericOp {
-    auto allocation = buffer.getDefiningOp<memref::AllocOp>();
-    if (!allocation) return {};
-    auto lifetime = storage.lifetime(allocation);
-    if (!lifetime || !lifetime->aliases.complete) return {};
-    linalg::GenericOp producer;
-    for (Operation *user : lifetime->aliases.users) {
-      if (auto generic = dyn_cast<linalg::GenericOp>(user)) {
-        if (!llvm::is_contained(generic.getOutputs(), buffer)) {
-          if (!storage.preserves(user, buffer)) return {};
-          continue;
-        }
-        if (producer) return {};
-        producer = generic;
-      } else if (!isa<memref::DimOp, memref::DeallocOp>(user) &&
-                 !storage.preserves(user, buffer)) return {};
-    }
-    return producer;
-  };
-  linalg::GenericOp producer = privateProducer();
+  if (!buffer.getDefiningOp<memref::AllocOp>()) return std::nullopt;
+  auto current = findCurrentBufferWrite(buffer, consumer, storage);
+  auto producer = current ? dyn_cast<linalg::GenericOp>(current->operation) : linalg::GenericOp{};
   if (!producer || producer == consumer || producer->getBlock() != consumer->getBlock() ||
       !producer->isBeforeInBlock(consumer) || producer.getOutputs().size() != 1 ||
-      producer.getNumResults() || producer.getNumReductionLoops()) return std::nullopt;
+      producer.getNumResults() || producer.getNumReductionLoops() ||
+      !completelyWritesBuffer(producer, buffer) ||
+      !storage.preserves(consumer, buffer)) return std::nullopt;
   auto projection = fullOutputProjection(buffer, producer.getIndexingMapsArray().back());
   if (failed(projection)) return std::nullopt;
   Block &body = producer.getRegion().front();

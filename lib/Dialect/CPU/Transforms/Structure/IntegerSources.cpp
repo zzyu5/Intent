@@ -6,6 +6,7 @@
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 
@@ -26,6 +27,7 @@ struct IntegerProducer {
   linalg::GenericOp operation;
   ProducerReplay payload;
   AffineMap outputProjection;
+  BufferVersionObservations observations;
 };
 
 std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
@@ -33,17 +35,11 @@ std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
   if (!integer(load.getType())) return std::nullopt;
   auto allocation = load.getMemref().getDefiningOp<memref::AllocOp>();
   if (!allocation) return std::nullopt;
-  auto lifetime = storage.lifetime(allocation);
-  if (!lifetime || !lifetime->aliases.complete) return std::nullopt;
-  linalg::GenericOp producer;
-  for (Operation *user : lifetime->aliases.users) {
-    auto generic = dyn_cast<linalg::GenericOp>(user);
-    if (!generic || !llvm::is_contained(generic.getOutputs(), allocation.getResult())) continue;
-    if (producer) return std::nullopt;
-    producer = generic;
-  }
+  auto current = findCurrentBufferWrite(allocation, load, storage);
+  auto producer = current ? dyn_cast<linalg::GenericOp>(current->operation) : linalg::GenericOp{};
   if (!producer || producer.getNumResults() || producer.getOutputs().size() != 1 ||
-      producer.getNumReductionLoops() || producer->getBlock() != allocation->getBlock())
+      producer.getNumReductionLoops() || producer->getBlock() != allocation->getBlock() ||
+      !completelyWritesBuffer(producer, allocation))
     return std::nullopt;
   auto projection = fullOutputProjection(allocation, producer.getIndexingMapsArray().back());
   if (failed(projection)) return std::nullopt;
@@ -52,17 +48,14 @@ std::optional<IntegerProducer> integerProducer(memref::LoadOp load,
   if (llvm::any_of(producer.getIndexingMapsArray(), [](AffineMap map) {
         return !projectedCoordinates(map);
       })) return std::nullopt;
-  for (Operation *user : lifetime->aliases.users)
-    if (user != producer && user != lifetime->end &&
-        !storage.preserves(user, allocation)) return std::nullopt;
-
-  Operation *consumer = producer->getBlock()->findAncestorOpInBlock(*load);
-  if (!consumer || consumer == producer || !producer->isBeforeInBlock(consumer)) return std::nullopt;
+  auto observations = queryBufferVersionObservations(allocation, producer, storage);
+  if (failed(observations) || !llvm::is_contained(observations->reads, load.getOperation()))
+    return std::nullopt;
   auto payload = analyzeProducerResult(producer, storage);
   if (failed(payload) ||
       !canReplayProducerAt(*payload, producer, load, storage, ValueRange{allocation}))
     return std::nullopt;
-  return IntegerProducer{producer, std::move(*payload), *projection};
+  return IntegerProducer{producer, std::move(*payload), *projection, std::move(*observations)};
 }
 
 Value replay(const ProducerReplayGroup &group, const IntegerProducer &source) {
@@ -114,10 +107,9 @@ LogicalResult foldIntegerSources(func::FuncOp function) {
       Value buffer = load.getMemref();
       SmallVector<ProducerReplayUse> uses;
       bool removesProducer = true;
-      for (Operation *user : buffer.getUsers()) {
-        if (user == producer->operation || isRemovableProducerMetadata(user)) continue;
+      for (Operation *user : producer->observations.reads) {
         auto read = dyn_cast<memref::LoadOp>(user);
-        if (!read) { removesProducer = false; continue; }
+        if (!read || read.getMemref() != buffer) { removesProducer = false; continue; }
         SmallVector<Value> coordinates;
         for (AffineExpr expression : producer->outputProjection.getResults())
           coordinates.push_back(read.getIndices()[cast<AffineDimExpr>(expression).getPosition()]);
@@ -135,7 +127,7 @@ LogicalResult foldIntegerSources(func::FuncOp function) {
           read->erase();
         }
       }
-      eraseUnusedProducer(producer->operation);
+      if (removesProducer) eraseReplayedProducerVersion(producer->operation);
       changed = true;
       // Uses, producer lifetime and possible scalar bindings have changed.
       // Recollect the next batch from the live program, never from this list.

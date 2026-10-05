@@ -5,6 +5,7 @@
 #include "Intent/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -225,33 +226,11 @@ private:
     if (!lifetime || !lifetime->aliases.complete ||
         lifetime->aliases.values.size() != 1 || !lifetime->contains(point))
       return std::nullopt;
-    Operation *consumer = allocation->getBlock()->findAncestorOpInBlock(*point);
-    if (!consumer) return std::nullopt;
-    Operation *writer = nullptr;
-    for (Operation *user : lifetime->aliases.users) {
-      if (user == lifetime->end || isa<memref::DimOp>(user)) continue;
-      auto effects = storage.effects(user);
-      if (!effects.complete || effects.ordered) return std::nullopt;
-      for (const StorageEffect &entry : effects.entries) {
-        if (isa<MemoryEffects::Read>(entry.effect.getEffect())) continue;
-        Value target = entry.effect.getValue();
-        if (target && storage.disjoint(target, memory)) continue;
-        if (!isa<MemoryEffects::Write>(entry.effect.getEffect()))
-          return std::nullopt;
-        Operation *owner = allocation->getBlock()->findAncestorOpInBlock(*user);
-        if (!owner) return std::nullopt;
-        // A later write does not change this observation. A write in the
-        // observing scope may change elements between its iterations.
-        if (owner == consumer) {
-          if (owner == point && pointwiseInput(memory, point)) continue;
-          return std::nullopt;
-        }
-        if (consumer->isBeforeInBlock(owner)) continue;
-        if (owner != user) return std::nullopt;
-        if (!writer || writer->isBeforeInBlock(owner)) writer = owner;
-      }
-    }
-    if (!writer) return std::nullopt;
+    if (!storage.preserves(point, memory) && !pointwiseInput(memory, point))
+      return std::nullopt;
+    auto current = findCurrentBufferWrite(memory, point, storage);
+    if (!current) return std::nullopt;
+    Operation *writer = current->operation;
     if (auto fill = dyn_cast<linalg::FillOp>(writer)) {
       if (fill.getNumResults() || fill.getOutputs().size() != 1 ||
           fill.getOutputs().front() != memory) return std::nullopt;
