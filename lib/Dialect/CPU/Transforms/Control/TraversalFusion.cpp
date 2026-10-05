@@ -81,18 +81,32 @@ bool movableBetween(Operation *operation) {
 
 bool canFuse(const Traversal &first, const Traversal &second,
              ArrayRef<Operation *> between, StorageAnalysis &storage,
-             DominanceInfo &dominance) {
+             DominanceInfo &dominance,
+             SmallVectorImpl<Operation *> &deferred) {
   if (!sameBounds(first, second)) return false;
   llvm::SmallPtrSet<Operation *, 16> movable;
   for (Operation *operation : between) {
     if (!movableBetween(operation)) return false;
     if (isa<memref::DeallocOp>(operation)) continue;
-    if (llvm::any_of(operation->getOperands(), [&](Value operand) {
-          return !dominance.properlyDominates(operand, first.operation) &&
-                 !movable.contains(operand.getDefiningOp());
-        })) return false;
+    bool availableBefore = llvm::all_of(operation->getOperands(), [&](Value operand) {
+      return dominance.properlyDominates(operand, first.operation) ||
+             movable.contains(operand.getDefiningOp());
+    });
+    if (!availableBefore) {
+      if (isa<memref::AllocOp>(operation)) return false;
+      deferred.push_back(operation);
+      continue;
+    }
     movable.insert(operation);
   }
+  // A completed reduction's scalar postprocessing may remain after both
+  // traversals. It cannot supply the second traversal or any earlier observer.
+  for (Operation *operation : deferred)
+    for (Operation *user : operation->getUsers())
+      if (!llvm::is_contained(deferred, user) &&
+          (second.operation->isAncestor(user) ||
+           !dominance.properlyDominates(second.operation, user)))
+        return false;
   llvm::SetVector<Value> captures;
   captures.insert(second.operation->operand_begin(), second.operation->operand_end());
   for (Region &region : second.operation->getRegions())
@@ -100,10 +114,12 @@ bool canFuse(const Traversal &first, const Traversal &second,
   for (Value value : captures)
     if (!dominance.properlyDominates(value, first.operation) &&
         !movable.contains(value.getDefiningOp())) return false;
-  // Native fusion inserts after the second traversal. No completed first-loop
-  // result may be needed before that point, including in a nested capture.
+  // Native fusion inserts after the second traversal. The only uses that may
+  // precede it are the pure postprocessing DAG moved to that same final scope.
   for (Operation *user : first.operation->getUsers())
-    if (!dominance.properlyDominates(second.operation, user)) return false;
+    if (!llvm::is_contained(deferred, user) &&
+        (second.operation->isAncestor(user) ||
+         !dominance.properlyDominates(second.operation, user))) return false;
 
   auto lhs = detail::traversalAccesses(first, storage);
   auto rhs = detail::traversalAccesses(second, storage);
@@ -127,13 +143,19 @@ bool canFuse(const Traversal &first, const Traversal &second,
 }
 
 void join(const Traversal &first, const Traversal &second,
-          ArrayRef<Operation *> between, ReductionOrderAttr order) {
+          ArrayRef<Operation *> between, ArrayRef<Operation *> deferred,
+          ReductionOrderAttr order) {
   Operation *freePoint = second.operation;
+  for (Operation *operation : deferred) {
+    operation->moveAfter(freePoint);
+    freePoint = operation;
+  }
   for (Operation *operation : between) {
     if (isa<memref::DeallocOp>(operation)) {
       operation->moveAfter(freePoint);
       freePoint = operation;
-    } else operation->moveBefore(first.operation);
+    } else if (!llvm::is_contained(deferred, operation))
+      operation->moveBefore(first.operation);
   }
   NamedAttrList attributes(first.operation->getAttrs());
   attributes.erase("intent_cpu.reduction_order");
@@ -172,9 +194,10 @@ bool fuseOne(func::FuncOp function) {
     auto second = next ? traversal(next) : std::nullopt;
     if (!second) continue;
     ReductionOrderAttr order;
+    SmallVector<Operation *> deferred;
     if (!compatibleAttributes(first.operation, second->operation, order) ||
-        !canFuse(first, *second, between, storage, dominance)) continue;
-    join(first, *second, between, order);
+        !canFuse(first, *second, between, storage, dominance, deferred)) continue;
+    join(first, *second, between, deferred, order);
     return true;
   }
   return false;
