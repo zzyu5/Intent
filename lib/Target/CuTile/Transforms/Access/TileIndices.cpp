@@ -33,9 +33,9 @@ FailureOr<Value> tileIndex(OpBuilder &builder, Location location, Value start,
     return tileIndex(builder, location, coordinate.getCoordinate(), extent);
   if (auto binary = start.getDefiningOp<gpu::BinaryOp>()) {
     if (binary.getOperatorKind() == BinaryOperator::Multiply) {
-      if (binary.getLhs() == extent)
+      if (gpu::samePhysicalScalarExpression(binary.getLhs(), extent))
         return binary.getRhs();
-      if (binary.getRhs() == extent)
+      if (gpu::samePhysicalScalarExpression(binary.getRhs(), extent))
         return binary.getLhs();
       if (isProvably(binary.getLhs(), 1))
         return tileIndex(builder, location, binary.getRhs(), extent);
