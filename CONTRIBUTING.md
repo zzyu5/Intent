@@ -1155,6 +1155,13 @@ realized shared GPU IR 和已绑定的有限配置。默认 shared pipeline 在 
 value relations 并检查配置，不要求调用者追加 repair。新增规则应在当前 tuple schema、
 combine、identity 和物理成员覆盖上成立；不能借此改变 ordered loop 或 scan。
 
+完整的参数化 partial 仍须证明实际 init/update、各字段的尾部 identity 与当前范围。
+单位 free-axis 域可以形成真正的全轴 scalar reduce，再广播回原输出 schema；Triton
+通过现有 native Reduce 的 `axis=-1` 明确映射 `axis=None`，cuTile 先统一有序展平再
+使用 axis 0。非单位域保留原树或已证明完整的静态合轴，不对普通 reshape 开放任意
+元素重排。Native axis 的 infer、verifier 与 serializer 必须一起闭合；scan 不继承
+这项全轴语义。
+
 职责对照是本地 Triton `python/triton/language/semantic.py:1679–1695`：全轴归约先
 把各 component reshape，再创建携带 scalar callback 的原生 reduce；callback 构造见
 `python/triton/language/core.py:2931–2944`。Intent 在自己的 pass 中证明哪些已完成的
@@ -1355,6 +1362,21 @@ SSA、product、domain 与 dimension 映射只有一份，完成后由独立 phy
 改写后重建事实。只有该版本的全部 observations 被替换，才可删除其 writer，后续
 版本继续保留 allocation。与私有版本确定 disjoint 的 ordered 操作不破坏其存储事实，
 但不会因此获得移动、replay 或提前发布的权限。
+
+版本也可以在顺序 `scf.for` 的一次迭代末闭合，但必须证明完整 alias/lifetime、
+该迭代的唯一完整写入，以及全部实际读取由它支配。Loop 外只有 descriptor metadata
+和释放时，后续迭代重新完整定义同一私有存储；跨 task、parallel、分支或未知 owner
+的观察不能获得这项证明。该查询不扩大 `readStable`：回放来源仍逐读取点检查。
+
+普通归约的整组供数在私有
+[ReductionSupply.cpp](lib/Dialect/CPU/Transforms/Structure/ReductionSupply.cpp)。它从
+一个完成版本的全部实际 collective readers 出发，恢复 collapse 前的成员轴，并通过
+同一已绑定 implementation 的 materializer 展开。Generic 与 scalar Reduce 共享
+[ReductionSources.cpp](lib/Dialect/CPU/Transforms/Structure/ReductionSources.cpp) 的
+member 回放；member 的 load/cast 和 horizontal combine 分开，不能把 source cast
+再次施加到 partial state。连续 stride 条件写成真实控制与 descriptor：满足时直接
+供数，不满足时执行原物化组。全部观察替换后重查版本再删 writer；其它消费者仍需
+读取、或原路径仍需 allocation 时，不因删除流量就宣称整个存储容量消失。
 
 [ExtentRelations.h](include/Intent/Dialect/CPU/Analysis/ExtentRelations.h) 统一当前 extent 的判等、表达式和常数上界查询；[IR ShapeRelations](include/Intent/Dialect/CPU/IR/ShapeRelations.h) 从公共接口取得同一 dimension 的代表及静态约束，也供入口 `memref.dim` 规范化使用。[registerExtentRelations](lib/Dialect/CPU/Analysis/ExtentRelations.cpp) 由 [Compiler Registration](lib/Compiler/Registration.cpp) 注册 CPU helper、ABI 与缺失的描述符 ValueBounds 模型，复用 MLIR 已有的 memref/SCF 模型。未知关系保留为 unknown，不把任意可能 wrap 的 index 算术当作无界整数；extent 相等不代表 offset、stride 或访问坐标相同。
 
