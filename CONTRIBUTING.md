@@ -213,6 +213,17 @@ CPU 遍历融合比较当前循环的实际 implementation bindings。Mojo 默�
 loop binding，再调用此组；提前独立运行时，绑定尚不一致的循环会保留，因而可能
 合法但融合更少。可选 CPU 优化不代替 provider 完成必要的绑定。
 
+`Control/TraversalFusion` 用完整 effects 和当前存储关系决定是否可跨过完成结果
+的普通写回：只有后续遍历与写回目标确定不相交，才把原值和地址一起延后；未知
+effects、atomic 或其它 ordered 操作仍是边界。纯后处理和写回保留次序，allocation
+只在同一 block/scope 内且其 operands 已可用时提前，释放在延后操作之后。
+`TraversalAccesses` 可以沿相同 bounds/attributes 的嵌套 counted loops 对应只读
+坐标，证明实际共享读取；这项收益判据不参与写依赖证明。原写入仍须通过地址
+对应与逐迭代分离检查。融合先共享遍历和供数，随后原 implementation 负责每行
+SIMD partial；不要为了少做一次 horizontal 就把向量 carries 延长到所有外层行。
+MLIR 的 `fuseIndependentSiblingForLoops` 负责拼接 loops/carries，调用者继续承担
+这些存储、顺序和收益证明。
+
 从正常公开编译取得闭合 shared IR 后，可经同一工具链运行组件并续编译：
 
 ```python
@@ -1140,6 +1151,7 @@ Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/Mapping/ProgramGrid.cpp) �
 | 私有模块 | 修改入口与职责 |
 |---|---|
 | [ReductionAnalysis.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionAnalysis.cpp) | source/root/extent 与 retained source 的只读资格查询 |
+| [ReductionChains.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionChains.cpp) | 完整 tuple combine/identity/captures 合同查询；直接相连的普通归约轴合并，和完成归约正规化共用一份判定 |
 | [ReductionParameters.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionParameters.cpp) | reduction 参数选择与 free-axis 绑定 |
 | [ReductionValues.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionValues.cpp) | identity 与 accumulator 资格、value schema 投影；typed combine 通过 Value/Helpers 的共同入口重建 |
 | [ReductionCoverage.cpp](lib/Dialect/GPU/Transforms/Reduction/ReductionCoverage.cpp) | static padding、完整 coverage 与 tail neutralization |
@@ -1149,13 +1161,28 @@ Triton [ProgramGrid.cpp](lib/Target/Triton/Transforms/Mapping/ProgramGrid.cpp) �
 
 分块机制由同一公开 driver 调用；driver 保留策略选择和改写后的 worklist 刷新，内部查询不各自注册 pass。`SourcePlan` 只是一次改写读取的当前 SSA 事实，不能成为独立持久计划。跨变换需要复用的范围证明、replay 和参数生命周期仍使用上表中的共同接口。
 
+多轴供数判断当前非 uniform producer 能否沿同一 unit-step 成员域重放并实际
+删除，且不会重复昂贵工作；uniform 字段复用其真实 scalar frontier，不虚构
+load root 或另一个成员域。完整静态外轴且有独立输出 lanes 时，既有选形策略
+使用这份完整资格绑定 outer/inner reduction 参数，从原 profile 形成双轴遍历。
+deferred full-coverage 外轴保留其完整表示；供数合法本身不构成默认改成双轴
+遍历的收益证明。当前源片段的已证资源压力仍由 `shouldTileReductionSources`
+选择 bounded 供数，不能重放的 retained/shared producer 保持原表示。轴合并
+不跨中间 mask/cast，普通归约许可不扩展到 scan 或作者的 ordered control。
+
 已完成归约链还有独立完整入口 `intent-gpu-normalize-completed-reductions`，输入为
 realized shared GPU IR 和已绑定的有限配置。默认 shared pipeline 在 traversal fusion
 之后运行它；显式 pipeline 可以省略，或用同一入口单独运行。该组自己删除死值、闭合
 value relations 并检查配置，不要求调用者追加 repair。新增规则应在当前 tuple schema、
 combine、identity 和物理成员覆盖上成立；不能借此改变 ordered loop 或 scan。
 
-完整的参数化 partial 仍须证明实际 init/update、各字段的尾部 identity 与当前范围。
+直接、唯一使用且中间没有 mask/cast 的普通归约链，其当前 operations 已经定义
+完整的物理成员并集；不要求 source SSA 的 producer 恰好是一层 For。复杂嵌套
+遍历的结果也可使用同一原生全轴形式，producer 本身保持原位。有中间 identity
+mask 时仍须额外证明完整逻辑覆盖和逐 component 中立，不能把直接链许可套上去。
+
+消除中间 mask 或依据逻辑覆盖改写参数化 partial 时，仍须证明实际 init/update、
+各字段的尾部 identity 与当前范围。
 单位 free-axis 域可以形成真正的全轴 scalar reduce，再广播回原输出 schema；Triton
 通过现有 native Reduce 的 `axis=-1` 明确映射 `axis=None`，cuTile 先统一有序展平再
 使用 axis 0。非单位域保留原树或已证明完整的静态合轴，不对普通 reshape 开放任意
@@ -1167,6 +1194,22 @@ combine、identity 和物理成员覆盖上成立；不能借此改变 ordered l
 `python/triton/language/core.py:2931–2944`。Intent 在自己的 pass 中证明哪些已完成的
 归约可以合流并写入真实 reshape/reduce，目标内部的归约树、通信和 layout 仍由
 Triton/cuTile 编译器处理。
+
+已实现的分块遍历还可通过 `intent-gpu-peel-traversal-tails` 独立优化。该组在
+已绑定配置的 shared IR 上按实际正步长形成完整前缀和尾部，并把前缀的完整
+loop results 接入尾部的全部状态。已证明只有零或一次的尾部形成 `scf.if`，
+真分支按原 IV/iterargs 绑定执行原 body 一次，假分支透传前缀结果；不保留多余
+循环状态，也不重写源 combine 或提前读取数据。内部 allocation 或未知 effects
+保留原遍历，不能在复制 body 时重复 kernel-unique buffer instance 或丢弃 owner。
+`Control/TraversalTails` 只负责区间改写，完整 pass 自己运行现有范围谓词简化、
+纯值清理、关系闭合和配置验证。默认在完成归约正规化之后运行，避免区间拆分
+遮住前一组需要的完整 partial 事实。
+
+对齐端点使用已有 `IntegerOrder::roundDown` 的 `floor(upper / width) * width`
+规则；在 upper 非负、width 为正时，相关乘积位于 `[0, upper]`，不依赖两个
+独立整数区间碰巧足够小。`IndexBounds::completeTileLimit` 消费这份当前 SSA
+关系，证明前缀中的完整 lane 域。不能在新变换中手删一个看似相同的 mask，
+也不能仅增加两个循环而不确认后续谓词消费者真实采用这份关系。
 
 Pointwise 的两个完整入口也在同一 driver 文件 [RealizePointwiseBlocking.cpp](lib/Dialect/GPU/Transforms/Pointwise/RealizePointwiseBlocking.cpp)：`realizePointwiseOwnership` 形成 ownership 与 program mapping；`realizePointwiseBlocking` 在已有 mapping 上形成局部 blocking、写回和复用 traversal。两者有各自明确的依赖次序，通过相邻私有头 [Pointwise.h](lib/Dialect/GPU/Transforms/Pointwise/Pointwise.h) 使用以下机制：
 
