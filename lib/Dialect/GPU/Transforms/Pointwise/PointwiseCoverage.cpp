@@ -300,7 +300,7 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
                                       chunkExtent)))
         return failure();
     }
-    return retargetDimensionExtent(source, dimension, chunkExtent);
+    return retargetFragmentAxisExtent(source, axis, chunkExtent);
   }
   if (failed(dimensionArgument(kernel, dimension))) {
     FailureOr<int64_t> staticExtent =
@@ -322,7 +322,7 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
       if (failed(retargetDimensionExtent(range.getResult(), dimension, covered)))
         return failure();
     }
-    return retargetDimensionExtent(source, dimension, covered);
+    return retargetFragmentAxisExtent(source, axis, covered);
   }
   std::string parameterName = ("FULL_D" + Twine(dimension)).str();
   ParameterAttr parameter = lookupParameter(kernel, StringAttr::get(kernel.getContext(), parameterName));
@@ -356,7 +356,7 @@ LogicalResult requireScanFullCoverage(func::FuncOp kernel, ScanOp scan,
     if (failed(retargetDimensionExtent(range.getResult(), dimension, covered)))
       return failure();
   }
-  if (failed(retargetDimensionExtent(source, dimension, covered)))
+  if (failed(retargetFragmentAxisExtent(source, axis, covered)))
     return failure();
   if (failed(
           bindFullCoverageDimension(kernel, dimension,
@@ -391,7 +391,7 @@ LogicalResult requireStructuredReductionFullCoverage(func::FuncOp kernel,
     for (MakeRangeOp range : ranges.roots)
       if (failed(retargetSourceExtent(range.getResult(), sourceAxis, extent)))
         return failure();
-    return retargetSourceExtent(source, sourceAxis, extent);
+    return retargetFragmentAxisExtent(source, axis, extent);
   }
   return realizeFullCoverageDimension(kernel, source, axis);
 }
