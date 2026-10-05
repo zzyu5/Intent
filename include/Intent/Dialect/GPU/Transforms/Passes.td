@@ -287,3 +287,24 @@ def NormalizeCompletedReductionsPass : IntentGPUTransformPass<
     after independent traversal fusion; explicit pipelines can omit or invoke
     this group without requiring a separate relation-repair pass.
   }]>;
+
+def PeelTraversalTailsPass : IntentGPUTransformPass<
+    "intent-gpu-peel-traversal-tails",
+    "Separate complete GPU traversal blocks from their tail", [{
+    Consumes verified, realized shared GPU IR after finite configuration
+    binding. Splits eligible counted traversals at their actual aligned upper
+    bound, preserving each iteration's body, captures, effects and complete
+    loop-carried state. The complete prefix and the remaining tail execute in
+    their original order; empty prefixes or tails perform no source access.
+
+    Eligibility follows current unit-step fragment coordinates, the positive
+    physical loop width, nonnegative bounds and representable aligned
+    arithmetic. Unknown geometry retains the original legal traversal. The
+    group proves and simplifies complete-block predicates, cleans pure values,
+    and closes value relations and unchanged configuration tuples. It does
+    not change a combine, numerical mode, member domain or provider layout.
+
+    This is optional and independently runnable on closed shared IR. The
+    default pipeline applies it after completed reduction normalization so
+    interval splitting does not obscure the original completion proof.
+  }]>;

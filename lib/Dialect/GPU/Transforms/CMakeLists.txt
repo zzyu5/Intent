@@ -53,6 +53,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Control/PredicateScalarControl.cpp
   Control/PredicatedCloning.cpp
   Control/Traversal.cpp
+  Control/TraversalTails.cpp
   Control/VectorizeBufferLoops.cpp
 
   Value/EliminateCommonValues.cpp

@@ -6,6 +6,7 @@
 #include "Intent/Dialect/GPU/Transforms/Region/Realization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Reduction/ReductionRealization.h"
+#include "Control/TraversalTails.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -41,6 +42,7 @@ namespace intent::gpu {
 #define GEN_PASS_DEF_MATERIALIZECONFIGURATIONSPASS
 #define GEN_PASS_DEF_FUSEINDEPENDENTTRAVERSALSPASS
 #define GEN_PASS_DEF_NORMALIZECOMPLETEDREDUCTIONSPASS
+#define GEN_PASS_DEF_PEELTRAVERSALTAILSPASS
 #include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
 
 namespace {
@@ -364,6 +366,30 @@ public:
   }
 };
 
+class PeelTraversalTailsPass
+    : public impl::PeelTraversalTailsPassBase<PeelTraversalTailsPass> {
+public:
+  void runOnOperation() final {
+    ModuleOp module = getOperation();
+    auto transform = [&]() -> LogicalResult {
+      if (failed(verifyGPUProgram(module))) return failure();
+      auto kernel = getPhysicalKernel(module);
+      if (failed(kernel) || failed(verifySharedConfigTuples(*kernel)))
+        return failure();
+      if (peelTraversalTails(*kernel)) {
+        if (failed(simplifyRangePredicates(module)) ||
+            failed(eliminateCommonValues(module)))
+          return failure();
+        eraseDeadPhysicalValues(*kernel);
+        if (failed(closeValueRelations(*kernel))) return failure();
+      }
+      return verifySharedConfigTuples(*kernel);
+    };
+    if (failed(finishTransformation(module, getArgument(), transform())))
+      signalPassFailure();
+  }
+};
+
 } // namespace
 
 #define GEN_PASS_REGISTRATION
@@ -389,6 +415,7 @@ void buildSharedGPUPipeline(OpPassManager &manager) {
   manager.addPass(createMaterializeConfigurationsPass());
   manager.addPass(createFuseIndependentTraversalsPass());
   manager.addPass(createNormalizeCompletedReductionsPass());
+  manager.addPass(createPeelTraversalTailsPass());
 }
 
 } // namespace intent::gpu
