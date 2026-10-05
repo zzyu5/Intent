@@ -1,5 +1,5 @@
 #include "Intent/Dialect/DSA/Transforms/StoragePatterns.h"
-#include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
+#include "LocalTransfers.h"
 #include "Intent/Dialect/DSA/IR/MemoryEffects.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "mlir/IR/Dominance.h"
@@ -11,46 +11,7 @@ using namespace mlir;
 namespace intent::dsa {
 namespace {
 
-struct LocalCopy {
-  Operation *operation;
-  Value source, destination, sourceOwner;
-};
-
-std::optional<LocalCopy> fullCopy(Operation *operation, StorageAnalysis &storage,
-                                 func::FuncOp function) {
-  Value source, destination;
-  if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
-    source = copy.getSource(); destination = copy.getTarget();
-  } else {
-    auto load = cast<LoadTileOp>(operation);
-    if (load.getAsynchronous()) return std::nullopt;
-    source = load.getSource(); destination = load.getOutput();
-    auto shape = cast<MemRefType>(destination.getType());
-    auto exact = [&](Value value, int64_t expected) {
-      auto interval = integerInterval(value, function);
-      return interval && interval->first == expected && interval->second == expected;
-    };
-    if (!exact(load.getOffset(), 0) || !exact(load.getRows(), shape.getDimSize(0)) ||
-        !exact(load.getColumns(), shape.getDimSize(1)) ||
-        (shape.getDimSize(0) > 1 && !exact(load.getRowStride(), shape.getDimSize(1))) ||
-        (shape.getDimSize(1) > 1 && !exact(load.getColumnStride(), 1))) return std::nullopt;
-  }
-  auto input = cast<MemRefType>(source.getType());
-  auto output = cast<MemRefType>(destination.getType());
-  Value origin = storage.uniqueOrigin(source);
-  if (!input.hasStaticShape() || !output.hasStaticShape() ||
-      input.getMemorySpaceAsInt() != nramSpace || output.getMemorySpaceAsInt() != nramSpace ||
-      !input.getLayout().isIdentity() || !output.getLayout().isIdentity() ||
-      input.getElementType() != output.getElementType() ||
-      input.getNumElements() != output.getNumElements() || !origin ||
-      !origin.getDefiningOp<memref::AllocaOp>() ||
-      !destination.getDefiningOp<memref::AllocaOp>() || origin == destination ||
-      !isCompleteLocalStorageView(source) || !isCompleteLocalStorageView(destination) ||
-      !isCompleteStorageViewOf(source, origin) ||
-      !storage.aliases(origin).complete || !storage.aliases(destination).complete)
-    return std::nullopt;
-  return LocalCopy{operation, source, destination, origin};
-}
+using detail::LocalTransfer;
 
 bool observes(const BufferStorageEffects &effects, Value memory,
               StorageAnalysis &storage) {
@@ -70,11 +31,12 @@ bool modifies(const BufferStorageEffects &effects, Value memory,
 
 // The copy defines one complete version. A later overwrite can terminate it;
 // other writes to the allocation outside that interval are not its consumers.
-bool forwardVersion(const LocalCopy &copy, StorageAnalysis &storage,
-                    DominanceInfo &dominance) {
+bool forwardVersion(const LocalTransfer &copy, StorageAnalysis &storage,
+                    DominanceInfo &dominance, LocalSupplyRelations &relations) {
   auto aliases = storage.aliases(copy.destination);
   llvm::SetVector<OpOperand *> reads;
   llvm::SmallPtrSet<Operation *, 16> readers;
+  SmallVector<Operation *> orderedReaders;
   bool overwritten = false;
   for (Operation *next = copy.operation->getNextNode();
        next && !next->hasTrait<OpTrait::IsTerminator>(); next = next->getNextNode()) {
@@ -92,6 +54,7 @@ bool forwardVersion(const LocalCopy &copy, StorageAnalysis &storage,
           storage.disjoint(copy.destination, entry.effect.getValue())) continue;
       Operation *reader = entry.operation;
       if (!readers.insert(reader).second) continue;
+      orderedReaders.push_back(reader);
       auto completion = storage.completionOfUse(reader);
       if (!dominance.properlyDominates(copy.operation, reader) ||
           failed(completion) || *completion != reader ||
@@ -121,6 +84,24 @@ bool forwardVersion(const LocalCopy &copy, StorageAnalysis &storage,
       if (!local || !point || !point->isBeforeInBlock(copy.operation)) return false;
     }
   }
+  SmallVector<detail::LocalTransferRead> composed;
+  if (!copy.identity) {
+    // Every actual observation of this version must be representable by the
+    // existing rectangular transfer. Never substitute a padded buffer into an
+    // arbitrary arithmetic consumer as though its inactive lanes were source.
+    for (Operation *reader : orderedReaders) {
+      auto load = dyn_cast<LoadTileOp>(reader);
+      if (!load || !isCompleteStorageViewOf(load.getSource(), copy.destination)) return false;
+      auto read = detail::composeTransferRead(copy, load, relations);
+      if (!read) return false;
+      for (OpOperand *operand : reads)
+        if (operand->getOwner() == reader && operand != &load.getSourceMutable()) return false;
+      composed.push_back(*read);
+    }
+    for (const auto &read : composed) detail::applyTransferRead(copy, read);
+    copy.operation->erase();
+    return true;
+  }
   OpBuilder builder(copy.operation);
   DenseMap<Type, Value> views;
   for (OpOperand *read : reads) {
@@ -141,8 +122,9 @@ bool forwardVersion(const LocalCopy &copy, StorageAnalysis &storage,
 // Publish directly into the copied-to version, without consuming an earlier
 // snapshot. Only the complete output slot changes; all source reads remain the
 // original operands, and no new input/output alias is introduced.
-bool writeThrough(const LocalCopy &copy, StorageAnalysis &storage,
+bool writeThrough(const LocalTransfer &copy, StorageAnalysis &storage,
                   DominanceInfo &dominance) {
+  if (!copy.identity) return false;
   Operation *writer = storage.lastWriterBefore(copy.source, copy.operation);
   if (!writer || writer->getBlock() != copy.operation->getBlock() ||
       writer->getNumRegions() || writer->getNumResults() ||
@@ -190,7 +172,7 @@ bool writeThrough(const LocalCopy &copy, StorageAnalysis &storage,
 
 } // namespace
 
-bool forwardFullLocalCopies(func::FuncOp function) {
+bool composeLocalTransfers(func::FuncOp function) {
   SmallVector<Operation *> copies;
   function.walk([&](Operation *operation) {
     if (isa<memref::CopyOp, LoadTileOp>(operation)) copies.push_back(operation);
@@ -198,10 +180,11 @@ bool forwardFullLocalCopies(func::FuncOp function) {
   bool changed = false;
   for (Operation *operation : copies) {
     StorageAnalysis storage(function);
-    auto copy = fullCopy(operation, storage, function);
+    LocalSupplyRelations relations(function);
+    auto copy = detail::queryLocalTransfer(operation, storage, relations);
     if (!copy) continue;
     DominanceInfo dominance(function);
-    changed |= forwardVersion(*copy, storage, dominance) ||
+    changed |= forwardVersion(*copy, storage, dominance, relations) ||
                writeThrough(*copy, storage, dominance);
   }
   return changed;

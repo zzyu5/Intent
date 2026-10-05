@@ -580,7 +580,7 @@ LogicalResult composeLocalStorage(func::FuncOp function,
   while (true) {
     bool changed = dsa::foldUniformLocalValues(function);
     changed |= dsa::reuseLocalMemoryValues(function);
-    changed |= dsa::forwardFullLocalCopies(function);
+    changed |= dsa::composeLocalTransfers(function);
     changed |= dsa::eliminateUnreadLocalWrites(function);
     if (!changed) return success();
     if (failed(cleanup())) return failure();

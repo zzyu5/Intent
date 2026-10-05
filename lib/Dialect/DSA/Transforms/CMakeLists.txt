@@ -8,6 +8,7 @@ add_mlir_library(MLIRIntentDSATransforms
   LocalSupplyRelations.cpp
   LocalValues.cpp
   LocalCopies.cpp
+  LocalTransfers.cpp
   LocalMemoryValues.cpp
   Collective/Passes.cpp
   Collective/Realize.cpp

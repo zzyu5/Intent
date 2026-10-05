@@ -22,7 +22,7 @@ bool normalizeLinearIndices(mlir::func::FuncOp function);
 void bindUniformOperands(mlir::func::FuncOp function);
 bool reuseLocalMemoryValues(mlir::func::FuncOp function);
 bool eliminateUnreadLocalWrites(mlir::func::FuncOp function);
-bool forwardFullLocalCopies(mlir::func::FuncOp function);
+bool composeLocalTransfers(mlir::func::FuncOp function);
 bool forwardIndexExpressions(mlir::func::FuncOp function);
 bool realizeRangeComparisons(mlir::func::FuncOp function);
 bool foldRangeCounts(mlir::func::FuncOp function);
