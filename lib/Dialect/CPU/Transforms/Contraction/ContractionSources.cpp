@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Contractions.h"
+#include "../Structure/ProducerVersions.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
@@ -25,23 +26,37 @@ linalg::GenericOp bufferProducer(Value buffer, Operation *consumer, bool soleCon
   StorageAnalysis storage(consumer->getParentOfType<func::FuncOp>());
   auto lifetime = storage.lifetime(allocation);
   if (!lifetime || !lifetime->aliases.complete || !lifetime->contains(consumer)) return {};
-  linalg::GenericOp producer;
+  SmallVector<linalg::GenericOp, 2> writers;
   for (Operation *user : lifetime->aliases.users) {
     auto generic = dyn_cast<linalg::GenericOp>(user);
     if (!generic || !llvm::is_contained(generic.getOutputs(), buffer)) continue;
-    if (producer) return {};
-    producer = generic;
+    writers.push_back(generic);
+  }
+  linalg::GenericOp producer;
+  bool completeVersion = writers.size() > 1;
+  if (!completeVersion) {
+    if (!writers.empty()) producer = writers.front();
+  } else {
+    if (!soleConsumer || !sameBlock) return {};
+    for (auto candidate : writers)
+      if (candidate->getBlock() == consumer->getBlock() && candidate->isBeforeInBlock(consumer) &&
+          (!producer || producer->isBeforeInBlock(candidate))) producer = candidate;
+    if (!producer) return {};
+    auto version = queryProducerVersion(producer, storage);
+    if (failed(version) || version->uses.size() != 1 || version->uses.front().operation != consumer)
+      return {};
   }
   if (!producer || producer == consumer ||
       (sameBlock && (producer->getBlock() != consumer->getBlock() || !producer->isBeforeInBlock(consumer))) ||
       producer.getNumResults() ||
       producer.getOutputs().size() != 1 || producer.getNumReductionLoops() ||
       !producer.getIndexingMapsArray().back().isIdentity()) return {};
-  for (Operation *user : lifetime->aliases.users) {
-    if (user == producer || user == lifetime->end || isa<memref::DimOp>(user) ||
-        isStorageAliasOperation(user)) continue;
-    if ((soleConsumer && user != consumer) || !storage.preserves(user, buffer)) return {};
-  }
+  if (!completeVersion)
+    for (Operation *user : lifetime->aliases.users) {
+      if (user == producer || user == lifetime->end || isa<memref::DimOp>(user) ||
+          isStorageAliasOperation(user)) continue;
+      if ((soleConsumer && user != consumer) || !storage.preserves(user, buffer)) return {};
+    }
   return producer;
 }
 
@@ -218,15 +233,23 @@ bool fuseProduct(linalg::GenericOp reduction) {
   auto product = productSource(reduction.getInputs()[0], reduction, views);
   if (!product) return false;
   auto multiply = product->multiply;
-  if (multiply.getInputs().size() != 2) return false;
   Block &productBody = multiply.getRegion().front();
   auto mul = productBody.getTerminator()->getOperand(0).getDefiningOp<arith::MulFOp>();
-  if (!mul || !mul.getType().isF32() || std::distance(productBody.begin(), productBody.end()) != 2 ||
-      !((mul.getLhs() == productBody.getArgument(0) && mul.getRhs() == productBody.getArgument(1)) ||
-        (mul.getRhs() == productBody.getArgument(0) && mul.getLhs() == productBody.getArgument(1)))) return false;
+  if (!mul || !mul.getType().isF32() || std::distance(productBody.begin(), productBody.end()) != 2)
+    return false;
+  SmallVector<unsigned, 2> inputs;
+  for (Value value : mul->getOperands()) {
+    auto argument = dyn_cast<BlockArgument>(value);
+    if (!argument || argument.getOwner() != &productBody ||
+        argument.getArgNumber() >= multiply.getInputs().size()) return false;
+    inputs.push_back(argument.getArgNumber());
+  }
+  // A repeated formal is a square, not a distinct input or a new broadcast.
+  // Keep every input that determines the original product iteration domain.
+  if (multiply.getInputs().size() != (inputs[0] == inputs[1] ? 1u : 2u)) return false;
   SmallVector<OperandAxes> operands;
   StorageAnalysis storage(reduction->getParentOfType<func::FuncOp>());
-  for (unsigned number = 0; number != 2; ++number) {
+  for (unsigned number : inputs) {
     ProjectedSource source{multiply.getInputs()[number], multiply.getIndexingMapsArray()[number].compose(product->map)};
     if (!storage.readStable(source.value, multiply, reduction)) return false;
     source = projectInput(source, reduction, views);
@@ -234,12 +257,19 @@ bool fuseProduct(linalg::GenericOp reduction) {
     if (!axes) return false;
     operands.push_back(std::move(*axes));
   }
+  // The same ordinary product-sum permission also applies without matrix
+  // reuse. Preserve its reduction/producer structure for partial formation and
+  // SIMD; the target may contract the cloned, same-dtype scalar/vector pair.
+  bool changed = (mul.getFastmath() & arith::FastMathFlags::contract) == arith::FastMathFlags::none ||
+      (add.getFastmath() & arith::FastMathFlags::contract) == arith::FastMathFlags::none;
+  mul.setFastmath(mul.getFastmath() | arith::FastMathFlags::contract);
+  add.setFastmath(add.getFastmath() | arith::FastMathFlags::contract);
   auto relate = [&](bool swap) {
     auto &lhs = operands[swap ? 1 : 0], &rhs = operands[swap ? 0 : 1];
     return ProductContractionAxes::get(lhs.projection, lhs.units, rhs.projection, rhs.units, reduced);
   };
   auto relation = relate(false);
-  if (!relation || (relation->axes.lhsFree.empty() && relation->axes.rhsFree.empty())) return false;
+  if (!relation || (relation->axes.lhsFree.empty() && relation->axes.rhsFree.empty())) return changed;
   auto contiguousColumns = [&](const ProductContractionAxes &axes, const OperandAxes &rhs) {
     if (axes.axes.rhsFree.empty()) return false;
     unsigned axis = axes.rhsKept[axes.axes.rhsFree.back()];
@@ -257,17 +287,17 @@ bool fuseProduct(linalg::GenericOp reduction) {
   // Keep strided-column products in the producer-fused reduction path instead
   // of materializing and packing a matrix solely to feed a vector-matrix tile.
   if ((relation->axes.lhsFree.empty() || relation->axes.rhsFree.empty()) &&
-      !contiguousColumns(*relation, operands[1])) return false;
+      !contiguousColumns(*relation, operands[1])) return changed;
   SmallVector<int64_t> outputAxes;
   for (int64_t productAxis : relation->resultProductAxes) {
     auto position = llvm::find(outputs, productAxis);
-    if (position == outputs.end()) return false;
+    if (position == outputs.end()) return changed;
     outputAxes.push_back(position - outputs.begin());
   }
   for (Value memory : {operands[0].source.value, operands[1].source.value, reduction.getOutputs()[0]}) {
     SmallVector<int64_t> strides;
     int64_t offset;
-    if (failed(cast<MemRefType>(memory.getType()).getStridesAndOffset(strides, offset))) return false;
+    if (failed(cast<MemRefType>(memory.getType()).getStridesAndOffset(strides, offset))) return changed;
   }
   OpBuilder builder(reduction);
   auto location = reduction.getLoc();
@@ -368,6 +398,10 @@ findContractionInitialization(linalg::GenericOp operation) {
       if (auto fill = dyn_cast<linalg::FillOp>(previous);
           fill && fill.getOutputs().size() == 1 && fill.getOutputs()[0] == memory) {
         value = fill.getInputs()[0];
+      } else if (auto store = dyn_cast<memref::StoreOp>(previous);
+                 store && store.getMemref() == memory && store.getIndices().empty() &&
+                 store.getMemRefType().getRank() == 0) {
+        value = store.getValue();
       } else if (auto copy = dyn_cast<memref::CopyOp>(previous);
                  copy && copy.getTarget() == memory) {
         auto source = find(copy.getSource(), copy);

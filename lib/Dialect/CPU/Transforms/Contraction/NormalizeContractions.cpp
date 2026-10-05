@@ -263,9 +263,11 @@ private:
           right = b.create<arith::ExtSIOp>(loc, accumulator, right);
         }
       }
-      Value product = isa<FloatType>(accumulator) ? Value(b.create<arith::MulFOp>(loc, left, right))
+      Value product = isa<FloatType>(accumulator) ? Value(b.create<arith::MulFOp>(
+          loc, left, right, arith::FastMathFlags::contract))
                                                 : Value(b.create<arith::MulIOp>(loc, left, right));
-      Value sum = isa<FloatType>(accumulator) ? Value(b.create<arith::AddFOp>(loc, body.getArgument(0), product))
+      Value sum = isa<FloatType>(accumulator) ? Value(b.create<arith::AddFOp>(
+          loc, body.getArgument(0), product, arith::FastMathFlags::contract))
                                             : Value(b.create<arith::AddIOp>(loc, body.getArgument(0), product));
       b.create<YieldOp>(loc, sum);
     }

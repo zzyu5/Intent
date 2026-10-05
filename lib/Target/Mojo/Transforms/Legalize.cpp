@@ -272,6 +272,27 @@ LogicalResult finalizeNativeProgram(ModuleOp module) {
   auto capabilities = module->getAttrOfType<cpu::CapabilitiesAttr>("intent_cpu.capabilities");
   if (!capabilities)
     return module.emitError("Mojo finalization requires CPU capabilities");
+  SmallVector<arith::AddFOp> additions;
+  module.walk([&](arith::AddFOp operation) { additions.push_back(operation); });
+  for (auto addition : additions) {
+    if ((addition.getFastmath() & arith::FastMathFlags::contract) == arith::FastMathFlags::none)
+      continue;
+    for (unsigned side = 0; side != 2; ++side) {
+      auto product = addition->getOperand(side).getDefiningOp<arith::MulFOp>();
+      if (!product || !product->hasOneUse() || product->getBlock() != addition->getBlock() ||
+          product.getType() != addition.getType() ||
+          (product.getFastmath() & arith::FastMathFlags::contract) == arith::FastMathFlags::none)
+        continue;
+      OpBuilder builder(addition);
+      auto fused = builder.create<math::FmaOp>(addition.getLoc(), product.getLhs(),
+          product.getRhs(), addition->getOperand(1 - side));
+      fused.setFastmath(addition.getFastmath() & product.getFastmath());
+      addition.replaceAllUsesWith(fused.getResult());
+      addition.erase();
+      product.erase();
+      break;
+    }
+  }
   SmallVector<math::RsqrtOp> roots;
   module.walk([&](math::RsqrtOp operation) { roots.push_back(operation); });
   for (auto operation : roots) {
