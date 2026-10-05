@@ -22,8 +22,9 @@ struct MatrixSupplyMatch {
   scf::ForOp work, reduction;
   MatMulOp matrix;
   LoadTileOp lhs, rhs;
+  detail::MatrixWorksetGeometry geometry;
 };
-std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, ConfigurationAttr config) {
+std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work) {
   if (!work.getLowerBound().getDefiningOp<TaskIdOp>() ||
       !work.getStep().getDefiningOp<TaskCountOp>() || !work.getInitArgs().empty()) return std::nullopt;
   SmallVector<MatMulOp> matrices;
@@ -79,15 +80,20 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
   auto rhsSourceType = cast<MemRefType>(rhs.getSource().getType());
   Type element = lhsSourceType.getElementType();
   if (!element.isF16() && !element.isBF16() && !element.isF32()) return std::nullopt;
-  if (rhsSourceType.getElementType() != element ||
-      !detail::hasCompleteMatrixWorkset(work, reduction, matrix, lhs, rhs)) return std::nullopt;
+  auto geometry = detail::queryCompleteMatrixWorkset(work, reduction, matrix, lhs, rhs);
+  if (rhsSourceType.getElementType() != element || !geometry) return std::nullopt;
+  // The geometry comes from current types, not a bounded profile tuple. This
+  // checked native footprint also bounds twice the input rows and panel bytes
+  // used by the cooperative double-buffer construction below.
+  if (!matrixPanelStorage(element, geometry->rows, geometry->columns, geometry->depth))
+    return std::nullopt;
   if (!storage.disjoint(matrix.getLhs(), matrix.getRhs()) ||
       !storage.disjoint(matrix.getAccumulator(), matrix.getLhs()) ||
       !storage.disjoint(matrix.getAccumulator(), matrix.getRhs()))
     return std::nullopt;
   SmallVector<Value> buffers{matrix.getLhs(), matrix.getRhs(), matrix.getAccumulator()};
-  SmallVector<SmallVector<int64_t>> shapes{{config.getTileM(), config.getTileK()},
-      {config.getTileK(), config.getTileN()}, {config.getTileM(), config.getTileN()}};
+  SmallVector<SmallVector<int64_t>> shapes{{geometry->rows, geometry->depth},
+      {geometry->depth, geometry->columns}, {geometry->rows, geometry->columns}};
   for (auto [buffer, shape] : llvm::zip(buffers, shapes)) {
     Value origin = storage.uniqueOrigin(buffer);
     auto allocation =
@@ -176,7 +182,7 @@ std::optional<MatrixSupplyMatch> matchMatrixSupply(scf::ForOp work, Configuratio
     if (!llvm::all_of(operation->getOperands(), canCapture)) return std::nullopt;
     available.insert(operation->result_begin(), operation->result_end());
   }
-  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs};
+  return MatrixSupplyMatch{work, reduction, matrix, lhs, rhs, *geometry};
 }
 
 class MatrixSupplyRewrite {
@@ -190,8 +196,9 @@ public:
     Value M = b.createOrFold<memref::DimOp>(loc, lhsSource, 0);
     Value N = b.createOrFold<memref::DimOp>(loc, rhsSource, 1);
     Value K = b.createOrFold<memref::DimOp>(loc, lhsSource, 1);
-    int64_t matrixDepth = resident ? resident->depth : config.getTileK();
-    Value tm = index(loc, config.getTileM()), tn = index(loc, config.getTileN()), tk = index(loc, matrixDepth);
+    int64_t rows = match.geometry.rows, columns = match.geometry.columns;
+    int64_t matrixDepth = resident ? resident->depth : match.geometry.depth;
+    Value tm = index(loc, rows), tn = index(loc, columns), tk = index(loc, matrixDepth);
     Value gridM = b.create<arith::CeilDivSIOp>(loc, M, tm), gridN = b.create<arith::CeilDivSIOp>(loc, N, tn);
     auto aType = cast<MemRefType>(lhsSource.getType());
     Type matrixElement = aType.getElementType();
@@ -226,7 +233,7 @@ public:
       Value memoryCore = b.create<dsa::IsMemoryCoreOp>(loc, b.getI1Type());
       Value computeCore = b.create<arith::XOrIOp>(loc, memoryCore, b.create<arith::ConstantIntOp>(loc, 1, 1));
       Value groupsN = b.create<arith::CeilDivSIOp>(loc, gridN, index(loc, 4));
-      auto sharedType = MemRefType::get({config.getTileM(), matrixDepth}, matrixElement,
+      auto sharedType = MemRefType::get({rows, matrixDepth}, matrixElement,
           MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::sharedSpace));
       auto shared = b.create<memref::AllocaOp>(loc, sharedType);
       shared.setAlignment(128);
@@ -245,7 +252,7 @@ public:
         Value cols = b.create<arith::MaxSIOp>(loc, index(loc, 0), b.create<arith::MinSIOp>(loc, sub(loc, N, n0), tn));
         Value active = b.create<arith::AndIOp>(loc, computeCore,
             b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, ni, gridN));
-        auto packedType = MemRefType::get({matrixDepth, config.getTileN()}, matrixElement,
+        auto packedType = MemRefType::get({matrixDepth, columns}, matrixElement,
             MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::matrixSpace));
         auto packed = b.create<memref::AllocaOp>(loc, packedType);
         packed.setAlignment(128);
@@ -267,18 +274,18 @@ public:
         const bool pipelineLocal = resident->pipeline;
         Value local0, local1;
         if (pipelineLocal) {
-          local0 = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
-          local1 = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
+          local0 = allocate(loc, matrixElement, rows, matrixDepth);
+          local1 = allocate(loc, matrixElement, rows, matrixDepth);
         }
         auto compute = [&](Value m0, Value slot, Value nextShared = Value{}, Value nextLocal = Value{}, Value nextRow = Value{}) -> LogicalResult {
           return when(active, [&]() -> LogicalResult {
             Value rows = b.create<arith::MinSIOp>(loc, sub(loc, M, m0), tm);
             Value lhs = slot;
             if (!pipelineLocal) {
-              lhs = allocate(loc, matrixElement, config.getTileM(), matrixDepth);
+              lhs = allocate(loc, matrixElement, match.geometry.rows, matrixDepth);
               b.create<dsa::LoadTileOp>(loc, slot, lhs, index(loc, 0), tk, index(loc, 1), rows, K);
             }
-            Value accumulator = allocate(loc, b.getF32Type(), config.getTileM(), config.getTileN());
+            Value accumulator = allocate(loc, b.getF32Type(), match.geometry.rows, columns);
             b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
             if (nextShared && failed(when(b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, nextRow, M), [&]() {
               Value nextRows = b.create<arith::MinSIOp>(loc, sub(loc, M, nextRow), tm);
@@ -301,7 +308,7 @@ public:
             return success();
           }))) return failure();
           b.create<dsa::GroupSynchronizeOp>(loc);
-          return loop(loc, index(loc, 0), M, index(loc, 2 * config.getTileM()), [&](Value m0) -> LogicalResult {
+          return loop(loc, index(loc, 0), M, index(loc, 2 * rows), [&](Value m0) -> LogicalResult {
             Value next = add(loc, m0, tm), following = add(loc, next, tm);
             Value hasNext = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, next, M);
             Value hasFollowing = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, following, M);
@@ -319,7 +326,7 @@ public:
           });
         }
         b.create<dsa::GroupSynchronizeOp>(loc);
-        return loop(loc, index(loc, 0), M, index(loc, 2 * config.getTileM()), [&](Value m0) -> LogicalResult {
+        return loop(loc, index(loc, 0), M, index(loc, 2 * rows), [&](Value m0) -> LogicalResult {
           Value next = add(loc, m0, tm);
           Value hasNext = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, next, M);
           if (failed(when(hasNext, [&]() { return supply(next, alternate); }))) return failure();
@@ -347,11 +354,11 @@ public:
       Value computeCore = b.create<arith::XOrIOp>(loc, memoryCore, b.create<arith::ConstantIntOp>(loc, 1, 1));
       Value groupsM = b.create<arith::CeilDivSIOp>(loc, gridM, index(loc, 4));
       Type element = aType.getElementType();
-      int64_t panelBytes = config.getTileK() * config.getTileN() * (element.getIntOrFloatBitWidth() / 8);
+      int64_t panelBytes = match.geometry.depth * columns * (element.getIntOrFloatBitWidth() / 8);
       int64_t stageTiles = std::min<int64_t>(8, (3968 * 1024) / (2 * panelBytes));
       if (!stageTiles) return matrix.emitError("matrix panel exceeds execution-group shared storage");
-      int64_t stageRows = stageTiles * config.getTileK();
-      auto sharedType = MemRefType::get({stageRows, config.getTileN()}, element,
+      int64_t stageRows = stageTiles * match.geometry.depth;
+      auto sharedType = MemRefType::get({stageRows, columns}, element,
           MemRefLayoutAttrInterface{}, b.getI64IntegerAttr(dsa::sharedSpace));
       auto shared = b.create<memref::AllocaOp>(loc, sharedType);
       shared.setAlignment(128);
@@ -363,11 +370,11 @@ public:
         b.setInsertionPointToStart(branch.thenBlock());
         return body();
       };
-      int64_t localDepth = config.getTileK();
+      int64_t localDepth = match.geometry.depth;
       if (aType.hasStaticShape() && aType.getDimSize(1) > 0 &&
           aType.getDimSize(1) % stageRows == 0)
         localDepth = selectMatrixPanelDepth(function, config, element,
-            config.getTileM(), config.getTileN(), stageRows, localDepth);
+            match.geometry.rows, columns, stageRows, localDepth);
       Value localStep = index(loc, localDepth);
       return loop(loc, groupId, mul(loc, groupsM, gridN), groupCount, [&](Value group) -> LogicalResult {
         Value mi = add(loc, mul(loc, b.create<arith::DivSIOp>(loc, group, gridN), index(loc, 4)), localId);
@@ -378,7 +385,7 @@ public:
         Value cols = b.create<arith::MinSIOp>(loc, sub(loc, N, n0), tn);
         Value active = b.create<arith::AndIOp>(loc, computeCore,
             b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, mi, gridM));
-        Value accumulator = allocate(loc, b.getF32Type(), config.getTileM(), config.getTileN());
+        Value accumulator = allocate(loc, b.getF32Type(), match.geometry.rows, columns);
         if (failed(when(active, [&]() {
           b.create<dsa::FillOp>(loc, accumulator, b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0)));
           return success();
@@ -395,8 +402,8 @@ public:
         auto compute = [&](Value stage, Value slot) -> LogicalResult {
           return when(active, [&]() {
             Value stageDepth = b.create<arith::MinSIOp>(loc, sub(loc, K, stage), index(loc, stageRows));
-            Value lhs = allocate(loc, element, config.getTileM(), localDepth);
-            Value rhs = allocate(loc, element, localDepth, config.getTileN());
+            Value lhs = allocate(loc, element, match.geometry.rows, localDepth);
+            Value rhs = allocate(loc, element, localDepth, columns);
             return loop(loc, index(loc, 0), stageDepth, localStep, [&](Value within) -> LogicalResult {
               Value depth = b.create<arith::MaxSIOp>(loc, index(loc, 0),
                   b.create<arith::MinSIOp>(loc, sub(loc, stageDepth, within), localStep));
@@ -469,7 +476,7 @@ LogicalResult realizeMatrixSupply(func::FuncOp function) {
     if (loop.getLowerBound().getDefiningOp<TaskIdOp>()) worksets.push_back(loop);
   });
   for (auto work : worksets) {
-    auto match = matchMatrixSupply(work, config);
+    auto match = matchMatrixSupply(work);
     if (!match) continue;
     auto a = cast<MemRefType>(match->lhs.getSource().getType());
     auto c = cast<MemRefType>(match->rhs.getSource().getType());
@@ -477,11 +484,11 @@ LogicalResult realizeMatrixSupply(func::FuncOp function) {
     std::optional<StreamedMatrixPanel> resident;
     if (a.hasStaticShape() && c.hasStaticShape() &&
         config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
-        c.getDimSize(1) / config.getTileN() >= config.getTasks())
+        c.getDimSize(1) / match->geometry.columns >= config.getTasks())
       resident = selectStreamedMatrixPanel(function, config, element,
-          config.getTileM(), config.getTileN(), a.getDimSize(1));
+          match->geometry.rows, match->geometry.columns, a.getDimSize(1), 0);
     bool shared = config.getTasks() >= 4 && config.getTasks() % 4 == 0 &&
-        a.getDimSize(0) / config.getTileM() >= 4;
+        a.getDimSize(0) / match->geometry.rows >= 4;
     if (!resident && !shared) continue;
     if (failed(MatrixSupplyRewrite(*match, config).run(resident))) return failure();
     work.erase();

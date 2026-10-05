@@ -164,23 +164,30 @@ private:
 
 } // namespace
 
-bool hasCompleteMatrixWorkset(scf::ForOp work, scf::ForOp reduction,
+std::optional<MatrixWorksetGeometry> queryCompleteMatrixWorkset(scf::ForOp work, scf::ForOp reduction,
     MatMulOp matrix, LoadTileOp lhs, LoadTileOp rhs) {
   auto function = work->getParentOfType<func::FuncOp>();
-  auto config = function->getAttrOfType<ConfigurationAttr>("intent_dsa.configuration");
   ExecutionRelations execution(function);
   if (!execution.readonlyView(lhs.getSource()) || !execution.readonlyView(rhs.getSource()))
-    return false;
+    return std::nullopt;
   llvm::SetVector<Value> captures;
   getUsedValuesDefinedAbove(work.getRegion(), captures);
   if (!llvm::all_of(captures, [&](Value value) { return execution.isUniform(value); }))
-    return false;
+    return std::nullopt;
   Coordinates coordinates(function);
   AffineExpr M = coordinates.dimension(lhs.getSource(), 0);
   AffineExpr N = coordinates.dimension(rhs.getSource(), 1);
   AffineExpr K = coordinates.dimension(lhs.getSource(), 1);
-  if (!coordinates.equal(K, coordinates.dimension(rhs.getSource(), 0))) return false;
-  int64_t tm = config.getTileM(), tn = config.getTileN(), tk = config.getTileK();
+  if (!coordinates.equal(K, coordinates.dimension(rhs.getSource(), 0))) return std::nullopt;
+  auto left = dyn_cast<MemRefType>(matrix.getLhs().getType());
+  auto right = dyn_cast<MemRefType>(matrix.getRhs().getType());
+  auto outputType = dyn_cast<MemRefType>(matrix.getAccumulator().getType());
+  if (!left || !right || !outputType || left.getRank() != 2 || right.getRank() != 2 ||
+      outputType.getRank() != 2 || !left.hasStaticShape() || !right.hasStaticShape() ||
+      !outputType.hasStaticShape() || matrix.getRhsTransposed()) return std::nullopt;
+  int64_t tm = left.getDimSize(0), tn = right.getDimSize(1), tk = left.getDimSize(1);
+  if (tm <= 0 || tn <= 0 || tk <= 0 || right.getDimSize(0) != tk ||
+      outputType.getShape() != ArrayRef<int64_t>({tm, tn})) return std::nullopt;
   auto upperTiles = [&](Value source, unsigned axis, int64_t width) {
     int64_t upper = coordinates.dimensionUpperBound(source, axis);
     return upper / width + (upper % width != 0);
@@ -191,13 +198,13 @@ bool hasCompleteMatrixWorkset(scf::ForOp work, scf::ForOp reduction,
   // a wrapped product. Empty worksets need no supply transformation.
   if (upperM <= 0 || upperN <= 0 ||
       static_cast<__int128>(upperM) * upperN > std::numeric_limits<int64_t>::max())
-    return false;
+    return std::nullopt;
   AffineExpr gridM = M.ceilDiv(tm), gridN = N.ceilDiv(tn);
   if (!coordinates.equal(work.getUpperBound(), gridM * gridN) ||
       !coordinates.equal(reduction.getLowerBound(), coordinates.constant(0)) ||
       !coordinates.equal(reduction.getUpperBound(), K) ||
       !coordinates.equal(reduction.getStep(), coordinates.constant(tk)))
-    return false;
+    return std::nullopt;
   AffineExpr ordinal = coordinates.expression(work.getInductionVar());
   AffineExpr row = ordinal.floorDiv(gridN) * tm;
   AffineExpr column = (ordinal % gridN) * tn;
@@ -218,7 +225,7 @@ bool hasCompleteMatrixWorkset(scf::ForOp work, scf::ForOp reduction,
       !coordinates.equal(lhs.getColumns(), coordinates.expression(matrix.getDepth())) ||
       !coordinates.equal(rhs.getRows(), coordinates.expression(matrix.getDepth())) ||
       !coordinates.equal(rhs.getColumns(), coordinates.expression(matrix.getColumns())))
-    return false;
+    return std::nullopt;
   // Each original output store must cover its corresponding tile. Reordering
   // the workset never changes an aliasing or partial-write program into a matrix
   // output merely because one read happened to have matrix-shaped storage.
@@ -237,10 +244,10 @@ bool hasCompleteMatrixWorkset(scf::ForOp work, scf::ForOp reduction,
                                                column * coordinates.expression(store.getColumnStride())) ||
         !coordinates.equal(store.getRows(), coordinates.expression(matrix.getRows())) ||
         !coordinates.equal(store.getColumns(), coordinates.expression(matrix.getColumns())))
-      return false;
+      return std::nullopt;
     output = true;
   }
-  return output;
+  return output ? std::optional(MatrixWorksetGeometry{tm, tn, tk}) : std::nullopt;
 }
 
 } // namespace intent::dsa::detail

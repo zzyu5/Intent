@@ -95,6 +95,16 @@ matrixPanelStorage(Type element, int64_t rows, int64_t columns,
   return MatrixPanelStorage{nram, *packed};
 }
 
+bool matrixPanelsFitStorage(func::FuncOp function, ConfigurationAttr config,
+                            ArrayRef<MatrixPanelStorage> panels, int64_t localReserve) {
+  auto available = availableStorage(function, config);
+  if (!available || localReserve < 0) return false;
+  int64_t nram = localReserve, wram = 0;
+  for (const MatrixPanelStorage &panel : panels)
+    if (!add(nram, panel.nram) || !add(wram, panel.wram)) return false;
+  return nram <= available->nram && wram <= available->wram;
+}
+
 llvm::SmallVector<MatrixPanelShape> largerMatrixPanels(
     ConfigurationAttr config, Type element, int64_t rows, int64_t columns,
     int64_t depth, MatrixPanelShape baseline) {
@@ -163,11 +173,13 @@ int64_t selectMatrixPanelDepth(func::FuncOp function, ConfigurationAttr config,
 
 std::optional<StreamedMatrixPanel> selectStreamedMatrixPanel(
     func::FuncOp function, ConfigurationAttr config, Type element,
-    int64_t rows, int64_t columns, int64_t depth) {
+    int64_t rows, int64_t columns, int64_t depth, int64_t localReserve) {
   auto geometry = matrixPanelStorage(element, rows, columns, depth);
   auto available = availableStorage(function, config);
-  if (!geometry || !available || geometry->wram > available->wram)
+  if (!geometry || !available || geometry->wram > available->wram ||
+      localReserve < 0 || localReserve > available->nram)
     return std::nullopt;
+  available->nram -= localReserve;
   int64_t elementBytes = element.getIntOrFloatBitWidth() / 8;
   auto lhs = bytes(rows, depth, elementBytes, 128);
   auto accumulator = bytes(rows, columns, 4, 128);

@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "Intent/Target/BangC/NativeWorkspace.h"
 
 using namespace mlir;
 namespace intent::bangc {
@@ -213,11 +214,12 @@ void realizeExponentialWorkspace(func::FuncOp function, dsa::ConfigurationAttr c
         unary->setAttr("bangc.input_non_subnormal", UnitAttr::get(function.getContext()));
       continue;
     }
-    if (!type.getElementType().isF32() || type.getNumElements() < 1024 || unary.getInput() == unary.getOutput() ||
+    auto shape = exponentialScratchShape(type.getElementType(), type.getNumElements());
+    if (shape.empty() || unary.getInput() == unary.getOutput() ||
         !unary.getInput().getDefiningOp<memref::AllocaOp>() || !unary.getOutput().getDefiningOp<memref::AllocaOp>()) continue;
-    for (int64_t width = std::min<int64_t>(8192, type.getNumElements()); width >= 256; width /= 2) {
+    for (int64_t width = shape[1]; width >= 256; width /= 2) {
       OpBuilder b(unary);
-      Value scratch = allocate(b, unary.getLoc(), b.getF32Type(), {4, width}, dsa::nramSpace);
+      Value scratch = allocate(b, unary.getLoc(), type.getElementType(), {shape[0], width}, dsa::nramSpace);
       unary.getScratchMutable().assign(scratch);
       int64_t nram = 0, wram = 0;
       measureStorage(function, nram, wram);
@@ -254,12 +256,12 @@ void realizeSelections(func::FuncOp function, dsa::ConfigurationAttr config) {
   function.walk([&](dsa::SelectOp select) { selections.push_back(select); });
   for (auto select : selections) {
     auto output = cast<MemRefType>(select.getOutput().getType());
-    if (select.getScratch() || !isa<MemRefType>(select.getCondition().getType()) ||
-        !output.getElementType().isF32() || output.getNumElements() < 64) continue;
-    for (int64_t width = int64_t(1) << llvm::Log2_64(std::min<int64_t>(8192, output.getNumElements())); width >= 64; width /= 2) {
+    auto shape = selectionScratchShape(output.getElementType(), output.getNumElements(),
+                                       isa<MemRefType>(select.getFalseValue().getType()));
+    if (select.getScratch() || !isa<MemRefType>(select.getCondition().getType()) || shape.empty()) continue;
+    for (int64_t width = shape[1]; width >= 64; width /= 2) {
       OpBuilder builder(select);
-      int64_t rows = isa<MemRefType>(select.getFalseValue().getType()) ? 2 : 1;
-      Value scratch = allocate(builder, select.getLoc(), builder.getI32Type(), {rows, width}, dsa::nramSpace);
+      Value scratch = allocate(builder, select.getLoc(), builder.getI32Type(), {shape[0], width}, dsa::nramSpace);
       select.getScratchMutable().assign(scratch);
       int64_t nram = 0, wram = 0;
       measureStorage(function, nram, wram);
@@ -536,15 +538,15 @@ LogicalResult realizeNativeComputations(ModuleOp module) {
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) output = binary.getOutput();
     if (!output) return;
     Type element = cast<MemRefType>(output.getType()).getElementType();
-    if (element.isBF16()) promotedPointwise.push_back(op);
+    if (arithmeticStorageType(element) != element) promotedPointwise.push_back(op);
   });
   for (Operation *op : promotedPointwise) {
     OpBuilder builder(op);
     auto convert = [&](Value source) -> Value {
       if (source.getType().isBF16())
-        return builder.create<arith::ExtFOp>(op->getLoc(), builder.getF32Type(), source);
+        return builder.create<arith::ExtFOp>(op->getLoc(), arithmeticStorageType(source.getType()), source);
       auto type = cast<MemRefType>(source.getType());
-      Value result = allocate(builder, op->getLoc(), builder.getF32Type(), type.getShape(), dsa::nramSpace);
+      Value result = allocate(builder, op->getLoc(), arithmeticStorageType(type.getElementType()), type.getShape(), dsa::nramSpace);
       builder.create<dsa::CastOp>(op->getLoc(), source, result);
       return result;
     };
@@ -552,7 +554,8 @@ LogicalResult realizeNativeComputations(ModuleOp module) {
     if (auto unary = dyn_cast<dsa::UnaryOp>(op)) {
       destination = unary.getOutput();
       Value input = convert(unary.getInput());
-      Value output = allocate(builder, op->getLoc(), builder.getF32Type(), cast<MemRefType>(input.getType()).getShape(), dsa::nramSpace);
+      auto inputType = cast<MemRefType>(input.getType());
+      Value output = allocate(builder, op->getLoc(), inputType.getElementType(), inputType.getShape(), dsa::nramSpace);
       unary.getInputMutable().assign(input); unary.getOutputMutable().assign(output);
       builder.setInsertionPointAfter(op);
       builder.create<dsa::CastOp>(op->getLoc(), output, destination);
@@ -560,7 +563,8 @@ LogicalResult realizeNativeComputations(ModuleOp module) {
       auto binary = cast<dsa::BinaryOp>(op);
       destination = binary.getOutput();
       Value lhs = convert(binary.getLhs()), rhs = convert(binary.getRhs());
-      Value output = allocate(builder, op->getLoc(), builder.getF32Type(), cast<MemRefType>(lhs.getType()).getShape(), dsa::nramSpace);
+      auto inputType = cast<MemRefType>(lhs.getType());
+      Value output = allocate(builder, op->getLoc(), inputType.getElementType(), inputType.getShape(), dsa::nramSpace);
       binary.getLhsMutable().assign(lhs); binary.getRhsMutable().assign(rhs); binary.getOutputMutable().assign(output);
       builder.setInsertionPointAfter(op);
       builder.create<dsa::CastOp>(op->getLoc(), output, destination);

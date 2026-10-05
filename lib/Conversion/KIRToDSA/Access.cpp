@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Target/BangC/NativeWorkspace.h"
 
 namespace intent::kir_to_dsa {
 
@@ -141,7 +142,8 @@ LogicalResult Construction::tensorAccess(Operation *op) {
   if (external && !store && allValid && tensor && shape.size() == 1 &&
       cast<MemRefType>(source.getType()).getElementType() == cast<MemRefType>(data.getType()).getElementType()) {
     int64_t capacity = shape[0].capacity;
-    Value offsets = allocate(loc, b.getI64Type(), 1, capacity);
+    auto offsetShape = bangc::rowOffsetsShape(capacity);
+    Value offsets = allocate(loc, b.getI64Type(), offsetShape[0], offsetShape[1]);
     if (failed(loop(loc, index(loc, 0), shape[0].count, index(loc, 1), [&](Value i) {
       Value offset;
       SmallVector<Value> ignored;
@@ -181,7 +183,8 @@ LogicalResult Construction::tensorAccess(Operation *op) {
     const auto &term = relation->terms[columnTerm];
     Value columnStride = mul(loc, stride(loc, source, *term.sourceAxis),
                              terms[columnTerm].range->step);
-    Value offsets = allocate(loc, b.getI64Type(), 1, shape[0].capacity);
+    auto offsetShape = bangc::rowOffsetsShape(shape[0].capacity);
+    Value offsets = allocate(loc, b.getI64Type(), offsetShape[0], offsetShape[1]);
     Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, shape[1].count, index(loc, 0));
     auto branch = b.create<scf::IfOp>(loc, nonempty, false);
     {

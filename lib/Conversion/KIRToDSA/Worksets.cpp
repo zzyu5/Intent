@@ -236,6 +236,7 @@ LogicalResult Construction::lowerTiledWorkset(Block &block, const WorksetTiling 
     if (!domain) return emitError(loc, "DSA workset tiling has no complete common logical axis");
     domains.push_back(*domain);
   }
+  coarsenMatrixWorkset(block, slices, domains, distribute);
   auto savedValues = values; auto savedProducts = products; auto savedSlices = valueSlices;
   bool savedDistributed = distributedTiles;
   auto restore = llvm::make_scope_exit([&] {

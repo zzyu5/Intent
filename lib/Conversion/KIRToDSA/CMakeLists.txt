@@ -10,8 +10,9 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   CollectiveConstruction.cpp
   Regions.cpp
   Worksets.cpp
+  WorksetCohorts.cpp
 
   LINK_LIBS PUBLIC MLIRIntentAnalysis MLIRIntentConversionSupport MLIRIntentDialect MLIRIntentDSADialect
-    MLIRIntentDSAAnalysis MLIRIntentDSATransforms
+    MLIRIntentDSAAnalysis MLIRIntentDSATransforms MLIRIntentBangCResources
     MLIRArithDialect MLIRFuncDialect MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect
     MLIRIR MLIRSupport MLIRTransformUtils)

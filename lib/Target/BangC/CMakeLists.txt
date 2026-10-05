@@ -1,3 +1,7 @@
+add_mlir_library(MLIRIntentBangCResources
+  NativeWorkspace.cpp
+  LINK_LIBS PUBLIC MLIRIntentDialect MLIRIntentDSADialect MLIRIR MLIRSupport)
+
 add_mlir_library(MLIRIntentBangC
   Transforms/Legalize.cpp
   Transforms/Matrix.cpp
@@ -15,4 +19,4 @@ add_mlir_library(MLIRIntentBangC
   Serialization/Scalar.cpp
   DEPENDS IntentBangCPassesIncGen
   LINK_LIBS PUBLIC MLIRIntentDialect MLIRIntentNativeABI MLIRIntentScalarSerialization MLIRIntentNativeSourceSerialization MLIRIntentDSADialect MLIRIntentDSAAnalysis MLIRIntentDSATransforms MLIRArithDialect MLIRFuncDialect
-    MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect MLIRTransforms MLIRPass MLIRIR MLIRSupport)
+    MLIRMathDialect MLIRMemRefDialect MLIRSCFDialect MLIRTransforms MLIRPass MLIRIR MLIRSupport MLIRIntentBangCResources)

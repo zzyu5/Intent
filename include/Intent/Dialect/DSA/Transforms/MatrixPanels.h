@@ -18,6 +18,12 @@ std::optional<MatrixPanelStorage>
 matrixPanelStorage(mlir::Type element, int64_t rows, int64_t columns,
                    int64_t depth);
 
+// Formation reserves every still-live source allocation and its complete local
+// producer/consumer storage before adding native matrix preparation.
+bool matrixPanelsFitStorage(mlir::func::FuncOp function, ConfigurationAttr config,
+                            llvm::ArrayRef<MatrixPanelStorage> panels,
+                            int64_t localReserve);
+
 struct MatrixPanelShape { int64_t rows, columns; };
 
 // Larger free-axis tiles for this already materialized matrix. Candidates
@@ -46,7 +52,7 @@ struct StreamedMatrixPanel {
 std::optional<StreamedMatrixPanel>
 selectStreamedMatrixPanel(mlir::func::FuncOp function, ConfigurationAttr config,
                          mlir::Type element, int64_t rows, int64_t columns,
-                         int64_t depth);
+                         int64_t depth, int64_t localReserve);
 
 } // namespace intent::dsa
 #endif

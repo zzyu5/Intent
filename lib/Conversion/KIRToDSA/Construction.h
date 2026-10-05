@@ -184,6 +184,9 @@ private:
                                          int64_t capacity, bool clampCapacity);
   void bindExecutionSlice(const WorksetTiling &plan, TileDomain domain,
                             Value begin, Value count);
+  void coarsenMatrixWorkset(Block &block, ArrayRef<WorksetTiling> slices,
+                            SmallVectorImpl<TileDomain> &domains,
+                            bool distribute);
   LogicalResult lowerTiledWorkset(Block &block, const WorksetTiling &plan, bool prepared = false,
         Value selectedOutput = {}, bool distribute = false);
   Value independentRowControl(Block &block);

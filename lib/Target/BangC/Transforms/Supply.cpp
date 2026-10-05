@@ -1,4 +1,5 @@
 #include "PassDetail.h"
+#include "Intent/Target/BangC/NativeWorkspace.h"
 
 using namespace mlir;
 namespace intent::bangc {
@@ -8,7 +9,8 @@ void realizeGatherWorkspace(func::FuncOp function, dsa::ConfigurationAttr config
   DenseMap<int64_t, Value> indicesByRows;
   for (auto gather : gathers) {
     int64_t rows = cast<MemRefType>(gather.getOutput().getType()).getDimSize(0);
-    if (rows < 64 || rows % 64 || rows > 65536) continue;
+    auto workspace = gatherWorkspace(rows);
+    if (!workspace) continue;
     OpBuilder b(gather);
     Location loc = gather.getLoc();
     dsa::StorageAnalysis storage(function);
@@ -24,21 +26,22 @@ void realizeGatherWorkspace(func::FuncOp function, dsa::ConfigurationAttr config
       }
     }
     if (gather.getPlan()) continue;
-    Value scratch = allocate(b, loc, b.getI64Type(), {3, rows}, dsa::nramSpace);
+    Value scratch = allocate(b, loc, b.getI64Type(), workspace->plan, dsa::nramSpace);
     Value indices = indicesByRows.lookup(rows);
     dsa::IotaOp initialize;
     if (!indices) {
       OpBuilder init(function.getContext());
       init.setInsertionPointToStart(&function.front());
-      indices = allocate(init, loc, init.getF32Type(), {1, rows}, dsa::nramSpace);
+      indices = allocate(init, loc, init.getF32Type(), workspace->indices, dsa::nramSpace);
       initialize = init.create<dsa::IotaOp>(loc, indices);
     }
     auto prepare = b.create<dsa::GatherPlanOp>(loc, gather.getRowOffsets(), gather.getRows(), indices, scratch);
-    prepare->setAttr("bangc.internal_nram_bytes", b.getI64IntegerAttr(512));
+    prepare->setAttr("bangc.internal_nram_bytes", b.getI64IntegerAttr(workspace->internalBytes));
     gather.getPlanMutable().assign(scratch);
     int64_t nram = 0, wram = 0;
     measureStorage(function, nram, wram);
-    if (nram + 512 > config.getLocalBytes() || nram + 512 > 768 * 1024) {
+    if (nram > config.getLocalBytes() - workspace->internalBytes ||
+        nram > 768 * 1024 - workspace->internalBytes) {
       gather.getPlanMutable().clear();
       prepare.erase();
       scratch.getDefiningOp()->erase();
