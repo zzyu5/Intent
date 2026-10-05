@@ -122,7 +122,18 @@ def ReductionsPass : IntentGPUTransformPass<
     region traversal have been formed. Fuses eligible independent reductions
     using native tuple capability, decomposes axes, forms bounded traversals
     and neutralizes inactive members with their actual identities. Completes
-    accumulator/value relations. Required reduction realization remains even
+    accumulator/value relations. Direct sole-use ordinary reduction chains
+    with the same complete tuple combine, identities and scalar captures can
+    first combine their axes; masks, numerical casts and different contracts
+    retain the original structure. This uses the same callback-contract query
+    as completed reduction normalization.
+
+    Load-rooted producers with independent output lanes may use bounded outer
+    and inner member traversals when current replay and producer-removal facts
+    permit it. Uniform tuple fields use their actual scalar values and the same
+    identity predicates, without fictitious load roots. Physical parameters
+    continue to come from the existing correlated profile and actual capacity.
+    Required reduction realization remains even
     when a fusion or blocking opportunity is inapplicable; provider-native
     reduction trees and communication are not reconstructed here.
   }]>;
@@ -277,6 +288,11 @@ def NormalizeCompletedReductionsPass : IntentGPUTransformPass<
     component schemas, combine bodies, identities, physical axes and complete
     member coverage. Keeps source computations and reads at their original
     points; only the collective trees and intermediate values change.
+
+    Direct sole-use chains without intervening masks define their exact
+    physical member union regardless of the source producer's representation.
+    Removing an intervening identity mask additionally requires current
+    logical coverage or completed-partial evidence for every tuple component.
 
     This optional group preserves the declared dtypes, numerical attributes,
     logical members, effects and configuration domain. Unknown coverage or

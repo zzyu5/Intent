@@ -33,6 +33,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Reduction/RealizeReductionBlocking.cpp
   Reduction/RealizeScanConsumers.cpp
   Reduction/ReductionAnalysis.cpp
+  Reduction/ReductionChains.cpp
   Reduction/ReductionCoverage.cpp
   Reduction/ReductionDecomposition.cpp
   Reduction/ReductionNormalization.cpp

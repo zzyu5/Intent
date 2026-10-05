@@ -92,38 +92,6 @@ FailureOr<bool> decomposeFullCoverageMultiAxisReduce(
       if (!size || *size > *extent)
         return false;
     }
-    // A load-rooted source with free output lanes can trade reduction width
-    // for a larger output tile. Keep that width parameterized even when the
-    // logical reduction extent is static; retained/pure sources stay native.
-    SmallVector<MakeRangeOp> chunkRanges;
-    bool canChunk = hasNonUnitFreeAxis(reduce);
-    for (Value source : reduce.getSources()) {
-      auto plan = analyzeSource(source, outerAxis);
-      if (failed(plan) || plan->roots.empty()) {
-        canChunk = false;
-        break;
-      }
-      for (MakeRangeOp range : plan->ranges) {
-        canChunk &= !range->hasAttr(sourceSubregionAttr);
-        chunkRanges.push_back(range);
-      }
-      if (plan->reductionRange)
-        chunkRanges.push_back(plan->reductionRange);
-      for (LoadOp load : plan->roots) {
-        auto access = analyzeRoot(load, plan->ranges, plan->reductionAxis);
-        if (failed(access) || !*access ||
-            (*access)->range->hasAttr(sourceSubregionAttr)) {
-          canChunk = false;
-          break;
-        }
-        chunkRanges.push_back((*access)->range);
-      }
-      if (!canChunk)
-        break;
-    }
-    if (canChunk &&
-        PhysicalProgramAnalysis(kernel).lockstepRanges(chunkRanges).isExact())
-      return false;
   }
 
   SmallVector<int64_t> innerAxes;
@@ -210,7 +178,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         "multi-axis reduction decomposition requires at least one source");
 
   unsigned outerAxis = static_cast<unsigned>(reduce.getAxes().front());
-  FailureOr<bool> fullCoverage = shouldTileReductionSources(reduce, kernel)
+  bool boundedOuter = prefersBoundedReductionOuter(reduce, kernel, outerAxis);
+  FailureOr<bool> fullCoverage = (boundedOuter || shouldTileReductionSources(reduce, kernel))
       ? FailureOr<bool>(false)
       : decomposeFullCoverageMultiAxisReduce(reduce, kernel, outerAxis);
   if (failed(fullCoverage))
@@ -350,14 +319,18 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       return reduce.emitOpError(
           "multi-axis outer reduction has no physical chunk parameter");
     outerChunk = *selected;
-    outerSliceExtent = expression(
-        reduce.getContext(), PhysicalExprKind::Parameter, 0,
-        outerChunk.getName().getValue());
+    auto bounded = boundedTraversalChunk(outerChunk, master->range);
+    if (failed(bounded))
+      return reduce.emitOpError("multi-axis outer chunk has no bounded source capacity");
+    outerSliceExtent = *bounded;
   }
   OpBuilder builder(reduce);
   Location location = reduce.getLoc();
-  Value outerChunkValue = blockOuterAxis
-      ? materializeParameter(builder, location, outerChunk.getReference()).getResult() : Value();
+  Value outerChunkValue;
+  if (blockOuterAxis)
+    outerChunkValue = outerSliceExtent.getKind() == PhysicalExprKind::Parameter
+        ? Value(materializeParameter(builder, location, outerSliceExtent.getParameterReference()))
+        : Value(builder.create<PhysicalExprOp>(location, builder.getIndexType(), outerSliceExtent));
   SmallVector<FragmentType> accumulatorTypes;
   if (blockOuterAxis)
     for (const SourcePlan &plan : plans)
@@ -401,6 +374,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
       location, master->range.getLogicalStart(),
       master->range.getLogicalStop(), outerLoopStep, loopInitials,
       [](OpBuilder &, Location, Value, ValueRange) {});
+  OpBuilder::atBlockEnd(loop.getBody()).create<scf::YieldOp>(location, loop.getRegionIterArgs());
   // Replay analyses require the new values to belong to the current kernel.
   // A ForOp build callback runs before the loop is attached to that kernel.
   auto buildBody = [&](OpBuilder &nested, Location nestedLocation, Value coordinate,
@@ -755,7 +729,8 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
         }
         nested.create<scf::YieldOp>(nestedLocation, *combined);
       };
-  OpBuilder bodyBuilder = OpBuilder::atBlockEnd(loop.getBody());
+  Operation *placeholder = loop.getBody()->getTerminator();
+  OpBuilder bodyBuilder(placeholder);
   buildBody(bodyBuilder, location, loop.getInductionVar(), loop.getRegionIterArgs());
   if (bodyFailed) {
     loop.erase();
@@ -763,6 +738,7 @@ LogicalResult decomposeMultiAxisReduce(ReduceOp reduce, func::FuncOp kernel) {
                "multi-axis reduction decomposition failed: ")
            << failureReason;
   }
+  placeholder->erase();
   if (Attribute origin = reduce->getAttr(originAttr))
     loop->setAttr(originAttr, origin);
   loop->setAttr(reductionSourcesAttr, reductionSources(reduce));

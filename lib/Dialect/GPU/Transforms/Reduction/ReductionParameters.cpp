@@ -9,6 +9,7 @@
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <tuple>
@@ -72,10 +73,26 @@ FailureOr<ParameterAttr> selectReductionTraversalChunk(
   auto selected = parameterForExtent(kernel, extent);
   ParameterRole role = tileProducerFreeAxis ? ParameterRole::ReductionOuter
                                             : ParameterRole::Reduction;
-  if (auto parent = reduce->getParentOfType<scf::ForOp>())
-    if (auto outer = parent.getStep().getDefiningOp<ParameterOp>();
-        outer && outer.getDeclaration().getRole() == ParameterRole::ReductionOuter)
-      role = ParameterRole::ReductionInner;
+  if (auto parent = reduce->getParentOfType<scf::ForOp>()) {
+    // Capacity clipping retains the same outer traversal role. Its step is an
+    // actual typed expression, not necessarily a bare parameter SSA value.
+    ParameterAttr outer;
+    bool ambiguous = false;
+    if (auto step = queryLaunchExpression(parent.getStep())) {
+      AttrTypeWalker references;
+      references.addWalk([&](ParameterRefAttr reference) {
+        auto declaration = lookupParameter(kernel, reference);
+        if (!declaration) { ambiguous = true; return; }
+        if (declaration.getRole() == ParameterRole::ReductionOuter) {
+          if (outer && outer != declaration) ambiguous = true;
+          outer = declaration;
+        } else if (declaration.getRole() != ParameterRole::FullCoverage)
+          ambiguous = true;
+      });
+      references.walk(step);
+    }
+    if (outer && !ambiguous) role = ParameterRole::ReductionInner;
+  }
   if (reduce.getSources().size() == 1 &&
       !range->hasAttr(sourceSubregionAttr) && succeeded(fullCoverage))
     return *fullCoverage;

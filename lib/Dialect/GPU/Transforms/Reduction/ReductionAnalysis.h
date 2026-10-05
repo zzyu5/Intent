@@ -35,6 +35,11 @@ bool exceedsRegisterFile(mlir::Value source, mlir::func::FuncOp kernel);
 // actually be removed. This nominal footprint is not a native resource limit.
 bool shouldTileReductionSources(ReduceOp reduce, mlir::func::FuncOp kernel);
 
+// A free-output workset can retain bounded outer-axis partials when every
+// actual source is either uniform or replayable from the same source window.
+bool prefersBoundedReductionOuter(ReduceOp reduce, mlir::func::FuncOp kernel,
+                                   unsigned outerAxis);
+
 bool requiresPhysicalRealization(ReduceOp reduce);
 
 mlir::ArrayAttr reductionSources(ReduceOp reduce);

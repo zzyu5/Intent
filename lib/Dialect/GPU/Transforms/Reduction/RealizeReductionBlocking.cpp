@@ -1,6 +1,7 @@
 #include "ReductionAnalysis.h"
 #include "ReductionParameters.h"
 #include "ReductionRealization.h"
+#include "ReductionChains.h"
 #include "ReductionValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -328,6 +329,8 @@ LogicalResult realizeReductionBlocking(ModuleOp module) {
   if (failed(physicalKernel))
     return failure();
   func::FuncOp kernel = *physicalKernel;
+  while (combineNestedReductions(kernel))
+    if (failed(fuseIndependentReductions(module))) return failure();
   // Tile a scalar consumer before its row reductions become loop results.
   // Their existing lowering then runs inside the selected outer traversal.
   while (true) {

@@ -99,6 +99,47 @@ bool shouldTileReductionSources(ReduceOp reduce, func::FuncOp kernel) {
   return true;
 }
 
+bool prefersBoundedReductionOuter(ReduceOp reduce, func::FuncOp kernel,
+                                  unsigned outerAxis) {
+  if (!hasNonUnitFreeAxis(reduce) || failed(proveLaneWiseHelper(reduce.getCombine())))
+    return false;
+  PhysicalProgramAnalysis analysis(kernel);
+  ReplayPolicy reuse(kernel, reduce.getSources(), {reduce.getOperation()});
+  SmallVector<MakeRangeOp> ranges;
+  bool hasRead = false;
+  for (Value source : reduce.getSources()) {
+    // Uniform components participate in the very same member set, but need no
+    // fictitious memory/range root. The realizer broadcasts their actual scalar
+    // and applies this outer slice's identity predicate component by component.
+    if (uniformScalarSource(source)) {
+      if (failed(scalarSource(source))) return false;
+      continue;
+    }
+    auto plan = analyzeSource(source, outerAxis, /*diagnose=*/false);
+    if (failed(plan) || plan->roots.empty() || !reuse.removesProducer(source) ||
+        reuse.duplicatesExpensiveWork(source)) return false;
+    auto type = cast<FragmentType>(source.getType());
+    auto axis = cast<AxisMapAttr>(type.getAxisMaps()[outerAxis]);
+    auto replay = analysis.replayAt(source, plan->sourceIdentity,
+        PhysicalReplayScope::ValueGraph, /*allowAccesses=*/true, reduce,
+        IRMapping{}, axis.getDimensionId());
+    if (!replay.isReplayable() || llvm::any_of(replay.accesses,
+        [](Operation *access) { return !isa<LoadOp>(access); })) return false;
+    for (MakeRangeOp range : plan->ranges) {
+      if (range->hasAttr(sourceSubregionAttr) || !isUnitStepRange(range)) return false;
+      ranges.push_back(range);
+    }
+    for (LoadOp load : plan->roots) {
+      auto access = analyzeRoot(load, plan->ranges, plan->reductionAxis, /*diagnose=*/false);
+      if (failed(access) || !*access || (*access)->range->hasAttr(sourceSubregionAttr) ||
+          !reuse.removesProducer(load.getResult())) return false;
+      ranges.push_back((*access)->range);
+      hasRead = true;
+    }
+  }
+  return hasRead && !ranges.empty() && analysis.lockstepRanges(ranges).isExact();
+}
+
 bool requiresPhysicalRealization(ReduceOp reduce) {
   auto kernel = reduce->getParentOfType<func::FuncOp>();
   if (!kernel)

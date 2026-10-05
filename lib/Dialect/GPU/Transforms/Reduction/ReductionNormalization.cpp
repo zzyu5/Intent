@@ -1,6 +1,7 @@
 #include "ReductionRealization.h"
 #include "ReductionValues.h"
 #include "CompletedReductions.h"
+#include "ReductionChains.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
@@ -8,7 +9,6 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/OperationSupport.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -21,40 +21,6 @@ using namespace mlir;
 
 namespace intent::gpu::reduction {
 namespace {
-
-// Scalarization compares the actual tuple callback, including field coupling
-// and numeric attributes, without requiring its intermediate free-axis shapes
-// to be identical. It does not grant reassociation to a scan or ordered loop.
-bool scalarCombine(Region &source, Region &result) {
-  SmallVector<Type> arguments, results;
-  for (Type type : source.front().getArgumentTypes())
-    arguments.push_back(scalarCallbackType(type));
-  for (Type type : source.front().getTerminator()->getOperandTypes())
-    results.push_back(scalarCallbackType(type));
-  std::string reason;
-  if (failed(cloneLaneWiseHelper(source, result, arguments, results, reason)))
-    return false;
-  result.walk([](Operation *operation) { operation->removeAttr(originAttr); });
-  return true;
-}
-
-bool sameContract(ReduceOp inner, ReduceOp outer, Region &outerCombine) {
-  if (inner.getAxes().size() != 1 || outer.getAxes().size() != 1 ||
-      inner.getSources().size() != outer.getSources().size() ||
-      !llvm::equal(inner.getCaptures(), outer.getCaptures()) ||
-      llvm::any_of(inner.getCaptures(), [](Value value) {
-        return !value.getType().isIntOrIndexOrFloat();
-      }))
-    return false;
-  for (auto [a, b] : llvm::zip(inner.getIdentities(), outer.getIdentities()))
-    if (!sameScalarValue(a, b))
-      return false;
-  Region innerCombine;
-  return scalarCombine(inner.getCombine(), innerCombine) &&
-         OperationEquivalence::isRegionEquivalentTo(
-             &innerCombine, &outerCombine,
-             OperationEquivalence::IgnoreLocations);
-}
 
 struct CoverageCheck {
   Value start, stop, extent;
@@ -250,7 +216,7 @@ bool collapseChain(ReduceOp outer, func::FuncOp kernel) {
   if (outer.getAxes().size() != 1 || outer.getSources().empty())
     return false;
   Region outerCombine;
-  if (!scalarCombine(outer.getCombine(), outerCombine))
+  if (!scalarReductionCombine(outer.getCombine(), outerCombine))
     return false;
 
   PhysicalProgramAnalysis analysis(kernel);
@@ -264,11 +230,11 @@ bool collapseChain(ReduceOp outer, func::FuncOp kernel) {
     Value input = consumer.getSources().front();
     if (auto select = input.getDefiningOp<SelectOp>()) input = select.getTrueValue();
     auto inner = input.getDefiningOp<ReduceOp>();
-    if (!inner || inner->getBlock() != outer->getBlock() ||
+    if (!inner || inner.getAxes().size() != 1 || inner->getBlock() != outer->getBlock() ||
         !inner->isBeforeInBlock(consumer) ||
         inner.getNumResults() != consumer.getSources().size() ||
         llvm::any_of(inner.getResults(), [](Value value) { return !value.hasOneUse(); }) ||
-        !sameContract(inner, outer, outerCombine))
+        !sameReductionContract(inner, outer, outerCombine))
       break;
     SmallVector<SelectOp> currentMasks;
     SmallVector<CoverageCheck> currentChecks(checks);
@@ -349,13 +315,19 @@ bool collapseChain(ReduceOp outer, func::FuncOp kernel) {
                                : std::nullopt;
   if (!scalarDomain && !ordered) return false;
   if (!scalarDomain) unitExtents.clear();
-  auto completed = queryCompletedReduction(first);
-  ValueRange coverageSources = completed ? ValueRange(completed->members) : first.getSources();
-  for (unsigned axis : reduced) {
-    if (completed && completed->axis == axis) continue;
-    if (!completeAxis(coverageSources, axis,
-            cast<PhysicalExprAttr>(original.getShape()[axis]), outer,
-            analysis, dominance, relations, checks)) return false;
+  // Direct ordinary trees reduce exactly the same physical member set. Their
+  // associativity/commutativity contract does not depend on how the input SSA
+  // was produced, including nested traversal results. Only removing intervening
+  // identity masks needs the additional logical/completed-source proof.
+  if (!masks.empty()) {
+    auto completed = queryCompletedReduction(first);
+    ValueRange coverageSources = completed ? ValueRange(completed->members) : first.getSources();
+    for (unsigned axis : reduced) {
+      if (completed && completed->axis == axis) continue;
+      if (!completeAxis(coverageSources, axis,
+              cast<PhysicalExprAttr>(original.getShape()[axis]), outer,
+              analysis, dominance, relations, checks)) return false;
+    }
   }
   if (scalarDomain && excludedByEnclosingGuard(outer, checks, unitExtents, relations)) return false;
   int64_t maximumCapacity = 1;
@@ -373,9 +345,8 @@ bool collapseChain(ReduceOp outer, func::FuncOp kernel) {
   SmallVector<int64_t> allAxes(original.getShape().size());
   std::iota(allAxes.begin(), allAxes.end(), 0);
 
-  // No source computation or memory access moves. Incomplete logical members
-  // retain their original trees; the equality branch changes only completed
-  // numeric values and never reinterprets one field's mask as a tuple identity.
+  // No source computation or memory access moves. The equality branch changes
+  // only native trees and never reinterprets one field's mask as a tuple identity.
   OpBuilder builder(outer);
   auto orderedCollapse = [&](OpBuilder &at) {
     IRMapping mapping;
