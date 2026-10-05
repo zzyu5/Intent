@@ -1,4 +1,5 @@
-#include "ProducerVersions.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
+#include "ProducerReuse.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
@@ -122,8 +123,15 @@ FailureOr<ProducerVersion> queryProducerVersion(linalg::GenericOp producer,
         !disjointEffect(entry.effect.getValue(), buffer, storage))
       return failure();
 
+  return queryCompletedBufferVersion(buffer, producer, storage);
+}
+
+FailureOr<ProducerVersion> queryCompletedBufferVersion(
+    Value buffer, Operation *completed, StorageAnalysis &storage) {
+  Value origin = storage.uniqueOrigin(buffer);
+  if (!origin || !storage.aliases(origin).complete) return failure();
   ProducerVersion result;
-  for (Operation *operation = producer->getNextNode(); operation;
+  for (Operation *operation = completed->getNextNode(); operation;
        operation = operation->getNextNode()) {
     auto effects = storage.effects(operation);
     if (!effects.complete || effects.ordered) return failure();

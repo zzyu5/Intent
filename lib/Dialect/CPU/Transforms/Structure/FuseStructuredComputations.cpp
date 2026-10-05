@@ -7,7 +7,7 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/ProducerReplay.h"
 #include "IntegerSources.h"
 #include "ProducerReuse.h"
-#include "ProducerVersions.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "ContiguousAccesses.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"

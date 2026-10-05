@@ -4,7 +4,7 @@
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "Contractions.h"
-#include "../Structure/ProducerVersions.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "Intent/Analysis/ContractionAxes.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"

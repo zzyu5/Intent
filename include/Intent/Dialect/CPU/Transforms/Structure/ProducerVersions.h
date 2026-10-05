@@ -1,8 +1,9 @@
 #ifndef INTENT_CPU_TRANSFORMS_STRUCTURE_PRODUCERVERSIONS_H
 #define INTENT_CPU_TRANSFORMS_STRUCTURE_PRODUCERVERSIONS_H
 
-#include "ProducerReuse.h"
+#include "Intent/Dialect/CPU/Analysis/ProducerReplay.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/AffineMap.h"
 
 namespace intent::cpu {
 
@@ -22,6 +23,11 @@ bool completelyWritesBuffer(mlir::Operation *operation, mlir::Value buffer);
 
 mlir::FailureOr<ProducerVersion> queryProducerVersion(
     mlir::linalg::GenericOp producer, StorageAnalysis &storage);
+
+// The caller proves that the buffer is fully initialized after this operation.
+// Query only that completed version's subsequent observations and termination.
+mlir::FailureOr<ProducerVersion> queryCompletedBufferVersion(
+    mlir::Value buffer, mlir::Operation *completed, StorageAnalysis &storage);
 
 // Select an existing complete copy as the representative of a stored version.
 // Retarget the defining write and its reads; do not replay any computation.

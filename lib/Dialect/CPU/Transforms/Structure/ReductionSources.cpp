@@ -1,6 +1,6 @@
 #include "ReductionSources.h"
 #include "ProducerReuse.h"
-#include "ProducerVersions.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "../Vector/ProducerVectorization.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
