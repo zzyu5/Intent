@@ -3,6 +3,7 @@
 #include "Intent/Target/BangC/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/Analysis/UniformValues.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -21,7 +22,6 @@
 namespace intent::bangc {
 using namespace mlir;
 using dsa::integerInterval;
-using dsa::uniformFillBefore;
 struct StorageUsage { int64_t nram = 0, wram = 0, sram = 0; };
 StorageUsage measureStorage(func::FuncOp function);
 void measureStorage(func::FuncOp function, int64_t &nram, int64_t &wram);
@@ -30,7 +30,6 @@ bool storageFitsBudget(func::FuncOp function, dsa::ConfigurationAttr config,
                        StorageUsage usage);
 LogicalResult realizeMatMul(dsa::MatMulOp matrix, dsa::ConfigurationAttr config);
 bool supportedScalarBinary(BinaryOperator kind);
-bool specializeUniformTransposes(func::FuncOp function);
 bool initializeMatrixStorage(func::FuncOp function);
 bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config);
 bool bindBroadcastOperands(func::FuncOp function);

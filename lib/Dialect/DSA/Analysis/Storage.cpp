@@ -32,19 +32,6 @@ FailureOr<Operation *> StorageAnalysis::completionOfUse(Operation *use) const {
   return failure();
 }
 
-FillOp uniformFillBefore(Value input, Operation *read) {
-  StorageAnalysis storage(read->getParentOfType<func::FuncOp>());
-  Value origin = storage.uniqueOrigin(input);
-  if (!origin)
-    return {};
-  auto fill = dyn_cast_or_null<FillOp>(storage.lastWriterBefore(input, read));
-  if (!fill || storage.uniqueOrigin(fill.getOutput()) != origin ||
-      cast<MemRefType>(input.getType()).getElementType() != fill.getValue().getType())
-    return {};
-  return fill.getOutput() == input || isCompleteStorageViewOf(fill.getOutput(), origin)
-             ? fill : FillOp();
-}
-
 SmallVector<StorageLifetime> analyzeStorageLifetimes(func::FuncOp function) {
   DenseMap<Operation *, uint64_t> begin, end;
   uint64_t clock = 0;

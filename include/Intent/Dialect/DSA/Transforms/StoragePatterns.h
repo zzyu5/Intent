@@ -12,6 +12,7 @@ namespace intent::dsa::detail {
 inline mlir::OpOperand *completeLocalOutput(mlir::Operation *operation) {
   if (auto op = mlir::dyn_cast<MatrixTileOp>(operation))
     return op.getAccumulate() ? nullptr : &op.getAccumulatorMutable();
+  if (auto op = mlir::dyn_cast<ReduceOp>(operation)) return &op.getOutputMutable();
   if (auto op = mlir::dyn_cast<FillOp>(operation)) return &op.getOutputMutable();
   if (auto op = mlir::dyn_cast<LoadTileOp>(operation))
     return op.getAsynchronous() ? nullptr : &op.getOutputMutable();

@@ -1,6 +1,7 @@
 #include "Intent/Dialect/DSA/Transforms/Passes.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/DSA/Analysis/Storage.h"
+#include "Intent/Dialect/DSA/Analysis/UniformValues.h"
 #include "Intent/Dialect/DSA/IR/ExecutionRelations.h"
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -34,22 +35,73 @@ void bindUniformOperands(func::FuncOp function) {
     Type element = cast<MemRefType>(binary.getLhs().getType()).getElementType();
     if (!element.isF16() && !element.isF32()) continue;
     Value previous = binary.getRhs();
-    auto fill = uniformFillBefore(previous, binary);
-    if (!fill) continue;
-    binary.getRhsMutable().assign(fill.getValue());
+    StorageAnalysis storage(function);
+    UniformMemoryAnalysis uniforms(function, storage);
+    Value scalar = uniforms.read(previous, binary);
+    if (!scalar) continue;
+    binary.getRhsMutable().assign(scalar);
     changed = true;
   }
   function.walk([&](dsa::SelectOp select) {
     if (!isa<MemRefType>(select.getFalseValue().getType())) return;
-    auto fill = uniformFillBefore(select.getFalseValue(), select);
+    StorageAnalysis storage(function);
+    UniformMemoryAnalysis uniforms(function, storage);
+    Value scalar = uniforms.read(select.getFalseValue(), select);
     FloatAttr constant;
-    if (fill && matchPattern(fill.getValue(), m_Constant(&constant))) {
-      select.getFalseValueMutable().assign(fill.getValue());
+    if (scalar && matchPattern(scalar, m_Constant(&constant))) {
+      select.getFalseValueMutable().assign(scalar);
       changed = true;
     }
   });
   if (changed)
     eliminateUnreadLocalWrites(function);
+}
+
+bool foldUniformLocalValues(func::FuncOp function) {
+  SmallVector<Operation *> operations;
+  function.walk([&](Operation *operation) {
+    if (isa<LoadTileOp, memref::CopyOp, TransposeOp, SelectOp>(operation))
+      operations.push_back(operation);
+  });
+  bool changed = false;
+  for (Operation *operation : operations) {
+    StorageAnalysis storage(function);
+    UniformMemoryAnalysis uniforms(function, storage);
+    OpBuilder builder(operation);
+    Location location = operation->getLoc();
+    if (auto select = dyn_cast<SelectOp>(operation)) {
+      Value condition = select.getCondition();
+      if (isa<MemRefType>(condition.getType()))
+        condition = uniforms.read(condition, select);
+      APInt predicate;
+      if (!condition || !matchPattern(condition, m_ConstantInt(&predicate))) continue;
+      Value source = predicate.isZero() ? select.getFalseValue() : select.getTrueValue();
+      if (!isa<MemRefType>(source.getType()))
+        builder.create<FillOp>(location, select.getOutput(), source);
+      else if (source != select.getOutput())
+        builder.create<memref::CopyOp>(location, source, select.getOutput());
+      select.erase(); changed = true;
+      continue;
+    }
+    Value output;
+    if (auto load = dyn_cast<LoadTileOp>(operation)) {
+      if (load.getAsynchronous()) continue;
+      output = load.getOutput();
+    } else if (auto copy = dyn_cast<memref::CopyOp>(operation)) {
+      output = copy.getTarget();
+    } else {
+      output = cast<TransposeOp>(operation).getOutput();
+    }
+    auto type = cast<MemRefType>(output.getType());
+    if (type.getRank() != 2 || !type.hasStaticShape() || type.getNumElements() <= 0 ||
+        type.getMemorySpaceAsInt() != nramSpace || !type.getLayout().isIdentity() ||
+        !operation->getNextNode()) continue;
+    Value scalar = uniforms.read(output, operation->getNextNode());
+    if (!scalar) continue;
+    builder.create<FillOp>(location, output, scalar);
+    operation->erase(); changed = true;
+  }
+  return changed;
 }
 
 bool eliminateUnreadLocalWrites(func::FuncOp function) {

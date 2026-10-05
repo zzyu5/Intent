@@ -578,7 +578,8 @@ LogicalResult realizeGroupParticipants(func::FuncOp function) {
 LogicalResult composeLocalStorage(func::FuncOp function,
     llvm::function_ref<LogicalResult()> cleanup) {
   while (true) {
-    bool changed = dsa::reuseLocalMemoryValues(function);
+    bool changed = dsa::foldUniformLocalValues(function);
+    changed |= dsa::reuseLocalMemoryValues(function);
     changed |= dsa::forwardFullLocalCopies(function);
     changed |= dsa::eliminateUnreadLocalWrites(function);
     if (!changed) return success();
@@ -596,7 +597,6 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (dsa::forwardIndexExpressions(function) && failed(cleanup())) return failure();
   if (dsa::realizeRangeComparisons(function) && failed(cleanup())) return failure();
   if (dsa::foldRangeCounts(function) && failed(cleanup())) return failure();
-  while (dsa::foldUniformBooleanTiles(function)) if (failed(cleanup())) return failure();
   if (realizeAffineRanges(function, config) && failed(cleanup())) return failure();
   if (realizeFullWidthMasks(function, config) && failed(cleanup())) return failure();
   while (dsa::eliminateUnreadLocalWrites(function)) if (failed(cleanup())) return failure();
@@ -605,7 +605,6 @@ LogicalResult composeLocalProgram(ModuleOp module,
   if (failed(composeLocalStorage(function, cleanup))) return failure();
   while (propagateLocalTransposeSupply(function, config))
     if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
-  if (specializeUniformTransposes(function) && failed(cleanup())) return failure();
   if (retainNarrowExtremaInputs(function, config) && failed(cleanup())) return failure();
   if (failed(composeLocalStorage(function, cleanup))) return failure();
   if (dsa::reuseGatherOffsets(function) && failed(cleanup())) return failure();

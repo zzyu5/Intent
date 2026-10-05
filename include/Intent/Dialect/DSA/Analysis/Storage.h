@@ -23,8 +23,6 @@ public:
                             mlir::Operation *except = nullptr);
 };
 
-FillOp uniformFillBefore(mlir::Value input, mlir::Operation *read);
-
 struct StorageLifetime {
   mlir::memref::AllocaOp allocation;
   uint64_t start, finish;

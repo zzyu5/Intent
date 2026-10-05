@@ -142,9 +142,12 @@ bool reuseConsumedBinaryInputs(func::FuncOp function, dsa::ConfigurationAttr con
     }
     Type element = cast<MemRefType>(operation.getOutput().getType()).getElementType();
     if (!element.isF16() && !element.isF32()) return;
-    if (auto loop = dyn_cast<scf::ForOp>(operation->getParentOp()))
-      if (auto uniform = uniformFillBefore(operation.getLhs(), operation);
-          uniform && loop.isDefinedOutsideOfLoop(uniform.getValue())) return;
+    if (auto loop = dyn_cast<scf::ForOp>(operation->getParentOp())) {
+      dsa::StorageAnalysis storage(function);
+      dsa::UniformMemoryAnalysis uniforms(function, storage);
+      if (Value scalar = uniforms.read(operation.getLhs(), operation);
+          scalar && loop.isDefinedOutsideOfLoop(scalar)) return;
+    }
     candidates.push_back({operation, 0, 2});
   });
   return reuseConsumedStorage(function, config, candidates);

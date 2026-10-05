@@ -208,48 +208,6 @@ bool foldPresentRange(dsa::ReduceOp reduce, dsa::CompareRangeOp range, dsa::Load
   return true;
 }
 
-bool foldUniformBooleanTiles(func::FuncOp function) {
-  SmallVector<Operation *> operations;
-  function.walk([&](Operation *operation) {
-    if (isa<dsa::LoadTileOp, memref::CopyOp, dsa::SelectOp>(operation)) operations.push_back(operation);
-  });
-  bool changed = false;
-  for (Operation *operation : operations) {
-    OpBuilder b(operation);
-    Location loc = operation->getLoc();
-    if (auto select = dyn_cast<dsa::SelectOp>(operation)) {
-      Value condition = select.getCondition();
-      if (isa<MemRefType>(condition.getType())) {
-        auto fill = uniformFillBefore(condition, select);
-        if (!fill) continue;
-        condition = fill.getValue();
-      }
-      APInt value;
-      if (!matchPattern(condition, m_ConstantInt(&value))) continue;
-      Value source = value.isZero() ? select.getFalseValue() : select.getTrueValue();
-      if (!isa<MemRefType>(source.getType())) b.create<dsa::FillOp>(loc, select.getOutput(), source);
-      else if (source != select.getOutput()) b.create<memref::CopyOp>(loc, source, select.getOutput());
-      select.erase(); changed = true; continue;
-    }
-    Value input, output;
-    if (auto copy = dyn_cast<memref::CopyOp>(operation)) { input = copy.getSource(); output = copy.getTarget(); }
-    else { auto load = cast<dsa::LoadTileOp>(operation); input = load.getSource(); output = load.getOutput(); }
-    auto type = cast<MemRefType>(output.getType());
-    if (!type.getElementType().isInteger(1) || type.getRank() != 2 || !type.hasStaticShape() ||
-        type.getNumElements() <= 0 || type.getMemorySpaceAsInt() != dsa::nramSpace || !type.getLayout().isIdentity()) continue;
-    auto fill = uniformFillBefore(input, operation);
-    if (!fill) continue;
-    if (auto load = dyn_cast<dsa::LoadTileOp>(operation)) {
-      auto rows = integerInterval(load.getRows(), function), columns = integerInterval(load.getColumns(), function);
-      if (!rows || !columns || rows->first != type.getDimSize(0) || rows->second != type.getDimSize(0) ||
-          columns->first != type.getDimSize(1) || columns->second != type.getDimSize(1)) continue;
-    }
-    b.create<dsa::FillOp>(loc, output, fill.getValue());
-    operation->erase(); changed = true;
-  }
-  return changed;
-}
-
 bool foldRangeCounts(func::FuncOp function) {
   DominanceInfo dominance(function);
   auto soleWriter = [&](Value buffer, Operation *consumer) -> Operation * {

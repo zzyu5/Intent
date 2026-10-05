@@ -282,9 +282,11 @@ void realizeApproximateReciprocals(func::FuncOp function, dsa::ConfigurationAttr
     auto type = cast<MemRefType>(binary.getOutput().getType());
     if (!type.getElementType().isF32() ||
         !isa<MemRefType>(binary.getRhs().getType()) || binary.getOutput() == binary.getRhs()) continue;
-    auto fill = uniformFillBefore(binary.getLhs(), binary);
+    dsa::StorageAnalysis storage(function);
+    dsa::UniformMemoryAnalysis uniforms(function, storage);
+    Value scalar = uniforms.read(binary.getLhs(), binary);
     FloatAttr value;
-    if (!fill || !matchPattern(fill.getValue(), m_Constant(&value)) || !value.getValue().isExactlyValue(1.0)) continue;
+    if (!scalar || !matchPattern(scalar, m_Constant(&value)) || !value.getValue().isExactlyValue(1.0)) continue;
     for (int64_t width = std::min<int64_t>(8192, type.getNumElements()); width >= 1; width /= 2) {
       OpBuilder b(binary);
       Value scratch = allocate(b, binary.getLoc(), b.getI32Type(), {2, width}, dsa::nramSpace);
@@ -298,24 +300,6 @@ void realizeApproximateReciprocals(func::FuncOp function, dsa::ConfigurationAttr
       binary.getScratchMutable().clear(); scratch.getDefiningOp()->erase();
     }
   }
-}
-
-bool specializeUniformTransposes(func::FuncOp function) {
-  SmallVector<dsa::TransposeOp> transposes;
-  function.walk([&](dsa::TransposeOp transpose) { transposes.push_back(transpose); });
-  bool changed = false;
-  for (auto transpose : transposes) {
-    auto fill = uniformFillBefore(transpose.getInput(), transpose);
-    if (!fill) continue;
-    auto shape = cast<MemRefType>(transpose.getInput().getType());
-    auto rows = integerInterval(transpose.getRows(), function), columns = integerInterval(transpose.getColumns(), function);
-    if (!rows || !columns || rows->first != shape.getDimSize(0) || rows->second != rows->first ||
-        columns->first != shape.getDimSize(1) || columns->second != columns->first) continue;
-    OpBuilder b(transpose);
-    b.create<dsa::FillOp>(transpose.getLoc(), transpose.getOutput(), fill.getValue());
-    transpose.erase(); changed = true;
-  }
-  return changed;
 }
 
 bool retainNarrowExtremaInputs(func::FuncOp function, dsa::ConfigurationAttr config) {
@@ -367,8 +351,9 @@ void realizeRoundedDivisions(func::FuncOp function, dsa::ConfigurationAttr confi
         !ownedCompleteStorage(division.getRhs(), storage) ||
         !storage.disjoint(division.getOutput(), division.getLhs()) ||
         !storage.disjoint(division.getOutput(), division.getRhs())) continue;
-    auto uniform = uniformFillBefore(division.getRhs(), division);
-    Value divisor = uniform ? uniform.getValue() : division.getRhs();
+    dsa::UniformMemoryAnalysis uniforms(function, storage);
+    Value uniform = uniforms.read(division.getRhs(), division);
+    Value divisor = uniform ? uniform : division.getRhs();
     for (int64_t width = std::min<int64_t>(4096, type.getNumElements()); width >= 64; width /= 2) {
       OpBuilder builder(division);
       Location loc = division.getLoc();
@@ -390,16 +375,7 @@ void realizeRoundedDivisions(func::FuncOp function, dsa::ConfigurationAttr confi
         continue;
       }
       indicesByWidth[width] = indices;
-      Value previous = division.getRhs();
       division.erase();
-      if (uniform && llvm::all_of(previous.getUsers(), [&](Operation *user) {
-            auto fill = dyn_cast<dsa::FillOp>(user);
-            return fill && fill.getOutput() == previous;
-          })) {
-        SmallVector<Operation *> fills(previous.getUsers());
-        for (Operation *fill : fills) fill->erase();
-        previous.getDefiningOp()->erase();
-      }
       break;
     }
   }
@@ -453,6 +429,9 @@ void fuseNarrowDivisions(func::FuncOp function, dsa::ConfigurationAttr config) {
           })) break;
     }
     if (next != narrow.getOperation()) continue;
+    dsa::UniformMemoryAnalysis uniforms(function, storage);
+    Value uniform = uniforms.read(division.getRhs(), division);
+    Value divisor = uniform ? uniform : division.getRhs();
     OpBuilder builder(narrow);
     Location loc = narrow.getLoc();
     Value bounds = allocate(builder, loc, builder.getF32Type(), type.getShape(), dsa::nramSpace);
@@ -467,8 +446,6 @@ void fuseNarrowDivisions(func::FuncOp function, dsa::ConfigurationAttr config) {
       laneIndices = allocate(initializer, loc, initializer.getF32Type(), {1, lanes}, dsa::nramSpace);
       initializeIndices = initializer.create<dsa::IotaOp>(loc, laneIndices);
     }
-    auto uniform = uniformFillBefore(division.getRhs(), division);
-    Value divisor = uniform ? uniform.getValue() : division.getRhs();
     auto fused = builder.create<dsa::DivideCastOp>(loc, division.getLhs(), divisor, narrow.getOutput(),
         quotient, bounds, accepted, narrowBounds, laneIndices);
     // Include the extended input lifetimes in the same allocation calculation
@@ -488,17 +465,8 @@ void fuseNarrowDivisions(func::FuncOp function, dsa::ConfigurationAttr config) {
       continue;
     }
     laneIndicesBySize[lanes] = laneIndices;
-    Value previousDivisor = division.getRhs();
     narrow.erase();
     division.erase();
-    if (uniform && llvm::all_of(previousDivisor.getUsers(), [&](Operation *user) {
-          auto fill = dyn_cast<dsa::FillOp>(user);
-          return fill && fill.getOutput() == previousDivisor;
-        })) {
-      SmallVector<Operation *> unusedFills(previousDivisor.getUsers());
-      for (Operation *fill : unusedFills) fill->erase();
-      previousDivisor.getDefiningOp()->erase();
-    }
   }
 }
 
@@ -617,7 +585,7 @@ LogicalResult realizeNativeWorkspace(ModuleOp module,
   realizeCompareWorkspace(function, config);
   realizeExponentialWorkspace(function, config);
   realizeFlushWorkspace(function, config);
-  return success();
+  return composeLocalStorage(function, cleanup);
 }
 
 LogicalResult selectNativeImplementations(ModuleOp module) {
@@ -668,8 +636,10 @@ LogicalResult selectNativeImplementations(ModuleOp module) {
         op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), division ? "divide_f32" : "scalar_divide"));
       if (binary.getKind() == BinaryOperator::Maximum && (element.isF16() || element.isF32()) &&
           isa<MemRefType>(binary.getRhs().getType()) && binary.getOutput() != binary.getRhs()) {
-        if (auto fill = uniformFillBefore(binary.getRhs(), op)) {
-          auto constant = fill.getValue().getDefiningOp<arith::ConstantOp>();
+        dsa::StorageAnalysis storage(function);
+        dsa::UniformMemoryAnalysis uniforms(function, storage);
+        if (Value scalar = uniforms.read(binary.getRhs(), op)) {
+          auto constant = scalar.getDefiningOp<arith::ConstantOp>();
           auto value = constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr{};
           // On MTP372 the SDK's NaN-propagating maximum first injects RHS NaNs
           // into the LHS, then issues maxequal. A non-NaN RHS makes that prefix

@@ -1,4 +1,5 @@
 #include "CollectiveLowering.h"
+#include "Intent/Dialect/DSA/Analysis/UniformValues.h"
 #include "Intent/Dialect/DSA/Transforms/Collective/Collectives.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/STLExtras.h"
@@ -27,10 +28,16 @@ Lowering::Lowering(ScanOp op)
 void Lowering::initialize(ValueRange sources, ValueRange initials,
                           ValueRange outputs, ValueRange counts,
                           ValueRange finals) {
+  auto function = operation->getParentOfType<func::FuncOp>();
+  StorageAnalysis storage(function);
+  UniformMemoryAnalysis uniforms(function, storage);
   unsigned offset = 0;
   for (auto [ordinal, source] : llvm::enumerate(sources)) {
     auto type = cast<MemRefType>(source.getType());
-    Field field{source, initials[ordinal], outputs[ordinal],
+    Value initial = initials[ordinal];
+    if (isa<MemRefType>(initial.getType()))
+      if (Value scalar = uniforms.read(initial, operation)) initial = scalar;
+    Field field{source, initial, outputs[ordinal],
                 finals.empty() ? Value() : finals[ordinal],
                 body.getArgument(ordinal).getType(), {}, {}, {}};
     llvm::append_range(field.counts, counts.slice(offset, type.getRank()));

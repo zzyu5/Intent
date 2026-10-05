@@ -40,6 +40,7 @@ std::optional<LocalMembers> queryMembers(scf::ForOp loop,
   int64_t pieces = llvm::divideCeil(*upper - *lower, *step);
   LocalMembers result{loop, *step, pieces};
   dsa::StorageAnalysis storage(function);
+  dsa::UniformMemoryAnalysis uniforms(function, storage);
   dsa::ExecutionRelations execution(function);
   DominanceInfo dominance(function);
   auto independent = [&](Value value) {
@@ -170,10 +171,9 @@ std::optional<LocalMembers> queryMembers(scf::ForOp loop,
     } else {
       if (!dominance.properlyDominates(value, loop) ||
           !storage.preservesContents(loop, value)) return std::nullopt;
-      auto fill = dsa::uniformFillBefore(value, loop);
-      if (!fill || !dominance.properlyDominates(fill.getValue(), loop) ||
-          !independent(fill.getValue())) return std::nullopt;
-      result.uniform.emplace_back(value, fill.getValue());
+      Value scalar = uniforms.read(value, loop);
+      if (!scalar || !independent(scalar)) return std::nullopt;
+      result.uniform.emplace_back(value, scalar);
     }
   }
   for (Operation &operation : loop.getBody()->without_terminator()) {

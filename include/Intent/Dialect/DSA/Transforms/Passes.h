@@ -26,7 +26,7 @@ bool forwardFullLocalCopies(mlir::func::FuncOp function);
 bool forwardIndexExpressions(mlir::func::FuncOp function);
 bool realizeRangeComparisons(mlir::func::FuncOp function);
 bool foldRangeCounts(mlir::func::FuncOp function);
-bool foldUniformBooleanTiles(mlir::func::FuncOp function);
+bool foldUniformLocalValues(mlir::func::FuncOp function);
 bool reuseGatherOffsets(mlir::func::FuncOp function);
 bool batchPointwiseTasks(mlir::func::FuncOp function);
 } // namespace intent::dsa
