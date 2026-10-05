@@ -33,7 +33,8 @@ WorksetRows parallelReductionWorkset(mlir::linalg::GenericOp operation,
 // Other implementations retain the shaped Generic and their native reduction.
 mlir::FailureOr<bool> materializeParallelReduction(
     mlir::linalg::GenericOp operation, int64_t width, int64_t replicas,
-    mlir::OpBuilder::Listener *listener);
+    mlir::OpBuilder::Listener *listener, mlir::Value completedSupply = {},
+    llvm::ArrayRef<mlir::Operation *> supplyReaders = {});
 
 } // namespace intent::cpu
 

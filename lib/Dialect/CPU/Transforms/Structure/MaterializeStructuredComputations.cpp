@@ -1,6 +1,7 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/ParallelReductions.h"
 #include "ReductionSources.h"
+#include "ReductionSupply.h"
 #include "../Vector/ContiguousMemory.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
@@ -340,16 +341,18 @@ void collapseProductReductionAxes(linalg::GenericOp operation) {
 }
 
 LogicalResult materialize(linalg::GenericOp operation, int64_t width, int64_t replicas,
-                          OpBuilder::Listener *listener) {
+                          OpBuilder::Listener *listener, Value completedSupply = {},
+                          ArrayRef<Operation *> supplyReaders = {}) {
   if (operation.getOutputs().empty() || operation.getNumResults())
     return operation.emitError("CPU structured materialization requires destination buffers");
   auto maps = operation.getIndexingMapsArray();
   if (!llvm::all_of(maps, supportedMap))
     return operation.emitError("CPU pointwise coordinate map has no implemented scalar projection");
-  auto parallel = materializeParallelReduction(operation, width, replicas, listener);
+  auto parallel = materializeParallelReduction(operation, width, replicas, listener,
+                                               completedSupply, supplyReaders);
   if (failed(parallel)) return operation.emitError("CPU parallel reduction cannot be materialized");
   if (*parallel) return success();
-  ReductionSources sources(operation);
+  ReductionSources sources(operation, completedSupply, supplyReaders);
   auto product = materializeProductReduction(operation, width, listener, sources);
   if (failed(product)) return operation.emitError("CPU reduction source member cannot be materialized");
   if (*product) return success();
@@ -368,14 +371,17 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width, int64_t re
   Block &body = operation.getRegion().front();
   auto order = operation->getAttrOfType<ReductionOrderAttr>("intent_cpu.reduction_order");
   auto iterators = operation.getIteratorTypesArray();
+  unsigned firstReduction = 0;
+  while (firstReduction < iterators.size() &&
+         iterators[firstReduction] == utils::IteratorType::parallel) ++firstReduction;
   SmallVector<AffineExpr> freeAxes;
-  for (unsigned axis = 0; axis + 1 < sizes.size(); ++axis)
+  for (unsigned axis = 0; axis < firstReduction; ++axis)
     freeAxes.push_back(b.getAffineDimExpr(axis));
   auto freeMap = AffineMap::get(sizes.size(), 0, freeAxes, b.getContext());
   bool carryReduction = order && operation.getOutputs().size() == 1 && !sizes.empty() &&
       iterators.back() == utils::IteratorType::reduction &&
-      llvm::all_of(ArrayRef(iterators).drop_back(), [](utils::IteratorType iterator) {
-        return iterator == utils::IteratorType::parallel;
+      llvm::all_of(ArrayRef(iterators).drop_front(firstReduction), [](utils::IteratorType iterator) {
+        return iterator == utils::IteratorType::reduction;
       }) && maps.back() == freeMap && !body.getArguments().back().use_empty() &&
       llvm::all_of(body.without_terminator(), [](Operation &instruction) {
         return !instruction.getNumRegions() && isMemoryEffectFree(&instruction);
@@ -421,26 +427,42 @@ LogicalResult materialize(linalg::GenericOp operation, int64_t width, int64_t re
     return results;
   };
   std::function<LogicalResult(unsigned)> visit = [&](unsigned axis) -> LogicalResult {
-    if (carryReduction && axis + 1 == sizes.size()) {
+    if (carryReduction && axis == firstReduction) {
       Value zero = index(b, loc, 0), one = index(b, loc, 1);
-      auto active = b.create<scf::IfOp>(loc,
-          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, sizes[axis], zero), false);
+      Value nonempty;
+      for (Value size : ArrayRef(sizes).drop_front(axis)) {
+        Value present = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, size, zero);
+        nonempty = nonempty ? b.create<arith::AndIOp>(loc, nonempty, present) : present;
+      }
+      auto active = b.create<scf::IfOp>(loc, nonempty, false);
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPointToStart(active.thenBlock());
       Value output = operation.getOutputs()[0];
       Value initial = b.create<memref::LoadOp>(loc, output, position);
-      auto reduction = b.create<scf::ForOp>(loc, zero, sizes[axis], one, ValueRange{initial});
-      reduction->setAttr("intent_cpu.reduction_order", order);
-      {
+      std::function<FailureOr<Value>(unsigned, Value)> reduce =
+          [&](unsigned current, Value seed) -> FailureOr<Value> {
+        auto reduction = b.create<scf::ForOp>(loc, zero, sizes[current], one, ValueRange{seed});
+        reduction->setAttr("intent_cpu.reduction_order", order);
         OpBuilder::InsertionGuard loopGuard(b);
         b.setInsertionPointToStart(reduction.getBody());
         position.push_back(reduction.getInductionVar());
-        auto values = compute(reduction.getRegionIterArgs()[0]);
-        if (failed(values)) return failure();
-        b.create<scf::YieldOp>(loc, *values);
+        Value result;
+        if (current + 1 == sizes.size()) {
+          auto values = compute(reduction.getRegionIterArgs()[0]);
+          if (failed(values)) return failure();
+          result = values->front();
+        } else {
+          auto nested = reduce(current + 1, reduction.getRegionIterArgs()[0]);
+          if (failed(nested)) return failure();
+          result = *nested;
+        }
+        b.create<scf::YieldOp>(loc, result);
         position.pop_back();
-      }
-      b.create<memref::StoreOp>(loc, reduction.getResult(0), output, position);
+        return reduction.getResult(0);
+      };
+      auto result = reduce(axis, initial);
+      if (failed(result)) return failure();
+      b.create<memref::StoreOp>(loc, *result, output, position);
       return success();
     }
     if (axis != sizes.size()) {
@@ -694,6 +716,15 @@ LogicalResult materializeStructuredComputation(Operation *operation,
       return operation->emitError("vector materialization requires a selected implementation binding");
     int64_t replicas = width > 1
         ? implementationParameter(loopBinding, "register_replicas") : 1;
+    auto supplied = materializeReductionSupplyGroup(generic, width,
+        [&](linalg::GenericOp reader, Value source, ArrayRef<Operation *> readers) {
+          ReductionSources members(reader, source, readers);
+          for (auto [number, input] : llvm::enumerate(reader.getInputs()))
+            if (input == source && !members.replays(number)) return failure();
+          return materialize(reader, width, replicas, &listener, source, readers);
+        });
+    if (failed(supplied)) return failure();
+    if (*supplied) return success();
     return materialize(generic, width, replicas, &listener);
   }
   if (auto reduce = dyn_cast<ReduceOp>(operation))
@@ -735,6 +766,22 @@ LogicalResult materializeStructuredComputations(
   for (auto operation : products) {
     auto uniform = ReductionSources(operation).foldUniformMembers();
     if (failed(uniform)) return operation.emitError("CPU uniform source member cannot be materialized");
+  }
+  while (true) {
+    linalg::GenericOp supplied;
+    function.walk([&](linalg::GenericOp producer) {
+      if (!hasReductionSupplyGroup(producer)) return WalkResult::advance();
+      supplied = producer;
+      return WalkResult::interrupt();
+    });
+    if (!supplied) break;
+    if (failed(materializeOperation(supplied))) return failure();
+  }
+  products.clear();
+  function.walk([&](linalg::GenericOp operation) {
+    if (operation.getOutputs().size() > 1 && !operation.getNumResults()) products.push_back(operation);
+  });
+  for (auto operation : products) {
     bool supplied = ReductionSources(operation).hasReplays();
     if (supplied && failed(materializeOperation(operation))) return failure();
   }

@@ -10,7 +10,9 @@ namespace intent::cpu {
 // adapter only supplies the former; it never specializes the combine's formals.
 class ReductionSources {
 public:
-  explicit ReductionSources(mlir::linalg::GenericOp consumer);
+  explicit ReductionSources(mlir::linalg::GenericOp consumer,
+      mlir::Value completedSupply = {},
+      llvm::ArrayRef<mlir::Operation *> supplyReaders = {});
   ~ReductionSources();
   bool hasReplays() const;
   bool replays(unsigned input) const;

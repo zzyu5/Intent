@@ -6,6 +6,7 @@
 #include "Intent/Dialect/CPU/IR/CollectiveHelpers.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -127,6 +128,54 @@ std::optional<unsigned> readingInput(Operation *operation, Value buffer,
         return std::nullopt;
   }
   return selected;
+}
+
+bool endsAtIteration(Value origin, Operation *completed,
+                     ArrayRef<Operation *> reads, StorageAnalysis &storage) {
+  auto loop = dyn_cast<scf::ForOp>(completed->getParentOp());
+  auto allocation = origin.getDefiningOp<memref::AllocOp>();
+  if (!loop || completed->getBlock() != loop.getBody() || !allocation ||
+      !completeWrite(completed, origin)) return false;
+  auto lifetime = storage.lifetime(allocation);
+  if (!lifetime || !lifetime->contains(loop)) return false;
+
+  // A lexical writer is not a unique dynamic writer across tasks or parallel
+  // regions. Only sequential control may separate this allocation instance
+  // from the loop that reuses it.
+  for (Operation *scope = loop; scope->getBlock() != allocation->getBlock();) {
+    scope = scope->getParentOp();
+    if (!scope || !isa<scf::ForOp, scf::IfOp>(scope)) return false;
+  }
+  DominanceInfo dominance(completed->getParentOfType<func::FuncOp>());
+  for (Operation *user : lifetime->aliases.users) {
+    if (user == lifetime->end) continue;
+    auto effects = storage.effects(user);
+    if (!knownVersionEffects(user, origin, effects, storage)) return false;
+    if ((isStorageAliasOperation(user) || isa<memref::DimOp, memref::RankOp>(user)) &&
+        effects.entries.empty() && !effects.ordered) continue;
+    bool observes = false;
+    for (const StorageEffect &entry : effects.entries) {
+      if (disjointEffect(entry.effect.getValue(), origin, storage)) continue;
+      observes = true;
+      if (isa<MemoryEffects::Write>(entry.effect.getEffect())) {
+        if (entry.operation != completed) return false;
+        continue;
+      }
+      if (!isa<MemoryEffects::Read>(entry.effect.getEffect()) ||
+          completed->isAncestor(entry.operation) ||
+          !dominance.properlyDominates(completed, entry.operation) ||
+          !llvm::is_contained(reads, entry.operation)) return false;
+      // Nested counted reads stay in this iteration. Crossing another execution
+      // or conditional boundary needs a stronger observation contract.
+      Operation *scope = entry.operation;
+      while (scope->getBlock() != loop.getBody()) {
+        scope = scope->getParentOp();
+        if (!scope || !isa<scf::ForOp>(scope)) return false;
+      }
+    }
+    if (!observes) return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -282,8 +331,14 @@ FailureOr<BufferVersionObservations> queryBufferVersionObservations(
       return result;
     }
   }
-  // A surviving output is an observation too. Without a complete overwrite or
-  // release, this query cannot authorize deleting the defining write.
+  // The next iteration starts with the same complete definition. On exit no
+  // contents observer remains, including through aliases outside the loop.
+  if (endsAtIteration(origin, completed, result.reads, storage)) {
+    result.end = completed->getBlock()->getTerminator();
+    return result;
+  }
+  // A surviving output is an observation too. A lexical block end alone does
+  // not establish that this version can be deleted.
   return failure();
 }
 

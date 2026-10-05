@@ -54,6 +54,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Structure/ProducerVersions.cpp
   Structure/ParallelReductions.cpp
   Structure/ReductionSources.cpp
+  Structure/ReductionSupply.cpp
   Structure/MaterializeStructuredComputations.cpp
   Structure/Passes.cpp
 

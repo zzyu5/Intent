@@ -258,15 +258,12 @@ bool isNonRepeatingProjection(AffineMap coordinates,
   return true;
 }
 
-namespace {
-
 // Reconstruct a stored representation from one no-wider element read. This is
 // a traffic heuristic, not zero work: conversion executes in each consumer,
 // while the removed version no longer writes or reads its wider materialization.
 // Numeric computation, packed-format decoding and multi-source payloads do not
 // qualify. In particular, float8 conversion is not assumed to be a cheap cast.
-bool replacesConvertedLoad(const ProducerReplay &payload, Value result,
-                           AffineMap coordinates) {
+Value convertedLoadSource(const ProducerReplay &payload, Value result) {
   auto bytes = [](Type type) -> unsigned {
     if (type.isIndex()) return 8;
     if (auto integer = dyn_cast<IntegerType>(type)) {
@@ -280,7 +277,7 @@ bool replacesConvertedLoad(const ProducerReplay &payload, Value result,
     return 0;
   };
   unsigned resultBytes = bytes(result.getType());
-  if (!resultBytes) return false;
+  if (!resultBytes) return {};
   Value source = result;
   while (!isLoadReplacement(payload, source)) {
     Operation *conversion = source.getDefiningOp();
@@ -291,11 +288,20 @@ bool replacesConvertedLoad(const ProducerReplay &payload, Value result,
         !isa<arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp,
              arith::IndexCastOp, arith::IndexCastUIOp, arith::BitcastOp>(conversion) ||
         !isMemoryEffectFree(conversion) || !isSpeculatable(conversion))
-      return false;
+      return {};
     source = conversion->getOperand(0);
   }
   unsigned sourceBytes = bytes(source.getType());
-  if (source == result || !sourceBytes || sourceBytes > resultBytes) return false;
+  if (source == result || !sourceBytes || sourceBytes > resultBytes) return {};
+  return source;
+}
+
+namespace {
+
+bool replacesConvertedLoad(const ProducerReplay &payload, Value result,
+                           AffineMap coordinates) {
+  Value source = convertedLoadSource(payload, result);
+  if (!source) return false;
   if (payload.reads.empty()) return true;
   // A stored representation also buys known dense addressing. Removing it must
   // not add dynamic-stride versioning or turn a contiguous consumer into a

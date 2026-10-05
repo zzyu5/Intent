@@ -164,7 +164,8 @@ WorksetRows parallelReductionWorkset(linalg::GenericOp operation,
 }
 
 FailureOr<bool> materializeParallelReduction(linalg::GenericOp operation,
-    int64_t width, int64_t replicas, OpBuilder::Listener *listener) {
+    int64_t width, int64_t replicas, OpBuilder::Listener *listener,
+    Value completedSupply, ArrayRef<Operation *> supplyReaders) {
   if (width <= 1) return false;
   auto reduction = queryParallelReduction(operation);
   if (!reduction) return false;
@@ -172,7 +173,7 @@ FailureOr<bool> materializeParallelReduction(linalg::GenericOp operation,
   if (!workset.unit)
     return operation.emitError("independent reduction grouping requires a representable positive width"), failure();
   replicas = workset.replicas;
-  ReductionSources sources(operation);
+  ReductionSources sources(operation, completedSupply, supplyReaders);
   OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
   auto maps = operation.getIndexingMapsArray();

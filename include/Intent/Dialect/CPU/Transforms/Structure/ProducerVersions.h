@@ -48,6 +48,9 @@ struct BufferVersionObservations {
 };
 
 // Observe one completed version until its next complete overwrite or release.
+// A sequential For yield also ends a version when its private allocation has
+// only this complete defining write and dominated reads in that iteration;
+// the full alias closure has no other contents observations or execution owner.
 // Readers are actual effect owners, including nested scalar reads. The caller
 // proves the defining write's coverage and each reader's transport relation.
 mlir::FailureOr<BufferVersionObservations> queryBufferVersionObservations(

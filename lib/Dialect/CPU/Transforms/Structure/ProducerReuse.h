@@ -9,6 +9,9 @@ namespace intent::cpu {
 // These queries select a rewrite after ProducerReplay has established legality.
 // They describe this IR snapshot only, and never become execution metadata.
 bool isLoadReplacement(const ProducerReplay &payload, mlir::Value result);
+// Identify representation-only reconstruction; callers separately establish
+// traversal geometry and the number of reads replacing the stored version.
+mlir::Value convertedLoadSource(const ProducerReplay &payload, mlir::Value result);
 // A profitability heuristic, unlike the zero-work/load-substitution case:
 // inexpensive address arithmetic may be rebuilt in place of a temporary load.
 // Integer-typed data computations and element reads do not qualify by dtype.

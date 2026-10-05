@@ -72,8 +72,10 @@ struct ReductionSources::Impl {
     });
   }
 
-  explicit Impl(linalg::GenericOp consumer)
-      : consumer(consumer), function(consumer->getParentOfType<func::FuncOp>()), storage(function) {
+  explicit Impl(linalg::GenericOp consumer, Value completedSupply,
+                ArrayRef<Operation *> supplyReaders)
+      : consumer(consumer), function(consumer->getParentOfType<func::FuncOp>()), storage(function),
+        completedSupply(completedSupply), supplyReaders(supplyReaders) {
     auto maps = consumer.getIndexingMapsArray();
     for (auto [number, input] : llvm::enumerate(consumer.getInputs())) {
       auto type = dyn_cast<MemRefType>(input.getType());
@@ -95,8 +97,12 @@ struct ReductionSources::Impl {
     // No snapshot is duplicated: this completed version's observations belong
     // to one consumer, even when another version later reuses the allocation.
     auto observations = queryBufferVersionObservations(memory, producer, storage);
-    if (failed(observations) || observations->reads.size() != 1 ||
-        observations->reads.front() != reader || !storage.preserves(reader, memory)) return nullptr;
+    bool sharedSupply = memory == completedSupply;
+    if (failed(observations) || !storage.preserves(reader, memory)) return nullptr;
+    if (sharedSupply) {
+      if (observations->reads.empty() || llvm::any_of(observations->reads,
+          [&](Operation *read) { return !llvm::is_contained(supplyReaders, read); })) return nullptr;
+    } else if (observations->reads.size() != 1 || observations->reads.front() != reader) return nullptr;
     for (const auto &known : sources)
       if (known->memory == memory && known->producer == producer)
         return known->lane == lane ? known.get() : nullptr;
@@ -109,8 +115,12 @@ struct ReductionSources::Impl {
         !canReplayProducerAt(*payload, producer, consumer, storage, consumer.getOutputs()))
       return nullptr;
     Value result = producer.getRegion().front().getTerminator()->getOperand(0);
-    if (!shouldFuseProducerResult(*payload, result, projection->compose(coordinates),
-                                 reader.getStaticLoopRanges(), true)) return nullptr;
+    if (sharedSupply) {
+      if (!convertedLoadSource(*payload, result) ||
+          !isNonRepeatingProjection(projection->compose(coordinates),
+                                    reader.getStaticLoopRanges())) return nullptr;
+    } else if (!shouldFuseProducerResult(*payload, result, projection->compose(coordinates),
+                                        reader.getStaticLoopRanges(), true)) return nullptr;
     auto source = std::make_unique<Source>();
     source->memory = memory;
     source->producer = producer;
@@ -228,10 +238,13 @@ struct ReductionSources::Impl {
   SmallVector<Source *> roots;
   SmallVector<std::unique_ptr<Source>> sources;
   SmallVector<Emitted> emitted;
+  Value completedSupply;
+  SmallVector<Operation *> supplyReaders;
 };
 
-ReductionSources::ReductionSources(linalg::GenericOp consumer)
-    : impl(std::make_unique<Impl>(consumer)) {}
+ReductionSources::ReductionSources(linalg::GenericOp consumer, Value completedSupply,
+                                   ArrayRef<Operation *> supplyReaders)
+    : impl(std::make_unique<Impl>(consumer, completedSupply, supplyReaders)) {}
 ReductionSources::~ReductionSources() = default;
 
 bool ReductionSources::hasReplays() const {
