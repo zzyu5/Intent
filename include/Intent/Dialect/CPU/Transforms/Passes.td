@@ -104,6 +104,15 @@ def CPUFuseSharedTraversals : CPUTransform<"intent-cpu-fuse-shared-traversals",
     compatible. Equal actual bounds, complete effects, storage independence and
     injective same-coordinate accesses authorize sibling fusion. A pure
     result-dependent suffix may move only when its uses remain dominated.
+    A completed plain store in that suffix can be delayed only when the
+    following traversal has complete effects and accesses disjoint storage;
+    its value, address and allocation lifetime stay valid at the new point.
+
+    Read-only sharing can be proved through corresponding nested counted
+    loops with equal bounds and coordinate mappings. This establishes a
+    concrete reuse benefit; it does not weaken write-dependence proofs or
+    give ordinary carries reduction-reordering permissions. Fusion preserves
+    per-row reductions rather than extending their SIMD state across rows.
 
     This is the complete traversal-reuse group: private access aliases, fusion,
     memory forwarding, CSE, canonicalization and dead private storage removal

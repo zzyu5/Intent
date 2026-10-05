@@ -26,6 +26,11 @@ struct TraversalAccess {
 bool sameTraversalAddress(const TraversalAccess &first,
                           const TraversalAccess &second,
                           const mlir::IRMapping &mapping);
+bool sameNestedReadFootprint(const TraversalAccess &first,
+                             const TraversalAccess &second,
+                             const Traversal &firstTraversal,
+                             const Traversal &secondTraversal,
+                             const mlir::IRMapping &mapping);
 mlir::FailureOr<llvm::SmallVector<TraversalAccess>>
 traversalAccesses(const Traversal &traversal, StorageAnalysis &storage);
 bool separatesIterations(const TraversalAccess &access,

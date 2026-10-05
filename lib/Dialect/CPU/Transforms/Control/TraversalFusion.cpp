@@ -75,8 +75,19 @@ bool compatibleAttributes(Operation *first, Operation *second,
 }
 
 bool movableBetween(Operation *operation) {
-  return isa<memref::AllocOp, memref::DeallocOp>(operation) ||
+  return isa<memref::AllocOp, memref::AllocaOp, memref::DeallocOp, memref::StoreOp>(operation) ||
       (!operation->getNumRegions() && isMemoryEffectFree(operation) && isSpeculatable(operation));
+}
+
+bool canDeferStore(memref::StoreOp store, Operation *across, StorageAnalysis &storage) {
+  auto effects = storage.effects(across);
+  if (!effects.complete || effects.ordered) return false;
+  for (const StorageEffect &entry : effects.entries) {
+    Value memory = entry.effect.getValue();
+    if (!memory || !isa<MemRefType>(memory.getType()) ||
+        !storage.disjoint(store.getMemref(), memory)) return false;
+  }
+  return true;
 }
 
 bool canFuse(const Traversal &first, const Traversal &second,
@@ -88,19 +99,25 @@ bool canFuse(const Traversal &first, const Traversal &second,
   for (Operation *operation : between) {
     if (!movableBetween(operation)) return false;
     if (isa<memref::DeallocOp>(operation)) continue;
+    if (auto store = dyn_cast<memref::StoreOp>(operation)) {
+      if (!canDeferStore(store, second.operation, storage)) return false;
+      deferred.push_back(operation);
+      continue;
+    }
     bool availableBefore = llvm::all_of(operation->getOperands(), [&](Value operand) {
       return dominance.properlyDominates(operand, first.operation) ||
              movable.contains(operand.getDefiningOp());
     });
     if (!availableBefore) {
-      if (isa<memref::AllocOp>(operation)) return false;
+      if (isa<memref::AllocOp, memref::AllocaOp>(operation)) return false;
       deferred.push_back(operation);
       continue;
     }
     movable.insert(operation);
   }
-  // A completed reduction's scalar postprocessing may remain after both
-  // traversals. It cannot supply the second traversal or any earlier observer.
+  // Completed scalar postprocessing and disjoint output stores may remain
+  // after both traversals, without supplying either an earlier SSA observer
+  // or any memory access in the second traversal.
   for (Operation *operation : deferred)
     for (Operation *user : operation->getUsers())
       if (!llvm::is_contained(deferred, user) &&
@@ -115,7 +132,7 @@ bool canFuse(const Traversal &first, const Traversal &second,
     if (!dominance.properlyDominates(value, first.operation) &&
         !movable.contains(value.getDefiningOp())) return false;
   // Native fusion inserts after the second traversal. The only uses that may
-  // precede it are the pure postprocessing DAG moved to that same final scope.
+  // precede it are the proved postprocessing DAG moved to that same final scope.
   for (Operation *user : first.operation->getUsers())
     if (!llvm::is_contained(deferred, user) &&
         (second.operation->isAncestor(user) ||
@@ -133,6 +150,8 @@ bool canFuse(const Traversal &first, const Traversal &second,
       // Sharing needs an actual read footprint or producer-consumer relation;
       // merely using the same allocation is not a benefit or legality proof.
       if (same && (!left.write || !right.write)) shared = true;
+      if (!shared && !left.write && !right.write)
+        shared = detail::sameNestedReadFootprint(left, right, first, second, mapping);
       if (!left.write && !right.write) continue;
       if (storage.disjoint(left.memory, right.memory)) continue;
       if (!same || !detail::separatesIterations(left, first, dominance) ||

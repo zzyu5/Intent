@@ -3,6 +3,7 @@
 #include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
@@ -20,6 +21,38 @@ bool sameTraversalAddress(const TraversalAccess &first, const TraversalAccess &s
   return llvm::all_of(llvm::zip(first.indices, second.indices), [&](auto pair) {
     return sameMemoryValue(std::get<0>(pair), std::get<1>(pair), mapping);
   });
+}
+
+bool sameNestedReadFootprint(const TraversalAccess &first, const TraversalAccess &second,
+                             const Traversal &firstTraversal,
+                             const Traversal &secondTraversal,
+                             const IRMapping &mapping) {
+  if (first.write || second.write) return false;
+  auto nest = [](Operation *access, Operation *root,
+                 SmallVectorImpl<scf::ForOp> &loops) {
+    for (Operation *scope = access->getParentOp(); scope != root;
+         scope = scope->getParentOp()) {
+      auto loop = dyn_cast_or_null<scf::ForOp>(scope);
+      if (!loop) return false;
+      loops.push_back(loop);
+    }
+    return true;
+  };
+  SmallVector<scf::ForOp> left, right;
+  if (!nest(first.operation, firstTraversal.operation, left) ||
+      !nest(second.operation, secondTraversal.operation, right) ||
+      left.size() != right.size()) return false;
+  IRMapping members(mapping);
+  for (auto [a, b] : llvm::zip(llvm::reverse(left), llvm::reverse(right))) {
+    if (a->getAttrs() != b->getAttrs() ||
+        !sameMemoryValue(a.getLowerBound(), b.getLowerBound(), members) ||
+        !sameMemoryValue(a.getUpperBound(), b.getUpperBound(), members) ||
+        !sameMemoryValue(a.getStep(), b.getStep(), members)) return false;
+    members.map(a.getInductionVar(), b.getInductionVar());
+  }
+  // Equal complete read domains are a reuse opportunity. This correspondence
+  // deliberately does not participate in the write-dependence proof.
+  return sameTraversalAddress(first, second, members);
 }
 
 FailureOr<SmallVector<TraversalAccess>> traversalAccesses(
