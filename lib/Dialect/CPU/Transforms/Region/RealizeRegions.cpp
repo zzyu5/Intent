@@ -270,12 +270,26 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
         knownPredicate ? ValueRange(predicate->predicates) : ValueRange(), knownPredicate.value_or(false),
         summaryIsNonempty ? predicate->validityReduction : nullptr);
   };
+  auto summarize = [&](ValueRange inputs, ValueRange destination,
+                       std::optional<bool> knownPredicate, bool summaryIsNonempty) {
+    return expand(program.getSummarize(), {{K::Sources, inputs}, {K::Captures, captures},
+        {K::Destinations, destination}}, knownPredicate, summaryIsNonempty);
+  };
+  auto initializeFold = [&](Value begin, int64_t width, bool summaryIsNonempty) -> LogicalResult {
+    auto firstSummary = scratch(b, loc, identities);
+    auto inputs = slices(b, loc, sources, program.getAxis(), begin, b.getIndexAttr(width));
+    if (failed(summarize(inputs, firstSummary, std::nullopt, summaryIsNonempty))) return failure();
+    // Fold starts at the declared whole-product identity. Finish every source
+    // read before copying the complete first summary into the running state.
+    for (auto [source, target] : llvm::zip(firstSummary, panelState)) copy(b, loc, source, target);
+    for (Value value : firstSummary) b.create<memref::DeallocOp>(loc, value);
+    return success();
+  };
   auto visitOne = [&](Value begin, int64_t width, std::optional<bool> knownPredicate,
                       bool summaryIsNonempty, bool omitValidity) -> LogicalResult {
     OpFoldResult extent = b.getIndexAttr(width);
     auto inputs = slices(b, loc, sources, program.getAxis(), begin, extent);
-    if (failed(expand(program.getSummarize(), {{K::Sources, inputs}, {K::Captures, captures},
-        {K::Destinations, summary}}, knownPredicate, summaryIsNonempty))) return failure();
+    if (failed(summarize(inputs, summary, knownPredicate, summaryIsNonempty))) return failure();
     if (program.isScan()) {
       SmallVector<Value> emitted;
       auto outputAxes = operation->getAttrOfType<DenseI64ArrayAttr>("output_axes").asArrayRef();
@@ -306,7 +320,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     b.setInsertionPointToStart(loop.getBody());
     return visitOne(loop.getInductionVar(), width, knownPredicate, knownPredicate == true, omitValidity);
   };
-  auto remainder = [&](Value start, bool omitValidity) -> LogicalResult {
+  auto traversalBounds = [&](Value start) -> std::pair<Value, Value> {
     Value end = count;
     if (intervals && predicate->identityWhenFalse) {
       Value begin = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
@@ -314,6 +328,10 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       start = b.create<arith::MaxSIOp>(loc, start, begin);
       end = intervals->possibleEnd;
     }
+    return {start, end};
+  };
+  auto remainder = [&](Value requestedStart, bool omitValidity) -> LogicalResult {
+    auto [start, end] = traversalBounds(requestedStart);
     Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
     Value lower = b.create<arith::MinSIOp>(loc, start, completeEnd);
     if (intervals) {
@@ -369,20 +387,47 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     b.setInsertionPointToStart(conditional.thenBlock());
     Value hasFull = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, count, step);
     auto first = b.create<scf::IfOp>(loc, hasFull, true);
+    auto firstSlice = [&](int64_t width) -> LogicalResult {
+      if (!program.isScan()) return initializeFold(zero, width, true);
+      allocate();
+      if (failed(visitOne(zero, width, std::nullopt, true, false))) return failure();
+      release();
+      return success();
+    };
     {
       OpBuilder::InsertionGuard branch(b);
       b.setInsertionPointToStart(first.thenBlock());
-      allocate();
-      if (failed(visitOne(zero, segmentSize, std::nullopt, true, false))) return failure();
-      release();
+      if (failed(firstSlice(segmentSize))) return failure();
       b.setInsertionPointToStart(first.elseBlock());
-      allocate();
-      if (failed(visitOne(zero, 1, std::nullopt, true, false))) return failure();
-      release();
+      if (failed(firstSlice(1))) return failure();
     }
     allocate();
     Value start = b.create<arith::SelectOp>(loc, hasFull, step, one);
     if (failed(remainder(start, true))) return failure();
+    release();
+  } else if (!program.isScan()) {
+    auto [begin, end] = traversalBounds(zero);
+    Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, end);
+    auto conditional = b.create<scf::IfOp>(loc, nonempty, false);
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(conditional.thenBlock());
+    Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
+    Value hasFull = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, completeEnd);
+    auto first = b.create<scf::IfOp>(loc, TypeRange{b.getIndexType()}, hasFull, true);
+    {
+      OpBuilder::InsertionGuard branch(b);
+      b.setInsertionPointToStart(first.thenBlock());
+      if (failed(initializeFold(begin, segmentSize, false))) return failure();
+      // begin is segment-aligned and below completeEnd, so begin + step <= end.
+      Value nextBegin = b.create<arith::AddIOp>(loc, begin, step);
+      b.create<scf::YieldOp>(loc, nextBegin);
+      b.setInsertionPointToStart(first.elseBlock());
+      if (failed(initializeFold(begin, 1, false))) return failure();
+      Value nextTail = b.create<arith::AddIOp>(loc, begin, one);
+      b.create<scf::YieldOp>(loc, nextTail);
+    }
+    allocate();
+    if (failed(remainder(first.getResult(0), false))) return failure();
     release();
   } else {
     allocate();

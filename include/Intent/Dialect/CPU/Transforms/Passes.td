@@ -153,6 +153,13 @@ def CPURealizeRegions : CPUTransform<"intent-cpu-realize-regions",
     Requires configured CPU buffer functions with valid bindings from the
     selected provider. Realizes region traversal and state transitions using
     those bindings, leaving valid buffer computations for subsequent passes.
+    A typed region fold's first summary initializes its complete state under
+    the declared neutral-identity contract. Empty traversals retain the
+    original identity; remaining slices execute the original combine in order.
+    The first summary is completed independently before all fields are
+    published. Later updates retain their snapshots for borrowed state fields.
+    Region scan application, emission and logical initial state are separate
+    responsibilities; arbitrary ordered arithmetic has no such permission.
   }];
   let options = [CPUProviderOption];
 }
