@@ -35,6 +35,15 @@ std::pair<Value, Value> balancedTaskInterval(OpBuilder &b, Location loc,
   return {begin, add(b, loc, begin, count)};
 }
 
+Value worksetBoundary(OpBuilder &b, Location loc, Value ordinal,
+                      Value chunk, Value fullChunks, Value tail) {
+  Value full = b.create<arith::MinSIOp>(loc, ordinal, fullChunks);
+  Value partial = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                       ordinal, fullChunks);
+  return add(b, loc, multiply(b, loc, full, chunk),
+      b.create<arith::SelectOp>(loc, partial, tail, index(b, loc, 0)));
+}
+
 SmallVector<scf::ParallelOp> partitionScalarSums(func::FuncOp function, int64_t grain) {
   SmallVector<scf::ParallelOp> partitioned;
   auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>("intent_cpu.capabilities");
@@ -114,10 +123,9 @@ SmallVector<scf::ParallelOp> partitionScalarSums(func::FuncOp function, int64_t 
   return partitioned;
 }
 
-}
-
-LogicalResult exposeStructuredWorksets(func::FuncOp function, const ImplementationRegistry &implementations,
-                                      ArrayRef<Value> leadingExtents) {
+LogicalResult exposeStructuredWorksets(func::FuncOp function,
+    const ImplementationRegistry &implementations, ArrayRef<Value> leadingExtents,
+    int64_t grain, SmallVectorImpl<scf::ParallelOp> &assigned) {
   SmallVector<linalg::GenericOp> computations(function.front().getOps<linalg::GenericOp>());
   for (auto operation : computations) {
     StorageAnalysis storage(function);
@@ -162,24 +170,62 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
           auto constant = getConstantIntValue(extent);
           return extent == candidate || (constant && constant == getConstantIntValue(candidate));
         })) continue;
-    int64_t rows = 1;
+    WorksetRows requirement;
     if (auto binding = operation->getAttrOfType<ImplementationAttr>("intent_cpu.implementation")) {
       auto implementation = implementations.lookup(operation);
       if (failed(implementation)) return failure();
-      if ((*implementation)->worksetRows) rows = (*implementation)->worksetRows(operation, binding);
-      if (rows <= 0) return operation.emitError("implementation requires a positive leading parallel workset");
+      if ((*implementation)->worksetRows)
+        requirement = (*implementation)->worksetRows(operation, binding);
+      if (requirement.unit <= 0 || requirement.replicas <= 0)
+        return operation.emitError("implementation requires a positive leading parallel workset");
     }
+    int64_t rows = requirement.unit;
     if (!leadingExtents.empty() && rows != 1) continue;
     Value zero = index(b, loc, 0), one = index(b, loc, 1);
     Value window = index(b, loc, rows);
     Value count = rows == 1 ? extent : b.create<arith::CeilDivSIOp>(loc, extent, window);
-    auto workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
-    b.setInsertionPointToStart(workset.getBody());
-    Value row = rows == 1 ? workset.getInductionVars()[0]
-                         : multiply(b, loc, workset.getInductionVars()[0], window);
+    scf::ParallelOp workset;
+    Value row;
     OpFoldResult rowCount = b.getIndexAttr(1);
-    if (rows != 1)
-      rowCount = b.create<arith::MinSIOp>(loc, window, b.create<arith::SubIOp>(loc, extent, row)).getResult();
+    if (grain > 0 && requirement.replicas > 1) {
+      // Assign exactly the original width-sized work items and grain to workers
+      // before combining adjacent items. A larger register group must not
+      // decrease the task count or cross an existing worker boundary.
+      auto capabilities = function->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>(
+          "intent_cpu.capabilities");
+      Value chunk = index(b, loc, grain);
+      Value chunks = b.create<arith::CeilDivSIOp>(loc, count, chunk);
+      auto active = b.create<scf::IfOp>(loc,
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, chunks, zero), false);
+      b.setInsertionPointToStart(active.thenBlock());
+      Value workers = b.create<arith::MinSIOp>(loc, chunks,
+          index(b, loc, capabilities.getWorkers()));
+      Value width = b.create<arith::DivSIOp>(loc, chunks, workers);
+      Value remainder = b.create<arith::RemSIOp>(loc, chunks, workers);
+      Value fullChunks = b.create<arith::DivSIOp>(loc, count, chunk);
+      Value tail = b.create<arith::RemSIOp>(loc, count, chunk);
+      Value fullRows = b.create<arith::DivSIOp>(loc, extent, window);
+      Value rowTail = b.create<arith::RemSIOp>(loc, extent, window);
+      workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{workers}, ValueRange{one});
+      assigned.push_back(workset);
+      b.setInsertionPointToStart(workset.getBody());
+      auto [first, last] = balancedTaskInterval(b, loc,
+          workset.getInductionVars()[0], width, remainder);
+      auto boundary = [&](Value ordinal) {
+        Value item = worksetBoundary(b, loc, ordinal, chunk, fullChunks, tail);
+        return worksetBoundary(b, loc, item, window, fullRows, rowTail);
+      };
+      row = boundary(first);
+      rowCount = b.create<arith::SubIOp>(loc, boundary(last), row).getResult();
+    } else {
+      workset = b.create<scf::ParallelOp>(loc, ValueRange{zero}, ValueRange{count}, ValueRange{one});
+      b.setInsertionPointToStart(workset.getBody());
+      row = rows == 1 ? workset.getInductionVars()[0]
+                     : multiply(b, loc, workset.getInductionVars()[0], window);
+      if (rows != 1)
+        rowCount = b.create<arith::MinSIOp>(loc, window,
+            b.create<arith::SubIOp>(loc, extent, row)).getResult();
+    }
     SmallVector<Value> inputs, outputs;
     for (auto [number, operand] : llvm::enumerate(operation->getOperands())) {
       Value selected = operand;
@@ -218,6 +264,14 @@ LogicalResult exposeStructuredWorksets(func::FuncOp function, const Implementati
     operation.erase();
   }
   return success();
+}
+
+}
+
+LogicalResult exposeStructuredWorksets(func::FuncOp function,
+    const ImplementationRegistry &implementations, ArrayRef<Value> leadingExtents) {
+  SmallVector<scf::ParallelOp> assigned;
+  return exposeStructuredWorksets(function, implementations, leadingExtents, 0, assigned);
 }
 
 namespace {
@@ -307,10 +361,7 @@ LogicalResult partition(scf::ParallelOp root, int64_t grain, bool distributeToWo
       // logical interval only once. The rounded final chunk may exceed index
       // range, so materialize endpoints through the bounded full part and tail.
       auto boundary = [&](Value ordinal) {
-        Value full = b.create<arith::MinSIOp>(loc, ordinal, fullChunks);
-        Value partial = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, ordinal, fullChunks);
-        return add(b, loc, multiply(b, loc, full, chunk),
-            b.create<arith::SelectOp>(loc, partial, tail, zero));
+        return worksetBoundary(b, loc, ordinal, chunk, fullChunks, tail);
       };
       begin = boundary(first);
       end = boundary(last);
@@ -508,14 +559,16 @@ LogicalResult partitionWorkset(scf::ParallelOp workset, int64_t grain) {
 
 LogicalResult partitionTasks(func::FuncOp function, int64_t grain, const ImplementationRegistry &implementations) {
   auto reductions = partitionScalarSums(function, grain);
-  if (failed(exposeStructuredWorksets(function, implementations))) return failure();
+  SmallVector<scf::ParallelOp> assigned;
+  if (failed(exposeStructuredWorksets(function, implementations, {}, grain, assigned)))
+    return failure();
   SmallVector<scf::ParallelOp> roots;
   function.walk([&](scf::ParallelOp operation) {
     if (!operation->getParentOfType<scf::ParallelOp>()) roots.push_back(operation);
   });
   for (scf::ParallelOp root : roots) {
     // These worksets already contain one complete partial per final task.
-    if (llvm::is_contained(reductions, root)) continue;
+    if (llvm::is_contained(reductions, root) || llvm::is_contained(assigned, root)) continue;
     foldDisjointCompareExchange(function, root);
     auto owners = partitionAtomicWorkset(function, root, grain);
     // Atomic row worksets have already consumed the grain and worker budget.

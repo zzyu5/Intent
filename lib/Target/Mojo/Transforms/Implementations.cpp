@@ -320,8 +320,10 @@ cpu::ImplementationRegistry implementations() {
     }, check, vectorParameters(), {}, {}};
   vector.worksetRows = [](linalg::GenericOp operation, ImplementationAttr binding) {
     if (queryParallelReduction(operation))
-      return implementationParameter(binding, "vector_width");
-    return registerContractionRows(operation);
+      return parallelReductionWorkset(operation,
+          implementationParameter(binding, "vector_width"),
+          implementationParameter(binding, "register_replicas"));
+    return WorksetRows{registerContractionRows(operation), 1};
   };
   vector.materialize = materializeVectorComputation;
   vector.vectorize = vectorizeSelectedLoop;

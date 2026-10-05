@@ -105,6 +105,13 @@ public:
                                    mlir::Value nativeValue) = 0;
 };
 
+struct WorksetRows {
+  // Task grain counts these original work items. Replicas only permit adjacent
+  // items to share a computation inside the interval assigned to one worker.
+  int64_t unit = 1;
+  int64_t replicas = 1;
+};
+
 struct Implementation {
   llvm::StringRef name;
   // Optional per-instance refinement of the registered operation family.
@@ -120,8 +127,7 @@ struct Implementation {
   bool requiresMatrixI8I32 = false;
   std::function<llvm::SmallVector<InputRequirement>(mlir::linalg::GenericOp,
       ConfigurationAttr, ImplementationAttr)> inputs;
-  // Leading parallel rows retained together inside one independent work item.
-  std::function<int64_t(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
+  std::function<WorksetRows(mlir::linalg::GenericOp, ImplementationAttr)> worksetRows;
   std::function<std::optional<std::string>(mlir::DictionaryAttr, CapabilitiesAttr)> parameterRelations;
   std::function<mlir::LogicalResult(mlir::Operation *, ImplementationAttr)> materialize;
   std::function<mlir::LogicalResult(mlir::scf::ForOp, ImplementationAttr)> vectorize;

@@ -10,6 +10,7 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "Intent/Dialect/CPU/Transforms/Vector/VectorReductions.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -338,14 +339,14 @@ void collapseProductReductionAxes(linalg::GenericOp operation) {
   }
 }
 
-LogicalResult materialize(linalg::GenericOp operation, int64_t width,
+LogicalResult materialize(linalg::GenericOp operation, int64_t width, int64_t replicas,
                           OpBuilder::Listener *listener) {
   if (operation.getOutputs().empty() || operation.getNumResults())
     return operation.emitError("CPU structured materialization requires destination buffers");
   auto maps = operation.getIndexingMapsArray();
   if (!llvm::all_of(maps, supportedMap))
     return operation.emitError("CPU pointwise coordinate map has no implemented scalar projection");
-  auto parallel = materializeParallelReduction(operation, width, listener);
+  auto parallel = materializeParallelReduction(operation, width, replicas, listener);
   if (failed(parallel)) return operation.emitError("CPU parallel reduction cannot be materialized");
   if (*parallel) return success();
   ReductionSources sources(operation);
@@ -688,8 +689,13 @@ LogicalResult materializeStructuredComputation(Operation *operation,
   if (width <= 0)
     return operation->emitError("structured materialization requires a positive vector width");
   LoopImplementationListener listener(loopBinding);
-  if (auto generic = dyn_cast<linalg::GenericOp>(operation))
-    return materialize(generic, width, &listener);
+  if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
+    if (width > 1 && !loopBinding)
+      return operation->emitError("vector materialization requires a selected implementation binding");
+    int64_t replicas = width > 1
+        ? implementationParameter(loopBinding, "register_replicas") : 1;
+    return materialize(generic, width, replicas, &listener);
+  }
   if (auto reduce = dyn_cast<ReduceOp>(operation))
     return materialize(reduce, &listener);
   if (auto scan = dyn_cast<ScanOp>(operation))

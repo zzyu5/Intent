@@ -5,13 +5,16 @@
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
+#include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include <functional>
+#include <limits>
 
 using namespace mlir;
 
@@ -135,11 +138,40 @@ LogicalResult orientParallelReductions(func::FuncOp function) {
   return success();
 }
 
+WorksetRows parallelReductionWorkset(linalg::GenericOp operation,
+                                    int64_t width, int64_t replicas) {
+  if (width <= 0 || replicas <= 0 ||
+      replicas > std::numeric_limits<int64_t>::max() / width)
+    return {0, 0};
+  if (width == 1 || replicas == 1) return {width, 1};
+  auto capabilities = operation->getParentOfType<ModuleOp>()->getAttrOfType<CapabilitiesAttr>(
+      "intent_cpu.capabilities");
+  int64_t stateBytes = 0;
+  for (Value output : operation.getOutputs()) {
+    Type element = cast<MemRefType>(output.getType()).getElementType();
+    int64_t bytes = element.isIndex() ? 8 : (element.getIntOrFloatBitWidth() + 7) / 8;
+    if (width > (std::numeric_limits<int64_t>::max() - stateBytes) / bytes)
+      return {width, 1};
+    stateBytes += width * bytes;
+  }
+  // This bounds simultaneous private state, not native register allocation.
+  replicas = std::min(replicas,
+      std::max<int64_t>(1, capabilities.getPrivateBytes() / stateBytes));
+  if (auto extent = constantExtentUpperBound(
+          ValueBoundsConstraintSet::Variable(operation.getOutputs().front(), 0)))
+    replicas = std::min(replicas, std::max<int64_t>(1, *extent / width));
+  return {width, replicas};
+}
+
 FailureOr<bool> materializeParallelReduction(linalg::GenericOp operation,
-    int64_t width, OpBuilder::Listener *listener) {
+    int64_t width, int64_t replicas, OpBuilder::Listener *listener) {
   if (width <= 1) return false;
   auto reduction = queryParallelReduction(operation);
   if (!reduction) return false;
+  auto workset = parallelReductionWorkset(operation, width, replicas);
+  if (!workset.unit)
+    return operation.emitError("independent reduction grouping requires a representable positive width"), failure();
+  replicas = workset.replicas;
   ReductionSources sources(operation);
   OpBuilder b(operation, listener);
   Location loc = operation.getLoc();
@@ -230,19 +262,33 @@ FailureOr<bool> materializeParallelReduction(linalg::GenericOp operation,
       for (Value value : body.getTerminator()->getOperands()) result.push_back(mapped(value));
       return result;
     };
-    auto tile = [&](Value coordinate, int64_t lanes) -> LogicalResult {
-      position[reduction->freeAxis] = coordinate;
+    auto tile = [&](Value coordinate, int64_t lanes, int64_t groups) -> LogicalResult {
+      SmallVector<Value> groupCoordinates;
+      for (int64_t group = 0; group < groups; ++group)
+        groupCoordinates.push_back(group ? add(b, loc, coordinate, index(b, loc, group * lanes))
+                                         : coordinate);
       SmallVector<Value> initial;
-      for (Value output : operation.getOutputs()) {
-        auto type = cast<MemRefType>(output.getType());
-        Value value = lanes ? Value(b.create<vector::LoadOp>(loc,
-            VectorType::get({lanes}, type.getElementType()), output, ValueRange{coordinate}))
-            : Value(b.create<memref::LoadOp>(loc, output, ValueRange{coordinate}));
-        initial.push_back(value);
-      }
+      for (Value selected : groupCoordinates)
+        for (Value output : operation.getOutputs()) {
+          auto type = cast<MemRefType>(output.getType());
+          Value value = lanes ? Value(b.create<vector::LoadOp>(loc,
+              VectorType::get({lanes}, type.getElementType()), output, ValueRange{selected}))
+              : Value(b.create<memref::LoadOp>(loc, output, ValueRange{selected}));
+          initial.push_back(value);
+        }
+      unsigned components = operation.getOutputs().size();
       std::function<FailureOr<SmallVector<Value>>(unsigned, ValueRange)> reduce =
           [&](unsigned depth, ValueRange carry) -> FailureOr<SmallVector<Value>> {
-        if (depth == reduction->reductionAxes.size()) return compute(carry, lanes);
+        if (depth == reduction->reductionAxes.size()) {
+          SmallVector<Value> next;
+          for (auto [group, selected] : llvm::enumerate(groupCoordinates)) {
+            position[reduction->freeAxis] = selected;
+            auto values = compute(carry.slice(group * components, components), lanes);
+            if (failed(values)) return failure();
+            llvm::append_range(next, *values);
+          }
+          return next;
+        }
         unsigned axis = reduction->reductionAxes[depth];
         auto loop = b.create<scf::ForOp>(loc, zero, sizes[axis], one, carry);
         {
@@ -257,18 +303,30 @@ FailureOr<bool> materializeParallelReduction(linalg::GenericOp operation,
       };
       auto final = reduce(0, initial);
       if (failed(final)) return failure();
-      for (auto [value, output] : llvm::zip(*final, operation.getOutputs())) {
-        if (lanes) b.create<vector::StoreOp>(loc, value, output, ValueRange{coordinate});
-        else b.create<memref::StoreOp>(loc, value, output, ValueRange{coordinate});
-      }
+      for (auto [group, selected] : llvm::enumerate(groupCoordinates))
+        for (auto [component, output] : llvm::enumerate(operation.getOutputs())) {
+          Value value = (*final)[group * components + component];
+          if (lanes) b.create<vector::StoreOp>(loc, value, output, ValueRange{selected});
+          else b.create<memref::StoreOp>(loc, value, output, ValueRange{selected});
+        }
       return success();
     };
     Value extent = sizes[reduction->freeAxis], step = index(b, loc, width);
     Value end = b.create<arith::SubIOp>(loc, extent, b.create<arith::RemSIOp>(loc, extent, step));
     LogicalResult status = success();
-    loop(b, loc, zero, end, width, [&](Value coordinate) { status = tile(coordinate, width); });
+    Value begin = zero;
+    if (replicas > 1) {
+      int64_t groupWidth = width * replicas;
+      Value groupStep = index(b, loc, groupWidth);
+      begin = b.create<arith::SubIOp>(loc, extent,
+          b.create<arith::RemSIOp>(loc, extent, groupStep));
+      loop(b, loc, zero, begin, groupWidth,
+          [&](Value coordinate) { status = tile(coordinate, width, replicas); });
+      if (failed(status)) return failure();
+    }
+    loop(b, loc, begin, end, width, [&](Value coordinate) { status = tile(coordinate, width, 1); });
     if (failed(status)) return failure();
-    loop(b, loc, end, extent, 1, [&](Value coordinate) { status = tile(coordinate, 0); });
+    loop(b, loc, end, extent, 1, [&](Value coordinate) { status = tile(coordinate, 0, 1); });
     return status;
   };
   if (contiguous.condition) {
