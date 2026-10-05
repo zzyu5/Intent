@@ -103,6 +103,11 @@ def RegionFoldsPass : IntentGPUTransformPass<
     preserving ordered membership and empty behavior, and closes value
     relations. This is required realization while region-fold operations
     remain, not an optional substitute for the author's algorithm.
+    An existing first-summary traversal directly supplies the complete state
+    using the fold's neutral-identity contract. It preserves the nonempty
+    guard, empty identity, source slices and subsequent combine. This does
+    not infer neutrality from an arbitrary lowered loop or force additional
+    peeling of the ordinary reduction's native partial traversal.
   }]>;
 
 def RegionScansPass : IntentGPUTransformPass<

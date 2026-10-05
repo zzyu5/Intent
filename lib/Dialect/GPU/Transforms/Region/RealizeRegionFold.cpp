@@ -353,13 +353,11 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       bodyFailed = true;
     }
     FailureOr<Value> payload = failure();
-    if (succeeded(first) && !bodyFailed) {
-      SmallVector<Value> arguments(identities);
-      llvm::append_range(arguments, *first);
-      auto combined = inlinePureRegion(nonemptyBuilder, fold.getCombine(), arguments, failureReason);
-      if (succeeded(combined) && combined->size() == 1)
-        payload = stripOptionalRecord(nonemptyBuilder, location, combined->front(), *emptiness);
-    }
+    // The fold's declared identity is neutral for the complete summary tuple.
+    // This branch has already materialized the first summary; forward it into
+    // the existing payload representation without an identity merge.
+    if (succeeded(first) && !bodyFailed)
+      payload = stripOptionalRecord(nonemptyBuilder, location, first->front(), *emptiness);
     if (failed(first) || failed(payload))
       bodyFailed = true;
 
