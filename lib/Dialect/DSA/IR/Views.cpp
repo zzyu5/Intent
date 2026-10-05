@@ -1,6 +1,8 @@
 #include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Dialect/DSA/IR/DSAOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include <cstdint>
+#include <optional>
 
 using namespace mlir;
 
@@ -62,6 +64,39 @@ bool isCompleteLocalStorageView(Value value) {
   if (value.getDefiningOp<memref::AllocaOp>()) return true;
   auto formal = dyn_cast<BlockArgument>(value);
   return formal && isCollectiveBorrowedArgument(formal);
+}
+
+bool isBoundedContiguousLocalView(Value value) {
+  auto view = value.getDefiningOp<memref::ReinterpretCastOp>();
+  if (!view || !isCompleteLocalStorageView(view.getSource()) ||
+      !view.getOffsets().empty() || !view.getSizes().empty() ||
+      !view.getStrides().empty()) return false;
+  auto source = cast<MemRefType>(view.getSource().getType());
+  auto result = view.getType();
+  if (result.getRank() != 2 || !result.hasStaticShape() ||
+      result.getElementType() != source.getElementType() ||
+      result.getMemorySpace() != source.getMemorySpace() ||
+      view.getStaticOffsets().size() != 1 ||
+      view.getStaticSizes() != result.getShape()) return false;
+  auto elements = [](MemRefType type) -> std::optional<int64_t> {
+    int64_t count = 1;
+    for (int64_t extent : type.getShape()) {
+      if (extent <= 0 || extent > INT64_MAX / count) return std::nullopt;
+      count *= extent;
+    }
+    return count;
+  };
+  auto capacity = elements(source), count = elements(result);
+  int64_t offset = view.getStaticOffsets().front();
+  if (!capacity || !count || offset < 0 || offset > *capacity ||
+      *count > *capacity - offset) return false;
+  auto dense = contiguousStrides(result);
+  SmallVector<int64_t> strides;
+  int64_t typeOffset;
+  if (failed(result.getStridesAndOffset(strides, typeOffset)) ||
+      strides != dense || view.getStaticStrides() != ArrayRef<int64_t>(dense) ||
+      (typeOffset != ShapedType::kDynamic && typeOffset != offset)) return false;
+  return true;
 }
 
 bool isCompleteStorageViewOf(Value value, Value origin) {

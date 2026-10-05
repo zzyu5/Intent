@@ -11,6 +11,10 @@ namespace intent::dsa {
 // borrowed collective argument. Partial or differently strided aliases fail.
 bool isCompleteLocalStorageView(mlir::Value value);
 
+// A static, bounded contiguous alias of complete local storage. This is view
+// legality only; it does not grant whole-storage coverage to a reader/writer.
+bool isBoundedContiguousLocalView(mlir::Value value);
+
 // Exact whole-storage coverage, not merely a common allocation origin. This
 // accepts identity descriptor casts and complete contiguous reinterpretations.
 bool isCompleteStorageViewOf(mlir::Value value, mlir::Value origin);

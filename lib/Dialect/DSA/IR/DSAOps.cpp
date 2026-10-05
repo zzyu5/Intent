@@ -675,8 +675,9 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
       }
     }
     if (auto view = dyn_cast<memref::ReinterpretCastOp>(op)) {
-      if (!isCompleteLocalStorageView(view.getResult())) {
-        op->emitError("DSA local views require a same-dtype contiguous reshape of complete local storage or a borrowed collective input");
+      if (!isCompleteLocalStorageView(view.getResult()) &&
+          !isBoundedContiguousLocalView(view.getResult())) {
+        op->emitError("DSA local views require a same-dtype complete reshape or a statically bounded contiguous alias of local storage");
         return WalkResult::interrupt();
       }
     }
