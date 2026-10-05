@@ -9,6 +9,13 @@ namespace intent::gpu::access {
 
 bool isZero(mlir::Value value);
 
+// Keep existing coordinate/validity/fill values over the untouched source
+// axes. These are numeric SSA snapshots, not permission to repeat their reads.
+void bindUnchangedAccessValues(
+    mlir::OpBuilder &builder, mlir::ValueRange values, FragmentType source,
+    FragmentType target, llvm::ArrayRef<int64_t> slicedAxes,
+    mlir::IRMapping &mapping);
+
 mlir::FailureOr<mlir::Value> replayFragmentValue(
     mlir::OpBuilder &builder, mlir::Value value, FragmentType target,
     mlir::IRMapping &mapping, PhysicalProgramAnalysis &analysis,

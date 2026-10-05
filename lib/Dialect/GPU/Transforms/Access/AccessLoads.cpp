@@ -312,20 +312,23 @@ FailureOr<bool> composeLoadGatherImpl(GatherOp gather) {
   }
 
   PhysicalProgramAnalysis analysis(gather->getParentOfType<func::FuncOp>());
-  // Earlier rewrites may have created gathers in the source mask or fill.
-  // Let the existing composition worklist normalize those producers before
-  // committing this rewrite, which must replay both at the selected positions.
-  SmallVector<Value> replayInputs(sourceLoad.getCoordinates());
-  replayInputs.append({sourceLoad.getValid(), sourceLoad.getFill()});
-  for (Value value : replayInputs)
-    if (value && isa<FragmentType>(value.getType()) &&
-        !analysis.replayability(value, std::nullopt,
-                                PhysicalReplayScope::Coordinate,
-                                /*allowAccesses=*/false).isReplayable())
-      return false;
-
   OpBuilder builder(gather);
   auto resultType = dyn_cast<FragmentType>(gather.getResult().getType());
+  IRMapping replay;
+  SmallVector<Value> replayInputs(sourceLoad.getCoordinates());
+  replayInputs.append({sourceLoad.getValid(), sourceLoad.getFill()});
+  if (resultType)
+    bindUnchangedAccessValues(builder, replayInputs, sourceType, resultType,
+                              gather.getSourceAxes(), replay);
+  // Rebuild only the selected axes. Indirect coordinates over untouched axes
+  // remain their original SSA snapshots; dependent accesses still block this
+  // rewrite until the composition worklist has normalized their producers.
+  for (Value value : replayInputs)
+    if (value && isa<FragmentType>(value.getType()) &&
+        !analysis.replayAt(value, std::nullopt, PhysicalReplayScope::Coordinate,
+                           /*allowAccesses=*/false, gather, replay).isReplayable())
+      return false;
+
   SmallVector<Value> originalCoordinates;
   for (Value coordinate : sourceLoad.getCoordinates()) {
     while (auto broadcast = coordinate.getDefiningOp<BroadcastOp>())
@@ -333,7 +336,6 @@ FailureOr<bool> composeLoadGatherImpl(GatherOp gather) {
     originalCoordinates.push_back(coordinate);
   }
   SmallVector<Value> coordinates(originalCoordinates);
-  IRMapping replay;
   SmallVector<MakeRangeOp> selectedRanges;
   llvm::SmallDenseSet<Value> selectedRoots;
   for (int64_t sourceAxis : gather.getSourceAxes()) {

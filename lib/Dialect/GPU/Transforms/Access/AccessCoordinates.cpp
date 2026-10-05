@@ -1,9 +1,11 @@
 #include "AccessComposition.h"
+#include "../Value/ReplayInsertion.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -14,6 +16,42 @@ bool isZero(Value value) {
   auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue())
                           : IntegerAttr();
   return integer && integer.getValue().isZero();
+}
+
+void bindUnchangedAccessValues(OpBuilder &builder, ValueRange values,
+                               FragmentType source, FragmentType target,
+                               ArrayRef<int64_t> slicedAxes, IRMapping &mapping) {
+  Operation *owner = builder.getInsertionBlock()->getParentOp();
+  auto kernel = dyn_cast<func::FuncOp>(owner);
+  if (!kernel) kernel = owner->getParentOfType<func::FuncOp>();
+  if (!kernel) return;
+  DominanceInfo dominance(kernel);
+  SmallVector<Value> pending(values.begin(), values.end());
+  llvm::DenseSet<Value> visited;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!value || !visited.insert(value).second || mapping.lookupOrNull(value)) continue;
+    auto type = dyn_cast<FragmentType>(value.getType());
+    if (!type) continue;
+    auto from = queryBroadcastProjection(type, source);
+    auto to = queryBroadcastProjection(type, target);
+    bool untouched = from.isExact() && to.isExact() &&
+        llvm::all_of(slicedAxes, [&](int64_t axis) {
+          return axis >= 0 && static_cast<size_t>(axis) < from.targetToSource.size() &&
+                 !from.targetToSource[axis];
+        });
+    if (untouched && availableAtInsertionPoint(value, builder, dominance)) {
+      // A page/index load may have happened before a later metadata mutation.
+      // Capture that old value exactly; the data load has its own read proof.
+      mapping.map(value, value);
+      continue;
+    }
+    Operation *producer = value.getDefiningOp();
+    if (!producer || producer->getNumRegions() ||
+        !isPhysicalReplayNode(producer, PhysicalReplayScope::Coordinate,
+                              /*allowAccesses=*/false)) continue;
+    llvm::append_range(pending, producer->getOperands());
+  }
 }
 
 FailureOr<Value> replayFragmentValue(OpBuilder &builder, Value value,
