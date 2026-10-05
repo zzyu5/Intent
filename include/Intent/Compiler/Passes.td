@@ -4,6 +4,15 @@ include "mlir/Pass/PassBase.td"
 
 def ConstructGPU : Pass<"intent-construct-gpu", "mlir::ModuleOp"> {
   let summary = "Construct the executable GPU program from canonical KIR";
+  let description = [{
+    Required KIR-to-GPU construction, not an optional performance transform.
+    Input is canonical typed KIR; target capability options describe the selected
+    device and provider. The conversion realizes logical integer storage and
+    forms GPU values, access relations and execution structure. Unsupported
+    source constructs fail conversion instead of being forwarded to a serializer.
+    The result still needs shared GPU realization and provider legalization.
+    This pass does not import tuning profiles or select a runtime winner.
+  }];
   let options = [
     Option<"computeUnits", "compute-units", "int64_t", "0", "Compute units">,
     Option<"sharedMemoryPerUnit", "shared-memory-per-unit", "int64_t", "0", "Shared bytes per unit">,
@@ -24,12 +33,30 @@ def ConstructGPU : Pass<"intent-construct-gpu", "mlir::ModuleOp"> {
 
 def ConstructCPU : Pass<"intent-construct-cpu", "mlir::ModuleOp"> {
   let summary = "Construct the executable CPU program from canonical KIR";
+  let description = [{
+    Required KIR-to-CPU construction. Consumes canonical typed KIR and creates
+    the CPU program on which structured computation passes operate. The
+    strided-inputs option changes external input layout representation for the
+    selected provider; it is an ABI decision, not a vectorization switch.
+    Logical integer storage and source conversion are performed here. CPU
+    bufferization, implementation selection and provider legalization remain
+    separate stages. Unsupported source constructs fail conversion.
+  }];
   let options = [Option<"stridedInputs", "strided-inputs", "bool", "false", "Preserve external input strides">];
   let dependentDialects = ["intent::cpu::IntentCPUDialect", "mlir::arith::ArithDialect", "mlir::func::FuncDialect", "mlir::linalg::LinalgDialect", "mlir::math::MathDialect", "mlir::memref::MemRefDialect", "mlir::scf::SCFDialect", "mlir::vector::VectorDialect"];
 }
 
 def ConstructDSA : Pass<"intent-construct-dsa", "mlir::ModuleOp"> {
   let summary = "Construct the executable local-memory DSA program";
+  let description = [{
+    Required construction from canonical typed KIR into explicit DSA execution
+    and local storage. Tile, task and local-capacity options form the checked
+    DSA configuration; shapes and strides bind parameter facts for this
+    compilation. They do not select a prewritten operator implementation.
+    Invalid bindings or unsupported conversion fail. The result requires the
+    shared DSA pipeline and target native legalization before serialization;
+    it is not yet a BANG C program with synchronized, arena-bound storage.
+  }];
   let options = [
     Option<"tile", "tile", "int64_t", "1024", "Element tile">,
     Option<"tileM", "tile-m", "int64_t", "16", "M tile">,
@@ -46,6 +73,14 @@ def ConstructDSA : Pass<"intent-construct-dsa", "mlir::ModuleOp"> {
 
 def ResolveGPUProfiles : Pass<"intent-resolve-gpu-profiles", "mlir::ModuleOp"> {
   let summary = "Resolve finite profile inputs into the current GPU module";
+  let description = [{
+    Reads the selected profile resource directory and explicit overrides,
+    validates the finite tables and attaches typed profiles to the current
+    GPU module. A missing directory or invalid profile is an error. This is
+    profile input resolution, not autotuning or configuration selection.
+    Later passes consume current IR attributes without rereading these files.
+    Shared-IR resume does not rerun this pass or accept replacement overrides.
+  }];
   let options = [
     Option<"directory", "directory", "std::string", [{""}], "Directory of compiler profile resources">,
     Option<"overrides", "overrides", "std::string", [{""}], "Explicit profile overrides">

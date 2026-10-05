@@ -3,6 +3,7 @@ add_llvm_executable(intent-opt
 )
 
 llvm_update_compile_flags(intent-opt)
+add_dependencies(intent-opt intent-pass-reference)
 if(SKBUILD)
   set_target_properties(intent-opt PROPERTIES
     INSTALL_RPATH "$ORIGIN/lib"

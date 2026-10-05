@@ -154,6 +154,13 @@ Python 对应 `intent.optimize_ir(ir, pipeline=...) -> OptimizedIR`；显式 com
 任意 pipeline 可能读取外部文件，因此优化工具不猜测其依赖并复用旧输出。
 这些入口处理调用者明确提供的 IR，不导入算法模块，也不启动 kernel。
 
+`intent-opt --help` 列出当前二进制注册的 pass 和 options；完整输入/输出合同由同一份
+`Passes.td` 经 MLIR TableGen 生成。构建 `intent-opt` 时自动生成相邻 `passes/` 中的
+`compiler.md`、`gpu.md`、`cpu.md`、`dsa.md` 及各 provider 文档；安装时随优化器一起
+交付，wheel 中位于 `intent/_bin/passes/`。也可单独构建 `intent-pass-reference`。
+这里没有另外维护的 pass 清单；修改声明后重新构建即可更新参考。语言 manual MCP
+仍只提供语言合同，compiler MCP 可用已有 `read_artifact` 读取明确指定的 pass 参考。
+
 Shared IR 优化后，用 `intent.generate_from_ir(optimized.ir, input_stage="shared",
 name=..., target=...)` 继续生成 `GeneratedProgram`，再按需调用 `materialize()`。
 命令行对应 `intent generate-ir current.mlir --name NAME --target PROVIDER --json`；
@@ -169,6 +176,80 @@ family passes 或 profile 导入，也不接受新的 tuning override。GPU/CPU 
 `python/triton/compiler/compiler.py:289–350` 顺序传递各阶段的实际产物。
 Intent 由同一个编译库连接 GPU、CPU 和 DSA 的不同 IR，保留各 family 的物理决策边界。
 标准工具可重放这些阶段；只有相应输入合同成立，单个 pass 才可独立使用。
+
+### 贡献一个可组合的优化组件
+
+先判断新增知识属于哪个层次，再选已有入口：
+
+| 需要扩展的知识 | 修改位置和复用方式 |
+|---|---|
+| 当前 SSA、轴、alias、版本或整数关系的证明 | 对应公共 analysis/IR 查询；无 mutation，不选择物理策略 |
+| GPU 值的作用域和稳定读取 | `Value/ScopePlacement` 内的规则；完整入口 `hoistLoopInvariantValues` 负责规范化与 CSE |
+| CPU 相同遍历中的值复用 | `Control` 内的依赖与存储证明；完整入口 `fuseSharedTraversals` 拥有局部 fixed point |
+| BANG C 已完成局部版本的复用 | target-local `Supply`/`InvariantSupply`；`storage-reuse` 组拥有 native 前后验证与存储闭合 |
+| 某个目标的指令、类型或调用拼写 | 既有 provider legalization/implementation；不让 shared IR 猜目标 API |
+
+已有组的同类规则直接扩展其 owner。只有独立输入/输出合同成立时，才在相邻
+`Passes.td` 声明新 pass：写清阶段、依赖事实、数值/effect 限制、非适用时行为、
+完成的 closure 和失效分析；在同族实现中定义它并通过现有注册接入。
+默认 PassManager 调度同一个完整入口。不要新增 CLI/runtime 分派，也不要在
+默认流水线另复制一份 rewrite 顺序。跨库复用的接口进入 `include/Intent/`；
+首个 rewrite、repair、预算事务留在 owner 的私有实现中。
+
+可选优化和必要 lowering 分开表达。目前可直接组合的三项入口如下：
+
+| 组件 | 合法输入及完成边界 | 如何关闭而保留必要 lowering |
+|---|---|---|
+| `intent-gpu-hoist-loop-invariant-values` | shared GPU module；规范化 → 有界值/稳定读取移动 → CSE，并验证 shared program | NormalizeStructuredSources、CommonValues、FuseIndependentTraversals 以及目标 finalize 的 `hoist-loop-invariants=false` 仅关闭相应位置的移动 |
+| `intent-cpu-fuse-shared-traversals` | CPU Buffers program，包括已有 Task/TaskDispatch；融合、转发及 dead storage 闭合 | Mojo vectorize 的 `fuse-shared-traversals=false`；loop binding 与 SIMD legalization 仍运行 |
+| `intent-bangc-storage-reuse` | native computation/workspace/implementation 已完成、arena 尚未绑定 | 从显式 pipeline 省略此组，继续 supply synchronization 与 storage binding |
+
+关闭某一处不表示其他组或下层 compiler 的相同优化也被关闭。GPU 的默认共享
+pipeline 在多个合法时点使用同一 hoist 组件；要观察整条路径关闭后的行为，应在
+这些组和 provider finalize 分别设选项。不要通过删除整个 cleanup、融合或最终
+legalization 来模拟关闭某个收益决策。
+
+CPU 遍历融合比较当前循环的实际 implementation bindings。Mojo 默认先补齐继承的
+loop binding，再调用此组；提前独立运行时，绑定尚不一致的循环会保留，因而可能
+合法但融合更少。可选 CPU 优化不代替 provider 完成必要的绑定。
+
+从正常公开编译取得闭合 shared IR 后，可经同一工具链运行组件并续编译：
+
+```python
+# definition、target 和 constexprs 沿用当前程序的普通编译请求。
+shared = intent.compile_ir(definition, stage="shared", target=target,
+                           constexprs=constexprs, compiler=compiler)
+optimized = intent.optimize_ir(
+    shared.ir,
+    pipeline="builtin.module(intent-gpu-hoist-loop-invariant-values)",
+    optimizer=optimizer,
+)
+generated = intent.generate_from_ir(
+    optimized.ir, input_stage="shared", name="optimized_program",
+    target=target, compiler=compiler,
+)
+callable_program = generated.materialize()
+```
+
+此例选择 GPU 组件；CPU 的同阶段入口可换为表中的 CPU pass。`target` 必须与
+原 IR 能力和 provider 一致；`materialize()` 后的调用继续使用原输入和完整 host
+编排。优化运行完成、源码生成完成、native 编译完成和真实运行正确各自记录。
+组不适用时允许保留原 IR；资源不满足时沿用已有候选/诊断行为；unsupported 与
+native 编译失败不能当作“优化没盈利”。观察收益使用原生产运行，复用原容差，
+不为新规则另外编写迎合 matcher 的算法或评测入口。
+
+若需要替换默认 pipeline 中间的组件，从标准 IR 打印取得该阶段的**完整 module**，
+依据生成的合同显式运行后续必要组。例如在 BANG C `storage-reuse` 前的快照上：
+
+```bash
+intent-opt /path/to/native-unbound.mlir \
+  --pass-pipeline='builtin.module(intent-bangc-storage-reuse,intent-bangc-supply-synchronization,intent-bangc-storage-binding)' \
+  -o /path/to/native-bound.mlir
+```
+
+省略第一个组即可观察合法未优化路径；同步与 arena 绑定继续运行。这个 native
+快照只能用于对应目标阶段，不能标成 `input_stage="shared"` 交回公开续编译入口。
+新增默认优化的最终源码仍由同一完整编译命令生成；不增加绕过阶段合同的导出路径。
 
 ### 编译目标与本机运行绑定
 
@@ -1737,7 +1818,7 @@ INTENT_COMPILER=/path/to/intent-build/tools/intent-compile/intent-compile \
 
 可安装分发使用 [environment/build.py](environment/build.py)，基线为 Ubuntu 22.04
 x86-64、CPython 3.10–3.12 和 LLVM/MLIR 20。它先生成 sdist，再从该归档构建 wheel，
-沿现有 CMake `IntentRuntime` 安装规则收集编译器、优化器、profiles、手册和依赖 notices：
+沿现有 CMake `IntentRuntime` 安装规则收集编译器、优化器、profiles、生成的 pass 参考、手册和依赖 notices：
 
 ```bash
 python3 environment/build.py --output-dir /path/to/distributions \
