@@ -600,4 +600,25 @@ LogicalResult materializeTaskDispatches(func::FuncOp function) {
   return success();
 }
 
+void localizeTaskConstants(func::FuncOp function) {
+  SmallVector<TaskDispatchOp> dispatches;
+  function.walk<WalkOrder::PreOrder>([&](TaskDispatchOp dispatch) {
+    dispatches.push_back(dispatch);
+  });
+  // Outer scopes are processed first so nested callbacks also receive their
+  // own constants, rather than capturing the enclosing callback's values.
+  for (TaskDispatchOp dispatch : dispatches) {
+    llvm::SetVector<Value> used;
+    getUsedValuesDefinedAbove(dispatch.getBody(), used);
+    OpBuilder builder(&dispatch.getBody().front(),
+                      dispatch.getBody().front().begin());
+    for (Value value : used) {
+      auto constant = value.getDefiningOp<arith::ConstantOp>();
+      if (!constant) continue;
+      Value local = builder.clone(*constant)->getResult(0);
+      replaceAllUsesInRegionWith(value, local, dispatch.getBody());
+    }
+  }
+}
+
 }
