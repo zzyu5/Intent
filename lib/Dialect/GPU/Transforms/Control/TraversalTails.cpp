@@ -6,6 +6,7 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 using namespace mlir;
 
@@ -60,12 +61,18 @@ bool peel(scf::ForOp loop, func::FuncOp kernel) {
     return false;
   PhysicalProgramAnalysis analysis(kernel);
   if (!hasMixedTilePredicate(loop, analysis, relations)) return false;
+  // A For is an automatic allocation scope; an If is not. Cloning a local
+  // allocation may also duplicate its resource identity. Preserve the original
+  // loop unless its complete effects prove that neither issue can arise.
+  auto effects = getEffectsRecursively(loop);
+  if (!effects || llvm::any_of(*effects, [](const auto &effect) {
+        return isa<MemoryEffects::Allocate>(effect.getEffect());
+      })) return false;
 
   // For U >= 0 and W > 0, floor(U/W)*W is representable, aligned, and in [0,U].
-  // The two loops partition precisely the original induction values. In
-  // particular U=0 reads nothing, and the suffix has zero or one iteration.
-  // Its final increment is the original loop's final increment; no new
-  // endpoint addition (which could wrap) is needed for the split itself.
+  // The prefix and suffix partition precisely the original induction values.
+  // U=0 reads nothing, and the suffix has zero or one iteration, starting at
+  // fullEnd. No endpoint addition or final increment is needed for that body.
   OpBuilder builder(loop);
   Value completeTiles = builder.create<BinaryOp>(loop.getLoc(), builder.getIndexType(),
       loop.getUpperBound(), loop.getStep(), BinaryOperator::FloorDivide);
@@ -74,11 +81,17 @@ bool peel(scf::ForOp loop, func::FuncOp kernel) {
   IRMapping mapping;
   auto complete = cast<scf::ForOp>(builder.clone(*loop, mapping));
   complete.getUpperBoundMutable().assign(fullEnd);
-  loop.getLowerBoundMutable().assign(fullEnd);
-  loop.getInitArgsMutable().assign(complete.getResults());
-  // Both attached loops already have their complete original bodies/yields.
-  // No source read, write, allocation, callback or carry component is moved
-  // across an original iteration; only its enclosing interval changes.
+  Value active = builder.create<CompareOp>(loop.getLoc(), builder.getI1Type(),
+      fullEnd, loop.getUpperBound(), ComparePredicate::Lt);
+  auto tail = builder.create<scf::IfOp>(loop.getLoc(), loop.getResultTypes(), active);
+  IRMapping tailMapping;
+  tailMapping.map(loop.getInductionVar(), fullEnd);
+  tailMapping.map(loop.getRegionIterArgs(), complete.getResults());
+  loop.getRegion().cloneInto(&tail.getThenRegion(), tailMapping);
+  builder.createBlock(&tail.getElseRegion());
+  builder.create<scf::YieldOp>(loop.getLoc(), complete.getResults());
+  loop.replaceAllUsesWith(tail.getResults());
+  loop.erase();
   return true;
 }
 

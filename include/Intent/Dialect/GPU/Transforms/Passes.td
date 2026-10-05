@@ -310,12 +310,15 @@ def PeelTraversalTailsPass : IntentGPUTransformPass<
     Consumes verified, realized shared GPU IR after finite configuration
     binding. Splits eligible counted traversals at their actual aligned upper
     bound, preserving each iteration's body, captures, effects and complete
-    loop-carried state. The complete prefix and the remaining tail execute in
-    their original order; empty prefixes or tails perform no source access.
+    loop-carried state. The complete prefix retains its loop; the zero-or-one
+    tail becomes a conditional body with the original induction/state bindings.
+    Both execute in their original order; empty intervals perform no access.
 
     Eligibility follows current unit-step fragment coordinates, the positive
     physical loop width, nonnegative bounds and representable aligned
-    arithmetic. Unknown geometry retains the original legal traversal. The
+    arithmetic. Unknown geometry/effects or an internal allocation retain the
+    original legal traversal: cloning does not invent new resource identities
+    or discard an allocation owner. The
     group proves and simplifies complete-block predicates, cleans pure values,
     and closes value relations and unchanged configuration tuples. It does
     not change a combine, numerical mode, member domain or provider layout.
