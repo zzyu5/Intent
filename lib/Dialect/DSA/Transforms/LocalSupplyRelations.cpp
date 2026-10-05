@@ -25,6 +25,15 @@ bool stableAfter(Value memory, Operation *writer, Operation *reader,
   return scope == reader || storage.preserves(scope, memory);
 }
 
+std::optional<BinaryOperator> integerOperator(Operation *operation) {
+  if (isa<arith::AddIOp>(operation)) return BinaryOperator::Add;
+  if (isa<arith::SubIOp>(operation)) return BinaryOperator::Subtract;
+  if (isa<arith::MulIOp>(operation)) return BinaryOperator::Multiply;
+  if (isa<arith::MinSIOp>(operation)) return BinaryOperator::Minimum;
+  if (isa<arith::MaxSIOp>(operation)) return BinaryOperator::Maximum;
+  return std::nullopt;
+}
+
 IntegerRangePolicy supplyPolicy(func::FuncOp function,
     std::function<std::optional<int64_t>(Value)> constant) {
   IntegerRangePolicy policy;
@@ -35,10 +44,6 @@ IntegerRangePolicy supplyPolicy(func::FuncOp function,
         return ConstantIntRanges::fromSigned(APInt(64, bounds->first), APInt(64, bounds->second));
       return std::nullopt;
     }
-    auto argument = dyn_cast<BlockArgument>(value);
-    auto loop = argument ? dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp()) : scf::ForOp{};
-    if (!loop || loop.getInductionVar() != value || !value.getType().isIndex())
-      return std::nullopt;
     auto bound = [&](Value value) {
       auto range = analysis.range(value);
       // The existing no-wrap affine relation can retain correlation lost by
@@ -47,6 +52,19 @@ IntegerRangePolicy supplyPolicy(func::FuncOp function,
         range = ConstantIntRanges::constant(APInt(64, *exact, true));
       return range;
     };
+    if (Operation *operation = value.getDefiningOp(); operation &&
+        (value.getType().isIndex() || value.getType().isInteger(64))) {
+      if (auto kind = integerOperator(operation)) {
+        auto lhs = bound(operation->getOperand(0));
+        auto rhs = bound(operation->getOperand(1));
+        if (lhs && rhs)
+          return inferIntegerBinary(*kind, value.getType(), *lhs, *rhs);
+      }
+    }
+    auto argument = dyn_cast<BlockArgument>(value);
+    auto loop = argument ? dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp()) : scf::ForOp{};
+    if (!loop || loop.getInductionVar() != value || !value.getType().isIndex())
+      return std::nullopt;
     auto lower = bound(loop.getLowerBound());
     auto upper = bound(loop.getUpperBound());
     auto step = bound(loop.getStep());
@@ -77,7 +95,8 @@ dsa::SignedInterval LocalSupplyRelations::interval(Value value) {
 }
 
 std::optional<int64_t> LocalSupplyRelations::constant(Value value) {
-  auto folded = dyn_cast<AffineConstantExpr>(simplifyAffineExpr(expression(value), 0, symbols));
+  AffineExpr expr = expression(value);
+  auto folded = dyn_cast<AffineConstantExpr>(simplifyAffineExpr(expr, 0, symbols));
   return folded ? std::optional<int64_t>(folded.getValue()) : std::nullopt;
 }
 
@@ -86,7 +105,8 @@ bool LocalSupplyRelations::equal(Value value, int64_t expected) {
 }
 
 AffineExpr LocalSupplyRelations::difference(Value first, Value second) {
-  return simplifyAffineExpr(expression(first) - expression(second), 0, symbols);
+  AffineExpr expr = expression(first) - expression(second);
+  return simplifyAffineExpr(expr, 0, symbols);
 }
 
 bool LocalSupplyRelations::equal(Value first, Value second) {
@@ -125,10 +145,9 @@ AffineExpr LocalSupplyRelations::expression(Value value) {
         if (left->first >= right->second) return expression(lhs);
         if (right->first >= left->second) return expression(rhs);
       }
-      std::optional<BinaryOperator> kind;
-      if (isa<arith::AddIOp>(op)) kind = BinaryOperator::Add;
-      if (isa<arith::SubIOp>(op)) kind = BinaryOperator::Subtract;
-      if (isa<arith::MulIOp>(op)) kind = BinaryOperator::Multiply;
+      auto kind = integerOperator(op);
+      if (kind == BinaryOperator::Minimum || kind == BinaryOperator::Maximum)
+        kind.reset();
       if (kind && provesSignedNoWrap(*kind,
               ConstantIntRanges::fromSigned(APInt(64, left->first), APInt(64, left->second)),
               ConstantIntRanges::fromSigned(APInt(64, right->first), APInt(64, right->second)))) {

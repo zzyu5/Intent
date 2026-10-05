@@ -1,4 +1,6 @@
 #include "PassDetail.h"
+#include "Intent/Dialect/DSA/Transforms/LocalSupplyRelations.h"
+#include "mlir/IR/PatternMatch.h"
 
 using namespace mlir;
 
@@ -15,7 +17,44 @@ Value suppliedValue(Operation *operation) {
   if (auto op = dyn_cast<dsa::UnaryOp>(operation)) return op.getOutput();
   if (auto op = dyn_cast<dsa::BinaryOp>(operation)) return op.getOutput();
   if (auto op = dyn_cast<dsa::TransposeOp>(operation)) return op.getOutput();
+  if (auto op = dyn_cast<dsa::PrepareMatrixOp>(operation)) return op.getOutput();
   return {};
+}
+
+std::optional<int64_t> tripCount(scf::ForOp loop,
+                                dsa::LocalSupplyRelations &relations) {
+  if (!loop.getInductionVar().getType().isIndex()) return std::nullopt;
+  auto span = dyn_cast<AffineConstantExpr>(
+      relations.difference(loop.getUpperBound(), loop.getLowerBound()));
+  auto step = relations.interval(loop.getStep());
+  if (!span || span.getValue() < 0 || !step || step->first <= 0 ||
+      step->first != step->second) return std::nullopt;
+  return llvm::divideCeil(static_cast<uint64_t>(span.getValue()),
+                          static_cast<uint64_t>(step->first));
+}
+
+bool exposeSingleIterationSupply(func::FuncOp function) {
+  SmallVector<scf::ForOp> loops;
+  function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) {
+    if (!loop.getInitArgs().empty()) return;
+    bool prepares = false;
+    loop.walk([&](dsa::PrepareMatrixOp) { prepares = true; });
+    if (prepares) loops.push_back(loop);
+  });
+  dsa::LocalSupplyRelations relations(function);
+  for (auto loop : loops) {
+    if (tripCount(loop, relations) != 1) continue;
+    // The current coordinate relation proves the same single iteration as the
+    // native SCF promotion, including a nonliteral clipped upper bound.
+    IRRewriter rewriter(function.getContext());
+    Operation *yield = loop.getBody()->getTerminator();
+    rewriter.inlineBlockBefore(loop.getBody(), loop->getBlock(),
+                               loop->getIterator(), loop.getLowerBound());
+    rewriter.eraseOp(yield);
+    rewriter.eraseOp(loop);
+    return true;
+  }
+  return false;
 }
 
 struct IterationDomain {
@@ -161,9 +200,11 @@ private:
       if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) return false;
       Value origin = storage.uniqueOrigin(entry.effect.getValue());
       auto allocation = origin ? origin.getDefiningOp<memref::AllocaOp>() : memref::AllocaOp{};
+      bool packed = isa<dsa::PrepareMatrixOp>(operation) && origin == output &&
+                    allocation && allocation.getType().getMemorySpaceAsInt() == dsa::matrixSpace;
       if (!allocation || !onPath(allocation) ||
           !allocation.getType().hasStaticShape() || !allocation.getType().getLayout().isIdentity() ||
-          allocation.getType().getMemorySpaceAsInt() != dsa::nramSpace ||
+          (allocation.getType().getMemorySpaceAsInt() != dsa::nramSpace && !packed) ||
           storage.uniqueWriter(origin) != operation || !storage.aliases(origin).complete)
         return false;
       auto uses = storage.accesses(origin);
@@ -215,10 +256,15 @@ private:
 bool hoistSupply(func::FuncOp function, scf::ForOp loop,
                  dsa::ConfigurationAttr config) {
   if (auto domain = staticDomain(loop); domain && domain->count <= 1) return false;
+  dsa::LocalSupplyRelations relations(function);
   SmallVector<Operation *> candidates;
   for (Operation &operation : loop.getBody()->without_terminator())
     if (suppliedValue(&operation)) candidates.push_back(&operation);
   for (Operation *root : llvm::reverse(candidates)) {
+    if (isa<dsa::PrepareMatrixOp>(root)) {
+      auto count = tripCount(loop, relations);
+      if (!count || *count < 2) continue;
+    }
     SupplySlice slice(function, loop);
     if (!slice.collect(root)) continue;
     auto positions = originalPositions(function, slice.operations);
@@ -260,7 +306,8 @@ bool cacheSupply(func::FuncOp function, Operation *root, scf::ForOp scope,
   Value output = suppliedValue(root);
   auto type = output ? dyn_cast<MemRefType>(output.getType()) : MemRefType{};
   if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
-      !type.getLayout().isIdentity() || type.getNumElements() <= 0) return false;
+      !type.getLayout().isIdentity() || type.getNumElements() <= 0 ||
+      type.getMemorySpaceAsInt() != dsa::nramSpace) return false;
   SupplySlice slice(function, scope, path);
   if (!slice.collect(root) || !slice.globalRead || !slice.closed(output)) return false;
   SmallVector<IterationDomain> domains;
@@ -344,6 +391,7 @@ bool cacheSupply(func::FuncOp function, Operation *root, scf::ForOp scope,
 } // namespace
 
 bool placeInvariantSupply(func::FuncOp function, dsa::ConfigurationAttr config) {
+  if (exposeSingleIterationSupply(function)) return true;
   SmallVector<scf::ForOp> loops;
   function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops)
