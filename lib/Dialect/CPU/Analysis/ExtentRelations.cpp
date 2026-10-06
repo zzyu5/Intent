@@ -261,6 +261,16 @@ bool stopAtExtentLeaf(Value value, std::optional<int64_t> axis,
   }
   if (isa_and_nonnull<arith::ConstantOp, memref::DimOp, memref::RankOp>(operation) ||
       metadataSize(value)) return false;
+  // Signed selection bounds hold for the actual operands even when their
+  // producers wrap. Keep the selected value as an exact SSA leaf for EQ
+  // queries rather than replacing it with an incomplete affine expression.
+  if (auto minimum = dyn_cast_or_null<arith::MinSIOp>(operation)) {
+    constraints.bound(value) <= constraints.getExpr(minimum.getLhs());
+    constraints.bound(value) <= constraints.getExpr(minimum.getRhs());
+  } else if (auto maximum = dyn_cast_or_null<arith::MaxSIOp>(operation)) {
+    constraints.bound(value) >= constraints.getExpr(maximum.getLhs());
+    constraints.bound(value) >= constraints.getExpr(maximum.getRhs());
+  }
   // Arbitrary index arithmetic wraps. Do not import its mathematical affine
   // model merely because the result is later used as a size.
   return true;
