@@ -248,6 +248,17 @@ LogicalResult realizeSparseReductionTraversal(SparseContractOp contract,
 LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
                               SmallVectorImpl<ContractOp> &pending);
 
+// Keep the complete read snapshot of a runtime row contraction when its
+// external outputs overlap inputs. The independent path retains its mapping;
+// the overlapping path stages completed tiles before publishing any output.
+// The caller has proved operand replay and complete epilogue relocation to the
+// original contraction. This does not authorize moving an author's RAW edge.
+LogicalResult preserveRuntimeContractionSnapshot(
+    scf::ForOp loop, MakeRangeOp rows, MakeRangeOp columns,
+    Value selectedColumns, Value columnValidity, Value rowWidth,
+    Value columnWidth, Value rowWorker, Value columnWorker,
+    OpBuilder::Listener *listener);
+
 LogicalResult realizeScaledContract(ScaledContractOp contract,
                                     func::FuncOp kernel);
 

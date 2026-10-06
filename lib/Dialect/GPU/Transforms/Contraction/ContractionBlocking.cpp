@@ -55,71 +55,6 @@ private:
   llvm::SmallPtrSet<Operation *, 16> observed;
 };
 
-// A mutually exclusive branch is also exclusive across row iterations only
-// when its scalar condition is invariant in this newly constructed loop.
-static bool mutuallyExclusiveRows(Operation *first, Operation *second,
-                                  scf::ForOp loop) {
-  llvm::DenseSet<Value> active;
-  std::function<bool(Value)> invariant = [&](Value value) {
-    Operation *owner = value.getParentBlock()->getParentOp();
-    if (owner != loop && !loop->isAncestor(owner))
-      return true;
-    if (!active.insert(value).second)
-      return false;
-    Operation *producer = value.getDefiningOp();
-    bool result = producer && producer->getNumRegions() == 0 &&
-                  isMemoryEffectFree(producer) &&
-                  llvm::all_of(producer->getOperands(), invariant);
-    active.erase(value);
-    return result;
-  };
-  for (Operation *current = first; current != loop;
-       current = current->getParentOp()) {
-    auto branch = dyn_cast<scf::IfOp>(current->getParentOp());
-    if (!branch || !invariant(branch.getCondition()))
-      continue;
-    for (Operation *other = second; other != loop;
-         other = other->getParentOp())
-      if (other->getParentOp() == branch &&
-          other->getBlock() != current->getBlock())
-        return true;
-  }
-  return false;
-}
-
-static LogicalResult verifyRowReplayReads(scf::ForOp loop) {
-  SmallVector<Operation *> reads;
-  SmallVector<StoreOp> stores;
-  WalkResult effects = loop.walk([&](Operation *operation) {
-    auto access = dyn_cast<AccessOpInterface>(operation);
-    if (!access)
-      return WalkResult::advance();
-    if (auto store = dyn_cast<StoreOp>(operation)) {
-      stores.push_back(store);
-      return WalkResult::advance();
-    }
-    auto effects = getEffectsRecursively(operation);
-    if (!effects || !hasOnlyReadEffects(operation))
-      return WalkResult::interrupt();
-    if (llvm::any_of(*effects, [](const MemoryEffects::EffectInstance &effect) {
-          return isa<MemoryEffects::Read>(effect.getEffect());
-        }))
-      reads.push_back(operation);
-    return WalkResult::advance();
-  });
-  if (effects.wasInterrupted())
-    return loop.emitOpError("runtime row replay contains an unordered or unknown access");
-  ResourceAliasAnalysis aliases;
-  for (Operation *read : reads)
-    for (StoreOp store : stores)
-      if (!mutuallyExclusiveRows(read, store, loop) &&
-          !placement::independentMemoryEffects(read, store, aliases))
-        return store.emitOpError(
-                   "runtime row output may change a subsequent replayed input read")
-               << "; read=" << *read;
-  return success();
-}
-
 LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
                               SmallVectorImpl<ContractOp> &pending) {
   if (!contract->getBlock())
@@ -480,29 +415,6 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         context, rowWorkers.getName().getValue());
 
   OpBuilder mapBuilder(mapping, &created);
-  Value rowExtent = mapBuilder.create<DimOp>(
-      location, mapBuilder.getIndexType(), lhsLoad.getResource(), rowResourceAxis);
-  Value columnExtent = mapBuilder.create<DimOp>(
-      location, mapBuilder.getIndexType(), rhsLoad.getResource(),
-      columnResourceAxis);
-  if (rowRangeExtent)
-    rowExtent = mapBuilder.create<PhysicalExprOp>(
-        location, mapBuilder.getIndexType(), rowRangeExtent);
-  if (columnRangeExtent)
-    columnExtent = mapBuilder.create<PhysicalExprOp>(
-        location, mapBuilder.getIndexType(), columnRangeExtent);
-  auto ceilDiv = [&](Value extent, Value divisor) {
-    Value one = mapBuilder.create<arith::ConstantIndexOp>(location, 1);
-    Value adjusted = binary(
-        mapBuilder, location, mapBuilder.getIndexType(), extent,
-        binary(mapBuilder, location, mapBuilder.getIndexType(), divisor, one,
-               BinaryOperator::Subtract),
-        BinaryOperator::Add);
-    return binary(mapBuilder, location, mapBuilder.getIndexType(), adjusted,
-                  divisor, BinaryOperator::FloorDivide);
-  };
-  Value rowTiles = ceilDiv(rowExtent, blockMValue);
-  Value columnTiles = ceilDiv(columnExtent, blockNValue);
   SmallVector<Value> mappingExtents(mapping.getExtents());
   SmallVector<Attribute> launchExtents(mapping.getLaunchExtents().begin(),
                                        mapping.getLaunchExtents().end());
@@ -518,6 +430,14 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     rowExpression = rowRangeExtent;
   if (columnRangeExtent)
     columnExpression = columnRangeExtent;
+  // Runtime coordinate decoding and launch coverage consume the same typed
+  // expressions. Do not reconstruct ceil-div with potentially wrapping adds.
+  Value rowTiles = mapBuilder.create<PhysicalExprOp>(
+      location, mapBuilder.getIndexType(),
+      binaryExpression(context, PhysicalExprKind::CeilDiv, rowExpression, unitM));
+  Value columnTiles = mapBuilder.create<PhysicalExprOp>(
+      location, mapBuilder.getIndexType(),
+      binaryExpression(context, PhysicalExprKind::CeilDiv, columnExpression, unitN));
   SmallVector<int64_t> coordinateRoles(mapping.getCoordinates().size(), -1);
   if (auto existing =
           mapping.getCoordinateRolesAttr())
@@ -999,7 +919,9 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
         location, rowStart, rowStop, rowStep);
     OpBuilder nested(rowLoop.getBody()->getTerminator(), &created);
     if (failed(emitRowBlock(nested, rowLoop.getInductionVar())) ||
-        failed(verifyRowReplayReads(rowLoop))) {
+        failed(preserveRuntimeContractionSnapshot(
+            rowLoop, rowRange, columnRange, columns, columnValid,
+            blockMValue, blockNValue, rowWorker, columnTile, &created))) {
       rowLoop.erase();
       return failure();
     }

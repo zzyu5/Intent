@@ -83,6 +83,8 @@ public:
     return true;
   }
 
+  void bind(Value lhs, Value rhs) { bindings[lhs] = rhs; }
+
 private:
   IndexRelations &relations;
   llvm::DenseMap<Value, Value> bindings;
@@ -90,23 +92,38 @@ private:
 
 bool matchingControl(Operation *first, Operation *second, scf::ForOp prefix,
                      scf::IfOp suffix, CoordinateMatch &match) {
-  SmallVector<std::pair<scf::IfOp, bool>> left, right;
+  SmallVector<Region *> left, right;
   auto collect = [](Operation *effect, Region *boundary,
-                    SmallVectorImpl<std::pair<scf::IfOp, bool>> &path) {
+                    SmallVectorImpl<Region *> &path) {
     for (Region *region = effect->getParentRegion(); region != boundary;) {
-      auto branch = region ? dyn_cast_or_null<scf::IfOp>(region->getParentOp()) : scf::IfOp();
-      // No unmatched loop, While, execution group or other region may repeat
-      // the effect inside the supposedly single suffix iteration.
-      if (!branch) return false;
-      path.emplace_back(branch, region == &branch.getThenRegion());
-      region = branch->getParentRegion();
+      Operation *owner = region ? region->getParentOp() : nullptr;
+      // A nested traversal must correspond on both sides. Stateful loops and
+      // unknown control cannot be inferred from their trip count alone.
+      if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
+        if (loop.getNumRegionIterArgs()) return false;
+      } else if (!isa_and_nonnull<scf::IfOp>(owner)) return false;
+      path.push_back(region);
+      region = owner->getParentRegion();
     }
     return true;
   };
   if (!collect(first, &prefix.getRegion(), left) ||
       !collect(second, &suffix.getThenRegion(), right) || left.size() != right.size()) return false;
-  for (auto [a, b] : llvm::zip(llvm::reverse(left), llvm::reverse(right)))
-    if (a.second != b.second || !match.same(a.first.getCondition(), b.first.getCondition())) return false;
+  for (auto [a, b] : llvm::zip(llvm::reverse(left), llvm::reverse(right))) {
+    if (auto loop = dyn_cast<scf::ForOp>(a->getParentOp())) {
+      auto other = dyn_cast<scf::ForOp>(b->getParentOp());
+      if (!other || loop->getAttrs() != other->getAttrs() ||
+          !match.same(loop.getLowerBound(), other.getLowerBound()) ||
+          !match.same(loop.getUpperBound(), other.getUpperBound()) ||
+          !match.same(loop.getStep(), other.getStep())) return false;
+      match.bind(loop.getInductionVar(), other.getInductionVar());
+    } else {
+      auto branch = cast<scf::IfOp>(a->getParentOp());
+      auto other = dyn_cast<scf::IfOp>(b->getParentOp());
+      if (!other || (a == &branch.getThenRegion()) != (b == &other.getThenRegion()) ||
+          !match.same(branch.getCondition(), other.getCondition())) return false;
+    }
+  }
   return true;
 }
 
@@ -146,13 +163,10 @@ bool matchingStores(Operation *first, Operation *second, scf::ForOp prefix,
       a.rangeState != PhysicalFactState::Exact || b.rangeState != PhysicalFactState::Exact ||
       a.resource != b.resource || a.sourceAxes != b.sourceAxes ||
       a.coordinates.size() != b.coordinates.size()) return false;
-  // Exact native boundary validity has no unrelated data-dependent filter. It
-  // preserves all in-bounds members of these actual coordinate ranges, including
-  // their original logical tail. Bounds remain checked by the ordinary verifier.
-  if (analysis.boundaryValidity(first).state != PhysicalFactState::Exact)
-    return false;
-  if (analysis.boundaryValidity(second).state != PhysicalFactState::Exact)
-    return false;
+  // The anchored coordinate separates the active Store domains. Additional
+  // predicates, including other axes' subregion bounds, can only narrow them;
+  // they need not describe a native rectangular boundary. This query proves
+  // disjointness, not coverage: each Store retains its original validity.
   if (!analysis.accessBounds(first).isExact() || !analysis.accessBounds(second).isExact())
     return false;
   CoordinateMatch match(prefix, relations);

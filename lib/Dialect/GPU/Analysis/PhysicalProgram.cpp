@@ -2,8 +2,10 @@
 #include "ScalarExpressions.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/STLExtras.h"
+#include <functional>
 
 
 using namespace mlir;
@@ -125,6 +127,97 @@ bool isPrivateWorkspaceProgramIndex(Value coordinate, Value buffer,
            assumption.getAxis() == axis &&
            dominance.properlyDominates(assumption, access);
   });
+}
+
+// An execution group's decoded coordinates identify its physical program.
+// A compact workspace may omit coordinates fixed by the actual access guard:
+// the remaining coordinates still distinguish every program that can use it.
+bool guardedProgramSlices(ArrayRef<AccessOpInterface> accesses,
+                          func::FuncOp kernel) {
+  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
+  if (!space || space.size() != 1) return false;
+  std::optional<DecodedCoordinate> reference;
+  SmallVector<std::optional<int64_t>> referenceAxes, referenceFixed;
+  auto sameDecode = [](const DecodedCoordinate &lhs,
+                       const DecodedCoordinate &rhs) {
+    return sameScalarExpression(lhs.linear, rhs.linear) &&
+        lhs.extents.size() == rhs.extents.size() &&
+        llvm::all_of(llvm::zip(lhs.extents, rhs.extents), [](auto pair) {
+          return sameScalarExpression(std::get<0>(pair), std::get<1>(pair));
+        });
+  };
+  for (AccessOpInterface access : accesses) {
+    SmallVector<std::pair<DecodedCoordinate, int64_t>> coordinates, fixed;
+    for (auto [value, axis] : llvm::zip(access.getAccessCoordinates(),
+                                       access.getAccessSourceAxes()))
+      if (auto decoded = queryDecodedCoordinate(stripScalarIdentity(value)))
+        coordinates.emplace_back(*decoded, axis);
+    std::function<void(Value, bool)> condition = [&](Value value, bool truth) {
+      if (auto binary = value.getDefiningOp<BinaryOp>(); binary &&
+          ((truth && binary.getOperatorKind() == BinaryOperator::LogicalAnd) ||
+           (!truth && binary.getOperatorKind() == BinaryOperator::LogicalOr))) {
+        condition(binary.getLhs(), truth);
+        condition(binary.getRhs(), truth);
+        return;
+      }
+      auto compare = value.getDefiningOp<CompareOp>();
+      if (!compare || (truth ? compare.getPredicate() != ComparePredicate::Eq
+                             : compare.getPredicate() != ComparePredicate::Ne))
+        return;
+      for (auto [coordinate, scalar] : {
+               std::pair<Value, Value>{compare.getLhs(), compare.getRhs()},
+               {compare.getRhs(), compare.getLhs()}})
+        if (auto decoded = queryDecodedCoordinate(stripScalarIdentity(coordinate)))
+          if (auto constant = integerConstant(scalar))
+            fixed.emplace_back(*decoded, *constant);
+    };
+    for (Operation *current = access.getOperation(); current && current != kernel;
+         current = current->getParentOp())
+      if (auto branch = dyn_cast_or_null<scf::IfOp>(current->getParentOp()))
+        condition(branch.getCondition(),
+                  current->getParentRegion() == &branch.getThenRegion());
+    if (coordinates.empty() && fixed.empty()) return false;
+    const DecodedCoordinate &decoded =
+        coordinates.empty() ? fixed.front().first : coordinates.front().first;
+    auto program = stripScalarIdentity(decoded.linear).getDefiningOp<ProgramIdOp>();
+    if (!program || program.getAxis() != 0 ||
+        llvm::any_of(decoded.extents, [](Value extent) {
+          return !queryLaunchExpression(extent);
+        }) || (reference && !sameDecode(*reference, decoded)))
+      return false;
+    PhysicalExprAttr capacity;
+    for (Value extent : decoded.extents) {
+      auto expression = queryLaunchExpression(extent);
+      capacity = !capacity ? expression : PhysicalExprAttr::get(
+          kernel.getContext(), PhysicalExprKind::Multiply, 0,
+          StringAttr::get(kernel.getContext(), ""),
+          ArrayAttr::get(kernel.getContext(), {capacity, expression}));
+    }
+    // Decoding is modulo the Cartesian capacity. Its complete tuple is an
+    // injective program identity only within this exact launch domain.
+    if (capacity != space[0]) return false;
+    SmallVector<std::optional<int64_t>> axes(decoded.extents.size());
+    SmallVector<std::optional<int64_t>> values(decoded.extents.size());
+    for (auto [selected, axis] : coordinates) {
+      if (!sameDecode(decoded, selected)) return false;
+      if (!axes[selected.axis]) axes[selected.axis] = axis;
+    }
+    for (auto [selected, value] : fixed) {
+      if (!sameDecode(decoded, selected)) continue;
+      if (values[selected.axis] && *values[selected.axis] != value) return false;
+      values[selected.axis] = value;
+    }
+    for (unsigned axis = 0; axis < axes.size(); ++axis) {
+      if (axes[axis]) values[axis].reset();
+      else if (!values[axis]) return false;
+    }
+    if (reference && (axes != referenceAxes || values != referenceFixed))
+      return false;
+    reference = decoded;
+    referenceAxes = std::move(axes);
+    referenceFixed = std::move(values);
+  }
+  return reference.has_value();
 }
 
 } // namespace
@@ -288,6 +381,8 @@ bool PhysicalProgramAnalysis::hasDisjointWorkspaceSlices(Value buffer) const {
     }
   }
   if (programPrefix)
+    return true;
+  if (guardedProgramSlices(accesses, kernel))
     return true;
   for (unsigned axis = 0; axis < shape.size(); ++axis) {
     MakeRangeOp owner;

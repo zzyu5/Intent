@@ -13,6 +13,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Contraction/ContractionEpilogue.cpp
   Contraction/ContractionProjection.cpp
   Contraction/ContractionSources.cpp
+  Contraction/ContractionSnapshots.cpp
   Contraction/ContractionTraversal.cpp
   Contraction/ContractionValues.cpp
   Contraction/RealizeContractionBlocking.cpp
