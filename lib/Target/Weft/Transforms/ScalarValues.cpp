@@ -397,15 +397,17 @@ FailureOr<Value> ScalarConversion::convert() {
     auto result = select(*negative, *opposite, *bits);
     return succeeded(result) ? finishInteger(*result) : FailureOr<Value>(failure());
   }
-  case K::Negate: case K::AbsFloat: case K::Exp: case K::Exp2: case K::Rsqrt: {
+  case K::Negate: case K::AbsFloat: case K::Exp: case K::Exp2:
+  case K::Sqrt: case K::Rsqrt: {
     StringRef kind = scalar.kind == K::Negate ? "neg"
                      : scalar.kind == K::AbsFloat ? "abs"
                      : scalar.kind == K::Exp ? "exp"
-                     : scalar.kind == K::Exp2 ? "exp2" : "rsqrt";
+                     : scalar.kind == K::Exp2 ? "exp2"
+                     : scalar.kind == K::Sqrt ? "sqrt" : "rsqrt";
     return Value(b.create<wk::UnaryOp>(loc, inputs[0].getType(), inputs[0], kind));
   }
   case K::Constant: llvm_unreachable("constant handled before dispatch");
-  case K::Log: case K::Sqrt: case K::Tanh: case K::Sin: case K::Cos:
+  case K::Log: case K::Tanh: case K::Sin: case K::Cos:
   case K::Floor: case K::Erf: case K::Power: case K::Fma:
     return unsupported("operation has no equivalent canonical Weft primitive");
   }

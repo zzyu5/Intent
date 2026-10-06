@@ -3,8 +3,11 @@ from __future__ import annotations
 import ctypes
 from math import prod
 
+from intent.language.dtypes import DTYPES
 
-ELEMENT_BYTES = {"u8": 1, "i8": 1, "i32": 4, "i64": 8, "f16": 2, "f32": 4}
+
+# This describes raw storage, not the external compiler's arithmetic support.
+ELEMENT_BYTES = {name: (dtype.bits + 7) // 8 for name, dtype in DTYPES.items()}
 
 
 class Buffer:

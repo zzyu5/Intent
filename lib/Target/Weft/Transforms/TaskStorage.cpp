@@ -593,6 +593,22 @@ LogicalResult TaskConversion::lower(memref::StoreOp store) {
   Location loc = store.getLoc();
   if (isLocal(store.getMemref()) && store.getIndices().empty())
     return write(store.getMemref(), values.lookup(store.getValue()));
+  if (isLocal(store.getMemref())) {
+    Value root = localRoot(store.getMemref());
+    if (failed(materializeLocal(root))) return failure();
+    auto current = locals.find(root);
+    if (current == locals.end())
+      return store.emitError("indexed private write requires a dominating initialized owner");
+    auto indices = localIndices(store.getMemref(), store.getIndices(), current->second);
+    if (failed(indices)) return failure();
+    auto scalar = alignValue(values.lookup(store.getValue()),
+        element(current->second.value.getType()), loc);
+    if (failed(scalar)) return failure();
+    current->second.value = b.create<wk::UpdateOp>(loc, current->second.value.getType(),
+        current->second.value, *scalar, *indices,
+        b.getArrayAttr(SmallVector<Attribute>(indices->size(), b.getStringAttr("index"))));
+    return success();
+  }
   auto region = view(store.getMemref());
   if (failed(region)) return failure();
   auto indices = projectIndices(store.getMemref(), store.getIndices(), shape((*region).getType()).size());
@@ -611,6 +627,21 @@ LogicalResult TaskConversion::lower(memref::LoadOp load) {
     values.map(load.getResult(), *value);
     return success();
   }
+  if (isLocal(load.getMemref())) {
+    auto current = locals.find(localRoot(load.getMemref()));
+    if (current == locals.end())
+      return load.emitError("indexed private read has no dominating initialized owner");
+    if (!isa<wk::ValueType>(current->second.value.getType())) {
+      values.map(load.getResult(), current->second.value);
+      return success();
+    }
+    auto indices = localIndices(load.getMemref(), load.getIndices(), current->second);
+    if (failed(indices)) return failure();
+    values.map(load.getResult(), b.create<wk::ExtractOp>(loc,
+        nativeScalarType(load.getType()), current->second.value, *indices,
+        b.getArrayAttr(SmallVector<Attribute>(indices->size(), b.getStringAttr("index")))));
+    return success();
+  }
   auto region = view(load.getMemref());
   if (failed(region)) return failure();
   auto indices = projectIndices(load.getMemref(), load.getIndices(), shape((*region).getType()).size());
@@ -620,6 +651,23 @@ LogicalResult TaskConversion::lower(memref::LoadOp load) {
   values.map(load.getResult(), b.create<wk::AdmitOp>(loc,
       nativeScalarType(load.getType()), selected));
   return success();
+}
+
+FailureOr<SmallVector<Value>> TaskConversion::localIndices(
+    Value memory, ValueRange indices, const LocalValue &state) {
+  auto projection = localProjection(memory, state);
+  if (failed(projection)) return failure();
+  auto relative = projectIndices(memory, indices, shape(projection->type).size());
+  SmallVector<Value> coordinates;
+  unsigned retained = 0;
+  for (auto [selector, offset] : llvm::zip_equal(projection->selectors, projection->offsets)) {
+    if (cast<StringAttr>(selector).getValue() == "index")
+      coordinates.push_back(offset);
+    else
+      coordinates.push_back(b.create<wk::BinaryOp>(memory.getLoc(), b.getIndexType(),
+          offset, relative[retained++], "add"));
+  }
+  return coordinates;
 }
 
 } // namespace intent::weft_provider

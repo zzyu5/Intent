@@ -4,7 +4,9 @@
 #include "Intent/Dialect/Intent/IR/CompileOptions.h"
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/IR/WeftDialect.h"
+#include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Storage/Bufferization.h"
 #include "TaskLowering.h"
@@ -13,6 +15,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
 #include <algorithm>
 #include <string>
 
@@ -25,6 +28,59 @@ LogicalResult legalizeProgram(ModuleOp program) {
   if (failed(registry)) return failure();
   if (failed(cpu::verifyCPUProgram(program, cpu::CPUProgramStage::Buffers))) return failure();
   if (failed(cpu::lowerOwnership(program))) return failure();
+  // Canonical Weft has ordered SCF carries, but no native prefix collective.
+  // Form the existing CPU scan traversal before any task axis/storage snapshot.
+  SmallVector<cpu::ScanOp> scans;
+  program.walk([&](cpu::ScanOp scan) { scans.push_back(scan); });
+  for (cpu::ScanOp scan : scans)
+  {
+    auto function = scan->getParentOfType<func::FuncOp>();
+    cpu::StorageAnalysis storage(function);
+    DominanceInfo dominance(function);
+    SmallVector<std::pair<Value, Value>> initializations;
+    for (auto [initial, output] : llvm::zip(scan.getInitials(), scan.getOutputs())) {
+      auto allocation = output.getDefiningOp<memref::AllocOp>();
+      if (!allocation || !allocation->getParentOfType<cpu::TasksOp>() ||
+          initial.getType() != allocation.getType().getElementType()) continue;
+      auto aliases = storage.aliases(output);
+      auto accesses = storage.accesses(output);
+      if (!aliases.complete || !accesses.complete || accesses.ordered) continue;
+      bool complete = true;
+      for (Value source : scan.getSources()) {
+        auto type = dyn_cast<MemRefType>(source.getType());
+        if (!type || type.getRank() != allocation.getType().getRank() ||
+            !storage.disjoint(source, output)) { complete = false; break; }
+        for (unsigned axis = 0; axis < type.getRank(); ++axis)
+          complete &= cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(source, axis),
+              ValueBoundsConstraintSet::Variable(output, axis));
+      }
+      for (Value capture : scan.getCaptures())
+        if (isa<MemRefType>(capture.getType())) complete &= storage.disjoint(capture, output);
+      for (Value other : scan.getOutputs())
+        if (other != output) complete &= storage.disjoint(other, output);
+      for (const cpu::StorageEffect &access : accesses.entries) {
+        if (access.operation == scan.getOperation() ||
+            !isa<MemoryEffects::Read, MemoryEffects::Write>(access.effect.getEffect())) continue;
+        if (!access.effect.getValue() ||
+            !dominance.properlyDominates(scan.getOperation(), access.operation))
+          complete = false;
+      }
+      for (Operation *user : aliases.users) {
+        if (user == scan.getOperation() || cpu::isStorageAliasOperation(user) ||
+            isa<memref::DimOp, memref::DeallocOp>(user)) continue;
+        auto effects = storage.effects(user);
+        if (!effects.complete || effects.ordered || effects.entries.empty()) complete = false;
+      }
+      if (complete) initializations.emplace_back(initial, output);
+    }
+    // The complete private prefix is observed only after Scan. Its real seed
+    // supplies the physical update owner's otherwise unobserved lanes; it is
+    // not a definition for arbitrary uninitialized allocations or partial scans.
+    OpBuilder builder(scan);
+    for (auto [initial, output] : initializations)
+      builder.create<linalg::FillOp>(scan.getLoc(), ValueRange{initial}, ValueRange{output});
+    if (failed(cpu::materializeStructuredComputation(scan, 1, {}))) return failure();
+  }
   program.getContext()->loadDialect<IntentWeftDialect, wk::WEFTKernelDialect>();
   auto cpuProgram = ModuleOp::create(program.getLoc(), hostModuleName);
   auto output = ModuleOp::create(program.getLoc(), deviceModuleName);
@@ -68,9 +124,10 @@ LogicalResult legalizeProgram(ModuleOp program) {
   for (auto [index, parameter] : llvm::enumerate(interface.getArguments())) {
     if (auto view = getPublicView(interface, index)) {
       Type element = publicViewTensor(view).getElementType();
-      if (!element.isF32() && !isa<IntegerType>(element))
+      auto storage = denseStorageType(element);
+      if (!storage)
         return cpuProgram.emitError("CPU view has no Weft native dtype");
-      int64_t alignment = std::max(int64_t(element.getIntOrFloatBitWidth() / 8),
+      int64_t alignment = std::max(storage->bytes,
           alignments.lookup(functions.front().getArgument(index)));
       publicAlignments[index] = ArgumentAlignmentAttr::getChecked(
           cpuProgram.getLoc(), program.getContext(), alignment);
@@ -103,6 +160,7 @@ LogicalResult legalizeProgram(ModuleOp program) {
     if (unresolved) return function.emitError("encoded CPU storage has unresolved origins");
     if (conflict) return function.emitError("one CPU storage has incompatible quantized record interpretations");
     TaskLowering lowering(function, output, formats, **registry);
+    if (failed(lowering.normalizeComputations())) return failure();
     OpBuilder host(function.getContext());
     host.setInsertionPointToStart(&function.front());
     auto shapeArguments = lowering.shapeArguments(function, host);

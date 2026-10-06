@@ -25,15 +25,21 @@ TaskConversion::TaskConversion(func::FuncOp function, ModuleOp output,
     for (unsigned axis = 0; axis < memory.getRank(); ++axis)
       if (memory.isDynamicDim(axis)) extentIds.try_emplace(publicViewDimensions(view)[axis], extentIds.size() + 1);
   }
+  initializeAxes();
+}
+
+void TaskConversion::initializeAxes() {
+  relations = cpu::AxisRelations(sourceFunction);
+  axisProjection.clear();
   auto join = [&](Value lhs, Value rhs) {
     int64_t a = physicalAxis(relations.axes(lhs).back());
     int64_t c = physicalAxis(relations.axes(rhs).back());
     if (a != c) axisProjection[std::max(a, c)] = std::min(a, c);
   };
-  function.walk([&](cpu::QuantizeOp op) { join(op.getInput(), op.getOutput()); });
-  function.walk([&](cpu::QuantizedDotOp op) { join(op.getLhs(), op.getRhs()); });
+  sourceFunction.walk([&](cpu::QuantizeOp op) { join(op.getInput(), op.getOutput()); });
+  sourceFunction.walk([&](cpu::QuantizedDotOp op) { join(op.getLhs(), op.getRhs()); });
   nextAxis = 1;
-  function.walk([&](Operation *operation) {
+  sourceFunction.walk([&](Operation *operation) {
     for (Value value : operation->getOperands())
       if (isa<MemRefType>(value.getType()))
         for (int64_t axis : relations.axes(value)) nextAxis = std::max(nextAxis, axis + 1);
@@ -215,6 +221,10 @@ TaskLowering::TaskLowering(func::FuncOp function, ModuleOp output,
     : implementation(std::make_unique<TaskConversion>(function, output, formats, implementations)) {}
 
 TaskLowering::~TaskLowering() = default;
+
+LogicalResult TaskLowering::normalizeComputations() {
+  return implementation->normalizeComputations();
+}
 
 SmallVector<Value> TaskLowering::shapeArguments(func::FuncOp function, OpBuilder &builder) {
   return implementation->shapeArguments(function, builder);

@@ -1,4 +1,5 @@
 #include "TaskABI.h"
+#include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "mlir/IR/BuiltinOps.h"
 
 using namespace mlir;
@@ -16,12 +17,11 @@ FailureOr<llvm::json::Object> serializeTaskABI(wk::KernelOp kernel) {
     int64_t bytes, elements, alignment;
     std::string scalar;
     if (encoding.getKind() == "dense") {
-      if (encoding.getFamily() == "f32") { scalar = "float"; bytes = 4; }
-      else if (encoding.getFamily() == "i32") { scalar = "int32_t"; bytes = 4; }
-      else if (encoding.getFamily() == "i64") { scalar = "int64_t"; bytes = 8; }
-      else if (encoding.getFamily() == "u8" || encoding.getFamily() == "i8") {
-        scalar = encoding.getFamily() == "u8" ? "uint8_t" : "int8_t"; bytes = 1;
-      } else return kernel.emitError("CPU task ABI has no native dense element representation"), failure();
+      auto storage = denseStorageType(encoding.getFamily());
+      if (!storage)
+        return kernel.emitError("CPU task ABI has no native dense element representation"), failure();
+      scalar = storage->cType;
+      bytes = storage->bytes;
       elements = 1; alignment = bytes;
     } else {
       wk::EncodingDeclOp declaration;

@@ -19,7 +19,10 @@ LogicalResult verifyHostType(Operation *owner, Type type) {
       if (!integer || integer.getInt() != 0)
         return owner->emitOpError("requires native host memory space");
     }
-    type = memory.getElementType();
+    if (!hostStorageType(memory.getElementType()))
+      return owner->emitOpError("element has no native host C storage representation: ")
+             << memory.getElementType();
+    return success();
   }
   if (!hostScalarType(type))
     return owner->emitOpError("type has no native host C representation: ")
@@ -66,7 +69,7 @@ HostSourceEmitter::HostSourceEmitter(ModuleOp module, llvm::raw_ostream &output)
 
 std::string HostSourceEmitter::nativeType(Type type) {
   if (auto memory = dyn_cast<MemRefType>(type))
-    return hostScalarType(memory.getElementType())->name + " *";
+    return hostStorageType(memory.getElementType())->name + " *";
   return hostScalarType(type)->name;
 }
 
@@ -201,7 +204,7 @@ LogicalResult HostSourceEmitter::emitAllocation(Operation *operation) {
   auto memory = allocationDescriptor(type, name, dynamicSizes);
   for (const std::string &size : memory.sizes)
     elements = "(" + elements + ") * (" + size + ")";
-  auto element = nativeType(type.getElementType());
+  auto element = hostStorageType(type.getElementType())->name;
   int64_t alignment = 16;
   if (auto attribute = operation->getAttrOfType<IntegerAttr>("alignment"))
     alignment = std::max(alignment, attribute.getInt());

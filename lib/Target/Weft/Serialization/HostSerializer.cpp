@@ -1,5 +1,6 @@
 #include "Intent/Target/Weft/Serialization/Serializer.h"
 #include "Intent/Target/Weft/Serialization/HostSource.h"
+#include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "TaskABI.h"
 #include "mlir/IR/Verifier.h"
 
@@ -56,7 +57,7 @@ public:
         std::string name = slot.name();
         if (!first) output << ", ";
         output << (slot.role == NativeSlotRole::Pointer
-                       ? nativeType(slot.element) + " *"
+                       ? hostStorageType(slot.element)->name + " *"
                        : nativeType(slot.carrier))
                << " " << name;
         first = false;

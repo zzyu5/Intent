@@ -23,6 +23,8 @@ public:
       const cpu::ImplementationRegistry &implementations);
   ~TaskLowering();
 
+  mlir::LogicalResult normalizeComputations();
+
   llvm::SmallVector<mlir::Value> shapeArguments(mlir::func::FuncOp function,
                                               mlir::OpBuilder &builder);
   mlir::LogicalResult lower(cpu::TasksOp task, llvm::StringRef name,

@@ -39,6 +39,17 @@ class TargetProfile:
     private_stack_bytes: int = 65536
 
     def __post_init__(self) -> None:
+        if not isinstance(self.march, str) or not isinstance(self.abi, str):
+            raise TypeError("Weft march and ABI must be strings")
+        if type(self.vlen_bits) is not int or type(self.private_stack_bytes) is not int:
+            raise TypeError("Weft VLEN and private stack budget must be integers")
+        if not isinstance(self.cpus, (tuple, list)) or any(type(cpu) is not int for cpu in self.cpus):
+            raise TypeError("Weft execution CPUs must be a sequence of integers")
+        if not isinstance(self.required_extensions, (tuple, list)) or any(
+                not isinstance(extension, str) or not extension for extension in self.required_extensions):
+            raise TypeError("Weft required extensions must be a sequence of names")
+        if self.matrix_extension is not None and not isinstance(self.matrix_extension, str):
+            raise TypeError("Weft matrix extension must be a name or None")
         object.__setattr__(self, "cpus", tuple(self.cpus))
         object.__setattr__(self, "required_extensions", tuple(sorted(set(self.required_extensions))))
         if not self.march.startswith("rv64") or self.abi != "lp64d":

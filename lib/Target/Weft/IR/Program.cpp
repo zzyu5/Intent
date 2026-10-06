@@ -1,5 +1,6 @@
 #include "Intent/Target/Weft/IR/Program.h"
 #include "Intent/Target/Weft/Serialization/HostSource.h"
+#include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/ViewRelations.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
@@ -15,12 +16,8 @@ namespace intent::weft_provider {
 namespace {
 
 bool matchesDenseStorage(Type element, StringRef family) {
-  if (element.isIndex()) return family == "i64";
-  if (element.isF32()) return family == "f32";
-  auto integer = dyn_cast<IntegerType>(element);
-  if (!integer) return false;
-  return family == (Twine(integer.isUnsigned() ? "u" : "i") +
-                    Twine(integer.getWidth())).str();
+  auto storage = denseStorageType(element);
+  return storage && storage->family == family;
 }
 
 LogicalResult verifyTaskSignature(func::FuncOp declaration, wk::KernelOp kernel) {

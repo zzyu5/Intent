@@ -3,8 +3,12 @@
 #include "ScalarValues.h"
 #include "Views.h"
 #include "Intent/Dialect/Intent/IR/Interface.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallBitVector.h"
 
 using namespace mlir;
@@ -12,6 +16,37 @@ namespace wk = ::weft::kernel;
 
 namespace intent::weft_provider {
 using namespace task_detail;
+
+LogicalResult TaskConversion::normalizeComputations() {
+  SmallVector<Operation *> scalarTraversals;
+  sourceFunction.walk([&](Operation *operation) {
+    if (!operation->getParentOfType<cpu::TasksOp>() ||
+        !isa<linalg::GenericOp, cpu::ReduceOp>(operation)) return;
+    for (Value operand : operation->getOperands()) {
+      auto type = dyn_cast<MemRefType>(operand.getType());
+      if (!type) continue;
+      for (unsigned axis = 0; axis < type.getRank(); ++axis)
+        if (type.isDynamicDim(axis) && !dimensionExtent(operand, axis)) {
+          scalarTraversals.push_back(operation);
+          return;
+        }
+    }
+  });
+  if (scalarTraversals.empty()) return success();
+  // A task-local computed extent is not a public shape symbol. Keep its
+  // existing scalar bound in ordered traversal, rather than inventing a shaped
+  // value whose type denotes a different domain.
+  for (Operation *operation : scalarTraversals)
+    if (failed(cpu::materializeStructuredComputation(operation, 1, {})))
+      return failure();
+  RewritePatternSet patterns(b.getContext());
+  memref::populateFoldMemRefAliasOpPatterns(patterns);
+  populateAffineToStdConversionPatterns(patterns);
+  if (failed(applyPatternsGreedily(sourceFunction, std::move(patterns))))
+    return sourceFunction.emitError("Weft scalar descriptor normalization did not converge");
+  initializeAxes();
+  return success();
+}
 
 namespace task_detail {
 

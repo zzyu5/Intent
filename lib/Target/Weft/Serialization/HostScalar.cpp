@@ -1,19 +1,52 @@
 #include "Intent/Target/Weft/Serialization/HostScalar.h"
 #include "Intent/Serialization/ScalarEmitters.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace mlir;
 namespace intent::weft_provider {
-std::optional<CScalarType> hostScalarType(Type type) {
-  if (type.isF32()) return CScalarType{"float", {}, {}};
-  if (type.isF64()) return CScalarType{"double", {}, {}};
-  if (type.isIndex()) return CScalarType{"int64_t", {}, {}};
-  if (type.isInteger(1)) return CScalarType{"int", {}, {}};
-  auto integer = dyn_cast<IntegerType>(type);
-  if (!integer || !integer.isSignless() ||
-      (integer.getWidth() != 8 && integer.getWidth() != 16 &&
-       integer.getWidth() != 32 && integer.getWidth() != 64))
+std::optional<DenseStorageType> denseStorageType(StringRef family) {
+  if (family == "f16") return DenseStorageType{family.str(), "_Float16", 2};
+  if (family == "bf16") return DenseStorageType{family.str(), "uint16_t", 2};
+  if (family == "f32") return DenseStorageType{family.str(), "float", 4};
+  if (family == "f64") return DenseStorageType{family.str(), "double", 8};
+  StringRef width = family;
+  bool isUnsigned = width.consume_front("u");
+  if (!isUnsigned && !width.consume_front("i")) return std::nullopt;
+  unsigned bits = 0;
+  if (width.getAsInteger(10, bits) ||
+      (bits != 1 && bits != 8 && bits != 16 && bits != 32 && bits != 64))
     return std::nullopt;
-  return CScalarType{"int" + std::to_string(integer.getWidth()) + "_t", {}, {}};
+  unsigned storageBits = std::max(8u, bits);
+  return DenseStorageType{family.str(),
+      std::string(isUnsigned ? "uint" : "int") +
+          std::to_string(storageBits) + "_t", storageBits / 8};
+}
+
+std::optional<DenseStorageType> denseStorageType(Type type) {
+  if (type.isIndex()) return denseStorageType("i64");
+  if (auto integer = dyn_cast<IntegerType>(type))
+    return denseStorageType((Twine(integer.isUnsigned() ? "u" : "i") +
+                             Twine(integer.getWidth())).str());
+  if (!isa<FloatType>(type)) return std::nullopt;
+  std::string family;
+  llvm::raw_string_ostream stream(family);
+  type.print(stream);
+  return denseStorageType(family);
+}
+
+std::optional<CScalarType> hostStorageType(Type type) {
+  auto storage = denseStorageType(type);
+  if (!storage) return std::nullopt;
+  return CScalarType{storage->cType, {}, {}};
+}
+
+std::optional<CScalarType> hostScalarType(Type type) {
+  // BF16 memory is raw storage. Its numerical conversion belongs to the
+  // canonical task and target lowering, not C integer arithmetic in the host.
+  if (type.isBF16()) return std::nullopt;
+  if (type.isInteger(1)) return CScalarType{"int", {}, {}};
+  return hostStorageType(type);
 }
 namespace {
 FailureOr<std::string> render(Operation *operation, ArrayRef<std::string> operands) {

@@ -29,6 +29,7 @@ public:
   TaskConversion(mlir::func::FuncOp function, mlir::ModuleOp output,
                  const llvm::DenseMap<mlir::Value, intent::QuantFormat> &formats,
                  const cpu::ImplementationRegistry &implementations);
+  mlir::LogicalResult normalizeComputations();
   llvm::SmallVector<mlir::Value>
   shapeArguments(mlir::func::FuncOp function, mlir::OpBuilder &builder);
   mlir::LogicalResult lower(cpu::TasksOp tasks, llvm::StringRef name,
@@ -50,6 +51,7 @@ private:
   mlir::LogicalResult lower(mlir::Operation *operation);
 
   int64_t physicalAxis(int64_t axis);
+  void initializeAxes();
   llvm::SmallVector<int64_t> memoryAxes(mlir::Value memory);
   mlir::DenseI64ArrayAttr array(llvm::ArrayRef<int64_t> entries);
   ::weft::kernel::EncodingType dense(mlir::Type type);
@@ -93,6 +95,9 @@ private:
   projectionIndices(const LocalProjection &projection, mlir::Location loc);
   mlir::FailureOr<LocalProjection>
   localProjection(mlir::Value memory, const LocalValue &state);
+  mlir::FailureOr<llvm::SmallVector<mlir::Value>>
+  localIndices(mlir::Value memory, mlir::ValueRange indices,
+               const LocalValue &state);
   mlir::FailureOr<mlir::Value> alignValue(mlir::Value value, mlir::Type target,
                                         mlir::Location loc);
   mlir::LogicalResult materializeLocal(mlir::Value root);

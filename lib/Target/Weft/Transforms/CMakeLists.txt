@@ -20,10 +20,13 @@ add_mlir_library(MLIRIntentWeftTransforms
   MLIRIntentCPUTransforms
   MLIRIntentScalarSerialization
   MLIRArithDialect
+  MLIRAffineToStandard
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMemRefDialect
+  MLIRMemRefTransforms
   MLIRSCFDialect
   MLIRIR
   MLIRPass
+  MLIRTransforms
 )
