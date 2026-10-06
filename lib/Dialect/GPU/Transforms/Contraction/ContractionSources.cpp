@@ -54,7 +54,8 @@ FailureOr<bool> rewriteContractionSnapshot(
 void fuseContractionAdds(func::FuncOp kernel) {
   SmallVector<BinaryOp> additions;
   kernel.walk([&](BinaryOp binary) {
-    if (binary.getOperatorKind() == BinaryOperator::Add)
+    if (binary.getOperatorKind() == BinaryOperator::Add &&
+        !binary.getStrictRounding())
       additions.push_back(binary);
   });
   for (BinaryOp add : additions) {
@@ -634,7 +635,8 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
     if (!resultType || !resultType.getElementType().isF32())
       continue;
     auto combine = queryBinaryCombine(reduce.getCombine());
-    if (!combine || combine->kind() != BinaryOperator::Add)
+    if (!combine || combine->kind() != BinaryOperator::Add ||
+        combine->operation.getStrictRounding())
       continue;
 
     Value product = reduce.getSources().front();
@@ -650,6 +652,7 @@ LogicalResult fuseMultiplyReductions(ModuleOp module) {
     auto productType = dyn_cast<FragmentType>(product.getType());
     if (!multiply || !product.hasOneUse() || !productType ||
         multiply.getOperatorKind() != BinaryOperator::Multiply ||
+        multiply.getStrictRounding() ||
         productType.getElementType() != resultType.getElementType())
       continue;
     auto unbroadcast = [&](Value value) {

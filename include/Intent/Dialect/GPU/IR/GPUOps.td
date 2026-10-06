@@ -166,10 +166,17 @@ def IntentGPU_UnaryOp : IntentGPU_Op<"unary", [Pure, Elementwise, Scalarizable, 
 }
 
 def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {
+  let description = [{
+    Elementwise arithmetic with explicit numerical permissions. For f32
+    add/subtract/multiply, strict_rounding requires a separate nearest-even
+    result with gradual underflow and forbids contraction across this result.
+    This is an execution requirement, independent of approximate and FTZ modes.
+  }];
   let arguments = (ins IntentGPU_DataValue:$lhs, IntentGPU_DataValue:$rhs,
                        Intent_BinaryOperatorAttr:$operator_kind,
                        DefaultValuedAttr<BoolAttr, "false">:$approximate,
-                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero);
+                       DefaultValuedAttr<BoolAttr, "false">:$flush_to_zero,
+                       DefaultValuedAttr<BoolAttr, "false">:$strict_rounding);
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
   let hasFolder = 1;

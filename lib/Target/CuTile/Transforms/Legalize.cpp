@@ -6,6 +6,8 @@
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Serialization/Serializer.h"
 #include "Configuration/Configurations.h"
+#include "Compute/StrictArithmetic.h"
+#include "Access/FragmentStorage.h"
 #include "Program.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
@@ -25,12 +27,14 @@ LogicalResult prepareProgram(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  legalizeStrictArithmetic(*kernel);
   if (failed(gpu::contraction::normalizeMatrixContractShapes(*kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
   auto profiles = gpu::TuningProfiles::from(module);
   if (failed(profiles) ||
       failed(prepareLaunchConfigurations(*kernel, *profiles)) ||
+      failed(materializeFragmentStorage(*kernel)) ||
       failed(gpu::lowerWorkspaceAllocations(module)))
     return failure();
   gpu::foldExactConstantDivisions(*kernel);

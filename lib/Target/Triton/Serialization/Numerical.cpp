@@ -141,6 +141,15 @@ FailureOr<Translation> translate(gpu::BinaryOp operation,
     return direct("tl." + name.str() + "(" + lhs + ", " + rhs +
                   ", propagate_nan=tl.PropagateNan." + nan.str() + ")");
   };
+  if (operation.getStrictRounding()) {
+    switch (operation.getOperatorKind()) {
+    case BinaryOperator::Add: return libraryMath(operation, "add_rn", operands);
+    case BinaryOperator::Subtract: return libraryMath(operation, "sub_rn", operands);
+    case BinaryOperator::Multiply: return libraryMath(operation, "mul_rn", operands);
+    default:
+      return operation.emitOpError("unsupported strict-rounding binary operation"), failure();
+    }
+  }
   switch (operation.getOperatorKind()) {
   case BinaryOperator::Add:
     return direct(infix("+"));

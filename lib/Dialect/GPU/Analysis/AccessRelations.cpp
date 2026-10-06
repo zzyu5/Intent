@@ -164,7 +164,8 @@ bool sameBroadcastCoordinateExpression(Value lhs, Value rhs) {
     if (!leftBinary || !rightBinary ||
         leftBinary.getOperatorKind() != rightBinary.getOperatorKind() ||
         leftBinary.getApproximate() != rightBinary.getApproximate() ||
-        leftBinary.getFlushToZero() != rightBinary.getFlushToZero())
+        leftBinary.getFlushToZero() != rightBinary.getFlushToZero() ||
+        leftBinary.getStrictRounding() != rightBinary.getStrictRounding())
       return false;
     for (auto [leftOperand, rightOperand] : llvm::zip(leftBinary->getOperands(),
                                                     rightBinary->getOperands())) {

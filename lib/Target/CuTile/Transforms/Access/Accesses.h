@@ -26,6 +26,7 @@ mlir::LogicalResult formNativeLoads(
 mlir::LogicalResult formFragmentExtractions(
     mlir::func::FuncOp kernel, llvm::ArrayRef<gpu::GatherOp> gathers,
     NativeFormRewriter &rewriter);
+bool requiresFragmentStorage(gpu::GatherOp gather);
 mlir::LogicalResult formNativeAtomics(
     mlir::func::FuncOp kernel, llvm::ArrayRef<gpu::AtomicRMWOp> atomics,
     NativeFormRewriter &rewriter);

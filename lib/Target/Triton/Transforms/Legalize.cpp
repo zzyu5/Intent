@@ -30,7 +30,7 @@ LogicalResult prepareTritonMemory(ModuleOp module) {
   detail::foldIntegerScanTails(*kernel);
   if (failed(detail::materializeOversizedGathers(*kernel)) ||
       failed(detail::legalizeLargeScalarGathers(*kernel)) ||
-      failed(detail::legalizeMaskedGather(*kernel)) ||
+      failed(detail::legalizeGatherCoordinates(*kernel)) ||
       failed(detail::legalizeExpandingGathers(*kernel)) ||
       failed(detail::legalizeScatterAdd(*kernel)) ||
       failed(gpu::contraction::normalizeMatrixContractShapes(*kernel)))

@@ -74,7 +74,11 @@ FailureOr<Type> ScalarRegionLowering::accessResultType(
   auto logicalTensor = dyn_cast<RankedTensorType>(logical);
   auto prototypeFragment =
       prototype ? dyn_cast<gpu::FragmentType>(*prototype) : gpu::FragmentType();
-  if (logicalTensor && prototypeFragment) {
+  if (logicalTensor && logicalTensor.getRank() == 0) {
+    // A logical rank-zero tensor is a scalar physical value. Ownership axes,
+    // when present, are appended from the actual coordinates/prototype below.
+    converted = logicalTensor.getElementType();
+  } else if (logicalTensor && prototypeFragment) {
     // A write value may already carry physical ownership axes introduced by
     // scalar logical indices.  The index relation describes only its result
     // tail.  Split that tail from the prototype before combining it with the

@@ -79,7 +79,8 @@ bool isSingleBinaryReduction(ReduceOp reduce, BinaryOperator kind) {
   return reduce.getNumResults() == 1 &&
          reduce.getAxes().size() == 1 && reduce.getSources().size() == 1 &&
          reduce.getIdentities().size() == 1 && reduce.getCaptures().size() == 0 &&
-         combine && combine->kind() == kind;
+         combine && combine->kind() == kind &&
+         !combine->operation.getStrictRounding();
 }
 
 bool isProjectedFrom(Value value, Value source,
@@ -234,6 +235,7 @@ FailureOr<NormalizedSummaryStructure> matchSummaryComponents(
     return failure();
   auto shift = exponential.getInput().getDefiningOp<BinaryOp>();
   if (!shift || shift.getOperatorKind() != BinaryOperator::Subtract ||
+      shift.getStrictRounding() ||
       shift.getLhs() != maskedScore.getResult() ||
       !isProjectedFrom(shift.getRhs(), maximumOrEmpty.getResult()))
     return failure();
@@ -350,7 +352,8 @@ matchNormalizedSummaryStructure(ContractOp moment) {
       ? probability.getTrueValue().getDefiningOp<UnaryOp>() : UnaryOp{};
   auto shift = exponential
       ? exponential.getInput().getDefiningOp<BinaryOp>() : BinaryOp{};
-  if (!shift || shift.getOperatorKind() != BinaryOperator::Subtract)
+  if (!shift || shift.getOperatorKind() != BinaryOperator::Subtract ||
+      shift.getStrictRounding())
     return failure();
   Value reference = shift.getRhs();
   while (Operation *producer = reference.getDefiningOp()) {
@@ -385,6 +388,9 @@ matchOnlineSummaryMerge(Region &region,
   if (region.empty() || !llvm::hasSingleElement(region) ||
       region.front().getNumArguments() != 2)
     return failure();
+  bool strict = false;
+  region.walk([&](BinaryOp binary) { strict |= binary.getStrictRounding(); });
+  if (strict) return failure();
   auto yield = dyn_cast<YieldOp>(region.front().getTerminator());
   auto record = yield && yield.getValues().size() == 1
                     ? yield.getValues().front().getDefiningOp<MakeRecordOp>()

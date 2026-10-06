@@ -12,9 +12,12 @@ add_mlir_library(MLIRIntentCuTileTransforms
   Access/TileIndices.cpp
   Access/Loads.cpp
   Access/Extraction.cpp
+  Access/FragmentStorage.cpp
   Access/Atomics.cpp
   Access/Stores.cpp
   Compute/ComputeForms.cpp
+  Compute/StrictArithmetic.cpp
+  Compute/ScaledMMA.cpp
   Configuration/Configurations.cpp
   Access/CollapseArrayViews.cpp
   Compute/RefineMMALoops.cpp

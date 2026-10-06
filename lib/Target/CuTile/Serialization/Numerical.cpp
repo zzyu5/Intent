@@ -38,6 +38,8 @@ std::string selectExpression(ArrayRef<std::string> operands) {
 
 FailureOr<Translation> translate(gpu::BinaryOp operation,
                                  ArrayRef<std::string> operands) {
+  if (operation.getStrictRounding())
+    return operation.emitOpError("strict f32 arithmetic must be legalized before cuTile source emission"), failure();
   Type element = Emitter::elementType(operation.getLhs().getType());
   auto expression = [&](std::string value) -> FailureOr<Translation> {
     return Translation{std::move(value), {}, true};

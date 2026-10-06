@@ -90,6 +90,17 @@ LogicalResult ScaledContractOp::verify() {
   auto rhs = getRhs().getType();
   auto rhsScale = getRhsScale().getType();
   auto result = getResult().getType();
+  auto carrierMatchesFormat = [](Type element, ScaledFormat format) {
+    return format == ScaledFormat::E4M3
+        ? isa<Float8E4M3FNType>(element) || element.isUnsignedInteger(8)
+        : element.isUnsignedInteger(8);
+  };
+  if (!carrierMatchesFormat(lhs.getElementType(), getLhsFormat()) ||
+      !carrierMatchesFormat(rhs.getElementType(), getRhsFormat()) ||
+      !lhsScale.getElementType().isUnsignedInteger(8) ||
+      !rhsScale.getElementType().isUnsignedInteger(8))
+    return emitOpError(
+        "scaled-contract requires format-matched carriers and u8 E8M0 scales");
   auto sameLogicalAxis = [](FragmentType left, unsigned leftAxis,
                             FragmentType right, unsigned rightAxis) {
     auto lhsMap = cast<AxisMapAttr>(left.getAxisMaps()[leftAxis]);

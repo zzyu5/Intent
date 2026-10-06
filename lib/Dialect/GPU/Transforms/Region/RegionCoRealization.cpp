@@ -33,6 +33,7 @@ additiveRegionContracts(RegionFoldOp fold, ValueRange identities) {
     auto add = mergedField ? mergedField.getDefiningOp<BinaryOp>() : BinaryOp();
     if (!contract || !contract->hasOneUse() || !add ||
         add.getOperatorKind() != BinaryOperator::Add ||
+        add.getStrictRounding() ||
         !isRecordField(stripAdditiveProjection(add.getLhs()),
                        combine.getArgument(0), field) ||
         !isRecordField(stripAdditiveProjection(add.getRhs()),

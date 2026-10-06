@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace mlir;
 
@@ -146,7 +147,63 @@ Value repeatTileForExtraction(OpBuilder &builder, Location location, Value value
       builder.getArrayAttr(mergeGroups));
 }
 
+struct RectangularCoordinate {
+  gpu::MakeRangeOp range;
+  unsigned resultAxis;
+  Value sourceExtent;
+  Value tileIndex;
+};
+
+FailureOr<RectangularCoordinate> rectangularCoordinate(
+    OpBuilder &builder, gpu::GatherOp gather, unsigned slot, Value coordinate,
+    gpu::PhysicalProgramAnalysis &analysis) {
+  auto access = cast<gpu::AccessOpInterface>(gather.getOperation());
+  auto source = cast<gpu::FragmentType>(gather.getSource().getType());
+  auto result = dyn_cast<gpu::FragmentType>(gather.getResult().getType());
+  if (!result) return failure();
+  auto ranges = analysis.sourceRanges(coordinate);
+  if (ranges.roots.size() != 1 || !gpu::isUnitStepRange(ranges.roots.front()))
+    return failure();
+  auto range = ranges.roots.front();
+  auto resultAxis = nativeAccessRangeAxis(access, slot, range);
+  if (failed(resultAxis) || result.getShape()[*resultAxis] !=
+          range.getResult().getType().getShape()[0])
+    return failure();
+  auto fullExtent = cast<gpu::PhysicalExprAttr>(source.getShape()[gather.getSourceAxes()[slot]]);
+  Value full;
+  if (fullExtent.getKind() == gpu::PhysicalExprKind::Parameter) {
+    auto kernel = gather->getParentOfType<func::FuncOp>();
+    auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getParameterReference().getName());
+    if (failed(parameter)) return failure();
+    full = gpu::materializeParameter(builder, gather.getLoc(), parameter->getReference());
+  } else {
+    full = builder.create<gpu::PhysicalExprOp>(gather.getLoc(), builder.getIndexType(), fullExtent);
+  }
+  auto index = extractionTileIndex(builder, gather.getLoc(), coordinate, range, full);
+  if (failed(index) || !index->second) return failure();
+  return RectangularCoordinate{range, *resultAxis, full, index->first};
+}
+
 } // namespace
+
+bool requiresFragmentStorage(gpu::GatherOp gather) {
+  if (!isa<gpu::FragmentType>(gather.getResult().getType())) return false;
+  auto kernel = gather->getParentOfType<func::FuncOp>();
+  gpu::PhysicalProgramAnalysis analysis(kernel);
+  OpBuilder builder(gather);
+  Operation *previous = gather->getPrevNode();
+  auto discardQueryValues = llvm::make_scope_exit([&] {
+    while (gather->getPrevNode() != previous) gather->getPrevNode()->erase();
+  });
+  for (auto [slot, value] : llvm::enumerate(gather.getCoordinates())) {
+    while (isa_and_nonnull<gpu::SplatOp, gpu::BroadcastOp>(value.getDefiningOp()))
+      value = value.getDefiningOp()->getOperand(0);
+    if (isa<gpu::FragmentType>(value.getType()) && !getCompileTimeScalar(value) &&
+        failed(rectangularCoordinate(builder, gather, slot, value, analysis)))
+      return true;
+  }
+  return false;
+}
 
 LogicalResult formFragmentExtractions(func::FuncOp kernel,
     ArrayRef<gpu::GatherOp> gathers, NativeFormRewriter &rewriter) {
@@ -185,44 +242,13 @@ LogicalResult formFragmentExtractions(func::FuncOp kernel,
       if (result) {
         if (isa<gpu::FragmentType>(coordinate.getType()) &&
             !getCompileTimeScalar(coordinate)) {
-          auto ranges = analysis.sourceRanges(coordinate);
-          // Scalar offsets can make general range analysis unknown. Use its
-          // root only as a candidate; extractionTileIndex proves unit slope,
-          // alignment and axis-preserving reshapes for the whole expression.
-          if (ranges.roots.size() != 1 ||
-              !gpu::isUnitStepRange(ranges.roots.front())) {
-            InFlightDiagnostic diagnostic = gather.emitOpError(
-                "cuTile tile extraction requires a contiguous unit-step coordinate");
-            diagnostic << "; coordinate=" << coordinate
-                       << "; range_state=" << static_cast<unsigned>(ranges.state)
-                       << "; roots=" << ranges.roots.size();
-            return failure();
-          }
-          auto range = ranges.roots.front();
-          auto resultAxis = nativeAccessRangeAxis(access, slot, range);
-          if (failed(resultAxis) || result.getShape()[*resultAxis] !=
-                  range.getResult().getType().getShape()[0])
-            return gather.emitOpError(
-                "cuTile tile extraction coordinate has no unique result axis");
-          extractionShape[sourceAxis] = result.getShape()[*resultAxis];
-          auto fullExtent =
-              cast<gpu::PhysicalExprAttr>(source.getShape()[sourceAxis]);
-          Value full;
-          if (fullExtent.getKind() ==
-              gpu::PhysicalExprKind::Parameter) {
-            auto parameter = gpu::queryParameterBySymbol(kernel, fullExtent.getParameterReference().getName());
-            if (failed(parameter))
-              return gather.emitOpError("tile extraction source extent has no parameter");
-            full = gpu::materializeParameter(builder, gather.getLoc(), parameter->getReference());
-          } else {
-            full = builder.create<gpu::PhysicalExprOp>(
-                gather.getLoc(), builder.getIndexType(), fullExtent);
-          }
-          auto index = extractionTileIndex(builder, gather.getLoc(), coordinate,
-                                           range, full);
-          if (failed(index) || !index->second)
+          auto selected = rectangularCoordinate(builder, gather, slot, coordinate, analysis);
+          if (failed(selected))
             return gather.emitOpError(
                 "cuTile coordinate is not an aligned rectangular sub-tile");
+          auto range = selected->range;
+          Value full = selected->sourceExtent;
+          extractionShape[sourceAxis] = result.getShape()[selected->resultAxis];
           Value extractionExtent = builder.create<gpu::BinaryOp>(
               gather.getLoc(), builder.getIndexType(), full, range.getExtent(),
               BinaryOperator::Maximum);
@@ -235,7 +261,7 @@ LogicalResult formFragmentExtractions(func::FuncOp kernel,
               gather.getLoc(), builder.getIndexType(), count, one,
               BinaryOperator::Subtract);
           Value nonnegative = builder.create<gpu::BinaryOp>(
-              gather.getLoc(), builder.getIndexType(), index->first, zero,
+              gather.getLoc(), builder.getIndexType(), selected->tileIndex, zero,
               BinaryOperator::Maximum);
           // An aligned sub-tile is either entirely inside or outside the
           // physical source. Preserve the gather mask/fill while keeping the

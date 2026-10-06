@@ -10,6 +10,7 @@ add_mlir_library(MLIRIntentKIRToGPU
   Memory.cpp
   Values.cpp
   Structured.cpp
+  Quantization.cpp
   Control.cpp
   ConstructionSchema.cpp
 

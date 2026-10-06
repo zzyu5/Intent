@@ -326,6 +326,10 @@ private:
 
   LogicalResult lower(intent::HistogramOp histogram);
 
+  LogicalResult lower(intent::QuantizeOp quantize);
+
+  LogicalResult lower(intent::QuantizedDotOp dot);
+
   LogicalResult lower(intent::RandomBitsOp random);
 
   LogicalResult lower(intent::BufferOp buffer);

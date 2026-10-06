@@ -200,6 +200,10 @@ LogicalResult ScalarRegionLowering::lower(Operation *operation) {
     return lower(contract);
   if (auto histogram = dyn_cast<intent::HistogramOp>(operation))
     return lower(histogram);
+  if (auto quantize = dyn_cast<intent::QuantizeOp>(operation))
+    return lower(quantize);
+  if (auto dot = dyn_cast<intent::QuantizedDotOp>(operation))
+    return lower(dot);
   if (auto random = dyn_cast<intent::RandomBitsOp>(operation))
     return lower(random);
   if (auto buffer = dyn_cast<intent::BufferOp>(operation))

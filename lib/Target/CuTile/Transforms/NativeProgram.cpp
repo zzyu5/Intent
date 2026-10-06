@@ -34,11 +34,6 @@ LogicalResult formNativeProgram(ModuleOp module) {
     else if (auto op = dyn_cast<gpu::ScanOp>(operation)) computations.scans.push_back(op);
     else if (auto op = dyn_cast<gpu::AssumeInBoundsOp>(operation)) assumptions.push_back(op);
   });
-  auto capabilities =
-      kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  if (!computations.scaledContracts.empty() && !supportsE8M0ScaledMMA(capabilities))
-    return computations.scaledContracts.front().emitOpError(
-        "cuTile E8M0 scaled MMA requires compute capability 10.0 or newer");
   NativeFormRewriter rewriter;
   if (failed(formNativeAccesses(kernel, *profiles, accesses, features.matrixCompute,
                                 rewriter)) ||

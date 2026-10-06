@@ -16,27 +16,11 @@
 
 using namespace mlir;
 namespace intent::cutile {
-gpu::FragmentType transposeRankTwo(gpu::FragmentType source) {
-  SmallVector<Attribute> shape = {source.getShape()[1], source.getShape()[0]};
-  SmallVector<Attribute> mappings;
-  mappings.reserve(2);
-  for (unsigned resultAxis = 0; resultAxis < 2; ++resultAxis) {
-    const unsigned sourceAxis = 1 - resultAxis;
-    auto mapping = cast<gpu::AxisMapAttr>(source.getAxisMaps()[sourceAxis]);
-    mappings.push_back(gpu::AxisMapAttr::get(
-        source.getContext(), mapping.getSourceId(), mapping.getSourceAxis(),
-        mapping.getDimensionId(), resultAxis, mapping.getDerived()));
-  }
-  return gpu::FragmentType::get(
-      source.getContext(), source.getElementType(),
-      ArrayAttr::get(source.getContext(), shape),
-      ArrayAttr::get(source.getContext(), mappings), source.getValidity(),
-      source.getOwner());
-}
-
 std::optional<BinaryOperator> nativeCombineKind(Region &region) {
   auto combine = gpu::queryBinaryCombine(region);
   if (!combine)
+    return std::nullopt;
+  if (combine->operation.getStrictRounding())
     return std::nullopt;
   // Every selected native kind below is commutative and has no non-default
   // math mode. Other combines retain the actual ordered callback operations.
@@ -350,33 +334,8 @@ LogicalResult formComputePrimitives(func::FuncOp kernel,
   }
 
   for (gpu::ScaledContractOp contract : inputs.scaledContracts) {
-    if (contract.getLhsReductionAxes() != ArrayRef<int64_t>{1, 2} ||
-        contract.getRhsReductionAxes() != ArrayRef<int64_t>{0, 1} ||
-        !contract.getLhsBatchAxes().empty() ||
-        !contract.getRhsBatchAxes().empty() ||
-        contract.getLhsFormat() != ScaledFormat::E4M3 ||
-        contract.getRhsFormat() != ScaledFormat::E4M3 ||
-        contract.getLhsGroupSize() != 32 ||
-        contract.getRhsGroupSize() != 32)
-      return contract.emitOpError(
-          "cuTile scaled MMA requires E4M3/E8M0 group-32 adjacent reduction axes");
-    OpBuilder builder(contract);
-    auto rhsScale = builder.create<gpu::TransposeOp>(
-        contract.getLoc(),
-        transposeRankTwo(
-            cast<gpu::FragmentType>(contract.getRhsScale().getType())),
-        contract.getRhsScale(), ArrayRef<int64_t>{1, 0});
-    if (Attribute origin = contract->getAttr(gpu::originAttr))
-      rhsScale->setAttr(gpu::originAttr, origin);
-    auto replacement = builder.create<ScaledMMAOp>(
-        contract.getLoc(), contract.getResult().getType(), contract.getLhs(),
-        contract.getLhsScale(), contract.getRhs(), rhsScale,
-        contract.getAccumulator(), contract.getLhsFormat(),
-        contract.getRhsFormat(), contract.getLhsGroupSize(),
-        contract.getRhsGroupSize());
-    if (Attribute origin = contract->getAttr(gpu::originAttr))
-      replacement->setAttr(gpu::originAttr, origin);
-    rewriter.replace(contract, ValueRange{replacement.getResult()});
+    if (failed(formScaledMMA(kernel, contract, rewriter)))
+      return failure();
   }
 
   return success();

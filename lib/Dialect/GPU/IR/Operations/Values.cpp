@@ -88,6 +88,13 @@ LogicalResult UnaryOp::verify() {
 }
 
 LogicalResult BinaryOp::verify() {
+  if (getStrictRounding() &&
+      (!elementType(getLhs().getType()).isF32() || getApproximate() ||
+       getFlushToZero() ||
+       (getOperatorKind() != BinaryOperator::Add &&
+        getOperatorKind() != BinaryOperator::Subtract &&
+        getOperatorKind() != BinaryOperator::Multiply)))
+    return emitOpError("strict rounding requires non-approximate, non-FTZ f32 add/subtract/multiply");
   if (failed(verifyPointwiseMathMode(getOperation(), elementType(getLhs().getType()))))
     return failure();
   return verifyDataSchemas(getOperation(), {getLhs().getType(), getRhs().getType()},

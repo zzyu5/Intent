@@ -71,6 +71,10 @@ bool composeReshapedPointwise(ReshapeOp reshape) {
       !isa<UnaryOp, BinaryOp, CompareOp, SelectOp, CastOp, BitcastOp,
            SplatOp, BroadcastOp>(producer))
     return false;
+  // Push the bijective shape change through computation only when that
+  // computation is replaced. A shared result is an existing complete snapshot;
+  // retain its reshape instead of duplicating the numerical producer DAG.
+  if (!reshape.getValue().hasOneUse()) return false;
   for (Value operand : producer->getOperands()) {
     auto fragment = dyn_cast<FragmentType>(operand.getType());
     if (fragment &&
