@@ -5,9 +5,11 @@ from math import prod
 from itertools import product
 from pathlib import Path
 
+from intent.language.dtypes import DTYPES
+
 
 _runtimes: dict[str, Runtime] = {}
-ELEMENT_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "i32": 4, "i64": 8, "bool": 1}
+ELEMENT_BYTES = {name: (dtype.bits + 7) // 8 for name, dtype in DTYPES.items()}
 
 
 class Runtime:
