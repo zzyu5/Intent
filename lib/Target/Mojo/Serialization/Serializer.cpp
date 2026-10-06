@@ -232,6 +232,7 @@ public:
       addNative<vector::StepOp>(result);
       addNative<vector::ShuffleOp>(result);
       addNative<vector::ExtractElementOp>(result);
+      addNative<math::RoundEvenOp>(result);
       addNative<vector::ReductionOp>(result, [](vector::ReductionOp op) -> LogicalResult {
         auto vectorType = cast<VectorType>(op.getVector().getType());
         Type element = vectorType.getElementType();
@@ -258,6 +259,8 @@ public:
 
   LogicalResult emitNativeOperation(Operation *operation) override {
     if (mlir::failed(verifySourceOperation(operation))) return failure();
+    if (isa<math::RoundEvenOp>(operation))
+      return targetEmitters().emit(operation, *this);
     if (isStandardScalarOperation(operation)) {
       SmallVector<std::string> operands;
       for (Value value : operation->getOperands()) operands.push_back(name(value));
@@ -392,6 +395,11 @@ private:
     assign(op.getResult(), expression);
     return success();
   }
+  LogicalResult emitTyped(math::RoundEvenOp op) {
+    assign(op.getResult(), "llvm_intrinsic[\"llvm.roundeven\", " + valueType(op.getType()) +
+        ", has_side_effect=False](" + name(op.getOperand()) + ")");
+    return success();
+  }
   LogicalResult emitTyped(vector::ReductionOp op) {
     if (op.getKind() == vector::CombiningKind::MAXIMUMF ||
         op.getKind() == vector::CombiningKind::MINIMUMF) {
@@ -457,6 +465,8 @@ LogicalResult verifySourceOperation(Operation *operation) {
   if (isa<ModuleOp, func::FuncOp, func::ReturnOp, scf::YieldOp,
           scf::ConditionOp, cpu::TaskYieldOp>(operation))
     return success();
+  if (isa<math::RoundEvenOp>(operation))
+    return Serializer::targetEmitters().verify(operation);
   if (isStandardScalarOperation(operation)) return verifyScalar(operation);
   const auto &metadata = NativeSourceEmitter::metadataEmitters();
   if (metadata.contains(operation)) return metadata.verify(operation);

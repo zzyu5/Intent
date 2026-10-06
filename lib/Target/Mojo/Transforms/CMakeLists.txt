@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentMojoTransforms
   Passes.cpp
   Implementations.cpp
   MaterializeRegisterContractions.cpp
+  Quantization.cpp
   DEPENDS IntentMojoTransformsIncGen
   LINK_LIBS PUBLIC
   MLIRIntentCPUTransforms

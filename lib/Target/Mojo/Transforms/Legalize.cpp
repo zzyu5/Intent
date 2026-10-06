@@ -8,6 +8,7 @@
 #include "Intent/Dialect/CPU/IR/CPUAttrs.h"
 #include "Intent/Target/Mojo/Transforms/Passes.h"
 #include "Legalize.h"
+#include "Quantization.h"
 #include "Intent/Target/Mojo/Serialization/Serializer.h"
 #include "Intent/Dialect/CPU/Transforms/Storage/Bufferization.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -213,7 +214,8 @@ LogicalResult prepareNativeProgram(ModuleOp module) {
     auto programBinding = function->getAttrOfType<cpu::ImplementationAttr>("intent_cpu.implementation");
     if (!programBinding)
       return function.emitError("Mojo materialization requires an explicit program implementation");
-    if (failed(materializeRegisterContractions(function)) ||
+    if (failed(materializeQuantizedComputations(function, **implementations)) ||
+        failed(materializeRegisterContractions(function)) ||
         failed(cpu::materializeStructuredComputations(function, [&](Operation *operation) {
           // Preparation and fills have no source computation to inherit from.
           // The explicitly selected program implementation owns these loops.
