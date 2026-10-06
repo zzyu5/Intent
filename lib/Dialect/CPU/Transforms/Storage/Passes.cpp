@@ -45,8 +45,10 @@ public:
   using CPUReuseScratchStorageBase::CPUReuseScratchStorageBase;
   void runOnOperation() final {
     if (failed(detail::transformFunctions(getOperation(), getArgument(),
-            [](func::FuncOp function) {
-              return reuseScratchStorage(function, ScratchRepresentation::PreserveDescriptors);
+            [&](func::FuncOp function) {
+              return reuseScratchStorage(function, linearCapacity
+                  ? ScratchRepresentation::LinearCapacity
+                  : ScratchRepresentation::PreserveDescriptors);
             })))
       signalPassFailure();
   }

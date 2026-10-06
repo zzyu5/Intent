@@ -3,7 +3,6 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/Support/MathExtras.h"
-#include <limits>
 
 using namespace mlir;
 
@@ -32,6 +31,25 @@ ScratchAllocation *ScratchSnapshot::get(unsigned number) {
 DominanceInfo &ScratchSnapshot::getDominance() {
   if (!dominance) dominance.emplace(function);
   return *dominance;
+}
+
+std::optional<bool> ScratchSnapshot::hasLoopOnlyDataUses(
+    const ScratchAllocation &scratch, scf::ForOp loop) {
+  if (!storage) storage.emplace(function);
+  bool accessed = false;
+  for (Operation *user : scratch.aliases.users) {
+    auto effects = storage->effects(user);
+    if (!effects.complete) return std::nullopt;
+    for (const auto &entry : effects.entries) {
+      if (!isa<MemoryEffects::Read, MemoryEffects::Write>(entry.effect.getEffect())) continue;
+      Value memory = entry.effect.getValue();
+      if (!memory) return std::nullopt;
+      if (storage->disjoint(scratch.memory, memory)) continue;
+      if (entry.operation != loop.getOperation() && !loop->isAncestor(entry.operation)) return false;
+      accessed = true;
+    }
+  }
+  return accessed;
 }
 
 std::optional<ScratchAllocation> scratchAllocation(Operation *operation,
@@ -81,19 +99,26 @@ std::optional<ScratchAllocation> scratchAllocation(Operation *operation,
                            std::move(aliases), stack};
 }
 
+std::optional<int64_t> scratchBytes(const ScratchAllocation &scratch,
+                                  int64_t capacity) {
+  Type element = scratch.type.getElementType();
+  if (!element.isIntOrIndexOrFloat() || capacity < 0) return std::nullopt;
+  int64_t bytes = element.isIndex() ? 8 : (element.getIntOrFloatBitWidth() + 7) / 8;
+  if (bytes <= 0 || llvm::MulOverflow(capacity, bytes, bytes)) return std::nullopt;
+  return bytes;
+}
+
 std::optional<int64_t> scratchCapacity(const ScratchAllocation &scratch,
                                       int64_t byteLimit) {
-  Type element = scratch.type.getElementType();
-  if (!element.isIntOrIndexOrFloat()) return std::nullopt;
-  int64_t bytes = element.isIndex() ? 8 : (element.getIntOrFloatBitWidth() + 7) / 8;
-  if (bytes <= 0 || byteLimit <= 0) return std::nullopt;
+  auto bytes = scratchBytes(scratch, 1);
+  if (!bytes || byteLimit <= 0) return std::nullopt;
   int64_t capacity = 1;
   for (int64_t axis = 0; axis < scratch.type.getRank(); ++axis) {
     auto extent = constantDimensionUpperBound(scratch.memory, axis);
     if (!extent || *extent < 0 || llvm::MulOverflow(capacity, *extent, capacity))
       return std::nullopt;
   }
-  if (capacity <= 0 || capacity > byteLimit / bytes) return std::nullopt;
+  if (capacity <= 0 || capacity > byteLimit / *bytes) return std::nullopt;
   return capacity;
 }
 

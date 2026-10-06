@@ -205,10 +205,15 @@ def CPUReuseScratchStorage : CPUTransform<"intent-cpu-reuse-scratch-storage",
   let description = [{
     Requires and preserves the CPU Buffers contract. Reuses nonescaping scratch
     slots with disjoint lifetimes and places storage outside serial traversals.
-    Preserves the existing descriptor representation. Initialization and
-    accesses retain their original locations; parallel and task allocation
-    owners are not crossed.
+    By default preserves the existing descriptor representation. Linear capacity
+    reuses bounded backing storage while keeping dynamic descriptors at their
+    original locations. Its loop-exclusive heap pool is constrained by current
+    CPU capabilities, including already resident backings. Initialization and
+    accesses retain their original locations; task and parallel owners are not
+    crossed, and conditional placement does not move automatic allocations.
   }];
+  let options = [Option<"linearCapacity", "linear-capacity", "bool", "false",
+    "Reuse bounded linear backings within the current CPU private capacity">];
 }
 
 def CPUOptimizeMemoryAccesses : CPUTransform<"intent-cpu-optimize-memory-accesses",

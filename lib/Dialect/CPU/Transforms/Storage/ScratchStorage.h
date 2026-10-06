@@ -33,6 +33,8 @@ public:
   llvm::ArrayRef<ScratchCandidate> candidates() const { return allocations; }
   ScratchAllocation *get(unsigned number);
   mlir::DominanceInfo &getDominance();
+  std::optional<bool> hasLoopOnlyDataUses(const ScratchAllocation &scratch,
+                                        mlir::scf::ForOp loop);
 
 private:
   mlir::func::FuncOp function;
@@ -45,6 +47,8 @@ std::optional<ScratchAllocation> scratchAllocation(
     mlir::Operation *operation, StorageAnalysis &storage);
 std::optional<int64_t> scratchCapacity(const ScratchAllocation &scratch,
                                       int64_t byteLimit);
+std::optional<int64_t> scratchBytes(const ScratchAllocation &scratch,
+                                  int64_t capacity);
 int64_t scratchAlignment(const ScratchAllocation &scratch);
 mlir::Value createScratchBacking(mlir::OpBuilder &builder,
     const ScratchAllocation &scratch, int64_t capacity, int64_t alignment);
