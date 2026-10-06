@@ -7,6 +7,14 @@
 using namespace mlir;
 
 namespace intent::dsa {
+bool isStorageElementType(Type type) {
+  if (type.isF16() || type.isBF16() || type.isF32() || type.isF64() ||
+      isa<Float8E4M3FNType, Float8E5M2Type>(type))
+    return true;
+  auto integer = dyn_cast<IntegerType>(type);
+  return integer && llvm::is_contained(ArrayRef<unsigned>{1, 8, 16, 32, 64},
+                                      integer.getWidth());
+}
 namespace {
 
 bool localCapacity(MemRefType type) {
@@ -15,8 +23,7 @@ bool localCapacity(MemRefType type) {
       type.getMemorySpaceAsInt() != nramSpace)
     return false;
   Type element = type.getElementType();
-  return element.isF16() || element.isBF16() || element.isF32() ||
-         element.isInteger(1) || element.isInteger(32) || element.isInteger(64);
+  return isStorageElementType(element);
 }
 
 SmallVector<int64_t> contiguousStrides(MemRefType type) {

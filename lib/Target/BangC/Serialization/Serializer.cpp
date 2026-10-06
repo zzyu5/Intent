@@ -286,6 +286,13 @@ private:
     if (auto store = dyn_cast<dsa::StoreScalarOp>(op)) {
       line(name(store.getDestination()) + "[" + name(store.getOffset()) + "] = " + name(store.getValue()) + ";"); return success();
     }
+    if (auto atomic = dyn_cast<dsa::AtomicAddOp>(op)) {
+      line("__bang_atomic_add(" + name(atomic.getOutput()) + ", " +
+           name(atomic.getSource()) + " + " + name(atomic.getOffset()) + ", " +
+           name(atomic.getValue()) + ", 1);");
+      line("__sync();");
+      return success();
+    }
     if (auto binary = dyn_cast<dsa::BinaryOp>(op)) {
       if (auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
           implementation && implementation.getValue() == "cycle") {

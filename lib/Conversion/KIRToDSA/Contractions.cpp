@@ -77,13 +77,18 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
   auto leftType = cast<RankedTensorType>(matrix.getLhs().getType());
   auto rightType = cast<RankedTensorType>(matrix.getRhs().getType());
   auto axes = contractionAxes(matrix);
-  if (leftType.getRank() < 1 || leftType.getRank() > 2 || rightType.getRank() < 1 || rightType.getRank() > 2 || !axes || axes->reduction.size() != 1 ||
-      !axes->batch.empty() ||
-      !cast<RankedTensorType>(matrix.getResult().getType()).getElementType().isF32())
-    return matrix.emitError("DSA local matrix/vector multiplication requires one paired axis and f32 accumulation");
+  Type accumulatorType = cast<RankedTensorType>(matrix.getResult().getType()).getElementType();
+  bool integer = leftType.getElementType().isInteger(8) &&
+      rightType.getElementType().isInteger(8) && accumulatorType.isInteger(32) &&
+      !cast<IntegerType>(leftType.getElementType()).isUnsigned() &&
+      !cast<IntegerType>(rightType.getElementType()).isUnsigned();
+  if (!axes || axes->reduction.size() != 1 || axes->lhsFree.size() > 1 ||
+      axes->rhsFree.size() > 1 || (!accumulatorType.isF32() && !integer))
+    return matrix.emitError("DSA matrix realization requires one paired reduction, at most one free axis per operand, and f32 or i8-to-i32 accumulation");
   int64_t leftReduce = axes->reduction.front().lhs, rightReduce = axes->reduction.front().rhs;
-  if (stream && shape.size() == 2 && leftType.getRank() == 2 && rightType.getRank() == 2) {
-    SmallVector<ContractOp> group = sharedInputProducts(matrix);
+  if (stream) {
+    SmallVector<ContractOp> group = !integer && axes->batch.empty() && shape.size() == 2
+        ? sharedInputProducts(matrix) : SmallVector<ContractOp>{matrix};
     SmallVector<std::pair<Value, unsigned>> roots{{matrix.getLhs(), leftReduce}};
     for (ContractOp product : group) roots.emplace_back(product.getRhs(), rightReduce);
     auto plan = planExecutionSlices(*matrix->getBlock(), 0, roots);
@@ -92,7 +97,10 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
       roots = {{matrix.getLhs(), leftReduce}, {matrix.getRhs(), rightReduce}};
       plan = planExecutionSlices(*matrix->getBlock(), 0, roots);
     }
-    int64_t capacity = config.getTileK();
+    // Every integer product and partial sum is exact in the selected f32
+    // accumulator: abs(i8*i8)*K <= 16384*1024 == 2^24.
+    int64_t capacity = integer ? std::min<int64_t>(config.getTileK(), 1024)
+                              : config.getTileK();
     // Existing complete snapshots already pay for their full reduction axis.
     // Inspect their actual descriptors without materializing another source or
     // changing a surrounding ordered loop's state transitions.
@@ -121,7 +129,7 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
         auto rhs = snapshotDepth(product.getRhs(), rightReduce);
         if (!rhs || !available || *rhs != *available) { available.reset(); break; }
       }
-      if (available)
+      if (available && !integer && shape.size() == 2)
         capacity = dsa::selectMatrixPanelDepth(function, config, leftType.getElementType(),
             shape[0].capacity, shape[1].capacity, *available, capacity, group.size());
     }
@@ -136,7 +144,7 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
         auto selected = localShape(product.getResult(), loc);
         if (failed(selected)) return failure();
         resultShapes.push_back(*selected);
-        accumulators.push_back(allocateTensor(loc, b.getF32Type(), *selected));
+        accumulators.push_back(allocateTensor(loc, accumulatorType, *selected));
       }
       auto savedValues = values; auto savedProducts = products; auto savedSlices = valueSlices;
       LogicalResult status = loop(loc, index(loc, 0), domain->extent, index(loc, domain->capacity), [&](Value begin) {
@@ -153,6 +161,8 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
       return success();
     }
   }
+  if (integer || !axes->batch.empty() || leftType.getRank() > 2 || rightType.getRank() > 2)
+    return localMatrixProduct(matrix, *axes, shape, output);
   Value rightOperand = matrix.getRhs();
   while (auto transpose = rightOperand.getDefiningOp<TransposeOp>()) {
     auto permutation = transpose.getPermutation();
@@ -205,6 +215,87 @@ LogicalResult Construction::localMatMul(ContractOp matrix, const LocalShape &sha
     }))) return failure();
   }
   values.map(matrix.getResult(), output); return success();
+}
+
+LogicalResult Construction::localMatrixProduct(
+    ContractOp matrix, const ContractionAxes &axes,
+    const LocalShape &shape, Value output) {
+  Location loc = matrix.getLoc();
+  Value lhs = get(matrix.getLhs()), rhs = get(matrix.getRhs());
+  if (!lhs || !rhs || !localShapes.count(lhs) || !localShapes.count(rhs))
+    return matrix.emitError("matrix operands have no selected local storage");
+  LocalShape left = localShapes.lookup(lhs), right = localShapes.lookup(rhs);
+  unsigned lk = axes.reduction.front().lhs, rk = axes.reduction.front().rhs;
+  if (!sameIndex(left[lk].begin, right[rk].begin) ||
+      !sameIndex(left[lk].count, right[rk].count) ||
+      left[lk].capacity != right[rk].capacity)
+    return matrix.emitError("matrix reduction windows disagree");
+  Type resultType = cast<RankedTensorType>(matrix.getResult().getType()).getElementType();
+  bool integer = resultType.isInteger(32);
+  if (integer && left[lk].capacity > 1024)
+    return matrix.emitError("exact i8 matrix partial requires at most 1024 reduction members");
+  Type inputType = integer ? Type(b.getF16Type()) : cast<MemRefType>(lhs.getType()).getElementType();
+  LocalAxis unit{index(loc, 1), index(loc, 0), index(loc, 1), 1};
+  LocalAxis rows = axes.lhsFree.empty() ? unit : left[axes.lhsFree.front()];
+  LocalAxis columns = axes.rhsFree.empty() ? unit : right[axes.rhsFree.front()];
+  LocalShape batches;
+  SmallVector<unsigned> batchResults;
+  for (auto pair : axes.batch) {
+    batchResults.push_back(*axes.lhsResultAxes[pair.lhs]);
+    batches.push_back(left[pair.lhs]);
+    if (!sameIndex(left[pair.lhs].begin, right[pair.rhs].begin) ||
+        !sameIndex(left[pair.lhs].count, right[pair.rhs].count))
+      return matrix.emitError("matrix batch windows disagree");
+  }
+  if (!output) output = allocateTensor(loc, resultType, shape);
+  if (failed(eachElement(loc, batches, [&](ValueRange batch) {
+    SmallVector<Value> resultCoordinates(shape.size(), index(loc, 0));
+    for (auto [position, value] : llvm::zip_equal(batchResults, batch))
+      resultCoordinates[position] = value;
+    LocalShape aShape{rows, left[lk]}, bShape{right[rk], columns};
+    Value a = allocateTensor(loc, inputType, aShape);
+    Value c = allocateTensor(loc, inputType, bShape);
+    auto pack = [&](Value input, Value destination, bool isLeft,
+                    const LocalShape &packed) {
+      const auto &mapping = isLeft ? axes.lhsResultAxes : axes.rhsResultAxes;
+      unsigned reduction = isLeft ? lk : rk;
+      return eachElement(loc, packed, [&](ValueRange ij) {
+        SmallVector<Value> source(mapping.size(), index(loc, 0));
+        for (unsigned axis = 0; axis < mapping.size(); ++axis)
+          if (mapping[axis]) source[axis] = resultCoordinates[*mapping[axis]];
+        if (isLeft && !axes.lhsFree.empty()) source[axes.lhsFree.front()] = ij[0];
+        if (!isLeft && !axes.rhsFree.empty()) source[axes.rhsFree.front()] = ij[1];
+        source[reduction] = ij[isLeft ? 1 : 0];
+        storeLocal(loc, loadLocal(loc, input, source), destination, ij);
+        return success();
+      });
+    };
+    if (failed(pack(lhs, a, true, aShape)) || failed(pack(rhs, c, false, bShape)))
+      return failure();
+    LocalShape resultShape{rows, columns};
+    Value partial = allocateTensor(loc, b.getF32Type(), resultShape);
+    auto bindResult = [&](ValueRange ij) {
+      if (!axes.lhsFree.empty()) resultCoordinates[*axes.lhsResultAxes[axes.lhsFree.front()]] = ij[0];
+      if (!axes.rhsFree.empty()) resultCoordinates[*axes.rhsResultAxes[axes.rhsFree.front()]] = ij[1];
+    };
+    if (!integer && failed(eachElement(loc, resultShape, [&](ValueRange ij) {
+      bindResult(ij);
+      storeLocal(loc, loadLocal(loc, output, resultCoordinates), partial, ij);
+      return success();
+    }))) return failure();
+    b.create<dsa::MatMulOp>(loc, a, c, partial, rows.count, left[lk].count,
+                            columns.count, b.getBoolAttr(false));
+    return eachElement(loc, resultShape, [&](ValueRange ij) {
+      bindResult(ij);
+      Value value = scalarCast(loc, loadLocal(loc, partial, ij), resultType);
+      if (integer)
+        value = b.create<arith::AddIOp>(loc, loadLocal(loc, output, resultCoordinates), value);
+      storeLocal(loc, value, output, resultCoordinates);
+      return success();
+    });
+  }))) return failure();
+  values.map(matrix.getResult(), output);
+  return success();
 }
 
 } // namespace intent::kir_to_dsa

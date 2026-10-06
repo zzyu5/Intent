@@ -124,6 +124,11 @@ private:
   LogicalResult joinTensor(Operation *op, const LocalShape &shape);
   bool canDefer(Operation *op);
   LogicalResult tensorOperation(Operation *op);
+  LogicalResult histogram(HistogramOp operation);
+  LogicalResult atomic(AtomicRMWOp operation);
+  LogicalResult quantize(QuantizeOp operation);
+  LogicalResult quantizedDot(QuantizedDotOp operation);
+  LogicalResult scaledMatMul(ScaledContractOp operation, const LocalShape &shape);
 
   // AccessCoordinates.cpp: logical coordinate reification and local geometry.
   IndexTermMaterialization indexMaterialization(Location loc);
@@ -141,6 +146,8 @@ private:
   std::optional<ContractionAxes> contractionAxes(ContractOp matrix);
   SmallVector<ContractOp> sharedInputProducts(ContractOp matrix);
   LogicalResult localMatMul(ContractOp matrix, const LocalShape &shape, Value output = {}, bool stream = true);
+  LogicalResult localMatrixProduct(ContractOp matrix, const ContractionAxes &axes,
+                                  const LocalShape &shape, Value output);
 
   // Collectives.cpp: typed helper binding, reductions, and scans.
   void bindHelperValue(Value formal, ArrayRef<Value> fields, bool rebase = false, int64_t sourceAxis = -1);

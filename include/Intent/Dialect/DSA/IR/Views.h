@@ -7,6 +7,10 @@
 
 namespace intent::dsa {
 
+// Addressable numerical elements. Native arithmetic primitives impose their
+// own, narrower operand requirements independently of storage legality.
+bool isStorageElementType(mlir::Type type);
+
 // A complete, zero-offset contiguous local view rooted in an allocation or a
 // borrowed collective argument. Partial or differently strided aliases fail.
 bool isCompleteLocalStorageView(mlir::Value value);

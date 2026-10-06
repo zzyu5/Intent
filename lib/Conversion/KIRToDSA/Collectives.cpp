@@ -248,13 +248,38 @@ LogicalResult Construction::reduceTensor(ReduceOp reduce) {
     unsigned axis = axes.front();
     auto shape = localShape(reduce.getSources().front(), loc);
     if (failed(shape)) return failure();
-    int64_t elements = 1;
-    for (const LocalAxis &local : *shape) elements *= local.capacity;
-    int64_t bytes = std::max<int64_t>(1,
-        (storageElement(first.getElementType()).getIntOrFloatBitWidth() + 7) / 8);
+    // A reduction consumes the materialized producer DAG, not only its final
+    // tensor. Count distinct local snapshots before selecting an unsliced row.
+    int64_t sourceBytes = 0;
+    DenseSet<Value> sized;
+    std::function<LogicalResult(Value)> account = [&](Value value) {
+      if (!sized.insert(value).second) return success();
+      if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
+        auto local = localShape(value, loc);
+        if (failed(local)) return failure();
+        int64_t bytes = std::max<int64_t>(1,
+            (storageElement(type.getElementType()).getIntOrFloatBitWidth() + 7) / 8);
+        for (const LocalAxis &axis : *local) {
+          if (bytes > config.getLocalBytes() / axis.capacity) {
+            sourceBytes = config.getLocalBytes();
+            return success();
+          }
+          bytes *= axis.capacity;
+        }
+        sourceBytes += std::min<int64_t>(bytes, config.getLocalBytes() - sourceBytes);
+      }
+      Operation *producer = value.getDefiningOp();
+      if (!producer || producer->getNumRegions() || values.lookupOrNull(value))
+        return success();
+      for (Value operand : producer->getOperands())
+        if (failed(account(operand))) return failure();
+      return success();
+    };
+    for (Value source : reduce.getSources())
+      if (failed(account(source))) return failure();
     int64_t dimension = cast<TensorShapeAttr>(first.getEncoding()).getDimensions()[axis];
     bool stream = (*shape)[axis].capacity > config.getRegionTile() &&
-        elements > config.getLocalBytes() / bytes / 2 && completeShape(*shape);
+        sourceBytes > config.getLocalBytes() / 2 && completeShape(*shape);
     for (const auto &field : logicalComponents(reduce.getSources())) {
       auto type = dyn_cast<RankedTensorType>(field.type);
       if (!type || axis >= type.getRank()) { stream = false; break; }

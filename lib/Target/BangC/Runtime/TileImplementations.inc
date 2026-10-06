@@ -28,6 +28,47 @@ __mlu_func__ uint64_t intent_round_shift(uint64_t value, int shift) {
   const uint64_t halfway = uint64_t(1) << (shift - 1);
   return quotient + (remainder > halfway || (remainder == halfway && (quotient & 1)));
 }
+template<class To, class From>
+__mlu_func__ To intent_scalar_bitcast(From value) {
+  static_assert(sizeof(To) == sizeof(From), "bitcast preserves storage bits");
+  union { From from; To to; } bits;
+  bits.from = value;
+  return bits.to;
+}
+template<int E, int M, int Bias, bool Finite>
+__mlu_func__ float intent_fp8_to_float(uint8_t value) {
+  const unsigned fraction = value & ((1u << M) - 1);
+  const unsigned exponent = (value >> M) & ((1u << E) - 1);
+  float magnitude;
+  if (exponent == ((1u << E) - 1) && (!Finite || fraction == ((1u << M) - 1)))
+    magnitude = Finite || fraction ? NAN : INFINITY;
+  else if (!exponent)
+    magnitude = ldexpf(float(fraction), 1 - Bias - M);
+  else
+    magnitude = ldexpf(float((1u << M) | fraction), int(exponent) - Bias - M);
+  return value & 128 ? -magnitude : magnitude;
+}
+template<int E, int M, int Bias, bool Finite>
+__mlu_func__ uint8_t intent_number_to_fp8(double value) {
+  const uint64_t bits = intent_scalar_bitcast<uint64_t>(value);
+  const uint8_t sign = uint8_t(bits >> 56) & 128;
+  const unsigned exponent = unsigned((bits >> 52) & 2047);
+  const uint64_t fraction = bits & ((uint64_t(1) << 52) - 1);
+  const uint8_t infinity = uint8_t(((1u << E) - 1) << M);
+  if (exponent == 2047) return sign | (Finite || fraction ? 127 : infinity);
+  if (!exponent) return sign;
+  int e = int(exponent) - 1023;
+  const uint64_t significand = (uint64_t(1) << 52) | fraction;
+  if (e < 1 - Bias)
+    return sign | uint8_t(intent_round_shift(significand, 53 - Bias - M - e));
+  if (e > int((1u << E) - 1) - Bias) return sign | (Finite ? 127 : infinity);
+  uint64_t rounded = intent_round_shift(significand, 52 - M);
+  if (rounded == (uint64_t(1) << (M + 1))) { rounded >>= 1; ++e; }
+  const unsigned encoded = unsigned(e + Bias) * (1u << M) + unsigned(rounded - (1u << M));
+  if (encoded >= (Finite ? 127u : unsigned(infinity)))
+    return sign | (Finite ? 127 : infinity);
+  return sign | uint8_t(encoded);
+}
 __mlu_func__ uint16_t intent_number_to_bf16(double value) {
   union { double value; uint64_t bits; } converted;
   converted.value = value;

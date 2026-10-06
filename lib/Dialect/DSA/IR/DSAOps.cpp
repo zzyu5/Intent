@@ -19,8 +19,7 @@ namespace {
 bool tile(Value value) {
   auto type = dyn_cast<MemRefType>(value.getType());
   return type && type.getRank() == 2 && type.hasStaticShape() &&
-      type.getNumElements() > 0 && (type.getElementType().isF16() || type.getElementType().isBF16() || type.getElementType().isF32() ||
-                                  type.getElementType().isInteger(1) || type.getElementType().isInteger(32) || type.getElementType().isInteger(64)) &&
+      type.getNumElements() > 0 && isStorageElementType(type.getElementType()) &&
       type.getMemorySpaceAsInt() == nramSpace;
 }
 bool same(Value a, Value b) { return a.getType() == b.getType() && tile(a); }
@@ -57,6 +56,16 @@ LogicalResult LoadScalarOp::verify() {
 LogicalResult StoreScalarOp::verify() {
   return cast<MemRefType>(getDestination().getType()).getElementType() == getValue().getType()
       ? success() : emitOpError("scalar store changes the storage dtype");
+}
+LogicalResult AtomicAddOp::verify() {
+  auto source = cast<MemRefType>(getSource().getType());
+  auto output = cast<MemRefType>(getOutput().getType());
+  Type element = source.getElementType();
+  if (source.getMemorySpaceAsInt() != 0 || !element.isInteger(32) ||
+      getValue().getType() != element || output.getElementType() != element ||
+      !tile(getOutput()) || output.getNumElements() != 1)
+    return emitOpError("atomic add requires an external i32 object and a one-element local old-value slot");
+  return success();
 }
 LogicalResult LoadTileOp::verify() {
   auto sourceSpace = cast<MemRefType>(getSource().getType()).getMemorySpaceAsInt();
@@ -596,8 +605,7 @@ LogicalResult intent::dsa::verifyProgram(ModuleOp module) {
     if (auto view = dyn_cast<intent::ViewType>(logical)) {
       auto tensor = intent::publicViewTensor(view);
       Type element = tensor.getElementType();
-      if (!element.isF16() && !element.isBF16() && !element.isF32() &&
-          !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
+      if (!isStorageElementType(element))
         return function.emitError("DSA view has unsupported numeric storage");
       auto physical = dyn_cast<MemRefType>(argument.getType());
       if (!physical || physical.getElementType() != storageType(element) || physical.getShape() != tensor.getShape() ||

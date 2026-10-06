@@ -9,6 +9,12 @@ std::optional<CScalarType> scalarType(Type type) {
     return CScalarType{"uint16_t", "intent_bf16_to_float", "intent_number_to_bf16"};
   if (type.isF32()) return CScalarType{"float", {}, {}};
   if (type.isF64()) return CScalarType{"double", {}, {}};
+  if (isa<Float8E4M3FNType>(type))
+    return CScalarType{"uint8_t", "intent_fp8_to_float<4, 3, 7, true>",
+                       "intent_number_to_fp8<4, 3, 7, true>"};
+  if (isa<Float8E5M2Type>(type))
+    return CScalarType{"uint8_t", "intent_fp8_to_float<5, 2, 15, false>",
+                       "intent_number_to_fp8<5, 2, 15, false>"};
   if (type.isInteger(1)) return CScalarType{"bool", {}, {}};
   if (type.isIndex()) return CScalarType{"int64_t", {}, {}};
   auto integer = dyn_cast<IntegerType>(type);
@@ -23,6 +29,9 @@ namespace {
 FailureOr<std::string> render(Operation *operation, ArrayRef<std::string> operands) {
   auto scalar = ScalarOperation::read(operation);
   if (failed(scalar)) return failure();
+  if (scalar->kind == ScalarKind::Bitcast)
+    return "intent_scalar_bitcast<" + scalarType(scalar->type())->name +
+           ">(" + operands.front() + ")";
   if (scalar->kind == ScalarKind::Erf || scalar->kind == ScalarKind::Power ||
       scalar->kind == ScalarKind::Fma)
     return operation->emitError("scalar math primitive has no bound BANG C implementation"), failure();

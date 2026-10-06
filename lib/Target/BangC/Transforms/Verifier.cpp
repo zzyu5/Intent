@@ -117,7 +117,7 @@ LogicalResult verifySurfaceOperations(func::FuncOp function) {
     if (auto native = verifyUnboundNativeSourceOperation(op))
       return failed(*native) ? WalkResult::interrupt() : WalkResult::advance();
     if (!isa<dsa::SynchronizeOp, dsa::GroupSynchronizeOp, dsa::GroupIdOp, dsa::GroupCountOp, dsa::LocalIdOp,
-             dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::LoadScalarOp, dsa::StoreScalarOp,
+             dsa::IsMemoryCoreOp, dsa::StageTileOp, dsa::TaskIdOp, dsa::TaskCountOp, dsa::LoadScalarOp, dsa::StoreScalarOp, dsa::AtomicAddOp,
              dsa::LoadTileOp, dsa::GatherPlanOp, dsa::GatherRowsOp, dsa::GroupGatherRowsOp, dsa::StoreTileOp, dsa::FillOp, dsa::IotaOp,
              dsa::IndexLayoutOp, dsa::IndexBinaryOp, dsa::BroadcastRowsOp, dsa::TransposeOp, dsa::SelectOp, dsa::MaskedFillOp, dsa::UnaryOp, dsa::BinaryOp,
              dsa::CastOp, dsa::CompareOp, dsa::CompareRangeOp, dsa::CompareRampOp, dsa::DivideCastOp, dsa::DivideRNOp, dsa::ReduceOp,

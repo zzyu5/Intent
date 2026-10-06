@@ -51,6 +51,12 @@ def IntentDSA_LoadScalarOp : IntentDSA_Op<"load_scalar"> {
 def IntentDSA_StoreScalarOp : IntentDSA_Op<"store_scalar"> {
   let arguments = (ins AnyType:$value, Arg<AnyMemRef, "", [MemWrite]>:$destination, Index:$offset);
 }
+def IntentDSA_AtomicAddOp : IntentDSA_Op<"atomic_add", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "One relaxed external atomic addition with its old value in local storage";
+  let arguments = (ins AnyMemRef:$source, Index:$offset, AnyType:$value,
+                       AnyMemRef:$output);
+}
 def IntentDSA_LoadTileOp : IntentDSA_Op<"load_tile", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Load a zero-padded local tile; asynchronous external loads complete at the next work-unit synchronization";

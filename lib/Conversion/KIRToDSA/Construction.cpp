@@ -1,4 +1,5 @@
 #include "Construction.h"
+#include "Intent/Dialect/DSA/IR/Views.h"
 #include "Intent/Dialect/DSA/Analysis/PhysicalProgram.h"
 
 namespace intent::kir_to_dsa {
@@ -47,7 +48,7 @@ LogicalResult Construction::lower(func::FuncOp source) {
     if (auto view = dyn_cast<ViewType>(argument.getType())) {
       auto tensor = cast<RankedTensorType>(view.getTensor());
       Type element = tensor.getElementType();
-      if (!element.isF16() && !element.isBF16() && !element.isF32() && !element.isInteger(32) && !element.isInteger(64) && !element.isInteger(1))
+      if (!dsa::isStorageElementType(element))
         return source.emitError("DSA construction does not implement this view storage type");
       auto shape = dyn_cast_or_null<TensorShapeAttr>(tensor.getEncoding());
       if (!shape) return source.emitError("DSA view has no dimension identities");
@@ -318,8 +319,10 @@ LogicalResult Construction::lowerBlock(Block &block) {
       if (dimension <= 0 || selectedAxis(value, 0)) continue;
       Value size = logicalExtent(value, 0, value.getLoc());
       if (!size) return emitError(value.getLoc(), "DSA full row has no logical extent");
-      if (failed(requireFullExtent(size, dimension))) return failure();
-      axisBindings[dimension] = {size, index(value.getLoc(), 0), size, config.getTile()};
+      auto bounded = upperDistance(size, index(value.getLoc(), 0));
+      if (!bounded && failed(requireFullExtent(size, dimension))) return failure();
+      int64_t capacity = bounded ? std::max<int64_t>(1, *bounded) : config.getTile();
+      axisBindings[dimension] = {size, index(value.getLoc(), 0), size, capacity};
       bound.push_back(dimension);
     }
   return lowerStructuredBlock(block);
@@ -355,6 +358,10 @@ LogicalResult Construction::lowerOperation(Operation *operation) {
       }
     }
     if (isa<RegionFoldOp, RegionScanOp>(operation)) return lowerRegion(operation);
+    if (auto histogramOp = dyn_cast<HistogramOp>(operation)) return histogram(histogramOp);
+    if (auto atomicOp = dyn_cast<AtomicRMWOp>(operation)) return atomic(atomicOp);
+    if (auto quantizeOp = dyn_cast<QuantizeOp>(operation)) return quantize(quantizeOp);
+    if (auto dot = dyn_cast<QuantizedDotOp>(operation)) return quantizedDot(dot);
     if (auto reduce = dyn_cast<ReduceOp>(operation)) return reduceTensor(reduce);
     if (auto scan = dyn_cast<ScanOp>(operation)) return scanTensor(scan);
     if (isa<ViewLoadOp, ViewStoreOp, GatherOp, ScatterUniqueOp>(operation)) return tensorAccess(operation);

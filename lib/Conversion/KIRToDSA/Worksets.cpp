@@ -144,6 +144,13 @@ std::optional<WorksetTiling> Construction::planExecutionSlices(Block &block, uns
         if (result) r[axis] = requested[*result];
       return require(matrix.getLhs(), l) && require(matrix.getRhs(), r);
     }
+    if (auto matrix = dyn_cast<ScaledContractOp>(op)) {
+      if (requested.size() != 2) return false;
+      return require(matrix.getLhs(), {requested[0], false, false}) &&
+          require(matrix.getLhsScale(), {requested[0], false}) &&
+          require(matrix.getRhs(), {false, false, requested[1]}) &&
+          require(matrix.getRhsScale(), {requested[1], false});
+    }
     if (!isa<UnaryOp, BinaryOp, CompareOp, SelectOp, MaskOp, CastOp>(op)) return false;
     for (Value input : op->getOperands()) {
       if (isa<RankedTensorType>(input.getType())) {
@@ -232,6 +239,20 @@ LogicalResult Construction::lowerTiledWorkset(Block &block, const WorksetTiling 
     auto rank = cast<RankedTensorType>(slice.extentSource.getType()).getRank();
     int64_t capacity = rank == 1 ? config.getTile()
         : slice.axis == 0 ? config.getTileM() : config.getTileN();
+    for (const auto &[value, selected] : slice.requirements) {
+      auto contract = value.getDefiningOp<ContractOp>();
+      if (!contract) continue;
+      auto axes = contractionAxes(contract);
+      if (!axes) continue;
+      for (auto [axis, requested] : llvm::enumerate(selected)) {
+        if (!requested) continue;
+        const auto &result = axes->results[axis];
+        bool batch = result.operand == ContractionOperand::Lhs &&
+            llvm::any_of(axes->batch, [&](auto pair) { return pair.lhs == result.axis; });
+        capacity = std::min<int64_t>(capacity, batch ? 1 :
+            result.operand == ContractionOperand::Lhs ? config.getTileM() : config.getTileN());
+      }
+    }
     auto domain = sliceDomain(slice, capacity, !distribute);
     if (!domain) return emitError(loc, "DSA workset tiling has no complete common logical axis");
     domains.push_back(*domain);

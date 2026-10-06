@@ -104,6 +104,14 @@ void SynchronizeOp::getEffects(
   ordering(effects);
 }
 
+void AtomicAddOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getSourceMutable());
+  effects.emplace_back(MemoryEffects::Write::get(), &getSourceMutable());
+  effects.emplace_back(MemoryEffects::Write::get(), &getOutputMutable());
+  ordering(effects);
+}
+
 void GroupSynchronizeOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   ordering(effects);

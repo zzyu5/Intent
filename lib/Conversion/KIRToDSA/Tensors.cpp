@@ -251,7 +251,7 @@ LogicalResult Construction::joinTensor(Operation *op, const LocalShape &shape) {
 }
 
 bool Construction::canDefer(Operation *op) {
-  if (isa<RegionFoldOp, RegionScanOp, IfOp, ForOp, WhileOp, ParallelOp>(op)) return false;
+  if (isa<RegionFoldOp, RegionScanOp, IfOp, ForOp, WhileOp, ParallelOp, QuantizeOp>(op)) return false;
   bool aggregate = llvm::any_of(op->getResultTypes(), [&](Type type) {
     return isa<RankedTensorType>(type) || static_cast<bool>(getProductComponents(type));
   });
@@ -272,6 +272,7 @@ LogicalResult Construction::tensorOperation(Operation *op) {
   if (isa<ReshapeOp>(op)) return reshapeTensor(op, *shape);
   if (isa<JoinOp>(op)) return joinTensor(op, *shape);
   if (auto matrix = dyn_cast<ContractOp>(op)) return localMatMul(matrix, *shape);
+  if (auto matrix = dyn_cast<ScaledContractOp>(op)) return scaledMatMul(matrix, *shape);
   if (auto indices = dyn_cast<IndicesOp>(op)) {
     Value source = indices->getOperand(0);
     if (!bindDomain(source) || shape->size() != 1) return op->emitError("DSA indices require a bound interval");
@@ -405,6 +406,8 @@ LogicalResult Construction::tensorOperation(Operation *op) {
   auto nativeCast = [&](CastOp cast) {
     Type source = getElementTypeOrSelf(cast.getInput().getType());
     Type target = type.getElementType();
+    if (isa<Float8E4M3FNType, Float8E5M2Type>(source) ||
+        isa<Float8E4M3FNType, Float8E5M2Type>(target)) return false;
     // The DSA tile cast has no signedness operand. Equal-width integer casts
     // preserve bits; other unsigned numeric conversions use scalar primitives.
     return (!unsignedElement(source) && !unsignedElement(target)) ||

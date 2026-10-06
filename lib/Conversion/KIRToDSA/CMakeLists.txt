@@ -5,7 +5,10 @@ add_mlir_conversion_library(MLIRIntentKIRToDSA
   Tensors.cpp
   Access.cpp
   AccessCoordinates.cpp
+  IndexedUpdates.cpp
+  Quantization.cpp
   Contractions.cpp
+  ScaledContractions.cpp
   Collectives.cpp
   CollectiveConstruction.cpp
   Regions.cpp
