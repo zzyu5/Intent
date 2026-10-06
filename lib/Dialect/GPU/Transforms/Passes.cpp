@@ -159,9 +159,11 @@ public:
 
 class RegionFoldsPass : public impl::RegionFoldsPassBase<RegionFoldsPass> {
 public:
+  using RegionFoldsPassBase::RegionFoldsPassBase;
   void runOnOperation() final {
     auto module = getOperation();
-    if (failed(finishTransformation(module, getArgument(), realizeRegionFolds(module))))
+    if (failed(finishTransformation(module, getArgument(),
+                                   realizeRegionFolds(module, simplifyFirstSummary))))
       signalPassFailure();
   }
 };

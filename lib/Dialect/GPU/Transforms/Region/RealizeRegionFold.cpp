@@ -22,7 +22,8 @@ namespace intent::gpu {
 namespace {
 using namespace region;
 
-LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
+LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel,
+                          bool simplifyFirstSummary) {
   foldKnownRecordProjections(fold);
   forwardUnusedRecordFields(fold);
   if (!lookupParameter(kernel, fold.getSegment()))
@@ -353,11 +354,19 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
       bodyFailed = true;
     }
     FailureOr<Value> payload = failure();
-    // The fold's declared identity is neutral for the complete summary tuple.
-    // This branch has already materialized the first summary; forward it into
-    // the existing payload representation without an identity merge.
-    if (succeeded(first) && !bodyFailed)
-      payload = stripOptionalRecord(nonemptyBuilder, location, first->front(), *emptiness);
+    if (succeeded(first) && !bodyFailed) {
+      if (simplifyFirstSummary) {
+        // The fold's declared identity is neutral for the complete summary
+        // tuple. Forward the summary already materialized in this branch.
+        payload = stripOptionalRecord(nonemptyBuilder, location, first->front(), *emptiness);
+      } else {
+        SmallVector<Value> arguments(identities);
+        llvm::append_range(arguments, *first);
+        auto combined = inlinePureRegion(nonemptyBuilder, fold.getCombine(), arguments, failureReason);
+        if (succeeded(combined) && combined->size() == 1)
+          payload = stripOptionalRecord(nonemptyBuilder, location, combined->front(), *emptiness);
+      }
+    }
     if (failed(first) || failed(payload))
       bodyFailed = true;
 
@@ -594,7 +603,7 @@ LogicalResult realizeFold(RegionFoldOp fold, func::FuncOp kernel) {
 
 } // namespace
 
-LogicalResult realizeRegionFolds(ModuleOp module) {
+LogicalResult realizeRegionFolds(ModuleOp module, bool simplifyFirstSummary) {
   FailureOr<func::FuncOp> physicalKernel = getPhysicalKernel(module);
   if (failed(physicalKernel))
     return failure();
@@ -602,7 +611,7 @@ LogicalResult realizeRegionFolds(ModuleOp module) {
   SmallVector<RegionFoldOp> folds;
   kernel.walk([&](RegionFoldOp fold) { folds.push_back(fold); });
   for (RegionFoldOp fold : folds)
-    if (fold->getBlock() && failed(realizeFold(fold, kernel)))
+    if (fold->getBlock() && failed(realizeFold(fold, kernel, simplifyFirstSummary)))
       return failure();
   return closeValueRelations(kernel);
 }

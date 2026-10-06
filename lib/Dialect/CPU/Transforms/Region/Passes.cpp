@@ -32,12 +32,13 @@ class RealizeRegionsPass
 public:
   using CPURealizeRegionsBase::CPURealizeRegionsBase;
   void runOnOperation() final {
-    auto transform = [](func::FuncOp function,
+    auto transform = [&](func::FuncOp function,
                         const ImplementationRegistry &implementations) {
       auto configuration = detail::currentConfiguration(function);
       return failed(configuration)
                  ? failure()
-                 : realizeRegions(function, *configuration, implementations);
+                 : realizeRegions(function, *configuration, implementations,
+                                  simplifyFirstSummary);
     };
     if (failed(detail::transformWithImplementations(
             getOperation(), getArgument(), provider.getValue(), transform)))

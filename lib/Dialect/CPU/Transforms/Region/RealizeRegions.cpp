@@ -168,7 +168,8 @@ SmallVector<Value> slices(OpBuilder &b, Location loc, ValueRange sources,
 }
 
 LogicalResult realize(Operation *operation, const Configuration &configuration,
-                      const ImplementationRegistry &implementations) {
+                      const ImplementationRegistry &implementations,
+                      bool simplifyFirstSummary) {
   auto program = cast<RegionOpInterface>(operation);
   OpBuilder b(operation);
   Location loc = operation->getLoc();
@@ -320,7 +321,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     b.setInsertionPointToStart(loop.getBody());
     return visitOne(loop.getInductionVar(), width, knownPredicate, knownPredicate == true, omitValidity);
   };
-  auto traversalBounds = [&](Value start) -> std::pair<Value, Value> {
+  auto remainder = [&](Value start, bool omitValidity) -> LogicalResult {
     Value end = count;
     if (intervals && predicate->identityWhenFalse) {
       Value begin = b.create<arith::SubIOp>(loc, intervals->possibleBegin,
@@ -328,10 +329,6 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
       start = b.create<arith::MaxSIOp>(loc, start, begin);
       end = intervals->possibleEnd;
     }
-    return {start, end};
-  };
-  auto remainder = [&](Value requestedStart, bool omitValidity) -> LogicalResult {
-    auto [start, end] = traversalBounds(requestedStart);
     Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
     Value lower = b.create<arith::MinSIOp>(loc, start, completeEnd);
     if (intervals) {
@@ -388,7 +385,7 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     Value hasFull = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, count, step);
     auto first = b.create<scf::IfOp>(loc, hasFull, true);
     auto firstSlice = [&](int64_t width) -> LogicalResult {
-      if (!program.isScan()) return initializeFold(zero, width, true);
+      if (simplifyFirstSummary && !program.isScan()) return initializeFold(zero, width, true);
       allocate();
       if (failed(visitOne(zero, width, std::nullopt, true, false))) return failure();
       release();
@@ -404,30 +401,6 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
     allocate();
     Value start = b.create<arith::SelectOp>(loc, hasFull, step, one);
     if (failed(remainder(start, true))) return failure();
-    release();
-  } else if (!program.isScan()) {
-    auto [begin, end] = traversalBounds(zero);
-    Value nonempty = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, end);
-    auto conditional = b.create<scf::IfOp>(loc, nonempty, false);
-    OpBuilder::InsertionGuard guard(b);
-    b.setInsertionPointToStart(conditional.thenBlock());
-    Value completeEnd = b.create<arith::SubIOp>(loc, end, b.create<arith::RemSIOp>(loc, end, step));
-    Value hasFull = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, begin, completeEnd);
-    auto first = b.create<scf::IfOp>(loc, TypeRange{b.getIndexType()}, hasFull, true);
-    {
-      OpBuilder::InsertionGuard branch(b);
-      b.setInsertionPointToStart(first.thenBlock());
-      if (failed(initializeFold(begin, segmentSize, false))) return failure();
-      // begin is segment-aligned and below completeEnd, so begin + step <= end.
-      Value nextBegin = b.create<arith::AddIOp>(loc, begin, step);
-      b.create<scf::YieldOp>(loc, nextBegin);
-      b.setInsertionPointToStart(first.elseBlock());
-      if (failed(initializeFold(begin, 1, false))) return failure();
-      Value nextTail = b.create<arith::AddIOp>(loc, begin, one);
-      b.create<scf::YieldOp>(loc, nextTail);
-    }
-    allocate();
-    if (failed(remainder(first.getResult(0), false))) return failure();
     release();
   } else {
     allocate();
@@ -462,13 +435,14 @@ LogicalResult realize(Operation *operation, const Configuration &configuration,
 }
 
 LogicalResult realizeRegions(func::FuncOp function, const Configuration &configuration,
-                              const ImplementationRegistry &implementations) {
+                              const ImplementationRegistry &implementations,
+                              bool simplifyFirstSummary) {
   SmallVector<Operation *> regions;
   function.walk([&](Operation *operation) {
     if (isa<RegionFoldOp, RegionScanOp>(operation)) regions.push_back(operation);
   });
   for (Operation *operation : regions)
-    if (failed(realize(operation, configuration, implementations))) return failure();
+    if (failed(realize(operation, configuration, implementations, simplifyFirstSummary))) return failure();
   return success();
 }
 

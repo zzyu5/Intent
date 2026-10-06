@@ -12,7 +12,7 @@ mlir::LogicalResult groupRegionComputations(
     mlir::func::FuncOp function, const Configuration &configuration);
 mlir::LogicalResult realizeRegions(
     mlir::func::FuncOp function, const Configuration &configuration,
-    const ImplementationRegistry &implementations);
+    const ImplementationRegistry &implementations, bool simplifyFirstSummary);
 
 } // namespace intent::cpu
 #endif

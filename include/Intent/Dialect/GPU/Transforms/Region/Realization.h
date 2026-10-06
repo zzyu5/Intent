@@ -6,7 +6,8 @@
 
 namespace intent::gpu {
 
-mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module);
+mlir::LogicalResult realizeRegionFolds(mlir::ModuleOp module,
+                                     bool simplifyFirstSummary);
 mlir::LogicalResult realizeRegionScans(mlir::ModuleOp module);
 
 } // namespace intent::gpu
