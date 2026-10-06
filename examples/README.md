@@ -13,16 +13,46 @@ python examples/use.py --list
 python examples/use.py layer_norm --target triton
 python examples/use.py paged_decode --target cutile --prepared
 python examples/use.py group_norm_backward --target mojo
+python examples/use.py --all --target triton --stage source --jobs 4 --json
+python examples/use.py attention --target mojo --stage native
+python examples/use.py paged_decode --target triton --measure 10 --json
+python examples/use.py --all --target weft --target-option vector_bits=256 --target-option workers=4 --stage source --jobs 4
+python examples/use.py --all --target bangc --stage source --jobs 4
 ```
 
 `--list` 不导入 Intent、PyTorch 或 provider。运行时可以用 `--compiler` 选择当前
-构建的编译器；GPU 可用 `--device` 选择设备。脚本输出结果的 shape、dtype 和
-每份 artifact 的产物目录。它不提供 reference、容差或计时循环。
+构建的编译器；GPU 可用 `--device` 选择设备。`--stage source` 生成后端源码并按
+公开接口绑定完整调用的 shape/dtype；`native` 编译已绑定的原生调用，不执行或
+读取其输出；`run` 执行完整程序并读回结果。`--all` 使用这里既定的 30 项，
+`--jobs` 只并发准备 source/native，真实执行按顺序进行。批量中任一项失败，命令
+返回非零，并保留实际失败阶段、诊断及产物路径；不会更换算法、dtype 或 target。
+`--jsonl` 逐项输出完成记录；长批次的普通/JSON 模式也在 stderr 显示完成状态，
+无需等最后一个原生编译结束。运行记录包含实际选中配置和 SDK 提供的资源观察，
+不会把候选可编译或资源估算当作已经执行。
 
-这些 PyTorch host 用法接受 Triton、cuTile、Mojo target；同一算法和输入不因
-target 改写。某个组合尚未 lowering 或不满足目标能力时，由当前编译器给出实际
-诊断。列表不是 30×3 已验证支持表；Weft/BANG C 使用各自 native buffer 接口，
-见下方对应实验入口，不能把它们当作 Torch tensor backend。
+输入准备只需要 NumPy；BF16/FP8 使用 `ml_dtypes` 的实际存储格式。安装时选择
+`environment/install.py --examples`，或安装本项目的 `examples` optional dependency。
+Triton、cuTile、Mojo 在调用边界接到实际 Torch tensor，Weft/BANG C 接到已有的
+native buffer。没有 Torch 的 RISC-V host 也可以准备同样的输入。BANG C 的实际
+shape/stride 从这些参数绑定，不需要在 kernel 内改写设备信息。
+
+`--seed` 固定输入流，默认 0；同一场景在各 target 使用相同输入字节、dtype 和
+算法。`--measure N` 在首次编译/调优与执行完成后，计时 N 次完整 prepared call，
+输出中位数和原始样本。多 kernel 场景包含作者全部调用及必要 workspace 初始化；
+传入 InOut 的恢复和 host 读回位于计时之外。GPU 使用 CUDA events，CPU/MLU 使用
+完整同步调用的 wall clock。`elapsed_seconds` 则包含输入准备、生成、编译和运行，
+不能当作 kernel 时间。执行状态与计时不代表数值验证或性能达标。
+
+`--target-option NAME=JSON` 直接传入公开 target 构造器。Weft source 要显式提供
+`vector_bits`、`workers`；原生 materialization 另外提供 `profile`、Weft `compiler`
+与非空 `cc` 命令列表。`profile` 沿用
+[TargetProfile](../python/intent/runtime/weft/target.py) 的 march、ABI、物理 VLEN、
+execution CPUs 与 stack budget，runtime 在加载时检查实际机器。已有的
+`export_artifact`/`compile_artifact` 仍用于跨主机 AOT；target 不隐式 SSH 或部署。
+BANG C 使用 `device`、`neuware` 和 `compiler` 选择现成 SDK 与设备。
+
+场景列表是使用导航，包含已实现及尚待闭合的合法语言组合，并非 30×5 的已验证
+支持承诺。真实 compiler 缺口会显示在对应阶段；目标能力限制与尚未执行分别说明。
 
 | 场景名称 | Host 用法 | 输入及完整结果 |
 |---|---|---|
@@ -58,15 +88,15 @@ target 改写。某个组合尚未 lowering 或不满足目标能力时，由当
 | `histogram` | [collectives](programs/collectives.py) | f32 samples，包括 masked 越界值 → 256 i32 bins |
 
 动态 shape 的用法使用适合交互的输入大小；固定 shape 的算法沿用定义中的常量。
-这些输入用于展示调用，性能比较继续使用 experiments 中原规模、dtype 和完整
-callable。Q4_K 示例的全零 record 表示零权重，实际模型使用自身已有的 packed
+这些输入用于产品调用与必要的同规模自比较，不代替大型模型工作量。
+Q4_K 示例的全零 record 表示零权重，实际模型使用自身已有的 packed
 records；脚本不替模型转换权重格式。
 
 ### 多 kernel 的唯一 host 编排
 
 [composition.py](programs/composition.py) 中的 `GroupNormBackward`、`PagedDecode`、
 `MoEAlignment` 组合调用者已编译的 artifacts。公开用法与 GPU/CPU 实验共同消费
-这些调用；reference、随机生产输入、计时和结果规范化仍属于 experiments。
+这些调用；产品输入与运行入口在本目录，论文实验材料保留在 experiments。
 `run` 分配输出，`into`/`run_into` 使用调用者的输出和工作区，`prepare` 提前绑定实际输出与跨 kernel
 workspace。编译器仍逐个编译原定义，host 负责 kernel 次序和中间 tensor。
 
@@ -131,11 +161,14 @@ intent compile examples/kernels/normalization/softmax.py:stable_softmax_f16 --ta
 
 JSON 包含原定义位置、真实编译阶段、source/IR/metadata 和日志路径。编译失败时从 `diagnostic` 与 `files` 继续查看；`intent doctor --target triton` 检查依赖和目标解析。完整算法保留在普通示例中，manual MCP 只提供通用语言规则。
 
-执行、reference baseline、生产 registry、实验结果和 pass 对照在 [experiments/](../experiments/README.md)：
+历史论文的 baseline、registry 与结果在 [experiments/](../experiments/README.md)，
+该目录冻结。后续产品编译、运行及 pass 观察使用这里的入口，生成源码、IR、缓存
+及运行观察保存在仓库外：
 
 - [GPU：Triton / cuTile](../experiments/gpu/README.md)
 - [CPU：Mojo / Weft](../experiments/cpu/README.md)
 - [MLU：DSA / BANG C](../experiments/mlu/README.md)
 - [Agent TritonBench](../experiments/agent_tritonbench/README.md)
 
-新增算法示例放在 `kernels/`，相应运行适配与实验数据放在所属实验组。不要在 examples 下重新建立 runner 或 baseline 副本。
+新增算法放在 `kernels/`，完整 host 调用复用 `programs/` 的相应入口和公开 artifact
+API。保留一份算法、一份作者编排；不要复制 reference 或新增并行执行机制。

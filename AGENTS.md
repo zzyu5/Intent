@@ -16,7 +16,7 @@
 - 合同相同且 provider 已有原生 primitive 时优先直接映射。Triton/TileLang 已承担的归约树、线程通信、布局和 pipeline 不在 Intent 重建；不为同一个原生能力另造 form、plan 或运行时分支。只有实际缺失的执行事实或不匹配的目标能力才引入必要扩展。
 - dtype 分清外部存储/ABI、source 运算、accumulator/result 与后端内部计算。先核对参考的 promotion、literal 推导和 store conversion；typed IR 要求类型闭合，不等于作者必须处处同 dtype 或显式 cast。额外限制须有独立理由，也不能以复用后端为由改变已声明的累加精度、NaN/tie 或 ABI。
 - `examples/kernels/` 只保存作者算法；`experiments/{gpu,cpu,mlu,agent_tritonbench}/` 分别保存对应实验的执行入口、操作说明、baseline 与结果。main 的 GPU 产品与实验只推进 Triton/cuTile；TileLang 后端、corpus 与结果保存在 `archive/tilelang-backend` 分支，不在 main 恢复或推进。外部 `../ref/tilelang` 仍可用于成熟编译器职责与机制对照。
-- Provider source/runtime corpus 放在实验组的 `baselines/`；registry 连接完整 callable，CSV 是运行观察。后续全量、单点和 pass 效果实验均归入对应组的 `results/`，分析与操作也保存在同组；这些材料不定义语言语义或 compiler policy。
+- `experiments/` 保留论文所需的历史入口、baseline 与结果，产品推进不再修改或回写这些材料。既定 30 个完整 program 是产品使用、编译、运行与优化观察的主入口；复用 examples 中唯一算法和 host 编排，不复制算法或重建论文实验 registry。
 - 中间 MLIR、生成的后端源码和编译缓存放在仓库外（如 `~/.cache/intentdsl/`）；实验目录只保留执行入口、必要的 baseline 和结果。
 
 ## IR、pass 与目录
@@ -28,13 +28,13 @@
 - 目录表达稳定职责与 lowering 边界；同层同抽象，强耦合文件相邻，source 与 runtime 相邻。不随手造层级、平铺模块或放入缓存和环境。
 - 可查清的信息自行调查；只有现有规格无法决定的语言语义、作者可观察行为或核心架构分叉才暂停问用户，不能用另造产物填补不确定性。
 
-## Benchmark 与实验
+## 产品运行与论文实验
 
-- 同一实验只维护一个既有结果输出，原位更新；不自行新增平行的汇总表、对照表或中间表。
-- 实验测评与性能修复分开组织；固定版本测评不自动夹带编译器修改和修复复测。
-- 运行只复用必要的生产算子 benchmark，同次做一次既定容差检查；容差内即可，不追求 bitwise 一致，不为通过放宽容差。
-- 不额外设计独立数值、边界、回归、兼容、压力或组合测试；不建 test 目录，不用 pytest，不留 fixture。临时脚本、内联命令和跑完即删也不是例外。
-- 全量指现有 registry 的性能运行，不扩矩阵。准备、编译与必要运行可按资源预算并发，同机性能计时避免干扰，不让所有工作全程串行。
+- 产品工作围绕既定 30 个 program 的完整编译与真实执行，包括显式多 kernel 调用；后端实现缺失属于待修复项，必要时修改 Weft 主线，不把未实现伪装成硬件限制。
+- 产品性能先观察自身版本、同类工作量与实际生成结构，既有论文 reference 与成熟实现用于校准和分析，不要求每个 program 有固定外部性能对手。正确性仍按算法合同核对，不通过放宽容差掩盖错误。
+- 复用产品 program 和现有 compiler/runtime 完成必要验证，不另造算法副本、论文实验矩阵或独立的边界、压力、兼容测试。生成源码、IR、缓存及运行观察留在仓库外。
+- 编译、native materialization、首次调优与热调用分别记录。准备和编译可按资源预算并发，同机性能计时避免干扰；完整程序的 host 准备、数据转移和同步按实际计时范围说明。
+- 论文固定版本测评与产品修改分开；未经明确要求不更新论文 CSV、baseline 或首次 agent 交付成绩。
 - 同算法、相同输入规模与外部 dtype 下比较；ABI、辅助输出、布局转换与精度细节注明，不一概阻断计时。Compiler 仍必须保持 Intent 语义。
 - 报真实完整算子时间、reference 时间及清楚的比值；编译/JIT/tuning 不是算子耗时，CSV 不承担历史审计。差距先查物理结构，再查 provider/外部 compiler/measurement，不无证据归因给下层。
 - Agent 实验每题每语言组只交付一次完整程序，提交后不反馈错误或性能继续生成。Bench 自带 reference 保留；开发端修 compiler 不改写首次交付成绩。

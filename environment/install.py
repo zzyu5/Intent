@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("--runtime-notices", type=Path, help="Source build: JSON library-to-notice mapping for custom SDKs")
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--examples", action="store_true", help="Install portable NumPy/BF16/FP8 inputs for the thirty public programs")
     parser.add_argument("--torch-index-url", help="Override the selected backend's PyTorch wheel index")
     parser.add_argument("--provider-compiler", type=Path, help="Existing Mojo, Weft, or BANG C compiler")
     parser.add_argument("--weft-source-dir", type=Path)
@@ -117,14 +118,15 @@ def main() -> None:
     if not (3, 10) <= tuple(interpreter) <= selected["python_max"]:
         parser.error("the public backend dependency routes currently require Python 3.10–3.12")
     run(python, "-m", "pip", "install", "--upgrade", "pip", env=env)
+    extras = "[manual,examples]" if args.examples else "[manual]"
     if args.wheel is not None:
-        run(python, "-m", "pip", "install", str(args.wheel) + "[manual]", env=env)
+        run(python, "-m", "pip", "install", str(args.wheel) + extras, env=env)
     else:
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
         build = (args.build_dir or cache / "intentdsl/install-build" / args.backend / sys.implementation.cache_tag).resolve()
         if args.runtime_notices is not None:
             extra_cmake.append("--config-settings=cmake.define.INTENT_RUNTIME_NOTICES=" + str(args.runtime_notices.expanduser().resolve()))
-        run(python, "-m", "pip", "install", str(REPOSITORY) + "[manual]",
+        run(python, "-m", "pip", "install", str(REPOSITORY) + extras,
             "--config-settings=cmake.define.MLIR_DIR=" + str(args.mlir_dir),
             "--config-settings=cmake.define.LLVM_DIR=" + str(args.llvm_dir),
             "--config-settings=build-dir=" + str(build), *extra_cmake, env=env)

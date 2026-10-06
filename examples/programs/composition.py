@@ -6,9 +6,8 @@ change an algorithm, time a call, or load a reference implementation.
 
 from dataclasses import dataclass
 
-import torch
-
 from kernels.routing.moe_align import EXPERTS, PADDED_ROUTES, ROUTES, TOKENS, TOP_K
+from .native import empty_like, fill
 
 
 @dataclass
@@ -97,9 +96,9 @@ class PagedDecode:
 
 
 def reset_moe_workspace(counts, cursors, sorted_routes):
-    counts.zero_()
-    cursors.zero_()
-    sorted_routes.fill_(ROUTES)
+    fill(counts, 0)
+    fill(cursors, 0)
+    fill(sorted_routes, ROUTES)
 
 
 @dataclass
@@ -140,8 +139,15 @@ class MoEAlignment:
 
     @staticmethod
     def _validate_ids(ids):
-        if ids.ndim != 2 or ids.shape[1] != TOP_K or ids.shape[0] > TOKENS:
+        if len(ids.shape) != 2 or ids.shape[1] != TOP_K or ids.shape[0] > TOKENS:
             raise ValueError(f"MoEAlignment requires at most {TOKENS} tokens with top-k {TOP_K}")
+
+    def _workspace(self, ids):
+        allocate = getattr(self.count, "empty_like", empty_like)
+        counts = allocate(ids, (EXPERTS,), dtype="i32")
+        cursors = allocate(ids, (EXPERTS,), dtype="i32")
+        sorted_routes = allocate(ids, (PADDED_ROUTES,), dtype="i32")
+        return counts, cursors, sorted_routes
 
     def run_into(self, ids, counts, cursors, sorted_routes):
         self._validate_ids(ids)
@@ -153,16 +159,12 @@ class MoEAlignment:
         return sorted_routes, expert_blocks, total_padded
 
     def run(self, ids):
-        counts = torch.empty((EXPERTS,), device=ids.device, dtype=torch.int32)
-        cursors = torch.empty_like(counts)
-        sorted_routes = torch.empty((PADDED_ROUTES,), device=ids.device, dtype=torch.int32)
+        counts, cursors, sorted_routes = self._workspace(ids)
         return self.run_into(ids, counts, cursors, sorted_routes)
 
     def prepare(self, ids):
         self._validate_ids(ids)
-        counts = torch.empty((EXPERTS,), device=ids.device, dtype=torch.int32)
-        cursors = torch.empty_like(counts)
-        sorted_routes = torch.empty((PADDED_ROUTES,), device=ids.device, dtype=torch.int32)
+        counts, cursors, sorted_routes = self._workspace(ids)
         count = self.count.prepare(ids, counts)
         prefix = self.prefix.prepare(counts)
         offsets, total_padded = prefix.result()
