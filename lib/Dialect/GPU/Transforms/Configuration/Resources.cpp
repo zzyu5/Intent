@@ -22,7 +22,7 @@ FailureOr<SmallVector<DictionaryAttr>> filterConfigurationRequirements(
   for (DictionaryAttr row : rows) {
     bool valid = true;
     for (ConfigurationRequirementAttr requirement : requirements) {
-      auto evaluation = evaluateConfigurationRequirement(requirement, row);
+      auto evaluation = evaluateConfigurationRequirement(requirement, row, kernel);
       if (evaluation.status == RequirementStatus::Unknown &&
           options->getOptimizationRemarks()) {
         kernel.emitRemark("configuration requirement deferred to invocation binding: ")

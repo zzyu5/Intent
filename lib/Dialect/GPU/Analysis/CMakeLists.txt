@@ -25,6 +25,7 @@ add_mlir_library(MLIRIntentGPUAnalysis
   UniformValues.cpp
 
   LINK_LIBS PUBLIC
+  MLIRAnalysis
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR

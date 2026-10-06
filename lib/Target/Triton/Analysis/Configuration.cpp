@@ -121,16 +121,16 @@ collectConfigurationRequirements(func::FuncOp kernel) {
     return failure();
   Builder builder(kernel.getContext());
   const gpu::FragmentResourceAnalysis resources(kernel);
-  SmallVector<ValueRange> reductionSources;
+  SmallVector<Operation *> reductions;
   TensorDescriptorChoiceOp descriptorChoice;
   SmallVector<TensorDescriptorOp> descriptors;
   SmallVector<gpu::MakeRangeOp> ranges;
   SmallVector<gpu::ContractOp> contracts;
   kernel.walk([&](Operation *operation) {
     if (auto reduce = dyn_cast<gpu::ReduceOp>(operation))
-      reductionSources.push_back(reduce.getSources());
+      reductions.push_back(reduce);
     else if (auto reduce = dyn_cast<ReduceOp>(operation))
-      reductionSources.push_back(reduce.getSources());
+      reductions.push_back(reduce);
     else if (auto choice = dyn_cast<TensorDescriptorChoiceOp>(operation))
       descriptorChoice = choice;
     else if (auto descriptor = dyn_cast<TensorDescriptorOp>(operation))
@@ -141,7 +141,7 @@ collectConfigurationRequirements(func::FuncOp kernel) {
       contracts.push_back(contract);
   });
   auto requirements = gpu::collectReductionRequirements(
-      kernel, reductionSources, gpu::ReductionRequirementScope::AllCandidates);
+      kernel, reductions, gpu::ReductionRequirementScope::AllCandidates);
   llvm::append_range(requirements, gpu::collectPointwiseRequirements(kernel, resources));
   auto expression = [&](gpu::PhysicalExprKind kind, int64_t value,
                         ArrayRef<Attribute> operands) {

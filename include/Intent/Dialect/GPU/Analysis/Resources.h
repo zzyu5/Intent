@@ -17,7 +17,7 @@ bool isPointwiseTraversalParameter(ParameterAttr parameter);
 
 // Collect from current IR for candidate filtering and invocation specialization.
 llvm::SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
-    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::ValueRange> sourceGroups,
+    mlir::func::FuncOp kernel, llvm::ArrayRef<mlir::Operation *> reductions,
     ReductionRequirementScope scope);
 
 // Verify the current condition set and rows without changing either. Conditions
@@ -28,8 +28,6 @@ mlir::LogicalResult verifyConfigurationRequirements(
 
 PhysicalExprAttr fragmentElementCount(FragmentType fragment);
 PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
-PhysicalExprAttr reductionRegisterFootprint(mlir::ValueRange sources,
-                                          mlir::func::FuncOp kernel);
 
 enum class FragmentFootprintScope { PhysicalShape, FullScalarSeedCapacity };
 
@@ -58,6 +56,12 @@ RequirementEvaluation evaluateConfigurationRequirement(
         resolveActivation = {});
 RequirementEvaluation evaluateConfigurationRequirement(
     ConfigurationRequirementAttr requirement, mlir::DictionaryAttr bindings);
+// A missing deferred binding remains unknown unless its declared domain proves
+// that a positive additive/multiplicative nominal footprint already exceeds the
+// budget. A domain lower bound never establishes satisfaction.
+RequirementEvaluation evaluateConfigurationRequirement(
+    ConfigurationRequirementAttr requirement, mlir::DictionaryAttr bindings,
+    mlir::func::FuncOp kernel);
 // Unknown includes expressions the checked evaluator cannot establish (missing
 // leaves or arithmetic failure); Invalid denotes a proven nonpositive extent.
 FootprintBound checkFragmentFootprint(
@@ -72,10 +76,14 @@ public:
   explicit FragmentResourceAnalysis(mlir::func::FuncOp kernel);
   llvm::ArrayRef<FragmentType> valueTypes() const { return values; }
   llvm::ArrayRef<FragmentType> materializedTypesUsing(mlir::StringAttr name) const;
+  llvm::ArrayRef<ConfigurationRequirementAttr> collectiveRequirements() const {
+    return collectives;
+  }
 
 private:
   llvm::SmallVector<FragmentType> values;
   llvm::DenseMap<mlir::StringAttr, llvm::SmallVector<FragmentType>> payloads;
+  llvm::SmallVector<ConfigurationRequirementAttr> collectives;
 };
 
 llvm::SmallVector<ConfigurationRequirementAttr> collectPointwiseRequirements(

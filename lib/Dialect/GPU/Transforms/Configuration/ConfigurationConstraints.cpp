@@ -34,6 +34,20 @@ bool fitsFragmentFootprints(
   return true;
 }
 
+bool fitsCollectiveFootprints(const FragmentResourceAnalysis &resources,
+                             func::FuncOp kernel, const NamedAttrList &bindings,
+                             StringAttr selected = {}, int64_t candidate = 0) {
+  NamedAttrList current(bindings);
+  if (selected)
+    current.set(selected, IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), candidate));
+  auto row = current.getDictionary(kernel.getContext());
+  return llvm::all_of(resources.collectiveRequirements(), [&](auto requirement) {
+    auto status = evaluateConfigurationRequirement(requirement, row, kernel).status;
+    return status != RequirementStatus::Violated &&
+           status != RequirementStatus::Invalid;
+  });
+}
+
 } // namespace
 
 void bindContractionFreeExtents(
@@ -129,7 +143,8 @@ LogicalResult bindTraversalFragmentFootprints(
     auto fragments = resources.materializedTypesUsing(schema.getName());
     auto fits = [&](int64_t candidate) {
       return fitsFragmentFootprints(
-          fragments, capabilities, bindings, schema.getName(), candidate);
+          fragments, capabilities, bindings, schema.getName(), candidate) &&
+          fitsCollectiveFootprints(resources, kernel, bindings, schema.getName(), candidate);
     };
     int64_t requested = cast<IntegerAttr>(
         bindings.get(schema.getName().getValue())).getInt();
@@ -147,7 +162,8 @@ LogicalResult bindTraversalFragmentFootprints(
   }
   // Every axis has now been projected. Recheck those same payload sets against
   // the complete tuple, since another traversal axis may have changed it.
-  return success(llvm::all_of(budgeted, [&](ArrayRef<FragmentType> fragments) {
+  return success(fitsCollectiveFootprints(resources, kernel, bindings) &&
+                 llvm::all_of(budgeted, [&](ArrayRef<FragmentType> fragments) {
     return fitsFragmentFootprints(fragments, capabilities, bindings);
   }));
 }

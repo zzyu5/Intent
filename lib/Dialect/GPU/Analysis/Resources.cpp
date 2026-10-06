@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "mlir/Analysis/Liveness.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
@@ -178,41 +179,127 @@ RequirementEvaluation evaluateConfigurationRequirement(
       });
 }
 
-PhysicalExprAttr reductionRegisterFootprint(ValueRange sources,
-                                          func::FuncOp kernel) {
-  std::function<bool(PhysicalExprAttr)> isTunableExtent =
-      [&](PhysicalExprAttr extent) {
-    if (extent.getKind() ==
-        PhysicalExprKind::Parameter) {
-      auto parameter = queryParameterBySymbol(kernel, extent.getParameterReference().getName());
-      if (failed(parameter))
-        return false;
-      auto role = parameter->getRole();
-      return role == ParameterRole::OwnershipM ||
-             role == ParameterRole::OwnershipN ||
-             role == ParameterRole::Reduction ||
-             role == ParameterRole::ReductionOuter ||
-             role == ParameterRole::ReductionInner;
-    }
-    return llvm::any_of(extent.getOperands(), [&](Attribute operand) {
-      return isTunableExtent(cast<PhysicalExprAttr>(operand));
-    });
+RequirementEvaluation evaluateConfigurationRequirement(
+    ConfigurationRequirementAttr requirement, DictionaryAttr bindings,
+    func::FuncOp kernel) {
+  auto exact = evaluateConfigurationRequirement(requirement, bindings);
+  if (exact.status != RequirementStatus::Unknown || !exact.limit ||
+      requirement.getActivation() ||
+      requirement.getKind() != ConfigurationRequirementKind::NominalBudget ||
+      requirement.getMetric() != ConfigurationRequirementMetric::FragmentRegisterWords ||
+      requirement.getPredicate() != ConfigurationRequirementPredicate::LessEqual)
+    return exact;
+  std::function<bool(PhysicalExprAttr)> monotone = [&](PhysicalExprAttr value) {
+    auto kind = value.getKind();
+    if (kind == PhysicalExprKind::Constant) return value.getValue() >= 0;
+    if (kind == PhysicalExprKind::Parameter) return true;
+    return (kind == PhysicalExprKind::Add || kind == PhysicalExprKind::Multiply) &&
+        llvm::all_of(value.getOperands(), [&](Attribute operand) {
+          return monotone(cast<PhysicalExprAttr>(operand));
+        });
   };
+  if (!monotone(requirement.getUsage())) return exact;
+  auto lower = evaluateConfigurationRequirement(requirement,
+      [&](PhysicalExprAttr leaf) -> std::optional<int64_t> {
+        if (leaf.getKind() != PhysicalExprKind::Parameter) return std::nullopt;
+        auto name = leaf.getParameterReference().getName();
+        if (auto value = bindings ? bindings.getAs<IntegerAttr>(name) : IntegerAttr())
+          return value.getInt() > 0 ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+        auto parameter = lookupParameter(kernel, leaf.getParameterReference());
+        if (!parameter || !parameter.isExtent() || !parameter.isDeferred())
+          return std::nullopt;
+        auto candidates = parameter.getCandidates().asArrayRef();
+        if (candidates.empty()) return std::nullopt;
+        int64_t minimum = *llvm::min_element(candidates);
+        return minimum > 0 ? std::optional<int64_t>(minimum) : std::nullopt;
+      });
+  return lower.status == RequirementStatus::Violated ? lower : exact;
+}
+
+namespace {
+
+// Shape views keep their underlying payload alive; they do not allocate a
+// second full fragment. Numeric casts and computations remain distinct values.
+void collectPayloads(Value value, llvm::DenseSet<Value> &payloads) {
+  if (auto view = value.getDefiningOp<BroadcastOp>())
+    return collectPayloads(view.getValue(), payloads);
+  if (auto view = value.getDefiningOp<ReshapeOp>())
+    return collectPayloads(view.getValue(), payloads);
+  if (auto view = value.getDefiningOp<SplatOp>())
+    return collectPayloads(view.getValue(), payloads);
+  if (auto record = value.getDefiningOp<MakeRecordOp>()) {
+    for (Value field : record.getFields()) collectPayloads(field, payloads);
+    return;
+  }
+  if (auto field = value.getDefiningOp<ExtractOp>()) {
+    if (auto record = field.getRecord().getDefiningOp<MakeRecordOp>())
+      return collectPayloads(record.getFields()[field.getField()], payloads);
+    // An opaque carried record owns its fields together. Count it once even
+    // when several field views and the record itself span the collective.
+    return collectPayloads(field.getRecord(), payloads);
+  }
+  if (isa<FragmentType, RecordType>(value.getType())) payloads.insert(value);
+}
+
+PhysicalExprAttr reductionRegisterFootprint(
+    Operation *reduction, const Liveness &liveness, ArrayRef<Value> orderedValues) {
+  auto *block = liveness.getLiveness(reduction->getBlock());
+  if (!block) return {};
+  llvm::DenseSet<Value> payloads;
+  for (Value value : block->currentlyLiveValues(reduction))
+    collectPayloads(value, payloads);
+  // A collective in a branch also spans values retained by its enclosing
+  // operation for later consumers. Block-local liveness alone omits those.
+  for (Operation *parent = reduction->getParentOp();
+       parent && !isa<func::FuncOp>(parent); parent = parent->getParentOp()) {
+    auto *parentBlock = liveness.getLiveness(parent->getBlock());
+    if (!parentBlock) continue;
+    for (Value value : parentBlock->currentlyLiveValues(parent)) {
+      if (value.getDefiningOp() == parent || liveness.isDeadAfter(value, parent))
+        continue;
+      collectPayloads(value, payloads);
+    }
+  }
   PhysicalExprAttr registers;
-  for (Value source : sources) {
-    auto fragment = dyn_cast<FragmentType>(source.getType());
-    if (!fragment || !llvm::any_of(fragment.getShape(), [&](Attribute extent) {
-          return isTunableExtent(cast<PhysicalExprAttr>(extent));
-        }))
-      continue;
+  bool tunable = false;
+  auto kernel = reduction->getParentOfType<func::FuncOp>();
+  auto append = [&](FragmentType fragment) {
+    AttrTypeWalker parameters;
+    parameters.addWalk([&](PhysicalExprAttr expression) {
+      if (expression.getKind() != PhysicalExprKind::Parameter) return;
+      auto parameter = lookupParameter(kernel, expression.getParameterReference());
+      if (!parameter) return;
+      auto role = parameter.getRole();
+      tunable |= role == ParameterRole::OwnershipM ||
+                 role == ParameterRole::OwnershipN ||
+                 role == ParameterRole::Reduction ||
+                 role == ParameterRole::ReductionOuter ||
+                 role == ParameterRole::ReductionInner;
+    });
+    parameters.walk(fragment.getShape());
     auto footprint = fragmentRegisterFootprint(fragment);
     registers = !registers ? footprint : PhysicalExprAttr::get(
-        kernel.getContext(), PhysicalExprKind::Add, 0,
-        StringAttr::get(kernel.getContext(), ""),
-        ArrayAttr::get(kernel.getContext(), {registers, footprint}));
+        reduction->getContext(), PhysicalExprKind::Add, 0,
+        StringAttr::get(reduction->getContext(), ""),
+        ArrayAttr::get(reduction->getContext(), {registers, footprint}));
+  };
+  std::function<void(Type)> appendType = [&](Type type) {
+    if (auto fragment = dyn_cast<FragmentType>(type)) append(fragment);
+    else if (auto record = dyn_cast<RecordType>(type))
+      for (Attribute field : record.getFieldTypes())
+        appendType(cast<TypeAttr>(field).getValue());
+  };
+  // Liveness sets are unordered. Preserve lexical value order in the published
+  // expression, including distinct values that happen to have the same type.
+  for (Value value : orderedValues) {
+    if (payloads.contains(value)) appendType(value.getType());
   }
-  return registers;
+  // This projects existing traversal candidates. It does not reject a fixed
+  // provider program on the basis of a nominal register-allocation estimate.
+  return tunable ? registers : PhysicalExprAttr();
 }
+
+} // namespace
 
 FootprintBound checkFragmentFootprint(
     FragmentType fragment, int64_t limit, int64_t wordsPerElement,
@@ -274,6 +361,10 @@ FragmentResourceAnalysis::FragmentResourceAnalysis(func::FuncOp kernel) {
         payloads[name].push_back(fragment);
     }
   });
+  SmallVector<Operation *> reductions;
+  kernel.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
+  collectives = collectReductionRequirements(
+      kernel, reductions, ReductionRequirementScope::AllCandidates);
 }
 
 ArrayRef<FragmentType>
@@ -339,24 +430,33 @@ SmallVector<ConfigurationRequirementAttr> collectPointwiseRequirements(
 }
 
 SmallVector<ConfigurationRequirementAttr> collectReductionRequirements(
-    func::FuncOp kernel, ArrayRef<ValueRange> sourceGroups,
+    func::FuncOp kernel, ArrayRef<Operation *> reductions,
     ReductionRequirementScope scope) {
   SmallVector<ConfigurationRequirementAttr> requirements;
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   if (!capabilities || capabilities.getRegistersPerUnit() <= 0)
     return requirements;
+  if (reductions.empty()) return requirements;
   Builder builder(kernel.getContext());
   auto limit = PhysicalExprAttr::get(kernel.getContext(), PhysicalExprKind::Constant,
       capabilities.getRegistersPerUnit(), builder.getStringAttr(""), builder.getArrayAttr({}));
-  for (ValueRange sources : sourceGroups) {
-    auto footprint = reductionRegisterFootprint(sources, kernel);
+  Liveness liveness(kernel);
+  SmallVector<Value> values;
+  kernel.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+    llvm::append_range(values, operation->getResults());
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        llvm::append_range(values, block.getArguments());
+  });
+  for (Operation *reduction : reductions) {
+    auto footprint = reductionRegisterFootprint(reduction, liveness, values);
     if (!footprint) continue;
     auto requirement = ConfigurationRequirementAttr::get(kernel.getContext(),
         ConfigurationRequirementKind::NominalBudget,
         ConfigurationRequirementMetric::FragmentRegisterWords,
         ConfigurationRequirementPredicate::LessEqual, footprint, limit,
         ParameterRefAttr(),
-        builder.getStringAttr("reduction source exceeds the candidate register budget"));
+        builder.getStringAttr("collective live payloads exceed the candidate register budget"));
     if (scope == ReductionRequirementScope::InvocationDependent &&
         !dependsOnInvocation(requirement, kernel)) continue;
     if (!llvm::is_contained(requirements, requirement)) requirements.push_back(requirement);
@@ -389,7 +489,7 @@ LogicalResult verifyConfigurationRequirements(
            << *remaining.begin();
   for (DictionaryAttr row : *rows)
     for (ConfigurationRequirementAttr requirement : *requirements) {
-      auto evaluation = evaluateConfigurationRequirement(requirement, row);
+      auto evaluation = evaluateConfigurationRequirement(requirement, row, kernel);
       if (evaluation.status != RequirementStatus::Violated &&
           evaluation.status != RequirementStatus::Invalid)
         continue;

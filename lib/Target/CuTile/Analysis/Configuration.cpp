@@ -12,13 +12,12 @@ collectConfigurationRequirements(func::FuncOp kernel) {
   auto parameters = gpu::ParameterSpace::read(kernel);
   if (failed(parameters))
     return failure();
-  SmallVector<ValueRange> reductionSources;
+  SmallVector<Operation *> reductions;
   kernel.walk([&](ReduceOp reduce) {
-    reductionSources.push_back(reduce.getSources());
+    reductions.push_back(reduce);
   });
   auto requirements = gpu::collectReductionRequirements(
-      kernel, reductionSources,
-      gpu::ReductionRequirementScope::InvocationDependent);
+      kernel, reductions, gpu::ReductionRequirementScope::AllCandidates);
   const gpu::FragmentResourceAnalysis resources(kernel);
   llvm::append_range(requirements, gpu::collectPointwiseRequirements(kernel, resources));
   auto resident = parameters->find(gpu::ParameterRole::ResidentWorkers);
