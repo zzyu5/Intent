@@ -1513,6 +1513,20 @@ alignment 或 dtype 舍入边界。数值 producer 只接受一次完整准备�
 查询，再删除整域物化。此状态只存在于
 该变换组内，不能跨删除已记录读取的规范化或其它 pass 沿用。
 
+私有 [InputCopies.cpp](lib/Dialect/CPU/Transforms/Implementation/InputCopies.cpp)
+统一完整 consumer preparation 与 group panel 的实际 copy 构造。准备阶段形成
+标准 descriptor 与 Linalg copy，保留上述 producer 融合的观察点；不提前把读取
+隐藏到 provider 的打包代码里。现有 structured materializer 再消费剩余纯 copy，
+依据实际 binding、width、strides 与 source/destination 独立性选择有界转置。
+完整 16×16 块使用连续 SIMD 读写，原 `ExtF` 保留 dtype 舍入位置；边缘和不满足
+连续性、行独立条件的 descriptor 继续按原合法成员访问。
+
+机械转置复用 MLIR 20 `LowerVectorTranspose.cpp:205–298,490–511` 的
+`Shuffle16x16`，并在同一局部物化组折叠 Insert/Extract/ShapeCast，结束时只留下
+rank-one vectors，不交 serializer 修结构。MAX `linalg/packing.mojo:193–266`
+同样在存储 dtype 上连续读取、转置和写入 packed panel。Weft 的 Canonical IR
+入口继续消费 structured copy；其 width-one materializer 不进入这条 Vector 路径。
+
 候选组合先为每个 contraction 找到合法且无需外围 preparation 的基准，再将每种注册实现应用于它能服务的计算，其余计算保持各自基准，按完整 bindings 去重。这样同一函数中的低精度 contraction 可以选择 widened 供数，另一个连续 f32 contraction 同时选择直接读取；不会因二者实现名不同而把后者改回默认 packing。需要准备供数的实现仍参与有限 portfolio，最终 winner 由实际调优决定，不展开每个 computation 的笛卡尔积，也不把这个基准当成布局或复用代价模型。
 
 共同 [BufferStorageAnalysis](include/Intent/Analysis/BufferStorage.h) 直接使用 MLIR 的

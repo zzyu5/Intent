@@ -7,6 +7,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   Implementation/GroupQuantizedDots.cpp
   Implementation/Implementation.cpp
   Implementation/ImplementationInputs.cpp
+  Implementation/InputCopies.cpp
   Implementation/InputProducers.cpp
   Implementation/InputWindows.cpp
   Implementation/Passes.cpp
@@ -96,6 +97,7 @@ add_mlir_library(MLIRIntentCPUTransforms
   MLIRTensorDialect
   MLIRTensorTransforms
   MLIRVectorDialect
+  MLIRVectorTransforms
   MLIRValueBoundsOpInterface
   MLIRIR
   MLIRPass

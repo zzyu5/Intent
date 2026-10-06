@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation/ImplementationInputs.h"
 #include "InputWindows.h"
 #include "InputProducers.h"
+#include "InputCopies.h"
 #include "Intent/Dialect/CPU/Analysis/ExtentRelations.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
@@ -171,17 +172,7 @@ bool copyTransposedRepresentation(OpBuilder &b, Location loc, Value source,
         {b.getIndexAttr(count), b.getIndexAttr(1)});
     Value output = view(storage, {column, row, b.getIndexAttr(0)},
         {b.getIndexAttr(1), b.getIndexAttr(count), b.getIndexAttr(1)});
-    auto identity = b.getMultiDimIdentityMap(1);
-    auto copy = b.create<linalg::GenericOp>(loc, ValueRange{input}, ValueRange{output},
-        ArrayRef<AffineMap>{identity, identity},
-        ArrayRef<utils::IteratorType>{utils::IteratorType::parallel},
-        [&](OpBuilder &body, Location at, ValueRange arguments) {
-          Value value = arguments[0];
-          if (value.getType() != requirement.elementType)
-            value = body.create<arith::ExtFOp>(at, requirement.elementType, value);
-          body.create<linalg::YieldOp>(at, value);
-        });
-    producers.record(preparation, copy);
+    producers.record(preparation, createInputCopy(b, loc, input, output, 0));
   };
   auto tile = [&](Value ordinal) {
     Value begin = multiply(b, loc, ordinal, step);
@@ -220,38 +211,36 @@ void copyRepresentation(OpBuilder &b, Location loc, Value source,
   auto type = cast<MemRefType>(source.getType());
   Value zero = index(b, loc, 0), one = index(b, loc, 1);
   Value panel = index(b, loc, requirement.panelSize);
-  SmallVector<Value> sourceSizes;
+  SmallVector<OpFoldResult> sourceSizes;
   for (int64_t axis = 0; axis < type.getRank(); ++axis)
-    sourceSizes.push_back(b.create<memref::DimOp>(loc, source, axis));
-  Value extent = sourceSizes[requirement.panelAxis];
+    sourceSizes.push_back(getAsOpFoldResult(b.createOrFold<memref::DimOp>(loc, source, axis)));
+  Value extent = getValueOrCreateConstantIndexOp(b, loc, sourceSizes[requirement.panelAxis]);
   auto copyPanel = [&](Value ordinal, Value width) {
-    SmallVector<Value> logical(type.getRank()), physical{ordinal};
     Value begin = multiply(b, loc, ordinal, panel);
-    std::function<void(unsigned)> axes = [&](unsigned axis) {
-      if (axis == static_cast<unsigned>(type.getRank())) {
-        loop(b, loc, zero, width, 1, [&](Value lane) {
-          logical[requirement.panelAxis] = add(b, loc, begin, lane);
-          physical.push_back(lane);
-          auto load = b.create<memref::LoadOp>(loc, source, logical);
-          producers.record(preparation, load);
-          Value value = load;
-          if (value.getType() != requirement.elementType)
-            value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
-          b.create<memref::StoreOp>(loc, value, storage, physical);
-          physical.pop_back();
-        });
-      } else if (axis == requirement.panelAxis) {
-        axes(axis + 1);
-      } else {
-        loop(b, loc, zero, sourceSizes[axis], 1, [&](Value coordinate) {
-          logical[axis] = coordinate;
-          physical.push_back(coordinate);
-          axes(axis + 1);
-          physical.pop_back();
-        });
-      }
-    };
-    axes(0);
+    SmallVector<OpFoldResult> offsets(type.getRank(), b.getIndexAttr(0));
+    SmallVector<OpFoldResult> sizes(sourceSizes);
+    offsets[requirement.panelAxis] = getAsOpFoldResult(begin);
+    sizes[requirement.panelAxis] = getAsOpFoldResult(width);
+    SmallVector<OpFoldResult> strides(type.getRank(), b.getIndexAttr(1));
+    Value input = b.create<memref::SubViewOp>(loc, source, offsets, sizes, strides);
+    SmallVector<OpFoldResult> packedOffsets(type.getRank() + 1, b.getIndexAttr(0));
+    packedOffsets.front() = getAsOpFoldResult(ordinal);
+    SmallVector<OpFoldResult> packedSizes{b.getIndexAttr(1)};
+    SmallVector<int64_t> shape;
+    for (unsigned axis = 0; axis < sizes.size(); ++axis) {
+      if (axis == requirement.panelAxis) continue;
+      packedSizes.push_back(sizes[axis]);
+      shape.push_back(getConstantIntValue(sizes[axis]).value_or(ShapedType::kDynamic));
+    }
+    packedSizes.push_back(sizes[requirement.panelAxis]);
+    shape.push_back(getConstantIntValue(sizes[requirement.panelAxis]).value_or(ShapedType::kDynamic));
+    SmallVector<OpFoldResult> packedStrides(packedSizes.size(), b.getIndexAttr(1));
+    auto packedType = cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+        shape, cast<MemRefType>(storage.getType()), packedOffsets, packedSizes, packedStrides));
+    Value output = b.create<memref::SubViewOp>(loc, packedType, storage,
+        packedOffsets, packedSizes, packedStrides);
+    producers.record(preparation,
+        createInputCopy(b, loc, input, output, requirement.panelAxis));
   };
   Value full = b.create<arith::DivSIOp>(loc, extent, panel);
   Value tail = b.create<arith::RemSIOp>(loc, extent, panel);
@@ -684,23 +673,8 @@ FailureOr<SmallVector<InputSupply>> ImplementationInputs::Impl::prepareGroup(OpB
         {ShapedType::kDynamic, ShapedType::kDynamic}, storage.getType(), packedOffsets, packedSizes, packedStrides));
     Value destination = b.create<memref::SubViewOp>(loc, resultType, storage, packedOffsets, packedSizes, packedStrides);
     unsigned preparation = producerCopies.begin(b.getInsertionBlock(), window);
-    if (requirement.panelAxis == 1 && sourceType.getElementType() == requirement.elementType) {
-      producerCopies.record(preparation, b.create<memref::CopyOp>(loc, window, destination));
-    } else {
-      auto zero = index(b, loc, 0);
-      loop(b, loc, zero, cast<Value>(sizes[0]), 1, [&](Value row) {
-        loop(b, loc, zero, cast<Value>(sizes[1]), 1, [&](Value column) {
-          auto load = b.create<memref::LoadOp>(loc, window, ValueRange{row, column});
-          producerCopies.record(preparation, load);
-          Value value = load;
-          if (value.getType() != requirement.elementType)
-            value = b.create<arith::ExtFOp>(loc, requirement.elementType, value);
-          SmallVector<Value> coordinates = requirement.panelAxis == 1 ? SmallVector<Value>{row, column}
-                                                                     : SmallVector<Value>{column, row};
-          b.create<memref::StoreOp>(loc, value, destination, coordinates);
-        });
-      });
-    }
+    producerCopies.record(preparation,
+        createInputCopy(b, loc, window, destination, requirement.panelAxis));
     supplies.push_back({requirement.operand, requirement.panelAxis, requirement.panelSize, storage, std::move(begins)});
   }
   return supplies;

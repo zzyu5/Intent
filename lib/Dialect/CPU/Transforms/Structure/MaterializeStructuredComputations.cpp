@@ -2,6 +2,7 @@
 #include "Intent/Dialect/CPU/Transforms/Structure/ParallelReductions.h"
 #include "ReductionSources.h"
 #include "ReductionSupply.h"
+#include "../Implementation/InputCopies.h"
 #include "../Vector/ContiguousMemory.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
@@ -714,6 +715,11 @@ LogicalResult materializeStructuredComputation(Operation *operation,
   if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
     if (width > 1 && !loopBinding)
       return operation->emitError("vector materialization requires a selected implementation binding");
+    if (width >= 16 && loopBinding) {
+      auto copied = tryMaterializeInputCopy(generic, width, &listener);
+      if (failed(copied)) return failure();
+      if (*copied) return success();
+    }
     int64_t replicas = width > 1
         ? implementationParameter(loopBinding, "register_replicas") : 1;
     auto supplied = materializeReductionSupplyGroup(generic, width,
