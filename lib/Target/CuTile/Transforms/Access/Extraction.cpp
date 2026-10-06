@@ -187,8 +187,22 @@ FailureOr<RectangularCoordinate> rectangularCoordinate(
 } // namespace
 
 bool requiresFragmentStorage(gpu::GatherOp gather) {
-  if (!isa<gpu::FragmentType>(gather.getResult().getType())) return false;
   auto kernel = gather->getParentOfType<func::FuncOp>();
+  if (!isa<gpu::FragmentType>(gather.getResult().getType())) {
+    auto source = cast<gpu::FragmentType>(gather.getSource().getType());
+    bool dynamicSelection = false;
+    for (auto [coordinate, axis] :
+         llvm::zip(gather.getCoordinates(), gather.getSourceAxes())) {
+      if (isa<gpu::FragmentType>(coordinate.getType())) return false;
+      if (getCompileTimeScalar(coordinate)) continue;
+      auto extent = gpu::IndexRelations().constant(
+          cast<gpu::PhysicalExprAttr>(source.getShape()[axis]), kernel);
+      dynamicSelection |= !extent || *extent != 1;
+    }
+    // Dynamic scalar lookup uses an array gather from the completed snapshot.
+    // Constant selections and unit axes keep the native tile extraction.
+    return dynamicSelection;
+  }
   gpu::PhysicalProgramAnalysis analysis(kernel);
   OpBuilder builder(gather);
   Operation *previous = gather->getPrevNode();
