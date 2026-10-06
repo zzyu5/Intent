@@ -134,11 +134,17 @@ LogicalResult bindTraversalFragmentFootprints(
     auto schema = parameter;
     auto category = schema.getCategory();
     auto role = schema.getRole();
-    bool reduction = category == ParameterCategory::Reduction &&
-                     (role == ParameterRole::Reduction ||
-                      role == ParameterRole::ReductionInner ||
-                      role == ParameterRole::ReductionOuter);
-    if (!reduction && !isPointwiseTraversalParameter(parameter))
+    bool physicalTraversal =
+        (category == ParameterCategory::Reduction &&
+         (role == ParameterRole::Reduction ||
+          role == ParameterRole::ReductionInner ||
+          role == ParameterRole::ReductionOuter)) ||
+        (role == ParameterRole::ScanChunk &&
+         (category == ParameterCategory::Scan ||
+          category == ParameterCategory::RegionReduction ||
+          category == ParameterCategory::RegionContraction)) ||
+        isPointwiseTraversalParameter(parameter);
+    if (!physicalTraversal)
       continue;
     auto fragments = resources.materializedTypesUsing(schema.getName());
     auto fits = [&](int64_t candidate) {

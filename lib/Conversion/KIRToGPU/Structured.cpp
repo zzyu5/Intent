@@ -180,16 +180,17 @@ FailureOr<gpu::ParameterAttr> ScalarRegionLowering::getOrCreateRegionSegment(
   if (!isa<IntegerType, FloatType>(sourceType))
     return operation->emitOpError(
         "region segment has no scalar element type for its physical parameter");
-  gpu::ParameterCategory category = gpu::ParameterCategory::Scan;
-  if (auto fold = dyn_cast<intent::RegionFoldOp>(operation)) {
-    bool contraction = false;
-    fold.getSummarize().walk([&](Operation *nested) {
+  bool contraction = false;
+  for (Region &region : operation->getRegions())
+    region.walk([&](Operation *nested) {
       contraction |= isa<intent::ContractOp, intent::ScaledContractOp,
                          intent::SparseContractOp>(nested);
     });
-    category = contraction ? gpu::ParameterCategory::RegionContraction
-                           : gpu::ParameterCategory::RegionReduction;
-  }
+  gpu::ParameterCategory category =
+      contraction ? gpu::ParameterCategory::RegionContraction
+                  : isa<intent::RegionFoldOp>(operation)
+                        ? gpu::ParameterCategory::RegionReduction
+                        : gpu::ParameterCategory::Scan;
   auto schema = gpu::ParameterAttr::get(
       operation->getContext(), builder.getStringAttr(name), builder.getIndexType(),
       gpu::ParameterRole::ScanChunk,
