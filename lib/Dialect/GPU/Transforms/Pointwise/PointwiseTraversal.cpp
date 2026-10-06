@@ -521,7 +521,12 @@ FailureOr<Value> replayPointwiseValue(OpBuilder &builder, Value value,
           return replaceTraversalExtent(original.getType(), source,
                                          traversalDimensions, blockedExtent);
         });
-    if (failed(cloned)) return failure();
+    if (failed(cloned))
+      return producer->emitOpError(
+          "pointwise replay cannot transport the producer's selected schema")
+          << "; result=" << value.getType()
+          << "; selected=" << replaceTraversalExtent(
+                 value.getType(), source, traversalDimensions, blockedExtent);
     replayed = (*cloned)[selectedResult.getResultNumber()];
     bool structuredControl = isa<scf::IfOp, scf::ForOp>(producer);
     llvm::SmallPtrSet<Operation *, 8> controlRanges;
@@ -1057,6 +1062,15 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
     auto loop = builder.create<scf::ForOp>(
         histogram.getLoc(), inputRange.getStart(), inputRange.getLogicalStop(),
         loopStep, ValueRange{zero},
+        [](OpBuilder &nested, Location location, Value, ValueRange carries) {
+          nested.create<scf::YieldOp>(location, carries);
+        });
+    // Schema and replay queries inspect the current kernel and loop carries.
+    // Attach a complete loop before rebuilding its body: a ForOp construction
+    // callback still owns a detached region, without those execution facts.
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    OpBuilder nested(yield);
+    auto populate =
         [&](OpBuilder &nested, Location location, Value tileStart,
             ValueRange carries) {
           Value blocked = nested.create<MakeRangeOp>(
@@ -1151,8 +1165,10 @@ LogicalResult realizeOwnedHistograms(func::FuncOp kernel) {
           Value accumulated = nested.create<BinaryOp>(
               location, *outputType, carries.front(), partial.getResult(),
               BinaryOperator::Add);
-          nested.create<scf::YieldOp>(location, accumulated);
-        });
+          yield.getResultsMutable().assign(accumulated);
+        };
+    populate(nested, histogram.getLoc(), loop.getInductionVar(),
+             loop.getRegionIterArgs());
     if (bodyFailed) {
       loop.erase();
       return histogram.emitOpError(

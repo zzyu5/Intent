@@ -43,7 +43,14 @@ FailureOr<SmallVector<int64_t>> contractionResultPermutation(
   }
   if (failed(remapSchemaAxes(operation, originalOperands, TypeRange{originalResult})))
     return failure();
-  auto current = queryContractionAxes(operation);
+  // The operands and axis attributes have moved, while the result and its
+  // accumulator still have their original types. Derive the new result axes
+  // from the transported operands before closing those two result boundaries.
+  auto current = ContractionAxes::get(
+      operation.getLhs().getType().getShape().size(),
+      operation.getRhs().getType().getShape().size(),
+      operation.getLhsReductionAxes(), operation.getRhsReductionAxes(),
+      operation.getLhsBatchAxes(), operation.getRhsBatchAxes());
   if (!current || current->results.size() != output->type.getShape().size())
     return failure();
   SmallVector<int64_t> permutation(current->results.size(), -1);

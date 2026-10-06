@@ -1,4 +1,5 @@
 #include "Intent/Dialect/GPU/Transforms/Passes.h"
+#include "Intent/Dialect/GPU/Analysis/TraversalPartitions.h"
 #include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/IR/TypeVerification.h"
 
@@ -340,7 +341,8 @@ LogicalResult verifyGPUProgram(ModuleOp module) {
       auto origin = operation->getAttrOfType<IntegerAttr>(originAttr);
       if (!origin || !llvm::all_of(effectDefinitions[origin.getInt()],
                                    [&](Operation *previous) {
-                                     return mutuallyExclusiveEffects(previous, operation);
+                                     return mutuallyExclusiveEffects(previous, operation) ||
+                                            areDisjointTraversalPartitions(previous, operation, physicalAnalysis);
                                    })) {
         operation->emitOpError(
             "observable effect requires one canonical origin per control path");
