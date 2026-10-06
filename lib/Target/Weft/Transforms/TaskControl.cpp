@@ -11,6 +11,16 @@ namespace wk = ::weft::kernel;
 namespace intent::weft_provider {
 using namespace task_detail;
 
+namespace {
+
+Type ownerValueType(Type type) {
+  if (isa<wk::ValueType>(type)) return type;
+  auto empty = DenseI64ArrayAttr::get(type.getContext(), {});
+  return wk::ValueType::get(type.getContext(), type, empty, empty);
+}
+
+} // namespace
+
 FailureOr<SmallVector<Value>> TaskConversion::writtenEnclosingLocals(Operation *scope) {
   SmallVector<Value> result;
   auto effects = storage->effects(scope);
@@ -19,6 +29,12 @@ FailureOr<SmallVector<Value>> TaskConversion::writtenEnclosingLocals(Operation *
   for (const cpu::StorageEffect &entry : effects.entries) {
     if (!isa<MemoryEffects::Write>(entry.effect.getEffect())) continue;
     Value memory = entry.effect.getValue();
+    // Atomic operations separately expose their addressed storage effects.
+    // Their resource-less effects order surrounding accesses; they do not
+    // mutate every private value carried by the enclosing structured region.
+    if (!memory && isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp,
+                       cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(entry.operation))
+      continue;
     if (!memory)
       return scope->emitError("Weft control write has no storage target"), failure();
     Value owner = localRoot(memory);
@@ -227,19 +243,17 @@ FailureOr<SmallVector<Type>> TaskConversion::controlTypes(ValueRange boundaries)
     else if (controlOwners.contains(value)) {
       auto type = resultType(value);
       if (failed(type)) return failure();
-      result.push_back(*type);
+      result.push_back(ownerValueType(*type));
     }
   }
   return result;
 }
 
 Value TaskConversion::controlOwner(Type type, Location loc, Value initial) {
-  Type scalar = element(type);
-  Value zero;
-  if (auto floating = dyn_cast<FloatType>(scalar))
-    zero = b.create<arith::ConstantOp>(loc, b.getFloatAttr(floating, 0.0));
-  else zero = b.create<wk::ConstantOp>(loc, scalar, b.getIntegerAttr(scalar, 0));
-  Value owner = b.create<wk::NewOp>(loc, type, zero, true);
+  SmallVector<Value> extents;
+  for (int64_t dimension : shape(type))
+    extents.push_back(dimension < 0 ? shapeValues[-dimension - 1] : index(loc, dimension));
+  Value owner = b.create<wk::EmptyOp>(loc, type, extents);
   if (initial)
     owner = b.create<wk::UpdateOp>(loc, type, owner, initial, ValueRange{},
         b.getArrayAttr(SmallVector<Attribute>(shape(type).size(), b.getStringAttr("all"))));
@@ -248,7 +262,8 @@ Value TaskConversion::controlOwner(Type type, Location loc, Value initial) {
 
 Value TaskConversion::nativeOwner(Value value) {
   while (auto update = value.getDefiningOp<wk::UpdateOp>()) value = update.getInput();
-  return value.getDefiningOp<wk::NewOp>() || value.getDefiningOp<wk::MaterializeOp>()
+  return value.getDefiningOp<wk::NewOp>() || value.getDefiningOp<wk::EmptyOp>() ||
+      value.getDefiningOp<wk::MaterializeOp>()
       ? value : Value{};
 }
 
@@ -309,9 +324,11 @@ FailureOr<SmallVector<Value>> TaskConversion::controlValues(ValueRange inputs, V
       if (Value owner = fullLocalOwner(input); owner && !locals.count(owner))
         if (failed(bindLocalReference(input, boundary.getParentBlock()->getParentOp())))
           return failure();
-      auto supplied = read(input);
+      auto supplied = cast<MemRefType>(input.getType()).getRank() == 0
+          ? readNative(input) : read(input);
       auto type = resultType(boundary);
       if (failed(supplied) || failed(type)) return failure();
+      *type = ownerValueType(*type);
       if (!owners.empty() && owners[result.size()]) *type = owners[result.size()].getType();
       auto aligned = alignControlValue(*supplied, *type, input.getLoc());
       if (failed(aligned)) return failure();
@@ -354,6 +371,7 @@ LogicalResult TaskConversion::mapControlValues(ValueRange source, ValueRange tar
       Value supplied = target[position++];
       auto type = resultType(value);
       if (failed(type)) return failure();
+      *type = ownerValueType(*type);
       auto aligned = alignControlValue(supplied, *type, value.getLoc());
       if (failed(aligned)) return failure();
       supplied = *aligned;

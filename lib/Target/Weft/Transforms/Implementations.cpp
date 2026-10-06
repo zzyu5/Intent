@@ -161,8 +161,14 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
     b.create<linalg::FillOp>(loc, ValueRange{tile.initial}, ValueRange{partial});
     auto term = b.create<linalg::GenericOp>(loc, ValueRange{lhs, rhs}, ValueRange{partial},
         operation.getIndexingMapsArray(), operation.getIteratorTypesArray(),
-        [](OpBuilder &nested, Location loc, ValueRange args) {
-          nested.create<linalg::YieldOp>(loc, nested.create<math::FmaOp>(loc, args[0], args[1], args[2]).getResult());
+        [&](OpBuilder &nested, Location loc, ValueRange args) {
+          IRMapping mapping;
+          Block &body = operation.getRegion().front();
+          mapping.map(body.getArguments(), args);
+          for (Operation &value : body.without_terminator())
+            nested.clone(value, mapping);
+          nested.create<linalg::YieldOp>(loc,
+              mapping.lookup(body.getTerminator()->getOperand(0)));
         });
     term->setAttr("intent_cpu.implementation", binding);
     SmallVector<Value> inputs{partial};
@@ -206,7 +212,8 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
         Value width = index(b, loc, count);
         auto supply = [&](Value m, int64_t rows) {
           Value lhs = view(tile.lhs, m, k, b.getIndexAttr(rows), width);
-          Value saved = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, count}, b.getF32Type()));
+          Value saved = b.create<memref::AllocaOp>(loc, MemRefType::get({rows, count},
+              cast<MemRefType>(lhs.getType()).getElementType()));
           b.create<memref::CopyOp>(loc, lhs, saved);
           if (count == 1) {
             loop(b, loc, tile.nBegin, add(b, loc, tile.nBegin, tile.nCount), 1,
@@ -324,12 +331,20 @@ cpu::ImplementationRegistry implementations() {
     return {{1, type.getElementType(), 1, 1, 64, InputReuse::Consumers, 1,
              InputStorageScope::Invocation}};
   };
+  Implementation vectorInteger = integer;
+  vectorInteger.name = "weft.vector_i8_i32";
+  vectorInteger.requiresMatrixI8I32 = false;
+  vectorInteger.parameterRelations = {};
   result.add<linalg::GenericOp>(std::move(integer));
+  result.add<linalg::GenericOp>(std::move(vectorInteger));
   result.add<linalg::GenericOp>({"weft.contract_f32", [](Operation *op) {
       auto generic = dyn_cast<linalg::GenericOp>(op);
+      auto input = [](Type element) {
+        return element.isF16() || element.isBF16() || element.isF32();
+      };
       return generic && isMatrixContraction(generic) &&
-          cast<MemRefType>(generic.getInputs()[0].getType()).getElementType().isF32() &&
-          cast<MemRefType>(generic.getInputs()[1].getType()).getElementType().isF32() &&
+          input(cast<MemRefType>(generic.getInputs()[0].getType()).getElementType()) &&
+          input(cast<MemRefType>(generic.getInputs()[1].getType()).getElementType()) &&
           cast<MemRefType>(generic.getOutputs()[0].getType()).getElementType().isF32();
     }, [](Operation *operation, CapabilitiesAttr, const Configuration &config) -> std::optional<std::string> {
       if (config.parameter("lhs_supply") != retainedLhsSupply) return std::nullopt;

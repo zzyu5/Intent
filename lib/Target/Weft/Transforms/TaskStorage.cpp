@@ -4,6 +4,7 @@
 #include "Intent/Analysis/ControlFlow.h"
 #include "Weft/Dialect/Kernel/IR/SubviewBounds.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/IR/Matchers.h"
 
 using namespace mlir;
@@ -18,10 +19,8 @@ Value TaskConversion::localRoot(Value memory) {
     return found->second;
   if (auto cast = memory.getDefiningOp<memref::CastOp>()) return localRoot(cast.getSource());
   if (auto view = memory.getDefiningOp<memref::SubViewOp>()) return localRoot(view.getSource());
-  if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp())) {
-    auto projection = queryAxisView(memory);
-    if (succeeded(projection)) return localRoot(projection->source);
-  }
+  if (memory.getDefiningOp() && isAxisView(memory.getDefiningOp()))
+    return localRoot(axisViewSource(memory.getDefiningOp()));
   return storage->uniqueOrigin(memory);
 }
 
@@ -73,6 +72,54 @@ bool TaskConversion::isLocal(Value memory) {
   Operation *owner = root ? root.getDefiningOp() : nullptr;
   return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(owner) &&
          currentTask->isProperAncestor(owner);
+}
+
+LogicalResult TaskConversion::allocateLocal(Value memory) {
+  if (!isLocal(memory))
+    return emitError(memory.getLoc(), "Weft local allocation requires a task-private owner");
+  auto aliases = storage->aliases(memory);
+  if (!aliases.complete || llvm::any_of(aliases.users, [&](Operation *user) {
+        return !currentTask->isProperAncestor(user);
+      }))
+    return emitError(memory.getLoc(), "Weft local allocation has an escaping storage alias");
+  auto type = cast<MemRefType>(memory.getType());
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<Value> extents;
+  SmallVector<int64_t> dimensions;
+  unsigned dynamic = 0;
+  for (auto [axis, dimension] : llvm::enumerate(type.getShape())) {
+    if (!ShapedType::isDynamic(dimension) && dimension != 0) {
+      sizes.push_back(b.getIndexAttr(dimension));
+      extents.push_back(index(memory.getLoc(), dimension));
+      dimensions.push_back(dimension);
+      continue;
+    }
+    OpFoldResult sourceExtent = dimension == 0 ? OpFoldResult(b.getIndexAttr(0))
+        : OpFoldResult(memory.getDefiningOp()->getOperand(dynamic++));
+    Value extent = dimension == 0 ? index(memory.getLoc(), 0)
+        : values.lookupOrNull(cast<Value>(sourceExtent));
+    if (!extent)
+      return emitError(memory.getLoc(), "private allocation extent has no current SSA value");
+    auto bound = dimensionExtent(memory, axis);
+    if (!bound || *bound == 0) {
+      int64_t id = shapeValues.size() + 1;
+      extent = b.create<wk::LocalShapeOp>(memory.getLoc(), b.getIndexType(), extent, id);
+      shapeValues.push_back(extent);
+      localShapeBindings.emplace_back(sourceExtent, id);
+      bound = -id;
+    }
+    if (*bound < 0) extent = shapeValues[-*bound - 1];
+    sizes.push_back(sourceExtent);
+    extents.push_back(extent);
+    dimensions.push_back(*bound);
+  }
+  Type scalar = type.getElementType();
+  if (scalar.isIndex()) scalar = IntegerType::get(b.getContext(), 64, IntegerType::Signed);
+  auto value = wk::ValueType::get(b.getContext(), nativeScalarType(scalar),
+      array(dimensions), array(memoryAxes(memory)));
+  locals[memory] = {b.create<wk::EmptyOp>(memory.getLoc(), value, extents),
+                    std::move(sizes)};
+  return success();
 }
 
 FailureOr<Value> TaskConversion::readNative(Value memory) {
@@ -135,6 +182,19 @@ FailureOr<Value> TaskConversion::readNative(Value memory) {
     if (failed(source)) return failure();
     viewAxes[memory] = viewAxes.at(cast.getSource());
     return source;
+  }
+  if (isStaticShapeView(memory.getDefiningOp())) {
+    Value source = axisViewSource(memory.getDefiningOp());
+    auto supplied = read(source);
+    auto target = resultType(memory);
+    if (failed(supplied) || failed(target)) return failure();
+    auto reshaped = reshapeViewValue(memory, *supplied, *target, axes((*supplied).getType()));
+    if (failed(reshaped)) return failure();
+    auto &mapping = viewAxes[memory];
+    mapping.clear();
+    for (unsigned axis = 0; axis < cast<MemRefType>(memory.getType()).getRank(); ++axis)
+      mapping.push_back(axis);
+    return reshaped;
   }
   auto projection = localProjection(memory, found->second);
   if (failed(projection)) return failure();
@@ -445,6 +505,17 @@ LogicalResult TaskConversion::write(Value memory, Value value, SmallVector<OpFol
   Value root = localRoot(memory);
   if (memory != root) {
     if (auto cast = memory.getDefiningOp<memref::CastOp>()) return write(cast.getSource(), value, sizes);
+    if (isStaticShapeView(memory.getDefiningOp())) {
+      if (!sizes.empty())
+        return emitError(memory.getLoc(), "partial shape-view definition requires an explicit subview");
+      Value source = axisViewSource(memory.getDefiningOp());
+      auto target = resultType(source), logical = resultType(memory);
+      if (failed(target) || failed(logical)) return failure();
+      auto supplied = alignValue(value, *logical, memory.getLoc());
+      if (failed(supplied)) return failure();
+      auto reshaped = reshapeViewValue(source, *supplied, *target, axes((*supplied).getType()));
+      return failed(reshaped) ? failure() : write(source, *reshaped);
+    }
     auto projection = memory.getDefiningOp<memref::SubViewOp>();
     auto found = locals.find(root);
     if (found != locals.end()) {
@@ -503,17 +574,32 @@ LogicalResult TaskConversion::write(Value memory, Value value, SmallVector<OpFol
   auto type = resultType(memory);
   if (failed(type)) return failure();
   auto current = locals.find(root);
+  auto empty = current == locals.end() ? wk::EmptyOp{}
+      : current->second.value.getDefiningOp<wk::EmptyOp>();
+  bool replacesEmpty = empty && empty->getBlock() == b.getInsertionBlock() &&
+      sameStorageShape(memory, root) && current->second.sizes.size() == sizes.size() &&
+      llvm::all_of(llvm::zip(current->second.sizes, sizes), [&](auto bounds) {
+        return cpu::haveEqualExtents(
+            ValueBoundsConstraintSet::Variable(std::get<0>(bounds)),
+            ValueBoundsConstraintSet::Variable(std::get<1>(bounds)));
+      });
   if (memory == root && !isa<wk::ValueType>(value.getType())) {
     Type scalar = element(*type);
     auto aligned = alignValue(value, scalar, memory.getLoc());
     if (failed(aligned)) return failure();
-    if (current != locals.end() && isa<wk::ValueType>(current->second.value.getType()))
+    if (replacesEmpty)
+      current->second = {*aligned, sizes};
+    else if (current != locals.end() && isa<wk::ValueType>(current->second.value.getType()))
       current->second.value = fillLocal(current->second.value, *aligned, memory.getLoc());
     else locals[root] = {*aligned, sizes};
     return success();
   }
   auto aligned = alignValue(value, *type, memory.getLoc());
   if (failed(aligned)) return failure();
+  if (replacesEmpty) {
+    current->second = {*aligned, sizes};
+    return success();
+  }
   if (current != locals.end() && isa<wk::ValueType>(*type)) {
     if ((isa<wk::ValueType>(current->second.value.getType()) &&
          current->second.value.getType() != *type) || current->second.sizes.size() != sizes.size() ||
@@ -599,7 +685,7 @@ LogicalResult TaskConversion::lower(memref::StoreOp store) {
     auto current = locals.find(root);
     if (current == locals.end())
       return store.emitError("indexed private write requires a dominating initialized owner");
-    auto indices = localIndices(store.getMemref(), store.getIndices(), current->second);
+    auto indices = localIndices(store.getMemref(), store.getIndices(), current->second, values);
     if (failed(indices)) return failure();
     auto scalar = alignValue(values.lookup(store.getValue()),
         element(current->second.value.getType()), loc);
@@ -611,7 +697,7 @@ LogicalResult TaskConversion::lower(memref::StoreOp store) {
   }
   auto region = view(store.getMemref());
   if (failed(region)) return failure();
-  auto indices = projectIndices(store.getMemref(), store.getIndices(), shape((*region).getType()).size());
+  auto indices = projectIndices(store.getMemref(), store.getIndices(), shape((*region).getType()).size(), values);
   Value selected = b.create<wk::SliceOp>(loc,
       sliceType(*region, {}, {}),
       *region, indices, b.getArrayAttr(SmallVector<Attribute>(indices.size(), b.getStringAttr("index"))));
@@ -620,52 +706,150 @@ LogicalResult TaskConversion::lower(memref::StoreOp store) {
 }
 
 LogicalResult TaskConversion::lower(memref::LoadOp load) {
-  Location loc = load.getLoc();
-  if (isLocal(load.getMemref()) && load.getIndices().empty()) {
-    auto value = read(load.getMemref());
-    if (failed(value)) return failure();
-    values.map(load.getResult(), *value);
-    return success();
-  }
-  if (isLocal(load.getMemref())) {
-    auto current = locals.find(localRoot(load.getMemref()));
-    if (current == locals.end())
-      return load.emitError("indexed private read has no dominating initialized owner");
-    if (!isa<wk::ValueType>(current->second.value.getType())) {
-      values.map(load.getResult(), current->second.value);
-      return success();
-    }
-    auto indices = localIndices(load.getMemref(), load.getIndices(), current->second);
-    if (failed(indices)) return failure();
-    values.map(load.getResult(), b.create<wk::ExtractOp>(loc,
-        nativeScalarType(load.getType()), current->second.value, *indices,
-        b.getArrayAttr(SmallVector<Attribute>(indices->size(), b.getStringAttr("index")))));
-    return success();
-  }
-  auto region = view(load.getMemref());
-  if (failed(region)) return failure();
-  auto indices = projectIndices(load.getMemref(), load.getIndices(), shape((*region).getType()).size());
-  SmallVector<Attribute> selectors(indices.size(), b.getStringAttr("index"));
-  Value selected = b.create<wk::SliceOp>(loc, sliceType(*region, {}, {}),
-      *region, indices, b.getArrayAttr(selectors));
-  values.map(load.getResult(), b.create<wk::AdmitOp>(loc,
-      nativeScalarType(load.getType()), selected));
+  auto result = indexedRead(load, values);
+  if (failed(result)) return failure();
+  values.map(load.getResult(), *result);
   return success();
 }
 
+LogicalResult TaskConversion::lower(cpu::AtomicRMWOp atomic) {
+  if (atomic.getKind() != AtomicRMWKind::Add ||
+      (!atomic.getValue().getType().isInteger(32) &&
+       !atomic.getValue().getType().isInteger(64)))
+    return atomic.emitError("Weft atomic update requires a supported integer add");
+  if (isLocal(atomic.getTarget()))
+    return atomic.emitError("Weft atomic update requires an addressable shared view");
+  auto region = view(atomic.getTarget());
+  if (failed(region)) return failure();
+  auto indices = projectIndices(atomic.getTarget(), atomic.getIndices(),
+      shape((*region).getType()).size(), values);
+  Value selected = b.create<wk::SliceOp>(atomic.getLoc(), sliceType(*region, {}, {}),
+      *region, indices,
+      b.getArrayAttr(SmallVector<Attribute>(indices.size(), b.getStringAttr("index"))));
+  StringRef order;
+  switch (atomic.getOrdering()) {
+  case AtomicOrdering::Relaxed: order = "relaxed"; break;
+  case AtomicOrdering::Acquire: order = "acquire"; break;
+  case AtomicOrdering::Release: order = "release"; break;
+  case AtomicOrdering::AcquireRelease: order = "acq_rel"; break;
+  }
+  Value result = b.create<wk::AtomicRMWOp>(atomic.getLoc(),
+      nativeScalarType(atomic.getOldValue().getType()),
+      values.lookup(atomic.getValue()), selected, "add", order);
+  values.map(atomic.getOldValue(), result);
+  return success();
+}
+
+LogicalResult TaskConversion::lower(bufferization::DeallocOp release) {
+  if (!release.getRetained().empty() || release.getNumResults())
+    return release.emitError("Weft value release cannot synthesize retained ownership results");
+  for (Value memory : release.getMemrefs()) {
+    auto origins = storage->origins(memory);
+    if (!origins.complete || origins.values.empty())
+      return release.emitError("Weft value release requires complete storage origins");
+    for (Value origin : origins.values) {
+      if (immutableBorrow(origin)) continue;
+      Operation *allocation = origin.getDefiningOp();
+      if (!isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(allocation) ||
+          !currentTask->isProperAncestor(allocation))
+        return release.emitError("Weft task cannot release host-owned addressable storage");
+      auto aliases = storage->aliases(origin);
+      if (!aliases.complete || llvm::any_of(aliases.users, [&](Operation *user) {
+            return !currentTask->isProperAncestor(user);
+          }))
+        return release.emitError("Weft value release has an escaping private storage alias");
+    }
+  }
+  // These private resources are represented by local SSA owners. Their native
+  // lifetimes follow the resulting uses; no source heap pointer exists to free.
+  return success();
+}
+
+FailureOr<Value> TaskConversion::indexedRead(memref::LoadOp load,
+                                             const IRMapping &mapping) {
+  Location loc = load.getLoc();
+  bool local = isLocal(load.getMemref());
+  Value base;
+  SmallVector<Value> indices;
+  if (local) {
+    auto current = locals.find(localRoot(load.getMemref()));
+    if (current == locals.end())
+      return load.emitError("indexed private read has no dominating initialized owner"), failure();
+    base = current->second.value;
+    if (isa<wk::ValueType>(base.getType())) {
+      auto projected = localIndices(load.getMemref(), load.getIndices(), current->second, mapping);
+      if (failed(projected)) return failure();
+      indices = std::move(*projected);
+    } else {
+      for (Value coordinate : load.getIndices()) indices.push_back(mapping.lookup(coordinate));
+    }
+  } else {
+    auto region = view(load.getMemref());
+    if (failed(region)) return failure();
+    base = *region;
+    indices = projectIndices(load.getMemref(), load.getIndices(), shape(base.getType()).size(), mapping);
+  }
+  SmallVector<Attribute> selectors;
+  SmallVector<int64_t> dimensions, ids;
+  for (Value &coordinate : indices) {
+    auto type = dyn_cast<wk::ValueType>(coordinate.getType());
+    if (!type) {
+      if (!coordinate.getType().isIndex())
+        coordinate = b.create<wk::CastOp>(loc, b.getIndexType(), coordinate);
+      selectors.push_back(b.getStringAttr("index"));
+      continue;
+    }
+    if (!local)
+      return load.emitError("shaped memory indexing requires its explicit scalar address traversal"), failure();
+    Type unsignedIndex = IntegerType::get(b.getContext(), 64, IntegerType::Unsigned);
+    coordinate = b.create<wk::CastOp>(loc,
+        valueType(unsignedIndex, shape(type), axes(type)), coordinate);
+    selectors.push_back(b.getStringAttr("gather"));
+    for (auto [axis, extent] : llvm::zip(type.getAxisIds().asArrayRef(), type.getShape().asArrayRef())) {
+      auto found = llvm::find(ids, axis);
+      if (found == ids.end()) { ids.push_back(axis); dimensions.push_back(extent); }
+      else if (dimensions[found - ids.begin()] != extent)
+        return load.emitError("indexed read coordinates disagree on their logical domain"), failure();
+    }
+  }
+  Type storageElement = local ? element(base.getType())
+      : nativeScalarType(cast<MemRefType>(load.getMemref().getType()).getElementType());
+  if (storageElement.isIndex()) storageElement = IntegerType::get(b.getContext(), 64, IntegerType::Signed);
+  Type loadedType = valueType(storageElement, dimensions, ids);
+  Value result;
+  if (local && !isa<wk::ValueType>(base.getType())) {
+    auto aligned = alignValue(base, loadedType, loc);
+    if (failed(aligned)) return failure();
+    result = *aligned;
+  } else if (local) {
+    result = b.create<wk::ExtractOp>(loc, loadedType, base, indices, b.getArrayAttr(selectors));
+  } else {
+    Value selected = b.create<wk::SliceOp>(loc, sliceType(base, dimensions, ids),
+        base, indices, b.getArrayAttr(selectors));
+    result = b.create<wk::AdmitOp>(loc, loadedType, selected);
+  }
+  Type expected = valueType(load.getType(), dimensions, ids);
+  if (result.getType() != expected)
+    result = b.create<wk::CastOp>(loc, expected, result);
+  return result;
+}
+
 FailureOr<SmallVector<Value>> TaskConversion::localIndices(
-    Value memory, ValueRange indices, const LocalValue &state) {
+    Value memory, ValueRange indices, const LocalValue &state,
+    const IRMapping &mapping) {
   auto projection = localProjection(memory, state);
   if (failed(projection)) return failure();
-  auto relative = projectIndices(memory, indices, shape(projection->type).size());
+  auto relative = projectIndices(memory, indices, shape(projection->type).size(), mapping);
   SmallVector<Value> coordinates;
   unsigned retained = 0;
   for (auto [selector, offset] : llvm::zip_equal(projection->selectors, projection->offsets)) {
     if (cast<StringAttr>(selector).getValue() == "index")
       coordinates.push_back(offset);
-    else
-      coordinates.push_back(b.create<wk::BinaryOp>(memory.getLoc(), b.getIndexType(),
-          offset, relative[retained++], "add"));
+    else {
+      auto coordinate = binary(memory.getLoc(), offset, relative[retained++], "add");
+      if (failed(coordinate)) return failure();
+      coordinates.push_back(*coordinate);
+    }
   }
   return coordinates;
 }

@@ -7,6 +7,8 @@
 namespace intent::weft_provider {
 
 bool isAxisView(mlir::Operation *operation);
+mlir::Value axisViewSource(mlir::Operation *operation);
+bool isStaticShapeView(mlir::Operation *operation);
 mlir::FailureOr<cpu::ViewAxisProjection> queryAxisView(mlir::Value value);
 
 // The native task ABI represents contiguous storage, not arbitrary memref

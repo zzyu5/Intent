@@ -25,7 +25,7 @@ public:
 
   mlir::LogicalResult normalizeComputations();
 
-  llvm::SmallVector<mlir::Value> shapeArguments(mlir::func::FuncOp function,
+  llvm::SmallVector<mlir::Value> shapeArguments(cpu::TasksOp task,
                                               mlir::OpBuilder &builder);
   mlir::LogicalResult lower(cpu::TasksOp task, llvm::StringRef name,
                             llvm::SmallVectorImpl<unsigned> &argumentPositions);

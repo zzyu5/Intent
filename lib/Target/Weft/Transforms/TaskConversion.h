@@ -7,6 +7,7 @@
 #include "Intent/Dialect/CPU/Analysis/Storage.h"
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -31,7 +32,7 @@ public:
                  const cpu::ImplementationRegistry &implementations);
   mlir::LogicalResult normalizeComputations();
   llvm::SmallVector<mlir::Value>
-  shapeArguments(mlir::func::FuncOp function, mlir::OpBuilder &builder);
+  shapeArguments(cpu::TasksOp task, mlir::OpBuilder &builder);
   mlir::LogicalResult lower(cpu::TasksOp tasks, llvm::StringRef name,
                             llvm::SmallVectorImpl<unsigned> &argumentPositions);
 
@@ -71,6 +72,8 @@ private:
   std::optional<int64_t> dimensionExtent(mlir::Value memory, unsigned axis);
   std::optional<int64_t>
   shapeSymbol(const mlir::ValueBoundsConstraintSet::Variable &extent);
+  std::optional<int64_t>
+  capturedShapeSymbol(const mlir::ValueBoundsConstraintSet::Variable &extent);
   mlir::FailureOr<mlir::Value> view(mlir::Value memory);
   mlir::FailureOr<mlir::Value>
   reshapeViewValue(mlir::Value memory, mlir::Value value, mlir::Type target,
@@ -79,7 +82,8 @@ private:
   projectViewValue(mlir::Value memory, mlir::Value value, mlir::Type nativeType,
                    bool inverse = false);
   llvm::SmallVector<mlir::Value>
-  projectIndices(mlir::Value memory, mlir::ValueRange indices, unsigned nativeRank);
+  projectIndices(mlir::Value memory, mlir::ValueRange indices, unsigned nativeRank,
+                 const mlir::IRMapping &mapping);
   mlir::FailureOr<mlir::Value> dimension(mlir::Value memory, unsigned axis);
   mlir::LogicalResult lower(mlir::memref::ExtractStridedMetadataOp metadata);
   mlir::LogicalResult lower(mlir::memref::DimOp dim);
@@ -88,6 +92,7 @@ private:
   bool sameStorageShape(mlir::Value first, mlir::Value second);
   mlir::Value fullLocalOwner(mlir::Value memory);
   bool isLocal(mlir::Value memory);
+  mlir::LogicalResult allocateLocal(mlir::Value memory);
   mlir::FailureOr<mlir::Value> readNative(mlir::Value memory);
   mlir::FailureOr<mlir::Value> read(mlir::Value memory);
   mlir::FailureOr<mlir::Value> readNamedAxes(mlir::Value memory);
@@ -97,7 +102,7 @@ private:
   localProjection(mlir::Value memory, const LocalValue &state);
   mlir::FailureOr<llvm::SmallVector<mlir::Value>>
   localIndices(mlir::Value memory, mlir::ValueRange indices,
-               const LocalValue &state);
+               const LocalValue &state, const mlir::IRMapping &mapping);
   mlir::FailureOr<mlir::Value> alignValue(mlir::Value value, mlir::Type target,
                                         mlir::Location loc);
   mlir::LogicalResult materializeLocal(mlir::Value root);
@@ -110,6 +115,10 @@ private:
   mlir::LogicalResult lower(mlir::linalg::FillOp fill);
   mlir::LogicalResult lower(mlir::memref::StoreOp store);
   mlir::LogicalResult lower(mlir::memref::LoadOp load);
+  mlir::LogicalResult lower(cpu::AtomicRMWOp atomic);
+  mlir::LogicalResult lower(mlir::bufferization::DeallocOp release);
+  mlir::FailureOr<mlir::Value> indexedRead(mlir::memref::LoadOp load,
+                                         const mlir::IRMapping &mapping);
 
   mlir::FailureOr<bool> expandSelected(mlir::Operation *operation);
   mlir::FailureOr<mlir::Value> binary(mlir::Location loc, mlir::Value lhs,
@@ -171,11 +180,14 @@ private:
   llvm::DenseMap<mlir::Value, mlir::Value> localReferences;
   llvm::DenseSet<mlir::Value> controlOwners;
   llvm::SmallVector<mlir::Value> shapeValues;
+  llvm::SmallVector<std::pair<mlir::OpFoldResult, int64_t>> localShapeBindings;
   llvm::DenseMap<mlir::Value, mlir::Value> operandReads;
   llvm::DenseMap<mlir::Value, mlir::Value> readOnlySupplies;
   const llvm::DenseMap<mlir::Value, intent::QuantFormat> &formats;
   const cpu::ImplementationRegistry &implementations;
   llvm::DenseMap<int64_t, int64_t> extentIds;
+  struct CapturedExtent { unsigned argument; unsigned axis; };
+  llvm::SmallVector<CapturedExtent> capturedExtents;
   llvm::DenseMap<int64_t, int64_t> axisProjection;
   int64_t nextAxis;
 };

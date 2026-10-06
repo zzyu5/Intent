@@ -8,6 +8,8 @@ namespace intent::weft_provider {
 std::optional<DenseStorageType> denseStorageType(StringRef family) {
   if (family == "f16") return DenseStorageType{family.str(), "_Float16", 2};
   if (family == "bf16") return DenseStorageType{family.str(), "uint16_t", 2};
+  if (family == "f8E4M3FN" || family == "f8E5M2")
+    return DenseStorageType{family.str(), "uint8_t", 1};
   if (family == "f32") return DenseStorageType{family.str(), "float", 4};
   if (family == "f64") return DenseStorageType{family.str(), "double", 8};
   StringRef width = family;
@@ -44,7 +46,7 @@ std::optional<CScalarType> hostStorageType(Type type) {
 std::optional<CScalarType> hostScalarType(Type type) {
   // BF16 memory is raw storage. Its numerical conversion belongs to the
   // canonical task and target lowering, not C integer arithmetic in the host.
-  if (type.isBF16()) return std::nullopt;
+  if (type.isBF16() || isa<Float8E4M3FNType, Float8E5M2Type>(type)) return std::nullopt;
   if (type.isInteger(1)) return CScalarType{"int", {}, {}};
   return hostStorageType(type);
 }

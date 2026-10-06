@@ -2,6 +2,8 @@
 #include "Reductions.h"
 #include "ScalarValues.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/CPU/Analysis/Storage.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Matchers.h"
 
@@ -74,6 +76,7 @@ FailureOr<Value> TaskConversion::binary(Location loc, Value lhs, Value rhs, Stri
 }
 
 FailureOr<Value> TaskConversion::expression(Operation *operation, IRMapping &mapping) {
+  if (auto load = dyn_cast<memref::LoadOp>(operation)) return indexedRead(load, mapping);
   SmallVector<Value> operands;
   for (Value operand : operation->getOperands()) {
     Value mapped = mapping.lookupOrNull(operand);
@@ -154,6 +157,8 @@ FailureOr<Value> TaskConversion::reductionContribution(Block &body,
                                        IRMapping &mapping) {
   for (Operation &operation : body.without_terminator()) {
     if (&operation == native.combine) continue;
+    if (operation.getNumResults() == 1 && mapping.contains(operation.getResult(0)))
+      continue;
     for (Value operand : operation.getOperands())
       if (!mapping.contains(operand))
         return operation.emitError("Weft reduction scalar capture has no current value binding"), failure();
@@ -187,12 +192,29 @@ LogicalResult TaskConversion::generic(linalg::GenericOp operation) {
     if (failed(lhs) || failed(rhs) || failed(initial)) return failure();
     auto definition = (*initial).getDefiningOp<wk::NewOp>();
     bool zero = definition && matchPattern(definition->getOperand(0), m_PosZeroFloat());
+    if (!zero) {
+      cpu::StorageAnalysis storage(operation->getParentOfType<func::FuncOp>());
+      auto uniform = cpu::queryUniformBufferValue(destination, operation, storage);
+      zero = uniform && (isa<FloatType>(uniform->value.getType())
+          ? matchPattern(uniform->value, m_PosZeroFloat())
+          : matchPattern(uniform->value, m_Zero()));
+    }
     if (definition && isa<IntegerType>(element((*initial).getType())))
       if (auto constant = definition->getOperand(0).getDefiningOp<wk::ConstantOp>())
         if (auto value = dyn_cast<IntegerAttr>(constant.getValue())) zero = value.getValue().isZero();
     bool integer = isa<IntegerType>(element((*initial).getType()));
     if (!zero && !integer)
       return operation.emitError("Weft contraction requires an explicit zero-initialized partial; nonzero fused accumulation has no equivalent canonical operation");
+    if (!integer) {
+      Type accumulator = element((*initial).getType());
+      auto promote = [&](Value value) -> Value {
+        if (element(value.getType()) == accumulator) return value;
+        return b.create<wk::CastOp>(operation.getLoc(),
+            valueType(accumulator, shape(value.getType()), axes(value.getType())), value);
+      };
+      lhs = promote(*lhs);
+      rhs = promote(*rhs);
+    }
     int64_t reduction = loopAxes[2];
     Value term = b.create<wk::OuterContractOp>(operation.getLoc(), (*initial).getType(),
         *lhs, *rhs, array({reduction}), TypeAttr::get(element((*initial).getType())));
@@ -211,8 +233,17 @@ LogicalResult TaskConversion::generic(linalg::GenericOp operation) {
     return operation.emitError("Weft structured reduction requires one explicit reduction axis");
   IRMapping mapping = values;
   Block &body = operation.getRegion().front();
+  auto extents = operation.getStaticLoopRanges();
+  for (linalg::IndexOp coordinate : body.getOps<linalg::IndexOp>()) {
+    unsigned axis = coordinate.getDim();
+    if (extents[axis] <= 0)
+      return coordinate.emitError("Weft coordinate requires its materialized traversal or a static Iota domain");
+    auto type = cast<wk::ValueType>(valueType(b.getIndexType(), {extents[axis]}, {loopAxes[axis]}));
+    mapping.map(coordinate.getResult(),
+        b.create<wk::IotaOp>(coordinate.getLoc(), type, 0, extents[axis]));
+  }
   for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
-    auto value = mappedInput(input, maps[number], loopAxes);
+    auto value = mappedInput(input, maps[number], loopAxes, !reductions.empty());
     if (failed(value)) return failure();
     mapping.map(body.getArgument(number), *value);
   }
@@ -237,6 +268,8 @@ LogicalResult TaskConversion::generic(linalg::GenericOp operation) {
     return operation.emitError("Weft pointwise legalization requires an identity output traversal");
   if (!body.getArguments().back().use_empty()) return operation.emitError("Weft pointwise output is not a pure definition");
   for (Operation &nested : body.without_terminator()) {
+    if (nested.getNumResults() == 1 && mapping.contains(nested.getResult(0)))
+      continue;
     auto value = expression(&nested, mapping);
     if (failed(value)) return failure();
     mapping.map(nested.getResult(0), *value);
@@ -252,7 +285,7 @@ LogicalResult TaskConversion::reduction(cpu::ReduceOp operation) {
   SmallVector<int64_t> loopAxes(cast<AffineMapAttr>(operation.getIndexingMaps()[0]).getValue().getNumDims());
   for (int64_t &axis : loopAxes) axis = nextAxis++;
   for (auto [number, input] : llvm::enumerate(operation.getInputs())) {
-    auto value = mappedInput(input, cast<AffineMapAttr>(operation.getIndexingMaps()[number]).getValue(), loopAxes);
+    auto value = mappedInput(input, cast<AffineMapAttr>(operation.getIndexingMaps()[number]).getValue(), loopAxes, true);
     if (failed(value)) return failure();
     mapping.map(body.getArgument(number + 1), *value);
   }

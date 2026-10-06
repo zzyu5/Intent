@@ -1,6 +1,7 @@
 #include "TaskConversion.h"
 #include "TaskInterface.h"
 #include "Views.h"
+#include "ScalarValues.h"
 #include "Intent/Dialect/Intent/IR/Interface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/SmallSet.h"
@@ -46,7 +47,8 @@ void TaskConversion::initializeAxes() {
   });
 }
 
-SmallVector<Value> TaskConversion::shapeArguments(func::FuncOp function, OpBuilder &builder) {
+SmallVector<Value> TaskConversion::shapeArguments(cpu::TasksOp task, OpBuilder &builder) {
+  auto function = sourceFunction;
   SmallVector<Value> result(extentIds.size());
   auto interface = getPublicInterface(function);
   for (BlockArgument argument : function.getArguments()) {
@@ -57,13 +59,29 @@ SmallVector<Value> TaskConversion::shapeArguments(func::FuncOp function, OpBuild
       if (ShapedType::isDynamic(extent))
         result[extentIds.at(ids[axis]) - 1] = builder.create<memref::DimOp>(function.getLoc(), argument, axis);
   }
+  for (const CapturedExtent &extent : capturedExtents)
+    result.push_back(builder.create<memref::DimOp>(task.getLoc(),
+        task.getCaptures()[extent.argument - 1], extent.axis));
   return result;
+}
+
+std::optional<int64_t> TaskConversion::capturedShapeSymbol(
+    const ValueBoundsConstraintSet::Variable &extent) {
+  for (auto [number, captured] : llvm::enumerate(capturedExtents))
+    for (Value memory : {currentTask.getCaptures()[captured.argument - 1],
+                         Value(currentTask.getBody().front().getArgument(captured.argument))})
+      if (cpu::haveEqualExtents(extent,
+              ValueBoundsConstraintSet::Variable(memory, captured.axis)))
+        return extentIds.size() + number + 1;
+  return std::nullopt;
 }
 
 LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
                     SmallVectorImpl<unsigned> &argumentPositions) {
   storage = std::make_unique<cpu::StorageAnalysis>(sourceFunction);
   currentTask = tasks;
+  capturedExtents.clear();
+  localShapeBindings.clear();
   values.clear(); locals.clear(); localReferences.clear(); controlOwners.clear(); shapeValues.clear(); readOnlySupplies.clear(); viewAxes.clear();
   Location loc = tasks.getLoc();
   SmallVector<Attribute> names, accesses, symbols;
@@ -109,7 +127,10 @@ LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
       for (auto [axis, extent] : llvm::enumerate(memory.getShape())) {
         if (ShapedType::isDynamic(extent)) {
           auto symbol = shapeSymbol(ValueBoundsConstraintSet::Variable(capture, axis));
-          if (!symbol) return tasks.emitError("captured view extent has no external shape binding");
+          if (!symbol) {
+            capturedExtents.push_back({position, static_cast<unsigned>(axis)});
+            symbol = extentIds.size() + capturedExtents.size();
+          }
           dimensions.push_back(-*symbol);
         } else dimensions.push_back(extent);
       }
@@ -124,6 +145,9 @@ LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
       bool reads = false, writes = false;
       for (const cpu::StorageEffect &entry : memoryEffects.entries) {
         Value affected = entry.effect.getValue();
+        if (!affected && isa<cpu::AtomicLoadOp, cpu::AtomicStoreOp,
+                             cpu::AtomicRMWOp, cpu::AtomicCompareExchangeOp>(entry.operation))
+          continue;
         if (!affected || !storage->disjoint(affected, capture)) {
           reads |= isa<MemoryEffects::Read>(entry.effect.getEffect());
           writes |= isa<MemoryEffects::Write>(entry.effect.getEffect());
@@ -138,7 +162,7 @@ LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
       aliases.push_back(0);
     }
   }
-  for (unsigned symbol = 1; symbol <= extentIds.size(); ++symbol)
+  for (unsigned symbol = 1; symbol <= extentIds.size() + capturedExtents.size(); ++symbol)
     symbols.push_back(b.getStringAttr("shape_" + std::to_string(symbol)));
   b.setInsertionPointToEnd(output.getBody());
   auto kernel = b.create<wk::KernelOp>(loc, name, b.getArrayAttr(names),
@@ -160,7 +184,8 @@ LogicalResult TaskConversion::lower(cpu::TasksOp tasks, StringRef name,
           sliceType(target, {}, {}),
           target, ValueRange{index(loc, 0)}, b.getArrayAttr({b.getStringAttr("index")}));
       Type storage = source.getType().isIndex()
-          ? Type(IntegerType::get(b.getContext(), 64, IntegerType::Signed)) : source.getType();
+          ? Type(IntegerType::get(b.getContext(), 64, IntegerType::Signed))
+          : nativeScalarType(source.getType());
       Value loaded = b.create<wk::AdmitOp>(loc, storage, scalar);
       if (source.getType().isIndex()) loaded = b.create<wk::CastOp>(loc, b.getIndexType(), loaded);
       values.map(source, loaded);
@@ -189,15 +214,18 @@ LogicalResult TaskConversion::lower(Operation *operation) {
   auto expanded = expandSelected(operation);
   if (failed(expanded)) return failure();
   if (*expanded) return success();
-  if (isa<memref::AllocOp, memref::AllocaOp>(operation)) return success();
+  if (isa<memref::AllocOp, memref::AllocaOp>(operation))
+    return allocateLocal(operation->getResult(0));
   if (isa<memref::SubViewOp, memref::CastOp>(operation) || isAxisView(operation)) {
     Value result = operation->getResult(0);
-    if (isAxisView(operation) && failed(queryAxisView(result))) return failure();
+    if (isAxisView(operation) && !(isLocal(result) && isStaticShapeView(operation)) &&
+        failed(queryAxisView(result))) return failure();
     if (!isLocal(result) && failed(view(result))) return failure();
     return success();
   }
   if (auto metadata = dyn_cast<memref::ExtractStridedMetadataOp>(operation)) return lower(metadata);
   if (auto dealloc = dyn_cast<memref::DeallocOp>(operation)) { locals.erase(localRoot(dealloc.getMemref())); return success(); }
+  if (auto release = dyn_cast<bufferization::DeallocOp>(operation)) return lower(release);
   if (auto dim = dyn_cast<memref::DimOp>(operation)) return lower(dim);
   if (auto copy = dyn_cast<memref::CopyOp>(operation)) return lower(copy);
   if (auto fill = dyn_cast<linalg::FillOp>(operation)) return lower(fill);
@@ -208,6 +236,7 @@ LogicalResult TaskConversion::lower(Operation *operation) {
   if (auto loop = dyn_cast<scf::ForOp>(operation)) return lower(loop);
   if (auto loop = dyn_cast<scf::WhileOp>(operation)) return lower(loop);
   if (auto load = dyn_cast<memref::LoadOp>(operation)) return lower(load);
+  if (auto atomic = dyn_cast<cpu::AtomicRMWOp>(operation)) return lower(atomic);
   if (operation->getNumResults() != 1) return operation->emitError("CPU task operation has no Weft representation");
   auto value = expression(operation, values);
   if (failed(value)) return failure();
@@ -226,8 +255,8 @@ LogicalResult TaskLowering::normalizeComputations() {
   return implementation->normalizeComputations();
 }
 
-SmallVector<Value> TaskLowering::shapeArguments(func::FuncOp function, OpBuilder &builder) {
-  return implementation->shapeArguments(function, builder);
+SmallVector<Value> TaskLowering::shapeArguments(cpu::TasksOp task, OpBuilder &builder) {
+  return implementation->shapeArguments(task, builder);
 }
 
 LogicalResult TaskLowering::lower(cpu::TasksOp task, StringRef name,

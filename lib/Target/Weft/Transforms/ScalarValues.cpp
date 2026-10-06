@@ -340,11 +340,11 @@ FailureOr<Value> ScalarConversion::convert() {
   case K::Compare: return comparison();
   case K::Select: return select(inputs[0], inputs[1], inputs[2]);
   case K::Cast: return cast();
-  case K::Bitcast:
-    if (isa<IntegerType>(scalar.type()) &&
-        isa<IntegerType>(scalar.inputType()))
-      return convertType(inputs[0], nativeScalarType(scalar.type()));
-    return unsupported("native numeric cast is not a floating bitcast");
+  case K::Bitcast: {
+    Type target = withElementType(inputs[0].getType(), nativeScalarType(scalar.type()));
+    if (target == inputs[0].getType()) return inputs[0];
+    return Value(b.create<wk::BitcastOp>(loc, target, inputs[0]));
+  }
   case K::Add: case K::Subtract: case K::Multiply: {
     StringRef kind = scalar.kind == K::Add ? "add"
                      : scalar.kind == K::Subtract ? "sub" : "mul";
@@ -397,17 +397,23 @@ FailureOr<Value> ScalarConversion::convert() {
     auto result = select(*negative, *opposite, *bits);
     return succeeded(result) ? finishInteger(*result) : FailureOr<Value>(failure());
   }
-  case K::Negate: case K::AbsFloat: case K::Exp: case K::Exp2:
+  case K::Negate: case K::AbsFloat: case K::Exp: case K::Exp2: case K::Log:
   case K::Sqrt: case K::Rsqrt: {
     StringRef kind = scalar.kind == K::Negate ? "neg"
                      : scalar.kind == K::AbsFloat ? "abs"
                      : scalar.kind == K::Exp ? "exp"
                      : scalar.kind == K::Exp2 ? "exp2"
+                     : scalar.kind == K::Log ? "log"
                      : scalar.kind == K::Sqrt ? "sqrt" : "rsqrt";
-    return Value(b.create<wk::UnaryOp>(loc, inputs[0].getType(), inputs[0], kind));
+    auto result = b.create<wk::UnaryOp>(loc, inputs[0].getType(), inputs[0], kind);
+    if (auto math = dyn_cast<arith::ArithFastMathInterface>(scalar.operation))
+      if ((math.getFastMathFlagsAttr().getValue() & arith::FastMathFlags::afn) !=
+          arith::FastMathFlags::none)
+        result->setAttr("approximate", b.getBoolAttr(true));
+    return Value(result);
   }
   case K::Constant: llvm_unreachable("constant handled before dispatch");
-  case K::Log: case K::Tanh: case K::Sin: case K::Cos:
+  case K::Tanh: case K::Sin: case K::Cos:
   case K::Floor: case K::Erf: case K::Power: case K::Fma:
     return unsupported("operation has no equivalent canonical Weft primitive");
   }

@@ -84,8 +84,9 @@ FailureOr<Value> Construction::arithmetic(Operation *operation, ValueRange argum
           (unary.getFlushToZero() && kind != UnaryOperator::Exp2))
         return unary.emitError("CPU non-default unary arithmetic requires the closed f32 exp2/tanh contract"), failure();
       Value input = unary.getFlushToZero() ? flushF32(arguments[0]) : arguments[0];
-      Value result = kind == UnaryOperator::Exp2 ? Value(builder.create<math::Exp2Op>(loc, input))
-                                                : Value(builder.create<math::TanhOp>(loc, input));
+      Value result = kind == UnaryOperator::Exp2
+          ? Value(builder.create<math::Exp2Op>(loc, input, arith::FastMathFlags::afn))
+          : Value(builder.create<math::TanhOp>(loc, input, arith::FastMathFlags::afn));
       return unary.getFlushToZero() ? flushF32(result) : result;
     }
     if (unary.getOperatorKind() == UnaryOperator::Sigmoid) {

@@ -4,10 +4,13 @@
 #include "Views.h"
 #include "Intent/Dialect/Intent/IR/Interface.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/Computations.h"
+#include "Intent/Dialect/CPU/Transforms/Storage/Storage.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SmallBitVector.h"
 
@@ -17,11 +20,61 @@ namespace wk = ::weft::kernel;
 namespace intent::weft_provider {
 using namespace task_detail;
 
+namespace {
+
+std::optional<int64_t> localExtent(
+    const ValueBoundsConstraintSet::Variable &extent,
+    ArrayRef<std::pair<OpFoldResult, int64_t>> bindings,
+    ValueRange shapeValues, OpBuilder &builder, ModuleOp module) {
+  if (!builder.getInsertionBlock()) return std::nullopt;
+  DominanceInfo dominance(module);
+  for (auto [source, id] : llvm::reverse(bindings)) {
+    Operation *definition = shapeValues[id - 1].getDefiningOp();
+    if (definition && dominance.properlyDominates(definition->getBlock(),
+            definition->getIterator(), builder.getInsertionBlock(), builder.getInsertionPoint()) &&
+        cpu::haveEqualExtents(extent, ValueBoundsConstraintSet::Variable(source)))
+      return -id;
+  }
+  return std::nullopt;
+}
+
+} // namespace
+
 LogicalResult TaskConversion::normalizeComputations() {
+  for (;;) {
   SmallVector<Operation *> scalarTraversals;
+  cpu::StorageAnalysis memory(sourceFunction);
   sourceFunction.walk([&](Operation *operation) {
     if (!operation->getParentOfType<cpu::TasksOp>() ||
         !isa<linalg::GenericOp, cpu::ReduceOp>(operation)) return;
+    if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
+      bool requiresTraversal = generic.getOutputs().size() != 1;
+      auto extents = generic.getStaticLoopRanges();
+      generic.getRegion().walk([&](linalg::IndexOp index) {
+        requiresTraversal |= extents[index.getDim()] <= 0;
+      });
+      generic.getRegion().walk([&](memref::LoadOp load) {
+        if (!llvm::any_of(load.getIndices(), [&](Value index) {
+              return index.getParentBlock() == &generic.getRegion().front();
+            })) return;
+        auto origins = memory.origins(load.getMemref());
+        auto task = generic->getParentOfType<cpu::TasksOp>();
+        bool local = origins.complete && !origins.values.empty() &&
+            llvm::all_of(origins.values, [&](Value origin) {
+              auto allocation = origin.getDefiningOp();
+              return isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(allocation) &&
+                  task->isProperAncestor(allocation);
+            });
+        // Canonical slices carry scalar coordinates. A shaped index into an
+        // already supplied local Value uses Extract; an addressable input must
+        // keep its original element-read traversal, without admitting the table.
+        requiresTraversal |= !local;
+      });
+      if (requiresTraversal) {
+        scalarTraversals.push_back(operation);
+        return;
+      }
+    }
     for (Value operand : operation->getOperands()) {
       auto type = dyn_cast<MemRefType>(operand.getType());
       if (!type) continue;
@@ -33,19 +86,24 @@ LogicalResult TaskConversion::normalizeComputations() {
     }
   });
   if (scalarTraversals.empty()) return success();
-  // A task-local computed extent is not a public shape symbol. Keep its
-  // existing scalar bound in ordered traversal, rather than inventing a shaped
-  // value whose type denotes a different domain.
-  for (Operation *operation : scalarTraversals)
-    if (failed(cpu::materializeStructuredComputation(operation, 1, {})))
-      return failure();
+  // Computed domains and coupled tuple combines need their existing complete
+  // traversal. Canonical Weft's scalar-kind Reduce cannot encode a tuple region,
+  // and Iota cannot invent a public shape symbol for a task-local extent.
+  // Expose the actual consumer reads before materializing their producers.
+  // The shared version-aware fusion can then transport a still-structured
+  // coordinate producer to those reads instead of allocating its full domain.
+  if (failed(cpu::materializeStructuredComputation(scalarTraversals.back(), 1, {})))
+    return failure();
   RewritePatternSet patterns(b.getContext());
   memref::populateFoldMemRefAliasOpPatterns(patterns);
   populateAffineToStdConversionPatterns(patterns);
   if (failed(applyPatternsGreedily(sourceFunction, std::move(patterns))))
     return sourceFunction.emitError("Weft scalar descriptor normalization did not converge");
+  if (failed(cpu::fuseStructuredComputations(sourceFunction)) ||
+      failed(cpu::fuseIntermediateBuffers(sourceFunction))) return failure();
+  cpu::reuseMemoryValues(sourceFunction);
   initializeAxes();
-  return success();
+  }
 }
 
 namespace task_detail {
@@ -131,7 +189,7 @@ FailureOr<Type> TaskConversion::resultType(Value memory, Type scalar) {
   auto ids = memoryAxes(memory);
   SmallVector<int64_t> dimensions;
   for (auto [axis, extent] : llvm::enumerate(type.getShape())) {
-    if (ShapedType::isDynamic(extent)) {
+    if (ShapedType::isDynamic(extent) || extent == 0) {
       auto dimension = dimensionExtent(memory, axis);
       if (!dimension) return emitError(memory.getLoc(), "private value extent has no explicit shape binding"), failure();
       dimensions.push_back(*dimension);
@@ -192,16 +250,27 @@ std::optional<int64_t> TaskConversion::nativeExtent(const cpu::ExtentExpression 
 
 std::optional<int64_t> TaskConversion::nativeExtent(OpFoldResult extent) {
   auto expression = cpu::queryExtent(extent);
-  return succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  auto result = succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  if (result && *result != 0) return result;
+  if (auto local = localExtent(ValueBoundsConstraintSet::Variable(extent),
+          localShapeBindings, shapeValues, b, output)) return local;
+  return result;
 }
 
 std::optional<int64_t> TaskConversion::dimensionExtent(Value memory, unsigned axis) {
+  if (auto symbol = capturedShapeSymbol(ValueBoundsConstraintSet::Variable(memory, axis)))
+    return -*symbol;
   auto expression = cpu::queryExtent(ValueBoundsConstraintSet::Variable(memory, axis));
-  return succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  auto result = succeeded(expression) ? nativeExtent(*expression) : std::nullopt;
+  if (result && *result != 0) return result;
+  if (auto local = localExtent(ValueBoundsConstraintSet::Variable(memory, axis),
+          localShapeBindings, shapeValues, b, output)) return local;
+  return result;
 }
 
 std::optional<int64_t>
 TaskConversion::shapeSymbol(const ValueBoundsConstraintSet::Variable &extent) {
+  if (auto symbol = capturedShapeSymbol(extent)) return symbol;
   if (auto expression = cpu::queryExtent(extent); succeeded(expression))
     if (auto native = nativeExtent(*expression); native && *native < 0)
       return -*native;
@@ -384,8 +453,30 @@ FailureOr<Value> TaskConversion::reshapeViewValue(Value memory, Value value, Typ
   }
   bool dynamic = llvm::any_of(shape(value.getType()), [](int64_t size) { return size < 0; }) ||
                  llvm::any_of(shape(target), [](int64_t size) { return size < 0; });
-  if (dynamic && (shape(value.getType()) != shape(target) || order != sourceAxes))
-    return emitError(memory.getLoc(), "Weft axis permutation requires a statically shaped admitted tile"), failure();
+  if (dynamic && (shape(value.getType()) != shape(target) || order != sourceAxes)) {
+    auto targetShape = shape(target), targetAxes = axes(target);
+    SmallVector<unsigned> sourceMembers, targetMembers;
+    for (auto [position, extent] : llvm::enumerate(sourceShape))
+      if (extent != 1) sourceMembers.push_back(position);
+    for (auto [position, extent] : llvm::enumerate(targetShape))
+      if (extent != 1) targetMembers.push_back(position);
+    if (order != sourceAxes || sourceMembers.size() != targetMembers.size())
+      return emitError(memory.getLoc(), "dynamic Weft view must preserve its ordered non-unit dimensions"), failure();
+    // Keep axis renaming separate from the existing unit-axis layout
+    // projection. The latter preserves every non-unit (axis, shape) pair.
+    SmallVector<int64_t> renamedAxes(sourceAxes.size());
+    for (unsigned position = 0; position < sourceShape.size(); ++position)
+      if (sourceShape[position] == 1) renamedAxes[position] = nextAxis++;
+    for (auto [sourcePosition, targetPosition] : llvm::zip(sourceMembers, targetMembers))
+      renamedAxes[sourcePosition] = targetAxes[targetPosition];
+    if (!wk::isUnitAxisProjection(sourceShape, renamedAxes, targetShape,
+                                  targetAxes, renamedAxes))
+      return emitError(memory.getLoc(), "dynamic Weft view changes a non-unit dimension"), failure();
+    Type renamed = valueType(element(value.getType()), sourceShape, renamedAxes);
+    if (value.getType() != renamed)
+      value = b.create<wk::ReshapeOp>(memory.getLoc(), renamed, value, array(sourceAxes));
+    order = std::move(renamedAxes);
+  }
   return Value(b.create<wk::ReshapeOp>(memory.getLoc(), target, value, array(order)));
 }
 
@@ -405,10 +496,11 @@ FailureOr<Value> TaskConversion::projectViewValue(Value memory, Value value, Typ
   return reshapeViewValue(memory, value, inverse ? nativeType : *logicalType, std::move(order));
 }
 
-SmallVector<Value> TaskConversion::projectIndices(Value memory, ValueRange indices, unsigned nativeRank) {
+SmallVector<Value> TaskConversion::projectIndices(Value memory, ValueRange indices,
+    unsigned nativeRank, const IRMapping &mapping) {
   SmallVector<Value> projected(nativeRank, index(memory.getLoc(), 0));
   for (auto [logical, native] : llvm::enumerate(viewAxes.at(memory)))
-    if (native >= 0) projected[native] = values.lookup(indices[logical]);
+    if (native >= 0) projected[native] = mapping.lookup(indices[logical]);
   return projected;
 }
 
@@ -456,9 +548,12 @@ LogicalResult TaskConversion::lower(memref::ExtractStridedMetadataOp metadata) {
   SmallVector<Value> descriptors{metadata.getBaseBuffer(), metadata.getOffset()};
   llvm::append_range(descriptors, metadata.getStrides());
   for (Value descriptor : descriptors)
-    for (Operation *user : descriptor.getUsers())
+    for (Operation *user : descriptor.getUsers()) {
+      if (descriptor == metadata.getBaseBuffer() &&
+          isa<memref::DeallocOp, bufferization::DeallocOp>(user)) continue;
       if (!isa<memref::ReinterpretCastOp>(user))
         return metadata.emitError("Weft strided metadata may only supply a proved axis view; arbitrary address arithmetic is unsupported");
+    }
   for (auto [axis, size] : llvm::enumerate(metadata.getSizes())) {
     if (size.use_empty()) continue;
     auto extent = dimension(metadata.getSource(), axis);

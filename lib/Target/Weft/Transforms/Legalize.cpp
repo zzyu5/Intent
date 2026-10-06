@@ -15,7 +15,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Dominance.h"
 #include <algorithm>
 #include <string>
 
@@ -27,58 +26,11 @@ LogicalResult legalizeProgram(ModuleOp program) {
   auto registry = cpu::lookupImplementationProvider(program, "weft");
   if (failed(registry)) return failure();
   if (failed(cpu::verifyCPUProgram(program, cpu::CPUProgramStage::Buffers))) return failure();
-  if (failed(cpu::lowerOwnership(program))) return failure();
   // Canonical Weft has ordered SCF carries, but no native prefix collective.
   // Form the existing CPU scan traversal before any task axis/storage snapshot.
   SmallVector<cpu::ScanOp> scans;
   program.walk([&](cpu::ScanOp scan) { scans.push_back(scan); });
-  for (cpu::ScanOp scan : scans)
-  {
-    auto function = scan->getParentOfType<func::FuncOp>();
-    cpu::StorageAnalysis storage(function);
-    DominanceInfo dominance(function);
-    SmallVector<std::pair<Value, Value>> initializations;
-    for (auto [initial, output] : llvm::zip(scan.getInitials(), scan.getOutputs())) {
-      auto allocation = output.getDefiningOp<memref::AllocOp>();
-      if (!allocation || !allocation->getParentOfType<cpu::TasksOp>() ||
-          initial.getType() != allocation.getType().getElementType()) continue;
-      auto aliases = storage.aliases(output);
-      auto accesses = storage.accesses(output);
-      if (!aliases.complete || !accesses.complete || accesses.ordered) continue;
-      bool complete = true;
-      for (Value source : scan.getSources()) {
-        auto type = dyn_cast<MemRefType>(source.getType());
-        if (!type || type.getRank() != allocation.getType().getRank() ||
-            !storage.disjoint(source, output)) { complete = false; break; }
-        for (unsigned axis = 0; axis < type.getRank(); ++axis)
-          complete &= cpu::haveEqualExtents(ValueBoundsConstraintSet::Variable(source, axis),
-              ValueBoundsConstraintSet::Variable(output, axis));
-      }
-      for (Value capture : scan.getCaptures())
-        if (isa<MemRefType>(capture.getType())) complete &= storage.disjoint(capture, output);
-      for (Value other : scan.getOutputs())
-        if (other != output) complete &= storage.disjoint(other, output);
-      for (const cpu::StorageEffect &access : accesses.entries) {
-        if (access.operation == scan.getOperation() ||
-            !isa<MemoryEffects::Read, MemoryEffects::Write>(access.effect.getEffect())) continue;
-        if (!access.effect.getValue() ||
-            !dominance.properlyDominates(scan.getOperation(), access.operation))
-          complete = false;
-      }
-      for (Operation *user : aliases.users) {
-        if (user == scan.getOperation() || cpu::isStorageAliasOperation(user) ||
-            isa<memref::DimOp, memref::DeallocOp>(user)) continue;
-        auto effects = storage.effects(user);
-        if (!effects.complete || effects.ordered || effects.entries.empty()) complete = false;
-      }
-      if (complete) initializations.emplace_back(initial, output);
-    }
-    // The complete private prefix is observed only after Scan. Its real seed
-    // supplies the physical update owner's otherwise unobserved lanes; it is
-    // not a definition for arbitrary uninitialized allocations or partial scans.
-    OpBuilder builder(scan);
-    for (auto [initial, output] : initializations)
-      builder.create<linalg::FillOp>(scan.getLoc(), ValueRange{initial}, ValueRange{output});
+  for (cpu::ScanOp scan : scans) {
     if (failed(cpu::materializeStructuredComputation(scan, 1, {}))) return failure();
   }
   program.getContext()->loadDialect<IntentWeftDialect, wk::WEFTKernelDialect>();
@@ -162,8 +114,6 @@ LogicalResult legalizeProgram(ModuleOp program) {
     TaskLowering lowering(function, output, formats, **registry);
     if (failed(lowering.normalizeComputations())) return failure();
     OpBuilder host(function.getContext());
-    host.setInsertionPointToStart(&function.front());
-    auto shapeArguments = lowering.shapeArguments(function, host);
     SmallVector<cpu::TasksOp> tasks;
     function.walk([&](cpu::TasksOp operation) { tasks.push_back(operation); });
     if (tasks.empty()) return function.emitError("Weft generation requires an explicit CPU task interface");
@@ -174,6 +124,7 @@ LogicalResult legalizeProgram(ModuleOp program) {
         if (!argument.use_empty()) argumentPositions.push_back(argument.getArgNumber());
       if (failed(lowering.lower(task, name, argumentPositions))) return failure();
       host.setInsertionPoint(task);
+      auto shapeArguments = lowering.shapeArguments(task, host);
       auto loc = task.getLoc();
       auto zero = host.create<arith::ConstantIndexOp>(loc, 0);
       auto one = host.create<arith::ConstantIndexOp>(loc, 1);
@@ -220,6 +171,7 @@ LogicalResult legalizeProgram(ModuleOp program) {
             })))
       return failure();
   }
+  if (failed(cpu::lowerOwnership(cpuProgram))) return failure();
   program->setAttr(taskBindingsAttr, ArrayAttr::get(program.getContext(), taskBindings));
   return verifyProgram(program);
 }
