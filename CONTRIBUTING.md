@@ -942,6 +942,30 @@ transfer 的完整目标版本及 active rectangle；[LocalCopies.cpp](lib/Diale
 `RegionSummary` 负责 summary/carry 的字段处理，`RegionCoRealization` 负责已存在的
 online/additive 合流。它们是组内机制，不是新增独立 pass。
 
+Fold 的首摘要初始化与后续状态更新在这两个 family 中分别兑现同一份
+`RegionFold` 中立 identity 合同。GPU 已经单独形成首摘要时可直接使用完整结果并
+投影原 payload，保留原非空 guard 和空域 identity。CPU 在已有受 guard 保护的
+首片入口，通过 `initializeFold` 在独立 summary scratch 中完成全部字段，再
+写入真实 state；首片省去 combine 和 next，后续更新仍先保存全部 next 字段，
+以支持返回值借用或交换旧 state。两边均不改 Scan 的 apply/emit 或逻辑初值，
+也不为通用 Fold 额外复制首片、增加分支和改变 scratch 的重复分配次数。
+
+这项可选简化由两个完整 realization pass 的标准选项
+`simplify-first-summary` 控制，默认关闭；关闭后仍完成必要的 Fold lowering、
+relation closure 和验证。专家可在已有 IR 阶段显式运行
+`intent-gpu-realize-region-folds{simplify-first-summary=true}`，或 CPU 的
+`intent-cpu-realize-regions{provider=mojo simplify-first-summary=true}`。
+开关只选择当前程序的构造，不增加语言许可或另存一份执行计划。采用前应检查
+实际省去的工作、目标布局和存储代价；中立代数成立不代替收益判断。
+
+这项许可必须在 typed Fold 仍然存在的 realization 阶段消费。一个普通 SCF loop
+后来成为 reduce 的输入，不会因此获得删除其 IEEE 运算的许可；晚 Generic 的
+initial 也可能是任意已有 partial，不能从常量零猜它是 identity。Triton 本地
+`ReduceOpToLLVM.cpp:113–135` 用首真实 tuple 初始化非空归约；TileLang 本地
+`language/reduce_op.py:351–368` 区分逻辑初值与 physical partial identity。
+对应的 Intent 入口是上述 GPU Fold 与 CPU `Region/RealizeRegions.cpp`，DSA
+`KIRToDSA/Regions.cpp` 已有首 summary 直接写 state 的路径，继续复用它。
+
 Region 的私有 [RegionCloning.cpp](lib/Dialect/GPU/Transforms/Region/RegionCloning.cpp) 负责
 helper 参数与 source slice 的 extent 绑定及内联。预先替换的值、clone 结果与 yield
 共用实际绑定的 schema 投影，并更新真实 SSA；只有已经绑定的轴约束物理 extent，
@@ -1557,6 +1581,34 @@ bufferization 消费，避免在构造到一半的控制流中启动整个函数
 本地 Triton `lib/Dialect/Triton/Transforms/LoopInvariantCodeMotion.cpp:22–52` 同样从
 operation effects 证明读取移动。Intent CPU 还要证明显式 allocation/free 和 helper
 调用边界，实际循环与物化改写继续由各 CPU pass 决定。
+
+CPU 私有工作区复用的完整入口是 `intent-cpu-reuse-scratch-storage`。
+独立运行该 pass 时默认保留 descriptor 表示；标准选项 `{linear-capacity=true}` 选择已供 Mojo
+legalization 使用的有界 backing 模式，消费当前 CPU capabilities。两种模式共用
+[ScratchReuse.cpp](lib/Dialect/CPU/Transforms/Storage/ScratchReuse.cpp) 的固定点驱动与
+[ScratchStorage.h](lib/Dialect/CPU/Transforms/Storage/ScratchStorage.h) 的临时查询。
+该选项不控制 Mojo legalization 已有的后期 `LinearCapacity` 调用；后者同样消费
+这一实现，以处理目标展开新增的存储。
+别名、释放及使用闭合后，有界 heap 可以穿过纯 If 链放到最近串行 For 外；
+动态 descriptor、初始化和读写仍在原分支，不扩 Alloca、task 或 parallel 的 owner。
+
+[ScratchPlacement.cpp](lib/Dialect/CPU/Transforms/Storage/ScratchPlacement.cpp)
+依据当前 IR 合计该循环专用、有界 heap 的驻留容量，而不是逐 buffer 判断。
+已经覆盖循环生命周期的 backing 也参与预算；直接 For 外提消费同一查询，避免
+固定点或嵌套循环把先前新增容量漏算。容量不明不作为零，超预算整组保留。
+循环外还参与计算的全域 state 与 prepared input 不属于这份专用 scratch 预算，
+因此这不是整个函数的峰值内存证明，也不另存来源标签或执行计划。
+对应成熟机制是 MLIR 20 `BufferOptimizations.cpp:191–219,267–269,316–354`
+中的 alias/dependency 与 region/loop hoisting 资格；Intent 额外消费实际私有容量。
+
+有界 tile 的关系由现有 CPU
+[ExtentRelations.cpp](lib/Dialect/CPU/Analysis/ExtentRelations.cpp) 查询统一提供。
+Signed `min` 不大于任一真实 operand，`max` 不小于任一 operand；这不依赖
+producer 的加减乘是否回绕。查询只导入安全不等式，保留 min/max 的真实 SSA
+作为精确 extent 叶子，不把容量上界当作动态 shape，也不导入未知算术的 affine
+关系。Scratch、prepared input、contraction 和 collective 的既有消费者各按自身
+资格使用这份事实。MLIR 20 `Arith/IR/ValueBoundsOpInterfaceImpl.cpp:153–160`
+尚未注册这两种 selection 的模型，因此此处在既有查询边界补齐关系。
 
 [IntegerSources.cpp](lib/Dialect/CPU/Transforms/Structure/IntegerSources.cpp) 在破坏性存储复用之前，将完整 pointwise 整数 producer 的读取替换为当前位置上的标量计算，保留位宽并证明输入快照稳定。[ContiguousAccesses.cpp](lib/Dialect/CPU/Transforms/Structure/ContiguousAccesses.cpp) 随后组合实际坐标与静态 strides：完整遍历的地址若等于同形状连续成员加固定基址，就形成标准 memref view/copy，交给既有输出转发与扫描实现。仿射证明同时检查原表达式及重排后算术的范围；未知 stride、无法证明的溢出或读写干扰保留原程序。两者是 `fuseStructuredComputations` 的相邻私有机制，不是新 scan 算法，也不让调用方手工拼装 pass 次序。
 
