@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from importlib import import_module
 import json
+from pathlib import Path
 from statistics import median
 import sys
 import time
@@ -102,6 +103,8 @@ def _measure(context, count, device):
 def _run(name, args, options):
     from intent.tools.backends import make_target
     from programs.common import ExampleContext
+    from programs.assets import KernelAssets
+    from programs.outputs import capture_outputs
     from programs import inputs
 
     started = time.perf_counter()
@@ -110,13 +113,18 @@ def _run(name, args, options):
         inputs.seed([args.seed, tuple(EXAMPLES).index(name)])
         target = make_target(args.target, options)
         device = f"cuda:{args.device}" if args.target in ("triton", "cutile") else "cpu"
+        assets = None
+        if args.assets or args.export_assets:
+            root = args.assets if args.assets else args.export_assets
+            assets = KernelAssets(Path(root) / name, mode="load" if args.assets else "export")
         context = ExampleContext(target, device, compiler=args.compiler,
-                                 prepared=args.prepared, stage=args.stage)
+                                 prepared=args.prepared, stage=args.stage, assets=assets)
         module, _ = EXAMPLES[name]
         result = getattr(import_module(f"programs.{module}"), name)(context)
         if args.stage == "run" and args.target in ("triton", "cutile"):
             import torch
             torch.cuda.synchronize(device)
+        output_manifest = capture_outputs(result, Path(args.outputs) / name) if args.outputs else None
         measurement = _measure(context, args.measure, device) if args.measure else None
         native = []
         for artifact in context.artifacts:
@@ -131,6 +139,7 @@ def _run(name, args, options):
                 "elapsed_seconds": time.perf_counter() - started,
                 "input_seed": args.seed, "measurement": measurement,
                 "native": native,
+                "outputs": str(output_manifest) if output_manifest is not None else None,
                 "result": _describe(result),
                 "artifacts": [str(artifact.cache_directory) for artifact in context.artifacts]}
     except Exception as error:
@@ -164,6 +173,12 @@ def main():
     parser.add_argument("--device", type=int, default=0, help="CUDA device for a GPU target")
     parser.add_argument("--compiler", help="Use an explicitly selected intent-compile")
     parser.add_argument("--prepared", action="store_true", help="Bind each kernel invocation before launch")
+    assets = parser.add_mutually_exclusive_group()
+    assets.add_argument("--export-assets", metavar="DIR",
+                        help="Save this host program's specialized kernel assets for deployment")
+    assets.add_argument("--assets", metavar="DIR",
+                        help="Load explicitly saved kernel assets instead of generating kernels")
+    parser.add_argument("--outputs", metavar="DIR", help="Save all typed results from actual execution")
     args = parser.parse_args()
     if args.list:
         for name, (_, description) in EXAMPLES.items():
@@ -181,6 +196,8 @@ def main():
         parser.error("seed and measurement count must be nonnegative")
     if args.measure and args.stage != "run":
         parser.error("measurement requires actual execution with --stage run")
+    if args.outputs and args.stage != "run":
+        parser.error("saving output values requires actual execution with --stage run")
     if args.stage == "run" and args.jobs != 1:
         parser.error("run uses one program at a time; use concurrent source/native preparation separately")
     options = {}

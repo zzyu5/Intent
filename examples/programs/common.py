@@ -91,9 +91,18 @@ class _ExampleKernel:
                 tuple(sorted((name, tuple(strides)) for name, strides in target.strides.items())))
                if isinstance(target, BangCTarget) else ())
         if key not in self._programs:
-            program = intent.generate(self.definition, target=target,
-                                      compiler=self.context.compiler, constexprs=self.constexprs)
-            artifact = None if self.context.stage == "source" else program.materialize()
+            assets = self.context.assets
+            if assets is not None and assets.mode == "load":
+                program, artifact = assets.resolve(self.definition, self.constexprs,
+                                                  target, self.context.stage)
+            else:
+                program = intent.generate(self.definition, target=target,
+                                          compiler=self.context.compiler, constexprs=self.constexprs)
+                if assets is not None:
+                    program, artifact = assets.store(self.definition, self.constexprs,
+                                                     target, program, stage=self.context.stage)
+                else:
+                    artifact = None if self.context.stage == "source" else program.materialize()
             self._programs[key] = program, artifact
             self.context.artifacts.append(program if artifact is None else artifact)
         return self._programs[key]
@@ -159,6 +168,7 @@ class ExampleContext:
     compiler: str | None = None
     prepared: bool = False
     stage: str = "run"
+    assets: object = None
     artifacts: list = field(default_factory=list)
     invocations: list = field(default_factory=list, init=False)
     buffers: object = field(default=None, init=False, repr=False)
