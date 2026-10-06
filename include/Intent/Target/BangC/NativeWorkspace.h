@@ -8,6 +8,7 @@
 namespace intent::bangc {
 mlir::Type arithmeticStorageType(mlir::Type element);
 llvm::SmallVector<int64_t, 2> exponentialScratchShape(mlir::Type element, int64_t elements);
+llvm::SmallVector<int64_t, 2> extremaScratchShape(mlir::Type element, int64_t elements);
 llvm::SmallVector<int64_t, 2> selectionScratchShape(mlir::Type element,
     int64_t elements, bool tensorFalseValue);
 llvm::SmallVector<int64_t, 2> rowOffsetsShape(int64_t rows);

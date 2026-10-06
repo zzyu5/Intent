@@ -15,6 +15,10 @@ SmallVector<int64_t, 2> exponentialScratchShape(Type element, int64_t elements) 
   if (!element.isF32() || elements < 1024) return {};
   return {4, std::min<int64_t>(8192, elements)};
 }
+SmallVector<int64_t, 2> extremaScratchShape(Type element, int64_t elements) {
+  if ((!element.isF16() && !element.isF32()) || elements <= 0) return {};
+  return {1, std::min<int64_t>(8192, elements)};
+}
 SmallVector<int64_t, 2> selectionScratchShape(Type element, int64_t elements,
                                             bool tensorFalseValue) {
   if (!element.isF32() || elements < 64) return {};
@@ -56,12 +60,16 @@ std::optional<NativeWorkspace> queryNativeWorkspace(Operation *operation,
     return true;
   };
   auto binary = [&](BinaryOperator kind, Type element, bool approximate,
-                    bool flush, unsigned inputs) {
+                    bool flush, unsigned inputs, bool hasScratch) {
     if (approximate || flush ||
         (kind != BinaryOperator::Add && kind != BinaryOperator::Subtract &&
          kind != BinaryOperator::Multiply && kind != BinaryOperator::Maximum &&
-         kind != BinaryOperator::Minimum)) return false;
-    arithmetic(element, inputs);
+         kind != BinaryOperator::Minimum && kind != BinaryOperator::MaximumNum &&
+         kind != BinaryOperator::MinimumNum)) return false;
+    Type storage = arithmetic(element, inputs);
+    if (!hasScratch && (kind == BinaryOperator::Maximum || kind == BinaryOperator::Minimum ||
+                        kind == BinaryOperator::MaximumNum || kind == BinaryOperator::MinimumNum))
+      add(storage, extremaScratchShape(storage, elements));
     return true;
   };
   auto gather = [&](int64_t rows, bool offsets) {
@@ -81,11 +89,11 @@ std::optional<NativeWorkspace> queryNativeWorkspace(Operation *operation,
   } else if (auto op = dyn_cast<intent::BinaryOp>(operation)) {
     unsigned inputs = llvm::count_if(op->getOperandTypes(), [](Type type) { return isa<ShapedType>(type); });
     if (!binary(op.getOperatorKind(), getElementTypeOrSelf(op.getResult().getType()),
-                op.getApproximate(), op.getFlushToZero(), inputs)) return std::nullopt;
+                op.getApproximate(), op.getFlushToZero(), inputs, false)) return std::nullopt;
   } else if (auto op = dyn_cast<dsa::BinaryOp>(operation)) {
     if (!binary(op.getKind(), cast<MemRefType>(op.getOutput().getType()).getElementType(),
                 op.getApproximate(), op.getFlushToZero(),
-                isa<MemRefType>(op.getRhs().getType()) ? 2 : 1)) return std::nullopt;
+                isa<MemRefType>(op.getRhs().getType()) ? 2 : 1, bool(op.getScratch()))) return std::nullopt;
   } else if (isa<intent::ViewLoadOp>(operation)) {
     gather(shape.empty() ? 1 : shape.front(), true);
   } else if (auto op = dyn_cast<dsa::GatherRowsOp>(operation)) {

@@ -1027,6 +1027,31 @@ __mlu_func__ void intent_select_bits(float *output, const bool *condition, const
   for (int i = prefix; i < N; ++i)
     intent_write_local(output + i, intent_read_local(condition + i) ? intent_read_local(lhs + i) : rhs);
 }
+template<class T> struct IntentExtremaBits;
+template<> struct IntentExtremaBits<float> { using Type = uint32_t; enum : uint32_t { magnitude = 0x7fffffffu, first_nan = 0x7f800001u }; };
+template<> struct IntentExtremaBits<half> { using Type = uint16_t; enum : uint16_t { magnitude = 0x7fffu, first_nan = 0x7c01u }; };
+template<class T, int N, int W, bool Maximum>
+__mlu_func__ void intent_propagating_extrema(T *output, const T *lhs, const T *rhs, T *workspace) {
+  using Bits = typename IntentExtremaBits<T>::Type;
+  for (int first = 0; first < N; first += W) {
+    const int count = N - first < W ? N - first : W;
+    auto *bits = reinterpret_cast<Bits *>(workspace);
+    const auto *left = reinterpret_cast<const Bits *>(lhs + first);
+    const auto *right = reinterpret_cast<const Bits *>(rhs + first);
+    __bang_band_scalar(bits, right, Bits(IntentExtremaBits<T>::magnitude), count);
+    __bang_ge_scalar(bits, bits, Bits(IntentExtremaBits<T>::first_nan), count);
+    __bang_mul_scalar(bits, bits, Bits(~Bits(0)), count);
+    __bang_band(bits, bits, right, count);
+    __bang_bor(bits, bits, left, count);
+    // Both NaNs now reach src0. The native extrema keeps src0 on unordered
+    // lanes; its only in-place destination is the independent workspace.
+    if constexpr (Maximum) __bang_maxequal(workspace, workspace, rhs + first, count);
+    else __bang_minequal(workspace, workspace, rhs + first, count);
+    __sync_compute();
+    __memcpy(output + first, workspace, count * sizeof(T), NRAM2NRAM);
+    __sync_move();
+  }
+}
 template<class T, int N, int W, bool Maximum>
 __mlu_func__ void intent_numeric_extrema(T *output, const T *lhs, const T *rhs, T *workspace) {
   // On compute_30 the SDK's maximum/minimum wrappers overwrite src1 during

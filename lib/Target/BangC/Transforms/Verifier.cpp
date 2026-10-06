@@ -34,6 +34,27 @@ LogicalResult verifyNativeProgram(ModuleOp module) {
     if (auto binary = dyn_cast<dsa::BinaryOp>(operation)) {
       auto rhs = dyn_cast<MemRefType>(binary.getRhs().getType());
       auto implementation = operation->getAttrOfType<StringAttr>("bangc.implementation");
+      if (binary.getKind() == BinaryOperator::Maximum || binary.getKind() == BinaryOperator::Minimum) {
+        auto callee = operation->getAttrOfType<StringAttr>("bangc.callee");
+        StringRef expected = binary.getKind() == BinaryOperator::Maximum ? "__bang_maxequal" : "__bang_minequal";
+        if (binary.getScratch() ? (!implementation || implementation.getValue() != "propagating_extrema")
+                                : (!callee || callee.getValue() != expected)) {
+          binary.emitError("propagating extrema requires a selected MTP372 implementation");
+          return WalkResult::interrupt();
+        }
+        if (binary.getScratch() && cast<MemRefType>(binary.getScratch().getType()).getNumElements() <
+                                       cast<MemRefType>(binary.getOutput().getType()).getNumElements()) {
+          dsa::StorageAnalysis storage(function);
+          Value output = binary.getOutput(), origin = storage.uniqueOrigin(output);
+          for (Value input : ValueRange{binary.getLhs(), binary.getRhs()})
+            if (!storage.disjoint(input, output) && input != output &&
+                !(origin && dsa::isCompleteStorageViewOf(input, origin) &&
+                  dsa::isCompleteStorageViewOf(output, origin))) {
+              binary.emitError("windowed propagating extrema requires disjoint or identical output storage");
+              return WalkResult::interrupt();
+            }
+        }
+      }
       bool compact = rhs && rhs != binary.getLhs().getType();
       bool selected = implementation && (implementation.getValue() == "cycle" ||
                                          implementation.getValue() == "row_scalar");

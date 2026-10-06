@@ -320,9 +320,12 @@ private:
       }
       if (binary.getScratch()) {
         auto workspace = cast<MemRefType>(binary.getScratch().getType());
-        line("intent_numeric_extrema<" + ctype(workspace.getElementType()) + ", " + count(binary.getOutput()) +
+        auto implementation = op->getAttrOfType<StringAttr>("bangc.implementation");
+        bool propagating = implementation && implementation.getValue() == "propagating_extrema";
+        line(std::string(propagating ? "intent_propagating_extrema<" : "intent_numeric_extrema<") +
+            ctype(workspace.getElementType()) + ", " + count(binary.getOutput()) +
             ", " + std::to_string(workspace.getNumElements()) + ", " +
-            (binary.getKind() == BinaryOperator::MaximumNum ? "true" : "false") + ">(" + name(binary.getOutput()) +
+            (binary.getKind() == BinaryOperator::MaximumNum || binary.getKind() == BinaryOperator::Maximum ? "true" : "false") + ">(" + name(binary.getOutput()) +
             ", " + name(binary.getLhs()) + ", " + name(binary.getRhs()) + ", " + name(binary.getScratch()) + ");");
         return success();
       }
@@ -348,8 +351,8 @@ private:
       case BinaryOperator::Add: intrinsic = "__bang_add"; break;
       case BinaryOperator::Subtract: intrinsic = "__bang_sub"; break;
       case BinaryOperator::Multiply: intrinsic = "__bang_mul"; break;
-      case BinaryOperator::Maximum: intrinsic = "__bang_nan_maximum"; break;
-      case BinaryOperator::Minimum: intrinsic = "__bang_nan_minimum"; break;
+      case BinaryOperator::Maximum:
+      case BinaryOperator::Minimum: break; // The selected, verified callee supplies the native spelling.
       case BinaryOperator::MaximumNum: intrinsic = "__bang_maximum"; break;
       case BinaryOperator::MinimumNum: intrinsic = "__bang_minimum"; break;
       default: return op->emitError("unbound BANG binary operation");

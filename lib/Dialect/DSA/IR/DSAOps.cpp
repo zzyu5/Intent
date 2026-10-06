@@ -330,7 +330,8 @@ LogicalResult BinaryOp::verify() {
           ? success() : emitOpError("reciprocal requires two independent bounded i32 workspace rows");
     }
     if (!tile(scratch) || !same(getLhs(), getRhs()) ||
-        (getKind() != BinaryOperator::MaximumNum && getKind() != BinaryOperator::MinimumNum))
+        (getKind() != BinaryOperator::MaximumNum && getKind() != BinaryOperator::MinimumNum &&
+         getKind() != BinaryOperator::Maximum && getKind() != BinaryOperator::Minimum))
       return emitOpError("destructive extrema workspace requires matching input tiles");
     auto input = cast<MemRefType>(getLhs().getType());
     auto workspace = cast<MemRefType>(scratch.getType());

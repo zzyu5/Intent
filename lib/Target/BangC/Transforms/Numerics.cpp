@@ -88,18 +88,54 @@ void realizeRowSumChannels(func::FuncOp function, dsa::ConfigurationAttr config)
   }
 }
 
+static StringRef directExtremaCallee(dsa::BinaryOp binary) {
+  auto kind = binary.getKind();
+  if ((kind != BinaryOperator::Maximum && kind != BinaryOperator::Minimum) ||
+      !isa<MemRefType>(binary.getRhs().getType()) || binary.getOutput() == binary.getRhs()) return {};
+  Type element = cast<MemRefType>(binary.getOutput().getType()).getElementType();
+  if (!element.isF16() && !element.isF32()) return {};
+  dsa::StorageAnalysis storage(binary->getParentOfType<func::FuncOp>());
+  if (!storage.disjoint(binary.getOutput(), binary.getRhs())) return {};
+  Value lhs = binary.getLhs(), output = binary.getOutput();
+  Value origin = storage.uniqueOrigin(lhs);
+  if (!storage.disjoint(output, lhs) && output != lhs &&
+      !(origin && dsa::isCompleteStorageViewOf(lhs, origin) &&
+        dsa::isCompleteStorageViewOf(output, origin))) return {};
+  dsa::UniformMemoryAnalysis uniforms(binary->getParentOfType<func::FuncOp>(), storage);
+  Value scalar = uniforms.read(binary.getRhs(), binary);
+  auto constant = scalar ? scalar.getDefiningOp<arith::ConstantOp>() : arith::ConstantOp{};
+  auto value = constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr{};
+  // With a non-NaN RHS, the SDK's src0-preserving unordered result is exactly
+  // the propagating operation; no NaN repair workspace is needed.
+  if (!value || value.getValue().isNaN()) return {};
+  return kind == BinaryOperator::Maximum ? "__bang_maxequal" : "__bang_minequal";
+}
+
 LogicalResult realizeNumericExtremaWorkspace(func::FuncOp function, dsa::ConfigurationAttr config) {
   SmallVector<dsa::BinaryOp> operations;
   function.walk([&](dsa::BinaryOp binary) {
-    if ((binary.getKind() == BinaryOperator::MaximumNum || binary.getKind() == BinaryOperator::MinimumNum) &&
+    if ((binary.getKind() == BinaryOperator::MaximumNum || binary.getKind() == BinaryOperator::MinimumNum ||
+         binary.getKind() == BinaryOperator::Maximum || binary.getKind() == BinaryOperator::Minimum) &&
         !binary.getScratch()) operations.push_back(binary);
   });
   for (auto binary : operations) {
+    if (!directExtremaCallee(binary).empty()) continue;
     auto type = cast<MemRefType>(binary.getOutput().getType());
     if ((!type.getElementType().isF16() && !type.getElementType().isF32()) ||
         !isa<MemRefType>(binary.getRhs().getType()))
       return binary.emitError("numeric extrema requires a supported floating tile");
-    for (int64_t width = std::min<int64_t>(8192, type.getNumElements()); width > 0; width /= 2) {
+    auto shape = extremaScratchShape(type.getElementType(), type.getNumElements());
+    int64_t minimumWidth = 1;
+    if (binary.getKind() == BinaryOperator::Maximum || binary.getKind() == BinaryOperator::Minimum) {
+      dsa::StorageAnalysis storage(function);
+      Value output = binary.getOutput(), origin = storage.uniqueOrigin(output);
+      for (Value input : ValueRange{binary.getLhs(), binary.getRhs()})
+        if (!storage.disjoint(input, output) && input != output &&
+            !(origin && dsa::isCompleteStorageViewOf(input, origin) &&
+              dsa::isCompleteStorageViewOf(output, origin)))
+          minimumWidth = type.getNumElements();
+    }
+    for (int64_t width = std::max(shape[1], minimumWidth); width >= minimumWidth; width /= 2) {
       OpBuilder b(binary);
       Value scratch = allocate(b, binary.getLoc(), type.getElementType(), {1, width}, dsa::nramSpace);
       binary.getScratchMutable().assign(scratch);
@@ -109,7 +145,7 @@ LogicalResult realizeNumericExtremaWorkspace(func::FuncOp function, dsa::Configu
       binary.getScratchMutable().clear();
       scratch.getDefiningOp()->erase();
     }
-    if (!binary.getScratch()) return binary.emitError("numeric extrema has no room for its destructive-operand workspace");
+    if (!binary.getScratch()) return binary.emitError("numeric extrema has no room for its input-preserving workspace");
   }
   return success();
 }
@@ -634,18 +670,14 @@ LogicalResult selectNativeImplementations(ModuleOp module) {
       }
       if (binary.getKind() == BinaryOperator::TrueDivide && !op->hasAttr("bangc.implementation"))
         op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), division ? "divide_f32" : "scalar_divide"));
-      if (binary.getKind() == BinaryOperator::Maximum && (element.isF16() || element.isF32()) &&
-          isa<MemRefType>(binary.getRhs().getType()) && binary.getOutput() != binary.getRhs()) {
-        dsa::StorageAnalysis storage(function);
-        dsa::UniformMemoryAnalysis uniforms(function, storage);
-        if (Value scalar = uniforms.read(binary.getRhs(), op)) {
-          auto constant = scalar.getDefiningOp<arith::ConstantOp>();
-          auto value = constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr{};
-          // On MTP372 the SDK's NaN-propagating maximum first injects RHS NaNs
-          // into the LHS, then issues maxequal. A non-NaN RHS makes that prefix
-          // an exact bitwise identity, including for special LHS values.
-          if (value && !value.getValue().isNaN())
-            op->setAttr("bangc.callee", StringAttr::get(module.getContext(), "__bang_maxequal"));
+      if (binary.getKind() == BinaryOperator::Maximum || binary.getKind() == BinaryOperator::Minimum) {
+        if (binary.getScratch())
+          op->setAttr("bangc.implementation", StringAttr::get(module.getContext(), "propagating_extrema"));
+        else if (StringRef callee = directExtremaCallee(binary); !callee.empty())
+          op->setAttr("bangc.callee", StringAttr::get(module.getContext(), callee));
+        else {
+          op->emitError("propagating extrema requires an independent NaN-repair workspace");
+          return WalkResult::interrupt();
         }
       }
     }
