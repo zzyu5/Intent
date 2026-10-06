@@ -176,6 +176,7 @@ class CuTileProgram:
         reused = cached is not None
         candidates = ()
         if cached is None:
+            self.compile(invocation)
             try:
                 configurations = self._configurations(values)
             except CompilationStageError as error:

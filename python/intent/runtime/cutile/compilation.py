@@ -1,10 +1,15 @@
 """Program-owned cuTile compilation, shared by preparation and SDK dispatch."""
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 import linecache
-import multiprocessing
+import os
+from pathlib import Path
+import pickle
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from threading import RLock
 
 
@@ -30,6 +35,28 @@ def _compile_configuration(function_name, parameters, convention, symbol, option
     except ct.TileError as error:
         return None, (type(error).__name__, str(error))
     return (compiled.cubin, compiled.kernel_signatures[0].symbol, None, []), None
+
+
+def _compile_batch(request, response):
+    # Launch an importable project module instead of multiprocessing's user
+    # __main__ bootstrap. The fresh interpreter never inherits a CUDA context.
+    environment = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parents[3])
+    inherited = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = package_root + (os.pathsep + inherited if inherited else "")
+    completed = subprocess.run(
+        [sys.executable, "-m", "intent.runtime.cutile._compiler_worker", str(request), str(response)],
+        env=environment, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        raise RuntimeError(
+            f"cuTile compiler worker exited with code {completed.returncode}\n"
+            f"{completed.stdout}{completed.stderr}")
+    if completed.stdout:
+        sys.stdout.write(completed.stdout)
+    if completed.stderr:
+        sys.stderr.write(completed.stderr)
+    with response.open("rb") as stream:
+        return pickle.load(stream)
 
 
 @dataclass(frozen=True)
@@ -141,19 +168,34 @@ class CuTileCompilation:
 
         if pending:
             exemplar = next(iter(self._kernels.values()))._pyfunc
-            with ProcessPoolExecutor(max_workers=4,
-                                     mp_context=multiprocessing.get_context("spawn"),
-                                     initializer=_initialize_compiler,
-                                     initargs=(exemplar.__module__, exemplar.__code__.co_filename,
-                                               self._source)) as executor:
-                submitted = [(key, executor.submit(_compile_configuration, name, signature.parameters,
-                                                   signature.calling_convention.code, signature.symbol,
-                                                   options, key[3], key[5]))
-                             for key, name, signature, options in pending]
-                for key, future in submitted:
-                    result, error = future.result()
-                    with self._lock:
-                        if self._lookup(key) is None:
-                            self._compiled.append(_Compilation(key, result, error))
+            batches = [[] for _ in range(min(4, len(pending)))]
+            for ordinal, (key, name, signature, options) in enumerate(pending):
+                batches[ordinal % len(batches)].append((
+                    ordinal, name, signature.parameters, signature.calling_convention.code,
+                    signature.symbol, options, key[3], key[5]))
+            # The SDK holds its compiler lock through the external compilation.
+            # Threads only supervise independent interpreter batches; compilation
+            # itself therefore remains four-way parallel even from stdin/notebooks.
+            with TemporaryDirectory(prefix="intent-cutile-compile-") as directory:
+                paths = []
+                for ordinal, batch in enumerate(batches):
+                    request = Path(directory) / f"request-{ordinal}.pickle"
+                    response = Path(directory) / f"response-{ordinal}.pickle"
+                    with request.open("wb") as stream:
+                        pickle.dump((exemplar.__module__, exemplar.__code__.co_filename,
+                                     self._source, batch), stream, protocol=pickle.HIGHEST_PROTOCOL)
+                    paths.append((request, response))
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    submitted = [executor.submit(_compile_batch, request, response)
+                                 for request, response in paths]
+                    results = {}
+                    for future in submitted:
+                        for ordinal, result, error in future.result():
+                            results[ordinal] = (result, error)
+            for ordinal, (key, _, _, _) in enumerate(pending):
+                result, error = results[ordinal]
+                with self._lock:
+                    if self._lookup(key) is None:
+                        self._compiled.append(_Compilation(key, result, error))
         with self._lock:
             return tuple(self._lookup(key).error for key in keys)
