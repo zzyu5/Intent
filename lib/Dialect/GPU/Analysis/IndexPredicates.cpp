@@ -36,6 +36,18 @@ std::optional<bool> proveRangeComparison(CompareOp comparison) {
   if (!bound.getType().isIndex())
     return std::nullopt;
   IndexRelations relations;
+  if (auto range = withoutProjection(source).getDefiningOp<MakeRangeOp>();
+      range && isUnitStepRange(range) &&
+      relations.same(range.getStart(), bound) &&
+      relations.alignedUnitWindow(range.getStart(), range.getExtent())) {
+    // The current aligned window is [start, start + extent - 1] in signed
+    // coordinates, even if the arithmetic that produced start was modular.
+    // This removes only its redundant lower test, not any resource boundary.
+    if (comparison.getPredicate() == ComparePredicate::Ge)
+      return true;
+    if (comparison.getPredicate() == ComparePredicate::Lt)
+      return false;
+  }
   if (comparison.getPredicate() == ComparePredicate::Lt &&
       relations.coordinateLessThan(source, bound))
     return true;

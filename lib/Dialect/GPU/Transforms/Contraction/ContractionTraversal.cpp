@@ -502,11 +502,17 @@ LogicalResult realizeReductionTraversal(ContractOp contract,
     if (failed(updateParameter(kernel, blockK.withBinding(blockK.getBinding().withDimension(
             IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), *lhsDimension))))))
       return failure();
+  auto boundedK = boundedTraversalChunk(
+      lookupParameter(kernel, *blockKRef), lhsRange);
+  if (failed(boundedK)) return failure();
+  PhysicalExprAttr unitK = *boundedK;
   OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
-  Value blockKValue = materializeParameter(parameterBuilder, contract.getLoc(), *blockKRef);
+  Value blockKValue = unitK.getKind() == PhysicalExprKind::Parameter
+      ? materializeParameter(parameterBuilder, contract.getLoc(), *blockKRef)
+            .getResult()
+      : parameterBuilder.create<PhysicalExprOp>(
+            contract.getLoc(), parameterBuilder.getIndexType(), unitK).getResult();
   MLIRContext *context = kernel.getContext();
-  PhysicalExprAttr unitK = parameterExpression(
-      context, blockK.getName().getValue());
   auto lhsIndexType = fragmentType(
       context, IndexType::get(context), {unitK},
       {cast<AxisMapAttr>(lhsRange.getResult().getType().getAxisMaps()[0])},

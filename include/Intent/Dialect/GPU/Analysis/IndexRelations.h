@@ -38,6 +38,12 @@ public:
   bool powerOfTwo(mlir::Value value) const;
   bool multipleOf(mlir::Value value, mlir::Value divisor) const;
 
+  // A positive power-of-two extent and an aligned scalar index origin prove
+  // that start + [0, extent - 1] does not cross signed index wraparound. This
+  // concerns the represented origin, not the arithmetic that produced it, and
+  // proves neither nonnegativity nor resource bounds.
+  bool alignedUnitWindow(mlir::Value start, mlir::Value extent) const;
+
   // An optional leaf proof is valid only within the caller's already guarded
   // specialization. It is consulted for typed parameter declarations, never
   // persisted as a fact about the unrestricted parameter domain.

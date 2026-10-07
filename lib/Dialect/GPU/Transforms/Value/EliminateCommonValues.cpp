@@ -200,6 +200,7 @@ LogicalResult canonicalizeCommonValues(func::FuncOp kernel) {
     foldConstantSelection(select);
   });
   RewritePatternSet patterns(kernel.getContext());
+  BinaryOp::getCanonicalizationPatterns(patterns, kernel.getContext());
   ReshapeOp::getCanonicalizationPatterns(patterns, kernel.getContext());
   TransposeOp::getCanonicalizationPatterns(patterns, kernel.getContext());
   SelectOp::getCanonicalizationPatterns(patterns, kernel.getContext());

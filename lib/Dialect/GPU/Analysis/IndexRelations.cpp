@@ -357,6 +357,17 @@ bool IndexRelations::multipleOf(Value value, Value divisor) const {
   return prove(value, 0);
 }
 
+bool IndexRelations::alignedUnitWindow(Value start, Value extent) const {
+  if (!start || !extent || !start.getType().isIndex() ||
+      !extent.getType().isIndex() || !powerOfTwo(extent) ||
+      !multipleOf(start, extent))
+    return false;
+  // For a represented signed index aligned to 2^k, the largest possible start
+  // is INT64_MAX - (2^k - 1). Adding a nonnegative offset below 2^k is safe,
+  // including for negative origins and modular arithmetic before this window.
+  return true;
+}
+
 Value IndexRelations::alignedBound(Value value, Value step) const {
   if (constant(value) == 0 || same(value, step))
     return value;

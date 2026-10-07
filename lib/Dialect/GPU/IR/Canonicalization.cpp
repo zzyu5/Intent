@@ -1,10 +1,49 @@
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include <optional>
 
 using namespace mlir;
 
 namespace intent::gpu {
+namespace {
+
+std::optional<bool> booleanJunction(BinaryOp operation) {
+  Type element = operation.getResult().getType();
+  if (auto fragment = dyn_cast<FragmentType>(element))
+    element = fragment.getElementType();
+  if (!element.isInteger(1) ||
+      operation.getLhs().getType() != operation.getResult().getType() ||
+      operation.getRhs().getType() != operation.getResult().getType())
+    return std::nullopt;
+  switch (operation.getOperatorKind()) {
+  case BinaryOperator::LogicalAnd:
+  case BinaryOperator::BitwiseAnd: return true;
+  case BinaryOperator::LogicalOr:
+  case BinaryOperator::BitwiseOr: return false;
+  default: return std::nullopt;
+  }
+}
+
+std::optional<bool> projectedBooleanConstant(Value value) {
+  while (Operation *definition = value.getDefiningOp()) {
+    if (auto constant = dyn_cast<arith::ConstantOp>(definition)) {
+      auto integer = dyn_cast<IntegerAttr>(constant.getValue());
+      if (integer && integer.getType().isInteger(1))
+        return integer.getValue().isOne();
+      return std::nullopt;
+    }
+    // These pure projections preserve a uniform value in every physical lane.
+    // A numerical cast or a nonuniform producer is not a constant proof.
+    if (!isa<SplatOp, BroadcastOp, ReshapeOp, TransposeOp>(definition))
+      return std::nullopt;
+    value = definition->getOperand(0);
+  }
+  return std::nullopt;
+}
+
+} // namespace
 
 Operation *IntentGPUDialect::materializeConstant(OpBuilder &builder,
     Attribute value, Type type, Location location) {
@@ -45,6 +84,13 @@ OpFoldResult SelectOp::fold(FoldAdaptor adaptor) {
 }
 OpFoldResult BinaryOp::fold(FoldAdaptor adaptor) {
   Type result = getResult().getType();
+  if (auto conjunction = booleanJunction(*this)) {
+    if (getLhs() == getRhs()) return getLhs();
+    for (unsigned side = 0; side < 2; ++side)
+      if (auto constant = projectedBooleanConstant(getOperand(side)))
+        return *constant == *conjunction ? getOperand(1 - side)
+                                        : getOperand(side);
+  }
   if (result.isIntOrIndex()) {
     auto lhs = dyn_cast_or_null<IntegerAttr>(adaptor.getLhs());
     auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs());
@@ -119,6 +165,45 @@ OpFoldResult MakeRecordOp::fold(FoldAdaptor) {
 }
 
 namespace {
+struct DeduplicateBooleanTerms : OpRewritePattern<BinaryOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(BinaryOp operation,
+                                PatternRewriter &rewriter) const override {
+    auto conjunction = booleanJunction(operation);
+    if (!conjunction) return failure();
+    SmallVector<Value> pending{operation.getRhs(), operation.getLhs()};
+    SmallVector<Value> terms;
+    llvm::SmallPtrSet<void *, 16> seen;
+    bool duplicate = false;
+    while (!pending.empty()) {
+      Value value = pending.pop_back_val();
+      auto nested = value.getDefiningOp<BinaryOp>();
+      // Expanding only uniquely used trees avoids copying a shared predicate
+      // DAG. The original leaf order remains stable after duplicate removal.
+      if (nested && value.hasOneUse() && value.getType() == operation.getType() &&
+          booleanJunction(nested) == conjunction) {
+        pending.push_back(nested.getRhs());
+        pending.push_back(nested.getLhs());
+      } else if (seen.insert(value.getAsOpaquePointer()).second) {
+        terms.push_back(value);
+      } else {
+        duplicate = true;
+      }
+    }
+    if (!duplicate) return failure();
+    Value replacement = terms.front();
+    for (Value term : llvm::drop_begin(terms)) {
+      auto combined = rewriter.create<BinaryOp>(operation.getLoc(), operation.getType(),
+          replacement, term, operation.getOperatorKind(), operation.getApproximate(),
+          operation.getFlushToZero(), operation.getStrictRounding());
+      combined->setDiscardableAttrs(llvm::to_vector(operation->getDiscardableAttrs()));
+      replacement = combined.getResult();
+    }
+    rewriter.replaceOp(operation, replacement);
+    return success();
+  }
+};
+
 struct SingletonInsertion : OpRewritePattern<ReshapeOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(ReshapeOp reshape,
@@ -187,6 +272,10 @@ struct CombineSelections : OpRewritePattern<SelectOp> {
 };
 } // namespace
 
+void BinaryOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                           MLIRContext *context) {
+  patterns.add<DeduplicateBooleanTerms>(context);
+}
 void ReshapeOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
                                             MLIRContext *context) {
   patterns.add<SingletonInsertion>(context);

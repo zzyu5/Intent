@@ -180,6 +180,7 @@ def IntentGPU_BinaryOp : IntentGPU_Op<"binary", [Pure, Elementwise, Scalarizable
   let results = (outs IntentGPU_DataValue:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def IntentGPU_CompareOp : IntentGPU_Op<"compare", [Pure, Elementwise, Scalarizable, DeclareOpInterfaceMethods<IntentGPU_FragmentOpInterface>]> {

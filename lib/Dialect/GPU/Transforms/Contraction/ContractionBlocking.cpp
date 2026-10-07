@@ -397,18 +397,23 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
     if (failed(updateParameter(kernel, current.withBinding(
             current.getBinding().withGroup(parameterGroup))))) return failure();
   }
+  auto boundedK = boundedTraversalChunk(
+      lookupParameter(kernel, *blockKRef), lhsReductionRange);
+  if (failed(boundedK)) return failure();
+  PhysicalExprAttr unitK = *boundedK;
   OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
   Value blockMValue = materializeParameter(parameterBuilder, location, *blockMRef);
   Value blockNValue = materializeParameter(parameterBuilder, location, *blockNRef);
-  Value blockKValue = materializeParameter(parameterBuilder, location, *blockKRef);
+  Value blockKValue = unitK.getKind() == PhysicalExprKind::Parameter
+      ? materializeParameter(parameterBuilder, location, *blockKRef).getResult()
+      : parameterBuilder.create<PhysicalExprOp>(
+            location, parameterBuilder.getIndexType(), unitK).getResult();
   Value rowWorkersValue = rowWorkers
       ? materializeParameter(parameterBuilder, location, rowWorkers.getReference()).getResult() : Value();
   PhysicalExprAttr unitM =
       parameterExpression(context, blockM.getName().getValue());
   PhysicalExprAttr unitN =
       parameterExpression(context, blockN.getName().getValue());
-  PhysicalExprAttr unitK =
-      parameterExpression(context, blockK.getName().getValue());
   PhysicalExprAttr unitRowWorkers;
   if (rowWorkers)
     unitRowWorkers = parameterExpression(

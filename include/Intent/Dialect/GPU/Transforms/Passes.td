@@ -156,7 +156,10 @@ def ContractionsPass : IntentGPUTransformPass<
     Consumes normalized contraction operands and formed ownership/ranges.
     Forms bounded source supply, contraction loops and typed accumulators from
     current axis, access and capability facts, preserving declared precision
-    and zero-reduction behavior. Closes value relations. Provider primitive
+    and zero-reduction behavior. Reduction granularity uses the same logical
+    capacity bound as other traversals; operand shapes and loop steps consume
+    one effective extent from the existing complete configuration row.
+    Closes value relations. Provider primitive
     selection, lane layout and native register allocation remain downstream.
   }]>;
 
@@ -226,14 +229,17 @@ def RangePredicatesPass : IntentGPUTransformPass<
     "Remove predicates proven by complete physical tiles", [{
     Consumes formed physical ranges, access bounds and validity. Removes only
     predicates proved redundant for the current members; unknown/tail domains
-    keep their original predicates and fill behavior. This optional
+    keep their original predicates and fill behavior. Aligned unit windows can
+    prove their own lower predicate without asserting external resource bounds.
+    This optional
     simplification changes actual SSA, never a side-table assertion of safety.
   }]>;
 
 def CommonValuesPass : IntentGPUTransformPass<
     "intent-gpu-eliminate-common-values",
     "Eliminate common GPU values and simplify masked coordinates", [{
-    Folds scalar/shape values, performs CSE and simplifies masked coordinates
+    Folds scalar/shape values and exact typed boolean identities, performs CSE
+    and simplifies masked coordinates
     from the current typed program. This complete cleanup requires no separate
     invariant-motion or relation-repair pass. With hoist-loop-invariants=false
     it does not move loop-invariant reads; all value/access cleanup still runs.

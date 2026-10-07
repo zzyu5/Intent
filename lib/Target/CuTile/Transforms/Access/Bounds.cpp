@@ -84,13 +84,11 @@ FailureOr<SmallVector<Value>> uniformAlignmentFactors(
 }
 
 bool isAlignedPeriodicTile(Value start, Value extent, Value period) {
-  if (!gpu::IndexRelations().powerOfTwo(extent) || !gpu::IndexRelations().positive(period) ||
-      !gpu::IndexRelations().multipleOf(period, extent))
-    return false;
-  auto factors = uniformAlignmentFactors(start, extent);
-  // A power-of-two aligned origin plus extent-1 cannot cross signed index
-  // wraparound. Dividing the period into complete tiles keeps one quotient.
-  return succeeded(factors) && factors->empty();
+  gpu::IndexRelations relations;
+  // Dividing the period into complete aligned windows keeps one quotient.
+  return relations.alignedUnitWindow(stripIndexIdentities(start),
+                                     stripIndexIdentities(extent)) &&
+         relations.positive(period) && relations.multipleOf(period, extent);
 }
 
 scf::ForOp completeAlignedTileLoop(Value start, Value extent) {

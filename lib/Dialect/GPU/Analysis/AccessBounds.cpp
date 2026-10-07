@@ -365,6 +365,7 @@ PhysicalProgramAnalysis::boundaryValidity(Operation *access,
             provesSignedNoWrap(BinaryOperator::Add, *start,
                 ConstantIntRanges::fromSigned(APInt(64, 0),
                                                extent->smax() - 1));
+        noWrap |= IndexRelations().alignedUnitWindow(range.getStart(), range.getExtent());
         if (!noWrap && !allowRangeGuards)
           continue;
         if (!noWrap) {
