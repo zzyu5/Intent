@@ -42,8 +42,9 @@ scf::ForOp createTraversalLoop(
   return loop;
 }
 
-FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
-                                                 MakeRangeOp range) {
+static FailureOr<PhysicalExprAttr>
+boundedCapacity(func::FuncOp kernel, ParameterAttr chunk,
+                PhysicalExprAttr capacity, bool preserveCandidateDomain) {
   auto expression = [&](PhysicalExprKind kind, int64_t value = 0,
                         StringRef symbol = {}, ArrayRef<Attribute> operands = {}) {
     return PhysicalExprAttr::get(chunk.getContext(), kind,
@@ -54,7 +55,6 @@ FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
   };
   auto extent = expression(PhysicalExprKind::Parameter, 0,
                            chunk.getName().getValue());
-  auto capacity = queryLogicalRangeCapacity(range);
   if (!capacity || !isShapeBound(capacity) || chunk.isDeferred())
     return extent;
   int64_t maximum =
@@ -69,7 +69,23 @@ FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
   auto bounded = expression(PhysicalExprKind::Minimum, 0, {},
                             {positive, expression(PhysicalExprKind::Constant, maximum)});
   auto padded = expression(PhysicalExprKind::NextPowerOfTwo, 0, {}, {bounded});
-  if (!isCompileTimePhysicalExpr(padded)) {
+  SmallVector<int64_t> candidates;
+  if (preserveCandidateDomain) {
+    candidates.assign(chunk.getCandidates().asArrayRef().begin(),
+                      chunk.getCandidates().asArrayRef().end());
+    llvm::sort(candidates);
+    if (auto bound = constantPhysicalExpression(bounded)) {
+      auto selected = llvm::lower_bound(candidates, *bound);
+      if (selected == candidates.end()) return failure();
+      padded = expression(PhysicalExprKind::Constant, *selected);
+    }
+  } else {
+    for (int64_t candidate = 1; candidate < maximum; candidate *= 2)
+      candidates.push_back(candidate);
+    candidates.push_back(llvm::PowerOf2Ceil(static_cast<uint64_t>(maximum)));
+  }
+  if (!isCompileTimePhysicalExpr(padded) ||
+      (preserveCandidateDomain && !constantPhysicalExpression(bounded))) {
     // Coverage is bound before candidate selection and cannot depend on another
     // parameter. A deferred parameter's coverageBound is only its required size,
     // not the value selected from its domain, so substituting that bound would
@@ -77,15 +93,10 @@ FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
     AttrTypeWalker dependencies;
     dependencies.addWalk([](ParameterRefAttr) { return WalkResult::interrupt(); });
     if (dependencies.walk(bounded).wasInterrupted()) return extent;
-    auto kernel = range->getParentOfType<func::FuncOp>();
     ParameterAttr capacityParameter;
     // Host-dependent capacity is bound once before candidate selection. Keep
     // runtime dimensions out of fragment types, without duplicating the host
     // evaluator or baking a particular invocation into the shared program.
-    SmallVector<int64_t> candidates;
-    for (int64_t candidate = 1; candidate < maximum; candidate *= 2)
-      candidates.push_back(candidate);
-    candidates.push_back(llvm::PowerOf2Ceil(static_cast<uint64_t>(maximum)));
     for (Attribute attribute : getParameterDeclarations(kernel)) {
       auto declaration = cast<ParameterAttr>(attribute);
       if (declaration.isDeferred() &&
@@ -113,6 +124,18 @@ FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
                         capacityParameter.getName().getValue());
   }
   return expression(PhysicalExprKind::Minimum, 0, {}, {extent, padded});
+}
+
+FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
+                                                 MakeRangeOp range) {
+  return boundedCapacity(range->getParentOfType<func::FuncOp>(), chunk,
+                         queryLogicalRangeCapacity(range), false);
+}
+
+FailureOr<PhysicalExprAttr>
+boundedOwnershipExtent(func::FuncOp kernel, ParameterAttr parameter,
+                       PhysicalExprAttr logicalCapacity) {
+  return boundedCapacity(kernel, parameter, logicalCapacity, true);
 }
 
 LogicalResult realizeFullCoverageDimension(func::FuncOp kernel, Value source,

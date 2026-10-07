@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction/Contraction.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Predication.h"
+#include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -1531,6 +1532,18 @@ LogicalResult PointwiseRewrite::mapOwnership() {
     PhysicalExprAttr tile = expression(
         module.getContext(), PhysicalExprKind::Parameter, 0,
         parameter.getName().getValue());
+    if (llvm::all_of(ranges, isUnitStepRange) &&
+        llvm::any_of(ranges, [&](MakeRangeOp candidate) {
+          return contractFreeAxisFacts(kernel, candidate).matrixSides !=
+                 ContractFreeAxisNone;
+        })) {
+      auto bounded = boundedOwnershipExtent(kernel, parameter, logical);
+      if (failed(bounded)) return failure();
+      if (*bounded != tile) {
+        tile = *bounded;
+        ownershipExtents[axisKey] = tile;
+      }
+    }
     PhysicalExprAttr launch = binaryExpression(
         module.getContext(), PhysicalExprKind::CeilDiv, logical, tile);
     Value tiles = mappingBuilder.create<PhysicalExprOp>(
@@ -1608,9 +1621,14 @@ LogicalResult PointwiseRewrite::mapOwnership() {
         if (!parameter)
           return kernel.emitError(
               "pointwise ownership mapping lost its blocking parameter");
+        Value extent = materializeParameter(
+            mappingBuilder, mapping.getLoc(), parameter.getReference());
+        if (PhysicalExprAttr bounded = ownershipExtents.lookup(*axisKey))
+          extent = mappingBuilder.create<PhysicalExprOp>(
+              mapping.getLoc(), mappingBuilder.getIndexType(), bounded);
         newCoordinate = mappingBuilder.create<BinaryOp>(
             mapping.getLoc(), mappingBuilder.getIndexType(), newCoordinate,
-            materializeParameter(mappingBuilder, mapping.getLoc(), parameter.getReference()), BinaryOperator::Multiply);
+            extent, BinaryOperator::Multiply);
         oldCoordinate.replaceAllUsesWith(newCoordinate);
         continue;
       }

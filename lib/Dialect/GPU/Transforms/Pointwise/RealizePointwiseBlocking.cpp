@@ -111,6 +111,17 @@ LogicalResult PointwiseRewrite::reuseMapping() {
   for (auto &[axis, ranges] : axes) {
     if (failed(reconcileCoordinate(ranges.front(), axis, *coordinates))) return failure();
     if (!parameters.lookup(axis)) return ranges.front().emitOpError("pointwise mapping lost its blocking parameter");
+    auto mapped = coordinates->axes.find(axis);
+    if (mapped != coordinates->axes.end()) {
+      auto launch = cast<PhysicalExprAttr>(
+          mapping.getLaunchExtents()[mapped->second]);
+      if (launch.getKind() == PhysicalExprKind::CeilDiv &&
+          launch.getOperands().size() == 2) {
+        auto extent = cast<PhysicalExprAttr>(launch.getOperands()[1]);
+        if (extent.getKind() == PhysicalExprKind::Minimum)
+          ownershipExtents[axis] = extent;
+      }
+    }
   }
   tileCoordinates = std::move(coordinates->tiles);
   return success();
@@ -415,10 +426,15 @@ LogicalResult PointwiseRewrite::materializeRanges() {
              << ", has_coverage="
              << parameter->isDeferred()
              << ", launch_extents=" << mapping->getAttr("launch_extents");
+    PhysicalExprAttr boundedExtent = ownershipExtents.lookup(*axisKey);
+    Value offsetExtent = materializeParameter(
+        builder, range.getLoc(), parameter->getReference());
+    if (boundedExtent)
+      offsetExtent = builder.create<PhysicalExprOp>(
+          range.getLoc(), builder.getIndexType(), boundedExtent);
     Value tileOffset = builder.create<BinaryOp>(
         range.getLoc(), builder.getIndexType(), tileCoordinate,
-        materializeParameter(builder, range.getLoc(), parameter->getReference()),
-        BinaryOperator::Multiply);
+        offsetExtent, BinaryOperator::Multiply);
     Value start;
     Value end;
     if (range->hasAttr(worksetCoordinateRangeAttr)) {
@@ -468,7 +484,8 @@ LogicalResult PointwiseRewrite::materializeRanges() {
       end = range.getLogicalStop();
     }
     auto sourceType = cast<FragmentType>(range.getResult().getType());
-    PhysicalExprAttr tileExtent = fragmentExtent(*parameter);
+    PhysicalExprAttr tileExtent = boundedExtent ? boundedExtent
+                                               : fragmentExtent(*parameter);
     if (sourceType.getShape()[0] != tileExtent) {
       if (FailureOr<uint64_t> dimension = rangeDimension(range);
           succeeded(dimension) && !queryParameterBinding(*parameter).source) {
@@ -486,6 +503,8 @@ LogicalResult PointwiseRewrite::materializeRanges() {
         PhysicalExprKind::Constant)
       physicalExtent = builder.create<arith::ConstantIndexOp>(
           range.getLoc(), tileExtent.getValue());
+    else if (boundedExtent)
+      physicalExtent = offsetExtent;
     auto blockedType = FragmentType::get(
         module.getContext(), sourceType.getElementType(),
         builder.getArrayAttr({tileExtent}), sourceType.getAxisMaps(),

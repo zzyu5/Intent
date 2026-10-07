@@ -258,6 +258,7 @@ private:
   SmallVector<RangeBinding> bindings;
   llvm::MapVector<Attribute, SmallVector<MakeRangeOp>> axes;
   llvm::DenseMap<Attribute, ParameterRefAttr> parameters;
+  llvm::DenseMap<Attribute, PhysicalExprAttr> ownershipExtents;
   llvm::SmallDenseSet<Attribute> ownershipAxes;
   llvm::SmallDenseSet<Attribute> internalAxes;
   llvm::SmallDenseSet<uint64_t> partiallyCarriedStructuredDimensions;

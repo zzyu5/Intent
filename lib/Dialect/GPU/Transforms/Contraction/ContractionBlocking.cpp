@@ -401,19 +401,49 @@ LogicalResult realizeContract(ContractOp contract, func::FuncOp kernel,
       lookupParameter(kernel, *blockKRef), lhsReductionRange);
   if (failed(boundedK)) return failure();
   PhysicalExprAttr unitK = *boundedK;
+  auto freeExtent = [&](ParameterRefAttr reference, MakeRangeOp range,
+                        FailureOr<unsigned> existing) -> FailureOr<PhysicalExprAttr> {
+    // An existing ownership coordinate already uses the range's physical
+    // extent in its start. Preserve that same current-IR expression when
+    // refining the parameter; only a newly placed axis chooses its capacity.
+    if (succeeded(existing)) {
+      auto extent = cast<PhysicalExprAttr>(
+          range.getResult().getType().getShape()[0]);
+      auto launch = cast<PhysicalExprAttr>(
+          mapping.getLaunchExtents()[*existing]);
+      if (!PhysicalProgramAnalysis(kernel)
+               .axisRealization(range.getResult(), 0).constructionScalarSeed &&
+          queryLaunchExpression(range.getExtent()) == extent &&
+          launch.getKind() == PhysicalExprKind::CeilDiv &&
+          launch.getOperands().size() == 2 &&
+          launch.getOperands()[1] == extent)
+        return extent;
+      return parameterExpression(context, reference.getName().getValue());
+    }
+    return boundedOwnershipExtent(kernel, lookupParameter(kernel, reference),
+                                  queryLogicalRangeCapacity(range));
+  };
+  auto boundedM = freeExtent(*blockMRef, rowRange, existingRowAxis);
+  auto boundedN = freeExtent(*blockNRef, columnRange, existingColumnAxis);
+  if (failed(boundedM) || failed(boundedN)) return failure();
+  PhysicalExprAttr unitM = *boundedM;
+  PhysicalExprAttr unitN = *boundedN;
   OpBuilder parameterBuilder(&kernel.front(), kernel.front().begin());
-  Value blockMValue = materializeParameter(parameterBuilder, location, *blockMRef);
-  Value blockNValue = materializeParameter(parameterBuilder, location, *blockNRef);
+  auto materializeExtent = [&](PhysicalExprAttr extent) -> Value {
+    if (extent.getKind() == PhysicalExprKind::Parameter)
+      return materializeParameter(parameterBuilder, location,
+                                  extent.getParameterReference());
+    return parameterBuilder.create<PhysicalExprOp>(
+        location, parameterBuilder.getIndexType(), extent);
+  };
+  Value blockMValue = materializeExtent(unitM);
+  Value blockNValue = materializeExtent(unitN);
   Value blockKValue = unitK.getKind() == PhysicalExprKind::Parameter
       ? materializeParameter(parameterBuilder, location, *blockKRef).getResult()
       : parameterBuilder.create<PhysicalExprOp>(
             location, parameterBuilder.getIndexType(), unitK).getResult();
   Value rowWorkersValue = rowWorkers
       ? materializeParameter(parameterBuilder, location, rowWorkers.getReference()).getResult() : Value();
-  PhysicalExprAttr unitM =
-      parameterExpression(context, blockM.getName().getValue());
-  PhysicalExprAttr unitN =
-      parameterExpression(context, blockN.getName().getValue());
   PhysicalExprAttr unitRowWorkers;
   if (rowWorkers)
     unitRowWorkers = parameterExpression(

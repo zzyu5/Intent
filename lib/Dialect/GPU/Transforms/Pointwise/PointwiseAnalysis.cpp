@@ -990,6 +990,12 @@ FailureOr<Attribute> mappingAxis(func::FuncOp kernel, Attribute attribute) {
                         PhysicalExprKind::CeilDiv &&
       expression.getOperands().size() == 2) {
     auto divisor = dyn_cast<PhysicalExprAttr>(expression.getOperands()[1]);
+    // Capacity projection retains the raw ownership parameter as the first
+    // operand; the second operand is its compile-time coverage capacity.
+    if (divisor && divisor.getKind() == PhysicalExprKind::Minimum &&
+        divisor.getOperands().size() == 2 &&
+        isCompileTimePhysicalExpr(divisor))
+      divisor = dyn_cast<PhysicalExprAttr>(divisor.getOperands()[0]);
     if (divisor && divisor.getKind() ==
                        PhysicalExprKind::Parameter) {
       FailureOr<ParameterAttr> parameter = queryParameterBySymbol(kernel, divisor.getParameterReference().getName());

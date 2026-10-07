@@ -18,6 +18,13 @@ mlir::scf::ForOp createTraversalLoop(
 
 mlir::FailureOr<PhysicalExprAttr> boundedTraversalChunk(ParameterAttr chunk,
                                                        MakeRangeOp range);
+// Clip a complete ownership domain using the original parameter's candidate
+// domain, including its lower bound. Host-dependent capacities use the existing
+// early Coverage binding; device-dependent or candidate-dependent bounds retain
+// the original extent.
+mlir::FailureOr<PhysicalExprAttr>
+boundedOwnershipExtent(mlir::func::FuncOp kernel, ParameterAttr parameter,
+                       PhysicalExprAttr logicalCapacity);
 mlir::LogicalResult bindFullCoverageDimension(mlir::func::FuncOp kernel,
                                               uint64_t dimension,
                                               mlir::Value physicalExtent);

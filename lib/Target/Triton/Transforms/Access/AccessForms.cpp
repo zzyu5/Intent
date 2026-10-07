@@ -12,7 +12,9 @@
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/Support/MathExtras.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <optional>
 
@@ -382,14 +384,46 @@ bool descriptorAccessEligible(func::FuncOp kernel, Value viewValue,
       blockAxes.begin(), llvm::find(blockAxes, view.getRank() - 1));
   auto extent =
       cast<gpu::PhysicalExprAttr>(fragment.getShape()[contiguousAxis]);
-  StringAttr alignedBlockParameter;
+  llvm::SmallDenseSet<StringAttr, 4> alignedBlockParameters;
   if (extent.getKind() ==
       gpu::PhysicalExprKind::Parameter)
-    alignedBlockParameter = extent.getParameterReference().getName();
+    alignedBlockParameters.insert(extent.getParameterReference().getName());
+  else {
+    // In the descriptor branch min(P, capacity) is at least the required
+    // alignment. Each operand is therefore at least that large; when every
+    // leaf has a power-of-two domain, each leaf is aligned as well. Keep this
+    // conditional fact local to the existing descriptor eligibility contract.
+    std::function<bool(gpu::PhysicalExprAttr)> collectAlignedLeaves =
+        [&](gpu::PhysicalExprAttr expression) {
+      if (expression.getKind() == gpu::PhysicalExprKind::Constant)
+        return expression.getValue() > 0 &&
+               llvm::isPowerOf2_64(expression.getValue());
+      if (expression.getKind() == gpu::PhysicalExprKind::Parameter) {
+        auto parameter = gpu::lookupParameter(
+            kernel, expression.getParameterReference());
+        if (!parameter ||
+            parameter.getRole() == gpu::ParameterRole::ResidentWorkers ||
+            parameter.getCandidates().empty() ||
+            !llvm::all_of(parameter.getCandidates().asArrayRef(),
+                          [](int64_t value) {
+                            return value > 0 && llvm::isPowerOf2_64(value);
+                          }))
+          return false;
+        alignedBlockParameters.insert(parameter.getName());
+        return true;
+      }
+      return expression.getKind() == gpu::PhysicalExprKind::Minimum &&
+             expression.getOperands().size() == 2 &&
+             llvm::all_of(expression.getOperands(), [&](Attribute operand) {
+               return collectAlignedLeaves(cast<gpu::PhysicalExprAttr>(operand));
+             });
+    };
+    if (!collectAlignedLeaves(extent)) alignedBlockParameters.clear();
+  }
   gpu::IndexRelations relations;
   return relations.multipleOf(offsets.back(), 16 / *elementBytes,
       [&](gpu::ParameterAttr parameter) {
-        return parameter.getName() == alignedBlockParameter;
+        return alignedBlockParameters.contains(parameter.getName());
       });
 }
 
