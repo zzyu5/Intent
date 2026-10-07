@@ -72,17 +72,10 @@ int main(int argc, char **argv) {
   llvm::cl::opt<bool> cpuMatrixI8I32("cpu-matrix-i8-i32", llvm::cl::init(false));
   llvm::cl::opt<int64_t> cpuPrivateBytes("cpu-private-bytes", llvm::cl::init(256 * 1024));
   llvm::cl::opt<std::string> dsaArchitecture("dsa-architecture", llvm::cl::init("mtp_372"));
-  llvm::cl::opt<int64_t> dsaTile("dsa-tile", llvm::cl::init(1024));
-  llvm::cl::opt<int64_t> dsaTileM("dsa-tile-m", llvm::cl::init(16));
-  llvm::cl::opt<int64_t> dsaTileN("dsa-tile-n", llvm::cl::init(64));
-  llvm::cl::opt<int64_t> dsaTileK("dsa-tile-k", llvm::cl::init(64));
-  llvm::cl::opt<int64_t> dsaRegionTile("dsa-region-tile", llvm::cl::init(64));
   llvm::cl::opt<std::string> dsaShapes("dsa-shapes", llvm::cl::init("{}"),
       llvm::cl::desc("JSON parameter shapes; -1 keeps an axis dynamic"));
   llvm::cl::opt<std::string> dsaStrides("dsa-strides", llvm::cl::init("{}"),
       llvm::cl::desc("JSON parameter element strides"));
-  llvm::cl::opt<int64_t> dsaTasks("dsa-tasks", llvm::cl::init(16));
-  llvm::cl::opt<int64_t> dsaLocalBytes("dsa-local-bytes", llvm::cl::init(512 * 1024));
   llvm::cl::opt<bool> stopAfterShared("stop-after-shared", llvm::cl::init(false),
       llvm::cl::desc("Stop after the selected family's complete shared pipeline"));
   llvm::cl::opt<bool> stopAfterKIR("stop-after-kir", llvm::cl::init(false),
@@ -103,8 +96,7 @@ int main(int argc, char **argv) {
   const llvm::SmallVector<llvm::cl::Option *> cpuOptions{
       &cpuVectorBits, &cpuWorkers, &cpuMatrixI8I32, &cpuPrivateBytes};
   const llvm::SmallVector<llvm::cl::Option *> dsaOptions{
-      &dsaArchitecture, &dsaTile, &dsaTileM, &dsaTileN, &dsaTileK,
-      &dsaRegionTile, &dsaShapes, &dsaStrides, &dsaTasks, &dsaLocalBytes};
+      &dsaArchitecture, &dsaShapes, &dsaStrides};
   auto rejectOptions = [&](llvm::ArrayRef<llvm::cl::Option *> options,
                            llvm::StringRef reason) {
     for (llvm::cl::Option *option : options)
@@ -178,9 +170,7 @@ int main(int argc, char **argv) {
         (family != intent::compiler::Family::CPU &&
          rejectOptions(cpuOptions, "selected provider does not consume CPU resources")) ||
         (family != intent::compiler::Family::DSA &&
-         rejectOptions(dsaOptions, "selected provider does not consume DSA bindings")) ||
-        (family == intent::compiler::Family::DSA &&
-         rejectOptions({&tuningConfigFilename}, "DSA takes explicit bindings, not a tuning profile")))
+         rejectOptions(dsaOptions, "selected provider does not consume DSA bindings")))
       return exitCode(Failure::Invocation);
   }
   if (request.stopAfter != intent::compiler::Stage::Provider &&
@@ -196,8 +186,7 @@ int main(int argc, char **argv) {
       registersPerUnit, maxThreadsPerBlock, computeCapabilityMajor, computeCapabilityMinor,
       singleToDoublePrecisionPerfRatio, matrixUnits, dynamicVectorWidth, false, false};
   request.cpu = {cpuVectorBits, cpuWorkers, cpuMatrixI8I32, cpuPrivateBytes};
-  request.dsa = {dsaArchitecture, dsaTile, dsaTileM, dsaTileN, dsaTileK,
-      dsaRegionTile, dsaTasks, dsaLocalBytes, dsaShapes, dsaStrides};
+  request.dsa = {dsaArchitecture, dsaShapes, dsaStrides};
   request.tuningConfig = tuningConfigFilename;
   request.profileDirectory = std::string(profileDirectory);
 

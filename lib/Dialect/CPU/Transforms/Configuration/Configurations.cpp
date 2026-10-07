@@ -61,17 +61,18 @@ LogicalResult materializeCPUConfigurations(
       return original.emitError("region size requires a region consumer; otherwise it must be 1")
           << "; profile '" << family << "' row " << row + 1;
     }
-    for (auto bindings : implementations.candidates(original, capabilities, configuration, rejected)) {
-      if (llvm::any_of(candidates, [&](const Candidate &previous) {
-            const auto &other = previous.configuration;
-            return other.taskGrain == configuration.taskGrain &&
-                   other.tileM == configuration.tileM && other.tileN == configuration.tileN &&
-                   other.tileK == configuration.tileK && other.regionSize == configuration.regionSize &&
-                   previous.bindings == bindings;
-          }))
-        continue;
-      candidates.push_back({configuration, std::move(bindings)});
-    }
+    auto bindings = implementations.select(original, capabilities, configuration, rejected);
+    if (failed(bindings))
+      continue;
+    if (llvm::any_of(candidates, [&](const Candidate &previous) {
+          const auto &other = previous.configuration;
+          return other.taskGrain == configuration.taskGrain &&
+                 other.tileM == configuration.tileM && other.tileN == configuration.tileN &&
+                 other.tileK == configuration.tileK && other.regionSize == configuration.regionSize &&
+                 previous.bindings == *bindings;
+        }))
+      continue;
+    candidates.push_back({configuration, std::move(*bindings)});
   }
   if (candidates.empty()) {
     auto diagnostic = original.emitError("no legal CPU candidates remain for family '");
@@ -83,6 +84,7 @@ LogicalResult materializeCPUConfigurations(
            << configuration.taskGrain << ", " << configuration.tileM << ", "
            << configuration.tileN << ", " << configuration.tileK << ", "
            << configuration.regionSize << "] local=" << configuration.local
+           << " implementations=" << configuration.implementations
            << ", computation " << rejection.operation;
       if (!rejection.implementation.empty()) note << ", implementation '" << rejection.implementation << "'";
       note << ": " << rejection.reason;
@@ -90,8 +92,7 @@ LogicalResult materializeCPUConfigurations(
     return failure();
   }
 
-  // Keep profile order and the registry's correlated finite portfolio. Each
-  // clone receives its complete executable binding before another group runs.
+  // Each accepted profile row forms one complete executable candidate.
   for (auto [number, candidate] : llvm::enumerate(candidates)) {
     auto function = cast<func::FuncOp>(original->clone());
     function.setName(original.getName().str() + "_config_" + std::to_string(number));

@@ -18,6 +18,8 @@ struct Configuration {
   int64_t tileK;
   int64_t regionSize;
   mlir::DictionaryAttr local;
+  // Profile selection only; executable consumers use per-operation bindings.
+  mlir::ArrayAttr implementations;
 
   int64_t parameter(llvm::StringRef name) const {
     return mlir::cast<mlir::IntegerAttr>(local.get(name)).getInt();

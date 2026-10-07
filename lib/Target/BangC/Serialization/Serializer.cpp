@@ -28,8 +28,10 @@ LogicalResult verifyAllocationGeometry(memref::AllocaOp allocation) {
 }
 class Serializer : public NativeSourceEmitter {
 public:
-  Serializer(func::FuncOp function, llvm::raw_ostream &output)
-      : NativeSourceEmitter(output, NativeSourceSyntax::C), function(function) {}
+  Serializer(func::FuncOp function, llvm::raw_ostream &output, unsigned candidate)
+      : NativeSourceEmitter(output, NativeSourceSyntax::C), function(function),
+        deviceEntry("intent_device_" + std::to_string(candidate)),
+        launchEntry("intent_launch_" + std::to_string(candidate)) {}
   static const OperationEmitters<Serializer> &nativeEmitters();
   std::string nativeType(Type type) override {
     if (auto memory = dyn_cast<MemRefType>(type))
@@ -63,6 +65,8 @@ public:
         });
     if (mlir::failed(requirements)) return failure();
     auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
+    auto architecture = function->getParentOfType<ModuleOp>()->getAttrOfType<StringAttr>("bangc.architecture");
+    if (!architecture) return function.emitError("BANG C serialization requires a bound architecture");
     for (const NativeSlot &slot : nativeABI->slots) {
       std::string name = slot.name();
       Value argument = function.getArgument(slot.parameter);
@@ -89,16 +93,16 @@ public:
       fullExtents.push_back(value);
     metadata = llvm::json::Object{{"provider", "bangc"}, {"entry_name", function.getName()},
         {"compile_options", serializeCompileOptions(*options)},
-        {"interface", std::move(*publicMetadata)}, {"entry", "intent_launch"},
-        {"target", llvm::json::Object{{"family", "dsa"}, {"architecture", "mtp_372"},
+        {"interface", std::move(*publicMetadata)}, {"entry", launchEntry},
+        {"target", llvm::json::Object{{"family", "dsa"}, {"architecture", architecture.getValue()}}},
+        {"configuration", llvm::json::Object{
             {"tile", config.getTile()}, {"tasks", config.getTasks()},
             {"tile_m", config.getTileM()}, {"tile_n", config.getTileN()}, {"tile_k", config.getTileK()},
             {"region_tile", config.getRegionTile()}, {"local_bytes", config.getLocalBytes()}}},
         {"full_extent_dimensions", std::move(fullExtents)},
         {"native", llvm::json::Object{{"requirements", requirements->serialize()},
             {"slots", nativeABI->serialize()}}}};
-    output << "#pragma bang walign(" << function->getAttrOfType<IntegerAttr>("bangc.wram_align").getInt() << ")\n"
-        << tileImplementations << "\n__mlu_global__ void intent_device(" << llvm::join(signature, ", ") << ") {\n";
+    output << "__mlu_global__ void " << deviceEntry << "(" << llvm::join(signature, ", ") << ") {\n";
     auto bytes = [&](StringRef name) { return function->getAttrOfType<IntegerAttr>(name).getInt(); };
     if (bytes("bangc.nram_bytes")) line("__nram__ __attribute__((aligned(128))) unsigned char local_nram[" + std::to_string(bytes("bangc.nram_bytes")) + "];", 1);
     if (bytes("bangc.wram_bytes")) line("__wram__ __attribute__((aligned(128))) unsigned char local_wram[" + std::to_string(bytes("bangc.wram_bytes")) + "];", 1);
@@ -106,12 +110,12 @@ public:
     indent = 1;
     if (mlir::failed(emitNativeBlock(function.front()))) return failure();
     indent = 0;
-    output << "}\n\nextern \"C\" int intent_launch(void *stream";
+    output << "}\n\nextern \"C\" int " << launchEntry << "(void *stream";
     if (!signature.empty()) output << ", " << llvm::join(signature, ", ");
     auto group = function->getAttrOfType<IntegerAttr>("intent_dsa.group_width");
     output << ") {\n  cnrtDim3_t dim = {" << (group ? group.getInt() : config.getTasks()) << ", "
         << (group ? config.getTasks() / group.getInt() : 1) << ", 1};\n"
-        << "  intent_device<<<dim, " << (group ? "cnrtFuncTypeUnion1" : "cnrtFuncTypeBlock") << ", static_cast<cnrtQueue_t>(stream)>>>("
+        << "  " << deviceEntry << "<<<dim, " << (group ? "cnrtFuncTypeUnion1" : "cnrtFuncTypeBlock") << ", static_cast<cnrtQueue_t>(stream)>>>("
         << llvm::join(call, ", ") << ");\n  return static_cast<int>(cnrtGetLastError());\n}\n";
     return failure(hasFailed());
   }
@@ -500,6 +504,7 @@ private:
     return success();
   }
   func::FuncOp function;
+  std::string deviceEntry, launchEntry;
   SmallVector<std::string> signature, call;
 };
 
@@ -607,11 +612,56 @@ std::optional<LogicalResult> verifyUnboundNativeSourceOperation(Operation *opera
 }
 
 LogicalResult serializeProgram(ModuleOp module, std::string &source, std::string &metadata) {
-  if (mlir::failed(verifyProgram(module))) return failure();
+  auto entry = module->getAttrOfType<StringAttr>("intent.entry_name");
+  if (!entry)
+    return module.emitError("BANG C portfolio requires a public entry and bound candidate modules");
+  for (Operation &operation : *module.getBody())
+    if (!isa<ModuleOp>(operation))
+      return operation.emitError("BANG C portfolio contains an operation outside its candidate modules");
+  auto options = module->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr);
+  if (!options)
+    return module.emitError("BANG C portfolio requires its numerical compile options");
+  if (module.getOps<ModuleOp>().empty())
+    return module.emitError("BANG C portfolio has no bound candidates");
+  IntegerAttr wramAlignment;
+  for (ModuleOp candidate : module.getOps<ModuleOp>()) {
+    if (candidate->getAttrOfType<CompileOptionsAttr>(compileOptionsAttr) != options)
+      return candidate.emitError("BANG C candidate compile options disagree with the portfolio");
+    if (mlir::failed(verifyProgram(candidate))) return failure();
+    auto function = *candidate.getOps<func::FuncOp>().begin();
+    auto alignment = function->getAttrOfType<IntegerAttr>("bangc.wram_align");
+    if (!alignment)
+      return function.emitError("BANG C candidate requires its bound WRAM alignment");
+    if (wramAlignment && alignment.getInt() != wramAlignment.getInt())
+      return function.emitError("BANG C candidates disagree on their bound WRAM alignment");
+    wramAlignment = alignment;
+  }
   llvm::raw_string_ostream output(source);
+  output << "#pragma bang walign(" << wramAlignment.getInt() << ")\n"
+         << tileImplementations << "\n";
+  int64_t preludeEnd = output.tell();
   llvm::json::Object interface;
-  Serializer serializer(*module.getOps<func::FuncOp>().begin(), output);
-  if (mlir::failed(serializer.emit(interface))) return failure();
+  llvm::json::Array candidates;
+  unsigned ordinal = 0;
+  for (ModuleOp candidate : module.getOps<ModuleOp>()) {
+    int64_t begin = output.tell();
+    llvm::json::Object description;
+    Serializer serializer(*candidate.getOps<func::FuncOp>().begin(), output, ordinal++);
+    if (mlir::failed(serializer.emit(description))) return failure();
+    for (StringRef name : {"provider", "compile_options", "target", "interface", "native"}) {
+      if (ordinal == 1) interface[name] = std::move(*description.get(name));
+      else if (*interface.get(name) != *description.get(name))
+        return candidate.emitError("BANG C candidates disagree on their public compilation contract: ") << name;
+    }
+    candidates.push_back(llvm::json::Object{
+        {"entry", std::move(*description.get("entry"))},
+        {"configuration", std::move(*description.get("configuration"))},
+        {"full_extent_dimensions", std::move(*description.get("full_extent_dimensions"))},
+        {"source_range", llvm::json::Array{begin, static_cast<int64_t>(output.tell())}}});
+  }
+  interface["entry_name"] = entry.getValue();
+  interface["source_prelude_end"] = preludeEnd;
+  interface["candidates"] = std::move(candidates);
   llvm::raw_string_ostream metadataOutput(metadata);
   metadataOutput << llvm::json::Value(std::move(interface));
   return success();

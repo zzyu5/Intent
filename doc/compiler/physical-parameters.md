@@ -116,3 +116,11 @@ Intent 的编译产物默认保存到 `$XDG_CACHE_HOME/intentdsl/`，未设置 X
 若进一步把性能差距归因于compiler program quality，则需要控制双方相关parameter roles、候选预算和计时范围，或明确说明这些因素的影响。相同调优winner不是比较目标，候选调优耗时也不是算子执行时间；ABI表示、辅助输出或布局转换的差异应明确计入或排除相应测量范围，不隐藏额外工作。
 
 Tuning只选择参数和已声明local forms，不能掩盖缺失的program mapping、access graph或structured realization。若generated依赖更大的search space才弥补结构缺口，该问题仍属于compiler IR/passes。
+
+## 9. DSA完整配置
+
+BANG C采用相同的完整经验列表原则，使用其独立执行模型的参数，不复用GPU参数角色。默认表位于provider配置模块；`tuning_config`的`bangc.block`整组替换列表。每行依次为`tile, tile_m, tile_n, tile_k, region_tile, tasks, local_bytes`，由既有`dsa.ConfigurationAttr`验证。配置不作为hardware target身份或作者DSL参数；`local_bytes`是配置使用的存储预算，不改变所选architecture的实际容量。
+
+每行从同一canonical KIR独立形成一份完整、已绑定的DSA物理程序。标准nested ModuleOp保存这些候选，各候选沿原shared/provider passes和verifiers处理；公共ABI、数值许可和architecture保持一致。Source范围、entry与候选配置由serializer机械发布，runtime不根据配置重建程序。
+
+单个合法候选直接调用；多个候选分别native编译、真实计时择优并缓存。试跑按allocation owner保存初始内容和alias关系，保留view的dtype、offset和strides，每次计时前恢复状态；winner只对原调用参数执行一次。编译失败记录到对应候选，全部无法编译时诊断；执行失败保留原错误并终止，不靠重试其它候选掩盖错误。完整配置列表也不能掩盖DSA实现或供数结构的缺失。

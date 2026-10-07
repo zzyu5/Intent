@@ -45,6 +45,10 @@ SmallVector<std::string> Backend::profilePaths(StringRef directory) const {
     llvm::SmallString<256> path(directory);
     llvm::sys::path::append(path, cpu->profileFilename);
     result.push_back(std::string(path));
+  } else if (std::holds_alternative<DSABackend>(model)) {
+    llvm::SmallString<256> path(directory);
+    llvm::sys::path::append(path, "bangc.json");
+    result.push_back(std::string(path));
   }
   return result;
 }

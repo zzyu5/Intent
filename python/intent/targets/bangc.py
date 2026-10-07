@@ -28,16 +28,9 @@ class ResolvedBangCTarget:
 
 @dataclass(frozen=True, slots=True)
 class BangCTarget:
-    """BANG C block bindings; source generation also works away from an MLU host."""
+    """BANG C device/toolchain binding; complete kernel configs are compiler inputs."""
 
     architecture: str = "mtp_372"
-    tile: int = 1024
-    tile_m: int = 16
-    tile_n: int = 64
-    tile_k: int = 64
-    region_tile: int = 64
-    tasks: int = 16
-    local_bytes: int = 512 * 1024
     device: int = 0
     neuware: str | Path = "/usr/local/neuware"
     compiler: str | Path | None = None
@@ -61,8 +54,7 @@ class BangCTarget:
         shapes = tuple(sorted((name, tuple(shape)) for name, shape in (self.shapes or {}).items()))
         strides = tuple(sorted((name, tuple(values)) for name, values in (self.strides or {}).items()))
         compilation = DSACompilationTarget(
-            self.architecture, self.tile, self.tile_m, self.tile_n, self.tile_k,
-            self.region_tile, self.tasks, self.local_bytes, shapes, strides)
+            self.architecture, shapes, strides)
         return ResolvedBangCTarget(
             compilation, self.device, str(Path(self.neuware).expanduser().resolve()),
             os.path.expanduser(str(self.compiler)) if self.compiler is not None else None,

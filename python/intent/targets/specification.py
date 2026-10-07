@@ -93,16 +93,9 @@ class CPUCompilationTarget:
 
 @dataclass(frozen=True, slots=True)
 class DSACompilationTarget:
-    """BANG C physical construction bindings, independent of NeuWare and a device ordinal."""
+    """BANG C hardware identity and source ABI refinements, independent of tuning."""
 
     architecture: str = "mtp_372"
-    tile: int = 1024
-    tile_m: int = 16
-    tile_n: int = 64
-    tile_k: int = 64
-    region_tile: int = 64
-    tasks: int = 16
-    local_bytes: int = 512 * 1024
     # Source ABI refinements are recorded in the resulting interface, not in
     # target metadata. They do not participate in runtime hardware matching.
     shapes: tuple[tuple[str, tuple[int, ...]], ...] = field(default=(), compare=False)
@@ -111,12 +104,6 @@ class DSACompilationTarget:
     def __post_init__(self) -> None:
         if self.architecture != "mtp_372":
             raise NotImplementedError("BANG C currently provides an MLU370 implementation profile")
-        if any(type(value) is not int for value in (self.tile, self.tile_m, self.tile_n,
-                self.tile_k, self.region_tile, self.tasks, self.local_bytes)):
-            raise TypeError("DSA construction bindings must be integers")
-        if min(self.tile, self.tile_m, self.tile_n, self.tile_k, self.region_tile,
-               self.tasks, self.local_bytes) <= 0 or self.tile % 64:
-            raise ValueError("DSA resource bindings must be positive and the vector tile divisible by 64")
         if any(not isinstance(name, str) or any(type(extent) is not int or extent < -1 for extent in shape)
                for name, shape in self.shapes):
             raise ValueError("DSA shape bindings require integer extents, with -1 for dynamic axes")

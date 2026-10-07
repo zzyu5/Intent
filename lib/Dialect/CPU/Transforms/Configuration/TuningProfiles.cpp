@@ -53,8 +53,9 @@ LogicalResult TuningProfiles::readFile(
         return diagnostic;
       };
       auto candidate = entry.getAsObject();
-      if (!candidate || candidate->size() != 2 || !candidate->getObject("local"))
-        return error() << "requires shared and local parameter bindings";
+      if (!candidate || candidate->size() != 3 || !candidate->getObject("local") ||
+          !candidate->getArray("implementations"))
+        return error() << "requires shared/local bindings and an implementation selection";
       auto shared = candidate->getArray("shared");
       if (!shared || shared->size() != 5)
         return error() << "shared binding requires task grain, M/N/K outer blocks and region size";
@@ -81,8 +82,20 @@ LogicalResult TuningProfiles::readFile(
           return error() << "missing local parameter '" << name << "'";
         bindings.push_back(builder.getNamedAttr(name, builder.getI64IntegerAttr(*value)));
       }
+      SmallVector<Attribute> selected;
+      for (const llvm::json::Value &entry : *candidate->getArray("implementations")) {
+        auto name = entry.getAsString();
+        if (!name || name->empty() || !implementations.hasImplementation(*name))
+          return error() << "implementation selection requires registered implementation names";
+        auto attribute = builder.getStringAttr(*name);
+        if (llvm::is_contained(selected, Attribute(attribute)))
+          return error() << "implementation selection contains a duplicate: " << *name;
+        selected.push_back(attribute);
+      }
+      if (selected.empty())
+        return error() << "implementation selection must not be empty";
       configurations.push_back({values[0], values[1], values[2], values[3], values[4],
-                                builder.getDictionaryAttr(bindings)});
+                                builder.getDictionaryAttr(bindings), builder.getArrayAttr(selected)});
     }
     // An explicitly supplied family replaces its complete ordered row list.
     families[familyName] = std::move(configurations);

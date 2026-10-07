@@ -153,6 +153,7 @@ public:
                   llvm::ArrayRef<llvm::StringRef> localParameters);
   std::optional<llvm::ArrayRef<llvm::StringRef>>
   profileParameters(llvm::StringRef name) const;
+  bool hasImplementation(llvm::StringRef name) const;
   template <typename... Operations>
   void add(Implementation implementation) {
     static_assert(sizeof...(Operations) > 0, "declare the implementation's operation family");
@@ -169,7 +170,7 @@ public:
       ImplementationAttr binding, CapabilitiesAttr capabilities,
       ConfigurationAttr configuration, mlir::Operation *diagnostic) const;
   mlir::LogicalResult verifyBindings(mlir::ModuleOp module) const;
-  llvm::SmallVector<llvm::SmallVector<ImplementationAttr>> candidates(
+  mlir::FailureOr<llvm::SmallVector<ImplementationAttr>> select(
       mlir::func::FuncOp function, CapabilitiesAttr capabilities,
       const Configuration &configuration,
       llvm::function_ref<void(mlir::Operation *, llvm::StringRef, llvm::StringRef)> rejected) const;

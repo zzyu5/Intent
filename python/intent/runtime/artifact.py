@@ -194,7 +194,7 @@ class CompiledArtifact:
 
         Preparation can allocate outputs and workspace. Use the prepared call's
         method to reuse an existing binding. Eligibility is not native compilation
-        success; DSA entries without a tuning portfolio return an empty tuple.
+        success; each provider reports its actual complete candidate set.
         """
         return self.prepare(*arguments, outputs=outputs).inspect_configurations()
 

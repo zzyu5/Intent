@@ -69,6 +69,8 @@ llvm::SmallVector<gpu::TuningProfileSource> gpuProfileSources(
     llvm::StringRef directory, llvm::StringRef provider);
 mlir::FailureOr<mlir::DictionaryAttr> parseDSAParameterBindings(
     mlir::ModuleOp module, llvm::StringRef text, bool shapes);
+mlir::FailureOr<mlir::ArrayAttr> readDSAConfigurations(
+    mlir::ModuleOp module, llvm::StringRef directory, llvm::StringRef overrides);
 
 } // namespace intent::compiler
 #endif

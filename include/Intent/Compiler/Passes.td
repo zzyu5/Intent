@@ -47,24 +47,20 @@ def ConstructCPU : Pass<"intent-construct-cpu", "mlir::ModuleOp"> {
 }
 
 def ConstructDSA : Pass<"intent-construct-dsa", "mlir::ModuleOp"> {
-  let summary = "Construct the executable local-memory DSA program";
+  let summary = "Construct complete local-memory DSA candidates";
   let description = [{
-    Required construction from canonical typed KIR into explicit DSA execution
-    and local storage. Tile, task and local-capacity options form the checked
-    DSA configuration; shapes and strides bind parameter facts for this
-    compilation. They do not select a prewritten operator implementation.
-    Invalid bindings or unsupported conversion fail. The result requires the
-    shared DSA pipeline and target native legalization before serialization;
+    Reads complete provider configurations and constructs each supplied row
+    from the same canonical typed KIR in a separate standard module. Tile,
+    task and local-storage bindings form the checked DSA configuration;
+    shapes and strides bind parameter facts for this compilation. No parameter
+    combinations or prewritten operator implementations are invented.
+    Invalid bindings or unsupported conversion fail. Each candidate requires
+    the shared DSA pipeline and target native legalization before serialization;
     it is not yet a BANG C program with synchronized, arena-bound storage.
   }];
   let options = [
-    Option<"tile", "tile", "int64_t", "1024", "Element tile">,
-    Option<"tileM", "tile-m", "int64_t", "16", "M tile">,
-    Option<"tileN", "tile-n", "int64_t", "64", "N tile">,
-    Option<"tileK", "tile-k", "int64_t", "64", "K tile">,
-    Option<"regionTile", "region-tile", "int64_t", "64", "Region tile">,
-    Option<"tasks", "tasks", "int64_t", "16", "Task count">,
-    Option<"localBytes", "local-bytes", "int64_t", "524288", "Local storage bytes">,
+    Option<"directory", "directory", "std::string", [{""}], "Directory of complete backend configurations">,
+    Option<"overrides", "overrides", "std::string", [{""}], "Complete configuration overrides">,
     Option<"shapes", "shapes", "std::string", [{"{}"}], "JSON parameter shapes">,
     Option<"strides", "strides", "std::string", [{"{}"}], "JSON parameter strides">
   ];

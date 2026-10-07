@@ -29,8 +29,6 @@ struct CPUOptions {
 
 struct DSAOptions {
   std::string architecture = "mtp_372";
-  int64_t tile = 1024, tileM = 16, tileN = 64, tileK = 64;
-  int64_t regionTile = 64, tasks = 16, localBytes = 512 * 1024;
   std::string shapes = "{}", strides = "{}";
 };
 

@@ -79,6 +79,8 @@ Capabilities 以 typed facts 描述实际消费者所需的 dtype、资源、mem
 
 共同参数约束 task grain、外层 block 和跨块组织；实现参数约束局部微块、vector/replica/unroll 等；外部 compiler 参数归其消费者。跨边界参数只有一个 binding owner，通过明确约束关联，不能各选一个值。有限配置与对应实现/变换相邻，保留 override，不构建任意程序树的笛卡尔积。
 
+CPU经验配置每行明确保存`shared`五个外层绑定、`local`实现参数和`implementations`实现集合。集合描述不同typed计算种类的实际实现，不是优先级或失败回退顺序。每个需要实现的计算必须有唯一适用成员，再检查原类型、布局、资源、数值和供数合法性；没有或多个匹配均拒绝该行。绑定写入当前operation的既有`ImplementationAttr`。一行至多形成一个完整候选，不按registry追加未指定的实现组合。
+
 每个候选固定实现和完整参数，形成同语义的具体程序；可按明确策略或实测选择合法候选，不用 tuning 代替缺失的实现。无合法实现时诊断，不在 serialization 或执行失败后隐式换算法。Artifact/winner cache 分离，身份包含实际依赖的 specialization、view facts、provider/hardware、implementation 定义与 bindings。
 
 ## 7. Provider 与验证边界

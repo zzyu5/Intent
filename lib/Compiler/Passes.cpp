@@ -15,6 +15,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/SymbolTable.h"
 
 using namespace mlir;
 
@@ -57,14 +58,36 @@ public:
   using Base::Base;
   void runOnOperation() final {
     auto module = getOperation();
-    auto configuration = dsa::ConfigurationAttr::getChecked(
-        [&]() { return module.emitError(); }, module.getContext(), tile.getValue(), tileM.getValue(),
-        tileN.getValue(), tileK.getValue(), regionTile.getValue(), tasks.getValue(), localBytes.getValue());
+    auto configurations = readDSAConfigurations(module, directory.getValue(), overrides.getValue());
     auto shapeBindings = parseDSAParameterBindings(module, shapes, true);
     auto strideBindings = parseDSAParameterBindings(module, strides, false);
-    if (!configuration || failed(shapeBindings) || failed(strideBindings) ||
-        failed(lowerCanonicalKIRToDSA(module, configuration, *shapeBindings, *strideBindings)))
-      signalPassFailure();
+    if (failed(configurations) || failed(shapeBindings) || failed(strideBindings))
+      return signalPassFailure();
+    SmallVector<OwningOpRef<ModuleOp>> candidates;
+    StringAttr entryName;
+    for (auto [index, attribute] : llvm::enumerate(*configurations)) {
+      OwningOpRef<ModuleOp> candidate(cast<ModuleOp>(module->clone()));
+      if (failed(lowerCanonicalKIRToDSA(*candidate, cast<dsa::ConfigurationAttr>(attribute),
+                                       *shapeBindings, *strideBindings)))
+        return signalPassFailure();
+      func::FuncOp entry;
+      for (auto function : candidate->getOps<func::FuncOp>())
+        if (!function.isExternal()) { entry = function; break; }
+      if (!entry) {
+        module.emitError("DSA configuration has no executable entry");
+        return signalPassFailure();
+      }
+      if (!entryName) entryName = StringAttr::get(module.getContext(), entry.getName());
+      SymbolTable symbols(*candidate);
+      if (failed(symbols.rename(entry, entryName.getValue().str() + "_config_" + std::to_string(index))))
+        return signalPassFailure();
+      (*candidate)->setAttr(SymbolTable::getSymbolAttrName(),
+                           StringAttr::get(module.getContext(), "config_" + std::to_string(index)));
+      candidates.push_back(std::move(candidate));
+    }
+    module.getBody()->clear();
+    module->setAttr("intent.entry_name", entryName);
+    for (auto &candidate : candidates) module.getBody()->push_back(candidate.release());
   }
 };
 

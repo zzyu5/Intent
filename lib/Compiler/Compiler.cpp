@@ -120,11 +120,6 @@ Result compile(OwningOpRef<ModuleOp> module, const Request &request) {
     result.failure = Failure::UnavailableProvider;
     return result;
   }
-  if (request.stopAfter != Stage::Kernel && backend(*request.provider).family() == Family::DSA && !request.tuningConfig.empty()) {
-    result.module->emitError("DSA compilation takes explicit bindings, not a tuning profile");
-    result.failure = Failure::Invocation;
-    return result;
-  }
   PassManager manager(result.module->getContext());
   if (failed(configurePassManager(manager))) { result.failure = Failure::Invocation; return result; }
   auto run = [&](Failure failure) {

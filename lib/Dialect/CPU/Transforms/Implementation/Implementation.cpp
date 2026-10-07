@@ -6,6 +6,7 @@
 #include "Intent/Dialect/CPU/IR/ImplementationProvider.h"
 #include "Intent/Dialect/CPU/IR/CPUOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
@@ -167,12 +168,6 @@ std::optional<std::string> checkInputLayouts(Operation *operation, const Contrac
   return std::nullopt;
 }
 
-struct ImplementationMatch {
-  const Implementation *implementation;
-  ImplementationAttr binding;
-  bool supplyFree;
-};
-
 ConfigurationAttr sharedConfiguration(MLIRContext *context, const Configuration &configuration) {
   return ConfigurationAttr::get(context, configuration.taskGrain, configuration.tileM,
       configuration.tileN, configuration.tileK, configuration.regionSize);
@@ -181,7 +176,7 @@ ConfigurationAttr sharedConfiguration(MLIRContext *context, const Configuration 
 std::optional<std::string> matchImplementation(
     const Implementation &implementation, Operation *operation,
     CapabilitiesAttr capabilities, const Configuration &configuration,
-    ImplementationMatch &match) {
+    ImplementationAttr &binding) {
   if (!implementation.matches(operation))
     return "implementation does not match this computation";
   if (auto reason = checkInputLayouts(operation, implementation.contraction)) return reason;
@@ -190,18 +185,16 @@ std::optional<std::string> matchImplementation(
   if (auto reason = bindParameters(implementation, builder, capabilities, configuration,
           sharedConfiguration(builder.getContext(), configuration), parameters)) return reason;
   if (auto reason = implementation.check(operation, capabilities, configuration)) return reason;
-  auto binding = ImplementationAttr::get(builder.getContext(), builder.getStringAttr(implementation.name),
+  auto selected = ImplementationAttr::get(builder.getContext(), builder.getStringAttr(implementation.name),
       parameters);
-  bool supplyFree = true;
   if (auto generic = dyn_cast<linalg::GenericOp>(operation)) {
     auto requirements = implementation.inputRequirements(
-        generic, sharedConfiguration(builder.getContext(), configuration), binding);
+        generic, sharedConfiguration(builder.getContext(), configuration), selected);
     if (auto reason = checkInputRequirements(generic, requirements)) return reason;
-    supplyFree = requirements.empty();
   } else if (implementation.inputs) {
     return "input representation requirements need a structured linalg computation";
   }
-  match = {&implementation, binding, supplyFree};
+  binding = selected;
   return std::nullopt;
 }
 } // namespace
@@ -223,6 +216,12 @@ ImplementationRegistry::profileParameters(StringRef name) const {
   }
   return selected ? std::optional<ArrayRef<StringRef>>(selected->localParameters)
                   : std::nullopt;
+}
+
+bool ImplementationRegistry::hasImplementation(StringRef name) const {
+  return llvm::count_if(implementations, [&](const Implementation &implementation) {
+    return implementation.name == name;
+  }) == 1;
 }
 
 bool ImplementationRegistry::needsImplementation(Operation *operation) const {
@@ -308,73 +307,66 @@ LogicalResult verifyImplementationBindings(ModuleOp module, StringRef provider) 
   return failed(registry) ? failure() : (**registry).verifyBindings(module);
 }
 
-SmallVector<SmallVector<ImplementationAttr>> ImplementationRegistry::candidates(
+FailureOr<SmallVector<ImplementationAttr>> ImplementationRegistry::select(
     func::FuncOp function, CapabilitiesAttr capabilities,
     const Configuration &configuration,
     llvm::function_ref<void(Operation *, StringRef, StringRef)> rejected) const {
-  struct Computation {
-    SmallVector<ImplementationMatch> choices;
-    unsigned anchor = 0;
-  };
-  SmallVector<Computation> computations;
+  if (!configuration.implementations || configuration.implementations.empty()) {
+    rejected(function, {}, "configuration has no explicit implementation selection");
+    return failure();
+  }
+  SmallVector<const Implementation *> selected;
+  for (Attribute attribute : configuration.implementations) {
+    auto name = dyn_cast<StringAttr>(attribute);
+    auto found = name ? llvm::find_if(implementations, [&](const Implementation &implementation) {
+      return implementation.name == name.getValue();
+    }) : implementations.end();
+    if (found == implementations.end() || llvm::is_contained(selected, &*found)) {
+      rejected(function, {}, "configuration has an unknown or repeated implementation selection");
+      return failure();
+    }
+    selected.push_back(&*found);
+  }
+  SmallVector<ImplementationAttr> bindings;
+  SmallVector<StringAttr> consumed;
+  bool invalid = false;
   function.walk([&](Operation *operation) {
     if (!needsImplementation(operation)) return;
-    auto &computation = computations.emplace_back();
-    SmallVector<std::pair<StringRef, std::string>> rejections;
-    for (const auto &implementation : implementations) {
-      if (!implementation.matches(operation)) continue;
-      ImplementationMatch match;
-      if (auto reason = matchImplementation(implementation, operation, capabilities, configuration, match)) {
-        rejections.emplace_back(implementation.name, std::move(*reason));
-        continue;
-      }
-      computation.choices.push_back(match);
-    }
-    if (computation.choices.empty()) {
-      if (rejections.empty())
-        rejected(operation, {}, "no registered implementation matches this computation");
-      else
-        for (const auto &[implementation, reason] : rejections)
-          rejected(operation, implementation, reason);
-      return;
-    }
-    // Use current input requirements to anchor each contraction independently.
-    // Prepared alternatives remain in the portfolio: supply-free is not a cost
-    // model for conversion, reuse, cache locality or the eventual winner.
-    for (auto [index, choice] : llvm::enumerate(computation.choices))
-      if (choice.implementation->formTile && choice.supplyFree) {
-        computation.anchor = index;
-        break;
-      }
-  });
-  SmallVector<SmallVector<ImplementationAttr>> result;
-  if (llvm::any_of(computations, [](const auto &computation) { return computation.choices.empty(); })) return result;
-  auto candidate = [&](const Implementation *preferred) {
-    SmallVector<ImplementationAttr> bindings;
-    SmallVector<StringAttr> consumed;
-    for (const auto &computation : computations) {
-      auto selected = llvm::find_if(computation.choices, [&](const ImplementationMatch &choice) {
-        return choice.implementation == preferred;
-      });
-      const auto &binding = selected == computation.choices.end()
-          ? computation.choices[computation.anchor].binding : selected->binding;
-      for (NamedAttribute parameter : binding.getParameters()) consumed.push_back(parameter.getName());
-      bindings.push_back(binding);
-    }
-    for (NamedAttribute parameter : configuration.local)
-      if (!llvm::is_contained(consumed, parameter.getName())) {
-        rejected(function, preferred ? preferred->name : StringRef(),
-            "candidate does not consume local parameter '" + parameter.getName().getValue().str() + "'");
+    // Applicability resolves the declared computation, before legality checks.
+    // A rejected selection must not silently choose another implementation.
+    const Implementation *implementation = nullptr;
+    for (const Implementation *choice : selected) {
+      if (!choice->matches(operation)) continue;
+      if (implementation) {
+        rejected(operation, choice->name,
+                 "configuration selects multiple implementations for this computation");
+        invalid = true;
         return;
       }
-    if (!llvm::is_contained(result, bindings)) result.push_back(std::move(bindings));
-  };
-  candidate(nullptr);
-  // Correlate a registered alternative across every consumer it can serve.
-  // This finite portfolio covers each legal implementation without forming
-  // an independent Cartesian product for every operation in the program.
-  for (const auto &implementation : implementations) candidate(&implementation);
-  return result;
+      implementation = choice;
+    }
+    if (!implementation) {
+      rejected(operation, {}, "configuration selects no implementation for this computation");
+      invalid = true;
+      return;
+    }
+    ImplementationAttr binding;
+    if (auto reason = matchImplementation(*implementation, operation, capabilities, configuration, binding)) {
+      rejected(operation, implementation->name, *reason);
+      invalid = true;
+      return;
+    }
+    for (NamedAttribute parameter : binding.getParameters()) consumed.push_back(parameter.getName());
+    bindings.push_back(binding);
+  });
+  if (invalid) return failure();
+  for (NamedAttribute parameter : configuration.local)
+    if (!llvm::is_contained(consumed, parameter.getName())) {
+      rejected(function, {},
+          "candidate does not consume local parameter '" + parameter.getName().getValue().str() + "'");
+      return failure();
+    }
+  return bindings;
 }
 
 LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAttr capabilities,
@@ -399,12 +391,12 @@ LogicalResult ImplementationRegistry::bind(func::FuncOp function, CapabilitiesAt
       operation->emitError("CPU candidate names an unregistered implementation: ") << binding.getName();
       return WalkResult::interrupt();
     }
-    ImplementationMatch match;
-    if (auto reason = matchImplementation(*implementation, operation, capabilities, configuration, match)) {
+    ImplementationAttr selectedBinding;
+    if (auto reason = matchImplementation(*implementation, operation, capabilities, configuration, selectedBinding)) {
       operation->emitError("CPU candidate implementation '") << implementation->name << "' rejected: " << *reason;
       return WalkResult::interrupt();
     }
-    if (match.binding != binding) {
+    if (selectedBinding != binding) {
       operation->emitError("CPU candidate parameters do not match the selected implementation");
       return WalkResult::interrupt();
     }
