@@ -53,6 +53,7 @@ LogicalResult formTritonProgram(ModuleOp module) {
   if (failed(detail::legalizeOrderedViewDependencies(*kernel)) ||
       failed(detail::legalizeSplitGatherPairs(*kernel)))
     return failure();
+  detail::selectRecurrencePipelineStages(*kernel);
   detail::selectOrderedLoadUnrolling(*kernel);
   auto descriptors =
       detail::materializeTensorDescriptorForms(*kernel, *localOptions);

@@ -1,9 +1,11 @@
 #include "Supply.h"
+#include "Intent/Analysis/ControlFlow.h"
 #include "Intent/Target/Triton/IR/Program.h"
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
@@ -50,17 +52,64 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   if (!hasOrderedViewDependencies(kernel))
     return success();
   gpu::ResourceAliasAnalysis aliases;
-  using Accesses = ViewAccessModes;
-  auto accesses = readViewAccessModes;
+  using Accesses = SmallVector<gpu::AccessOpInterface>;
+  auto accesses = [](Operation *owner) {
+    Accesses result;
+    owner->walk([&](gpu::AccessOpInterface access) {
+      if (isa<gpu::ViewType>(access.getAccessResource().getType()) &&
+          (access.getAccessKind() == gpu::AccessKind::Load ||
+           access.getAccessKind() == gpu::AccessKind::Store))
+        result.push_back(access);
+    });
+    return result;
+  };
+  auto append = [](Accesses &target, const Accesses &source) {
+    for (auto access : source)
+      if (!llvm::is_contained(target, access)) target.push_back(access);
+  };
   auto conflicts = [&](const Accesses &pending, const Accesses &current) {
-    for (auto [resource, mode] : pending)
-      for (auto [other, otherMode] : current)
-        if (((mode | otherMode) & 2) &&
-            !aliases.alias(resource, other).isNo())
+    for (auto first : pending)
+      for (auto second : current)
+        if ((first.writesMemory() || second.writesMemory()) &&
+            !aliases.alias(first.getAccessResource(),
+                           second.getAccessResource()).isNo())
           return true;
     return false;
   };
   llvm::DenseMap<Value, Value> nonOverlappingViews;
+  auto nonOverlapping = [&](Value resource) -> Value {
+    Value &condition = nonOverlappingViews[resource];
+    if (!condition) {
+      auto proof = gpu::materializeNonOverlappingView(kernel, resource);
+      if (succeeded(proof)) condition = *proof;
+    }
+    return condition;
+  };
+  auto disjointCoordinates = [&](gpu::AccessOpInterface first,
+                                 gpu::AccessOpInterface second) {
+    if (first.getAccessResource() != second.getAccessResource()) return false;
+    gpu::PhysicalProgramAnalysis analysis(kernel);
+    if (!analysis.accessBounds(first.getOperation()).isExact() ||
+        !analysis.accessBounds(second.getOperation()).isExact())
+      return false;
+    // These intervals cover every represented coordinate, including padding.
+    // Access predicates can only restrict the sets. Logical separation implies
+    // address separation only under the view's non-overlapping-layout proof.
+    for (auto [coordinate, axis] : llvm::zip(first.getAccessCoordinates(),
+                                            first.getAccessSourceAxes())) {
+      auto left = gpu::queryIntegerRange(coordinate);
+      if (!left) continue;
+      for (auto [other, otherAxis] : llvm::zip(second.getAccessCoordinates(),
+                                               second.getAccessSourceAxes())) {
+        if (axis != otherAxis) continue;
+        auto right = gpu::queryIntegerRange(other);
+        if (right && (left->smax().slt(right->smin()) ||
+                      right->smax().slt(left->smin())))
+          return true;
+      }
+    }
+    return false;
+  };
   auto disjointLoopAccesses = [&](Block &body, const Accesses &bodyAccesses) {
     llvm::DenseMap<Value, Value> conditions;
     auto loop = dyn_cast<scf::ForOp>(body.getParentOp());
@@ -81,10 +130,13 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       return conditions;
     llvm::DenseMap<Value, bool> varying;
     Value safeRange;
-    for (auto [resource, mode] : bodyAccesses) {
+    llvm::DenseSet<Value> checked;
+    for (auto access : bodyAccesses) {
+      Value resource = access.getAccessResource();
+      if (!access.writesMemory() || !checked.insert(resource).second) continue;
       auto argument = dyn_cast<BlockArgument>(resource);
       auto view = dyn_cast<gpu::ViewType>(resource.getType());
-      if (!(mode & 2) || !argument || argument.getOwner() != &kernel.front() || !view)
+      if (!argument || argument.getOwner() != &kernel.front() || !view)
         continue;
       gpu::StoreOp selected;
       unsigned stores = 0;
@@ -110,8 +162,9 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
               break;
           }
           auto range = root.getDefiningOp<gpu::MakeRangeOp>();
-          if (root == loop.getInductionVar() ||
-              (range && range.getStart() == loop.getInductionVar() &&
+          if (gpu::samePhysicalScalarExpression(root, loop.getInductionVar()) ||
+              (range && gpu::samePhysicalScalarExpression(
+                            range.getStart(), loop.getInductionVar()) &&
                gpu::isUnitStepRange(range) &&
                gpu::samePhysicalScalarExpression(range.getExtent(),
                                                   loop.getStep()))) {
@@ -135,13 +188,8 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
       });
       if (!disjoint)
         continue;
-      Value &layout = nonOverlappingViews[resource];
-      if (!layout) {
-        auto proof = gpu::materializeNonOverlappingView(kernel, resource);
-        if (failed(proof))
-          continue;
-        layout = *proof;
-      }
+      Value layout = nonOverlapping(resource);
+      if (!layout) continue;
       OpBuilder builder(loop);
       if (!safeRange) {
         // Include the final padded chunk and the terminating IV update in
@@ -174,24 +222,34 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
                      isa<gpu::ViewType>(argument.getType())
                  ? argument : BlockArgument();
     };
-    for (auto [resource, mode] : pending)
-      for (auto [other, otherMode] : current) {
-        if (!((mode | otherMode) & 2) || aliases.alias(resource, other).isNo())
-          continue;
-        if (resource == other)
-          if (auto proof = disjointIterations.find(resource);
-              proof != disjointIterations.end()) {
-            Value zero = builder.create<arith::ConstantIntOp>(location, 0, 1);
-            Value needed = builder.create<gpu::CompareOp>(
-                location, builder.getI1Type(), proof->second, zero,
-                ComparePredicate::Eq);
-            condition = condition
-                            ? Value(builder.create<gpu::BinaryOp>(
+    auto requireUnless = [&](Value proof) {
+      Value zero = builder.create<arith::ConstantIntOp>(location, 0, 1);
+      Value needed = builder.create<gpu::CompareOp>(
+          location, builder.getI1Type(), proof, zero, ComparePredicate::Eq);
+      condition = condition ? Value(builder.create<gpu::BinaryOp>(
                                   location, builder.getI1Type(), condition,
                                   needed, BinaryOperator::LogicalOr))
                             : needed;
+    };
+    for (auto first : pending)
+      for (auto second : current) {
+        Value resource = first.getAccessResource();
+        Value other = second.getAccessResource();
+        if (!(first.writesMemory() || second.writesMemory()) ||
+            aliases.alias(resource, other).isNo())
+          continue;
+        if (resource == other) {
+          if (disjointCoordinates(first, second))
+            if (Value proof = nonOverlapping(resource)) {
+              requireUnless(proof);
+              continue;
+            }
+          if (auto proof = disjointIterations.find(resource);
+              proof != disjointIterations.end()) {
+            requireUnless(proof->second);
             continue;
           }
+        }
         auto left = externalArgument(resource);
         auto right = externalArgument(other);
         if (resource == other || !left || !right) {
@@ -283,13 +341,29 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
           Accesses &pending) -> LogicalResult {
     Accesses bodyAccesses;
     for (Operation &operation : block)
-      for (auto [resource, mode] : accesses(&operation))
-        bodyAccesses[resource] |= mode;
+      append(bodyAccesses, accesses(&operation));
     auto disjointIterations = loopBody ? disjointLoopAccesses(block, bodyAccesses)
                                       : llvm::DenseMap<Value, Value>();
     for (Operation &operation : llvm::make_early_inc_range(block.without_terminator())) {
       if (isa<CtaBarrierOp>(operation)) {
         pending.clear();
+        continue;
+      }
+      if (auto branch = dyn_cast<scf::IfOp>(operation);
+          branch && uniformControl && uniform(branch.getCondition())) {
+        // Only the selected uniform arm executes. Synchronize its first real
+        // conflict instead of the union of both arms before the condition.
+        // Each arm starts with the same incoming state: a barrier on one path
+        // cannot discharge accesses outstanding on another path.
+        Accesses joined;
+        for (Region &region : branch->getRegions()) {
+          Accesses outstanding = pending;
+          if (!region.empty() &&
+              failed(synchronize(region.front(), false, true, outstanding)))
+            return failure();
+          append(joined, outstanding);
+        }
+        pending = std::move(joined);
         continue;
       }
       Accesses current = accesses(&operation);
@@ -315,12 +389,10 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
             if (failed(synchronize(nested, isa<scf::ForOp, scf::WhileOp>(operation),
                                    nestedUniform, outstanding)))
               return failure();
-            for (auto [resource, mode] : outstanding)
-              pending[resource] |= mode;
+            append(pending, outstanding);
           }
       } else {
-        for (auto [resource, mode] : current)
-          pending[resource] |= mode;
+        append(pending, current);
       }
     }
     if (loopBody && conflicts(pending, bodyAccesses)) {
@@ -336,32 +408,62 @@ LogicalResult legalizeOrderedViewDependencies(func::FuncOp kernel) {
   return synchronize(kernel.front(), false, true, pending);
 }
 
-// Query all loop-carried roots in one address-graph traversal. Nested loop
-// results keep their init/yield dependency; IV variation alone is pipeline legal.
-bool addressDependsOnLoopCarry(ValueRange operands, scf::ForOp loop) {
+// Follow actual control forwarding slots as well as ordinary value operands.
+// IV variation alone is not a loop-carried dependency.
+bool dependsOnLoopCarry(ValueRange operands, scf::ForOp loop,
+                        bool fragmentsOnly) {
   SmallVector<Value> pending(operands);
   llvm::DenseSet<Value> visited;
   while (!pending.empty()) {
     Value value = pending.pop_back_val();
-    if (llvm::is_contained(loop.getRegionIterArgs(), value))
-      return true;
+    if (llvm::is_contained(loop.getRegionIterArgs(), value)) {
+      if (!fragmentsOnly || isa<gpu::FragmentType>(value.getType())) return true;
+      continue;
+    }
     if (!visited.insert(value).second)
       continue;
     Operation *definition = value.getDefiningOp();
-    if (!definition || !loop->isProperAncestor(definition))
+    Operation *owner = definition;
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      owner = argument.getOwner()->getParentOp();
+    if (!owner || !loop->isProperAncestor(owner))
       continue;
-    if (auto nested = dyn_cast<scf::ForOp>(definition)) {
-      auto result = dyn_cast<OpResult>(value);
-      auto yield = dyn_cast<scf::YieldOp>(nested.getBody()->getTerminator());
-      if (result && yield && result.getResultNumber() < nested.getInitArgs().size()) {
-        unsigned index = result.getResultNumber();
-        pending.push_back(nested.getInitArgs()[index]);
-        pending.push_back(yield.getOperand(index));
-      }
+    auto incoming = queryControlFlowIncoming(value);
+    if (incoming.complete && !incoming.edges.empty()) {
+      for (const auto &edge : incoming.edges)
+        if (edge.operand) pending.push_back(edge.operand->get());
+      if (auto branch = dyn_cast<scf::IfOp>(owner))
+        pending.push_back(branch.getCondition());
+      else if (auto nested = dyn_cast<scf::ForOp>(owner))
+        llvm::append_range(pending, ValueRange{nested.getLowerBound(),
+                                              nested.getUpperBound(),
+                                              nested.getStep()});
+      else if (auto nested = dyn_cast<scf::WhileOp>(owner))
+        pending.push_back(cast<scf::ConditionOp>(
+                              nested.getBefore().front().getTerminator())
+                              .getCondition());
+      continue;
     }
-    llvm::append_range(pending, definition->getOperands());
+    if (definition) llvm::append_range(pending, definition->getOperands());
   }
   return false;
+}
+
+void selectRecurrencePipelineStages(func::FuncOp kernel) {
+  kernel.walk([&](scf::ForOp loop) {
+    auto recurrence = loop.walk([&](gpu::ContractOp contract) {
+      return dependsOnLoopCarry({contract.getLhs(), contract.getRhs()}, loop,
+                                /*fragmentsOnly=*/true)
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    });
+    if (!recurrence.wasInterrupted()) return;
+    // A carried fragment used as a matrix operand keeps state and its supply
+    // live together across iterations. Select the native single-stage form;
+    // ordinary GEMM accumulator recurrence alone does not enter this policy.
+    loop->setAttr(loopStagesAttr,
+                  IntegerAttr::get(IntegerType::get(kernel.getContext(), 64), 1));
+  });
 }
 
 SmallVector<scf::ForOp> findLoadPipelineLoops(func::FuncOp kernel) {
@@ -382,7 +484,7 @@ SmallVector<scf::ForOp> findLoadPipelineLoops(func::FuncOp kernel) {
         llvm::append_range(addressing, access.getAccessCoordinates());
         if (access.getAccessValidity()) addressing.push_back(access.getAccessValidity());
         if (access.getAccessFill()) addressing.push_back(access.getAccessFill());
-        if (addressDependsOnLoopCarry(addressing, loop))
+        if (dependsOnLoopCarry(addressing, loop, /*fragmentsOnly=*/false))
           return;
         vectorLoad |= access.getAccessKind() == gpu::AccessKind::Load &&
                       isa<gpu::FragmentType>(access.getAccessValueType());
@@ -431,7 +533,7 @@ void selectOrderedLoadUnrolling(func::FuncOp kernel) {
         llvm::append_range(dependencies, access.getAccessCoordinates());
         if (access.getAccessValidity()) dependencies.push_back(access.getAccessValidity());
         if (access.getAccessFill()) dependencies.push_back(access.getAccessFill());
-        if (addressDependsOnLoopCarry(dependencies, loop))
+        if (dependsOnLoopCarry(dependencies, loop, /*fragmentsOnly=*/false))
           return;
         ++loads;
       } else if (!isMemoryEffectFree(&operation)) {

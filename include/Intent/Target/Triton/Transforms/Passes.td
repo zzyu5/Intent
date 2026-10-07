@@ -54,6 +54,19 @@ def NativeFormsPass : IntentTritonTransformPass<
     ordered accesses and form eligible descriptors/pointer accesses. Selects
     legal finite configurations and native contraction forms from these facts.
 
+    Ordered-view synchronization consumes complete current access coordinates.
+    Disjoint represented windows or consecutive loop chunks can omit a barrier
+    only with the existing layout and no-wrap proofs. Unknown overlaps and
+    cross-view aliases retain their synchronization; a value dependency alone
+    does not prove that all CTA reads have completed.
+    Uniform branches propagate incoming accesses independently and conservatively
+    join outstanding dependencies at their exits.
+
+    Matrix multiplicands carried between iterations use the existing native
+    single-stage loop hint to bound retained supply lifetimes. Independent
+    matrix supply and ordinary accumulator carries keep the row's stage option;
+    external Triton still constructs layouts and the actual pipeline schedule.
+
     This required transition produces explicit native Triton operations and
     configuration requirements; public source semantics remain unchanged and
     any compiler-private resources are represented in IR. Unsupported provider

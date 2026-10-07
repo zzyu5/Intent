@@ -145,11 +145,17 @@ private:
   }
   std::string forRange(scf::ForOp loop) override {
     auto unroll = loop->getAttrOfType<IntegerAttr>(loopUnrollFactorAttr);
-    auto stages = loop->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
+    Attribute stages = loop->getAttr(loopStagesAttr);
     std::string result = unroll || stages ? "tl.range(" : "range(";
     result += valueString(loop.getLowerBound()) + ", " + valueString(loop.getUpperBound()) + ", " + valueString(loop.getStep());
     if (unroll) result += ", loop_unroll_factor=" + std::to_string(unroll.getInt());
-    if (stages) result += ", num_stages=" + stages.getName().getValue().str();
+    if (stages) {
+      result += ", num_stages=";
+      if (auto constant = dyn_cast<IntegerAttr>(stages))
+        result += std::to_string(constant.getInt());
+      else
+        result += cast<gpu::ParameterRefAttr>(stages).getName().getValue().str();
+    }
     return result + ")";
   }
 

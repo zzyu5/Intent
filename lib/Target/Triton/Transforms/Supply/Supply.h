@@ -9,6 +9,7 @@ namespace intent::triton::detail {
 bool hasOrderedViewDependencies(mlir::func::FuncOp kernel);
 mlir::LogicalResult legalizeOrderedViewDependencies(mlir::func::FuncOp kernel);
 llvm::SmallVector<mlir::scf::ForOp> findLoadPipelineLoops(mlir::func::FuncOp kernel);
+void selectRecurrencePipelineStages(mlir::func::FuncOp kernel);
 void selectOrderedLoadUnrolling(mlir::func::FuncOp kernel);
 
 } // namespace intent::triton::detail

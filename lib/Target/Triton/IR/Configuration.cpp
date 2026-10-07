@@ -81,11 +81,25 @@ FailureOr<ConfigurationSchema> ConfigurationSchema::read(func::FuncOp kernel) {
 
   bool stagesInKernel = false;
   auto walked = kernel.walk([&](Operation *operation) {
-    if (!operation->hasAttr(loopStagesAttr)) return WalkResult::advance();
-    auto binding = operation->getAttrOfType<gpu::ParameterRefAttr>(loopStagesAttr);
-    if (!isa<scf::ForOp>(operation) || !binding ||
-        binding != stageDeclaration.getReference()) {
-      operation->emitOpError("loop stages must bind the declared Triton stage parameter");
+    Attribute stages = operation->getAttr(loopStagesAttr);
+    if (!stages) return WalkResult::advance();
+    if (!isa<scf::ForOp>(operation)) {
+      operation->emitOpError("loop stages require an scf.for operation");
+      return WalkResult::interrupt();
+    }
+    if (auto constant = dyn_cast<IntegerAttr>(stages)) {
+      if (!constant.getType().isSignlessInteger(64) ||
+          !isLegalDeviceOption(gpu::ParameterRole::ProviderStages,
+                               constant.getInt(), capabilities,
+                               requiresSingleCTA)) {
+        operation->emitOpError("constant loop stages must be a positive i64 within the Triton stage limit");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
+    auto binding = dyn_cast<gpu::ParameterRefAttr>(stages);
+    if (!binding || binding != stageDeclaration.getReference()) {
+      operation->emitOpError("loop stages must be a positive i64 or bind the declared Triton stage parameter");
       return WalkResult::interrupt();
     }
     stagesInKernel = true;
