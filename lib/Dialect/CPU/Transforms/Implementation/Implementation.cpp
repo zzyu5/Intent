@@ -224,6 +224,26 @@ bool ImplementationRegistry::hasImplementation(StringRef name) const {
   }) == 1;
 }
 
+FailureOr<SmallVector<StringRef>>
+ImplementationRegistry::localParameters(ArrayAttr selection) const {
+  if (!selection || selection.empty()) return failure();
+  SmallVector<StringRef> names, parameters;
+  for (Attribute attribute : selection) {
+    auto name = dyn_cast<StringAttr>(attribute);
+    if (!name || !hasImplementation(name.getValue()) ||
+        llvm::is_contained(names, name.getValue())) return failure();
+    names.push_back(name.getValue());
+    const auto &implementation = *llvm::find_if(implementations,
+        [&](const Implementation &candidate) {
+          return candidate.name == name.getValue();
+        });
+    for (const auto &parameter : implementation.parameters)
+      if (auto local = std::get_if<ImplementationParameter::Local>(&parameter.source))
+        if (!llvm::is_contained(parameters, local->name)) parameters.push_back(local->name);
+  }
+  return parameters;
+}
+
 bool ImplementationRegistry::needsImplementation(Operation *operation) const {
   if (auto function = dyn_cast<func::FuncOp>(operation); function && function.isExternal())
     return false;
@@ -327,8 +347,19 @@ FailureOr<SmallVector<ImplementationAttr>> ImplementationRegistry::select(
     }
     selected.push_back(&*found);
   }
+  auto declaredParameters = localParameters(configuration.implementations);
+  if (failed(declaredParameters)) {
+    rejected(function, {}, "configuration has an invalid implementation selection");
+    return failure();
+  }
+  for (NamedAttribute parameter : configuration.local)
+    if (!llvm::is_contained(*declaredParameters, parameter.getName().getValue())) {
+      rejected(function, {},
+          "local parameter '" + parameter.getName().getValue().str() +
+          "' is not declared by a selected implementation");
+      return failure();
+    }
   SmallVector<ImplementationAttr> bindings;
-  SmallVector<StringAttr> consumed;
   bool invalid = false;
   function.walk([&](Operation *operation) {
     if (!needsImplementation(operation)) return;
@@ -356,16 +387,11 @@ FailureOr<SmallVector<ImplementationAttr>> ImplementationRegistry::select(
       invalid = true;
       return;
     }
-    for (NamedAttribute parameter : binding.getParameters()) consumed.push_back(parameter.getName());
     bindings.push_back(binding);
   });
   if (invalid) return failure();
-  for (NamedAttribute parameter : configuration.local)
-    if (!llvm::is_contained(consumed, parameter.getName())) {
-      rejected(function, {},
-          "candidate does not consume local parameter '" + parameter.getName().getValue().str() + "'");
-      return failure();
-    }
+  // The executable bindings contain only actual typed consumers. Parameters of
+  // absent selected members do not create variants or enter the current IR.
   return bindings;
 }
 

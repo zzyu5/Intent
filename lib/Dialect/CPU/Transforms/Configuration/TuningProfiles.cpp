@@ -66,22 +66,6 @@ LogicalResult TuningProfiles::readFile(
           return error() << "shared parameters must be positive integers";
         values.push_back(*value);
       }
-      const auto &local = *candidate->getObject("local");
-      for (auto &parameter : local) {
-        StringRef parameterName = parameter.first;
-        if (!llvm::is_contained(*schema, parameterName))
-          return error() << "unconsumed local parameter '" << parameterName << "'";
-        auto value = parameter.second.getAsInteger();
-        if (!value || *value <= 0)
-          return error() << "local parameter '" << parameterName << "' must be a positive integer";
-      }
-      SmallVector<NamedAttribute> bindings;
-      for (StringRef name : *schema) {
-        auto value = local.getInteger(name);
-        if (!value)
-          return error() << "missing local parameter '" << name << "'";
-        bindings.push_back(builder.getNamedAttr(name, builder.getI64IntegerAttr(*value)));
-      }
       SmallVector<Attribute> selected;
       for (const llvm::json::Value &entry : *candidate->getArray("implementations")) {
         auto name = entry.getAsString();
@@ -94,8 +78,30 @@ LogicalResult TuningProfiles::readFile(
       }
       if (selected.empty())
         return error() << "implementation selection must not be empty";
+      auto selection = builder.getArrayAttr(selected);
+      auto declared = implementations.localParameters(selection);
+      if (failed(declared)) return error() << "invalid implementation selection";
+      const auto &local = *candidate->getObject("local");
+      for (auto &parameter : local) {
+        StringRef parameterName = parameter.first;
+        if (!llvm::is_contained(*schema, parameterName))
+          return error() << "unconsumed local parameter '" << parameterName << "'";
+        if (!llvm::is_contained(*declared, parameterName))
+          return error() << "local parameter '" << parameterName
+                         << "' is not declared by a selected implementation";
+        auto value = parameter.second.getAsInteger();
+        if (!value || *value <= 0)
+          return error() << "local parameter '" << parameterName << "' must be a positive integer";
+      }
+      SmallVector<NamedAttribute> bindings;
+      for (StringRef name : *schema) {
+        auto value = local.getInteger(name);
+        if (!value)
+          return error() << "missing local parameter '" << name << "'";
+        bindings.push_back(builder.getNamedAttr(name, builder.getI64IntegerAttr(*value)));
+      }
       configurations.push_back({values[0], values[1], values[2], values[3], values[4],
-                                builder.getDictionaryAttr(bindings), builder.getArrayAttr(selected)});
+                                builder.getDictionaryAttr(bindings), selection});
     }
     // An explicitly supplied family replaces its complete ordered row list.
     families[familyName] = std::move(configurations);

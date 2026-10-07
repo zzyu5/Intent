@@ -251,12 +251,12 @@ LogicalResult formTile(OpBuilder &b, linalg::GenericOp operation,
 
 cpu::ImplementationRegistry implementations() {
   ImplementationRegistry result;
-  result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k", "rhs_supply"});
-  result.addProfile("weft.q8_k", {"chunk"});
+  result.addProfile("weft.contract_i8_i32", {"micro_m", "micro_n", "micro_k", "rhs_supply", "panel"});
+  result.addProfile("weft.q8_k", {"chunk", "panel"});
   for (StringRef family : {"weft.region_contract_f32", "weft.contract_f32"})
-    result.addProfile(family, {"lhs_supply", "lhs_window"});
+    result.addProfile(family, {"lhs_supply", "lhs_window", "panel"});
   for (StringRef family : {"weft.region_structured", "weft.structured"})
-    result.addProfile(family, {});
+    result.addProfile(family, {"panel"});
   result.profile = [](func::FuncOp function) -> StringRef {
     bool quantize = false, contraction = false, integer = false, region = false;
     function.walk([&](cpu::QuantizeOp) { quantize = true; });
@@ -363,7 +363,7 @@ cpu::ImplementationRegistry implementations() {
   Implementation structured{"weft.structured", [](Operation *op) {
       if (auto generic = dyn_cast<linalg::GenericOp>(op)) return !isMatrixContraction(generic);
       return true;
-    }, check, {ImplementationParameter::minimum("panel", 4, {ImplementationParameter::Axis::TileN})},
+    }, check, {ImplementationParameter::local("panel", {true, {}, 0, {}})},
     {}, {}, {}, [](ImplementationAttr binding) {
       return implementationParameter(binding, "panel");
     }};

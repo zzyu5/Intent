@@ -154,6 +154,10 @@ public:
   std::optional<llvm::ArrayRef<llvm::StringRef>>
   profileParameters(llvm::StringRef name) const;
   bool hasImplementation(llvm::StringRef name) const;
+  /// Local configuration inputs declared by the explicitly selected members,
+  /// including members whose typed computation is absent from this program.
+  mlir::FailureOr<llvm::SmallVector<llvm::StringRef>>
+  localParameters(mlir::ArrayAttr selection) const;
   template <typename... Operations>
   void add(Implementation implementation) {
     static_assert(sizeof...(Operations) > 0, "declare the implementation's operation family");

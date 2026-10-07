@@ -4,6 +4,7 @@
 #include "Intent/Dialect/CPU/Transforms/Implementation/Implementation.h"
 #include "Intent/Dialect/CPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/CPU/Transforms/Structure/LoopBuilders.h"
+#include "Intent/Dialect/CPU/Transforms/Structure/ProducerVersions.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Dominance.h"
 
@@ -47,7 +48,8 @@ LogicalResult block(linalg::GenericOp operation, int64_t width) {
     else break;
   }
   if (allParallel && operation.getRegion().front().getArguments().back().use_empty() &&
-      isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp())) {
+      isa_and_nonnull<memref::AllocOp, memref::AllocaOp>(root.getDefiningOp()) &&
+      !completelyWritesBuffer(operation, root)) {
     DominanceInfo dominance(operation->getParentOfType<func::FuncOp>());
     bool initialized = llvm::any_of(root.getUsers(), [&](Operation *user) {
       bool complete = false;
