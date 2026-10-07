@@ -165,8 +165,11 @@ def AccessCompositionPass : IntentGPUTransformPass<
     "Compose realized GPU accesses and values", [{
     Consumes newly realized fragments, traversals and storage. Composes actual
     coordinates/validity, materializes retained values, recomposes resulting
-    accesses and orients loop contractions as one closed group. Necessary
-    access/schema composition remains part of this boundary even when no
+    accesses and orients loop contractions as one closed group.
+    Stable same-block reads reuse their current storage version only across
+    proved non-clobbering effects, including writable external views. Exact
+    coordinate and validity coverage preserves each consumer's original fill.
+    Necessary access/schema composition remains part of this boundary even when no
     optional retention or orientation rewrite applies. No caller-supplied
     repair pass is required before shared verification.
   }]>;

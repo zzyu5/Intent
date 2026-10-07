@@ -656,17 +656,49 @@ FailureOr<bool> composeLoadGather(GatherOp gather) {
 
 namespace {
 
-bool sameRead(LoadOp available, LoadOp current) {
-  auto view = dyn_cast<ViewType>(current.getResource().getType());
-  if (!view || view.getAccess() != 0 ||
+bool sameReadCoordinates(LoadOp available, LoadOp current) {
+  if (!isa<ViewType>(current.getResource().getType()) ||
       available.getResource() != current.getResource() ||
       available.getResult().getType() != current.getResult().getType() ||
-      available.getValid() != current.getValid() ||
-      available.getFill() != current.getFill() ||
       available.getSourceAxes() != current.getSourceAxes() ||
       available.getCoordinates().size() != current.getCoordinates().size())
     return false;
-  return llvm::equal(available.getCoordinates(), current.getCoordinates());
+  return llvm::all_of(llvm::zip(available.getCoordinates(), current.getCoordinates()),
+      [](auto pair) {
+        auto [left, right] = pair;
+        return left == right || (left.getType().isIndex() &&
+            right.getType().isIndex() && IndexRelations().same(left, right));
+      });
+}
+
+// Exact boundary forms describe the same resource coordinates, not merely
+// masks with similar syntax. Bounds must close on both accesses, so a lower
+// bound and an upper bound on one axis cannot be mistaken for equal validity.
+std::optional<bool> coveredRead(LoadOp available, LoadOp current,
+                                PhysicalProgramAnalysis &analysis) {
+  if (!sameReadCoordinates(available, current)) return std::nullopt;
+  bool equalValidity = available.getValid() == current.getValid();
+  if (!equalValidity && available.getValid()) {
+    auto earlier = analysis.boundaryValidity(available);
+    auto later = analysis.boundaryValidity(current);
+    if (!earlier.isExact() || !later.isExact() ||
+        !earlier.rangeBounds.empty() || !later.rangeBounds.empty() ||
+        !analysis.accessBounds(available).isExact() ||
+        !analysis.accessBounds(current).isExact() ||
+        !llvm::all_of(earlier.boundaryAxes, [&](int64_t axis) {
+          return llvm::is_contained(later.boundaryAxes, axis);
+        })) return std::nullopt;
+    equalValidity = earlier.boundaryAxes == later.boundaryAxes;
+  }
+  bool equalFill = available.getFill() == current.getFill();
+  if (!equalFill && available.getFill() && current.getFill()) {
+    UniformValueAnalysis uniform(describeUniformValue);
+    Attribute earlier = uniform.evaluate(available.getFill());
+    Attribute later = uniform.evaluate(current.getFill());
+    // Attribute equality retains floating-point payload bits and signed zero.
+    equalFill = earlier && earlier == later;
+  }
+  return !current.getValid() || (equalValidity && equalFill);
 }
 
 } // namespace
@@ -678,17 +710,27 @@ bool reuseStableLoads(func::FuncOp kernel) {
   for (LoadOp current : loads) {
     if (!current->getBlock())
       continue;
+    PhysicalProgramAnalysis analysis(kernel);
     Block *block = current->getBlock();
     auto cursor = current->getIterator();
     while (cursor != block->begin()) {
       --cursor;
       Operation *candidate = &*cursor;
       if (auto available = dyn_cast<LoadOp>(candidate)) {
-        if (!sameRead(available, current))
+        auto direct = coveredRead(available, current, analysis);
+        if (!direct)
           continue;
         if (!canReplayReadAt(available, current))
           break;
-        current.getResult().replaceAllUsesWith(available.getResult());
+        Value replacement = available.getResult();
+        if (!*direct) {
+          OpBuilder builder(current);
+          replacement = builder.create<SelectOp>(current.getLoc(), current.getType(),
+              current.getValid(), replacement, current.getFill());
+          if (Attribute origin = current->getAttr(originAttr))
+            replacement.getDefiningOp()->setAttr(originAttr, origin);
+        }
+        current.getResult().replaceAllUsesWith(replacement);
         current.erase();
         changed = true;
         break;
