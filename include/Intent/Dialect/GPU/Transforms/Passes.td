@@ -187,6 +187,13 @@ def BufferVectorizationPass : IntentGPUTransformPass<
     Consumes explicit buffer traversals after access composition. Vectorizes
     eligible independent iterations using current coordinates, injectivity,
     alias/effect and bounds facts, rebuilding values and accesses together.
+    Across multiple program instances, inferred read-free scalar external
+    stores retain each non-singleton program coordinate on a distinct invariant
+    resource axis. Unit iteration coordinates and non-overlapping view guards
+    establish disjoint writes. This domain has no loop carries, nested regions,
+    memory reads or other effects; mutable-buffer inference remains restricted
+    to a single instance. Existing physical parameters bound the chunks, and
+    inactive lanes and zero-trip loops retain their original effects.
     Owns relation closure. This optional optimization does not parallelize an
     ordinary loop whose iteration independence has not been proved.
   }]>;

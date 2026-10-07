@@ -258,6 +258,51 @@ bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
   return independent;
 }
 
+bool hasProgramOwnedExternalWrites(scf::ForOp loop) {
+  auto group = loop->getParentOfType<ExecutionGroupOp>();
+  IndexRelations relations;
+  if (!group || !relations.nonnegative(loop.getLowerBound()) ||
+      !relations.nonnegative(loop.getUpperBound()))
+    return false;
+  bool writes = false;
+  for (Operation &operation : loop.getBody()->without_terminator()) {
+    if (operation.getNumRegions()) return false;
+    auto store = dyn_cast<StoreOp>(operation);
+    if (!store) {
+      if (!isMemoryEffectFree(&operation)) return false;
+      continue;
+    }
+    if (!isa<ViewType>(store.getResource().getType()) ||
+        !store.getValue().getType().isIntOrIndexOrFloat() ||
+        !llvm::all_of(store.getCoordinates(), [](Value coordinate) {
+          return coordinate.getType().isIndex();
+        }))
+      return false;
+    // Keep every non-singleton program coordinate on a distinct, invariant
+    // resource axis. The existing whole-view layout guard then separates both
+    // program instances and the unit-stride iteration slices proved below.
+    llvm::SmallDenseSet<unsigned> ownerAxes;
+    for (auto [ordinal, coordinate] : llvm::enumerate(group.getCoordinates())) {
+      if (relations.constant(group.getExtents()[ordinal]) == 1) continue;
+      std::optional<unsigned> ownerAxis;
+      for (auto [axis, value] : llvm::zip(store.getSourceAxes(), store.getCoordinates())) {
+        if (!loop.isDefinedOutsideOfLoop(value)) continue;
+        if (auto workset = value.getDefiningOp<WorksetCoordinateOp>()) {
+          if (relations.constant(workset.getStep()) != 1) continue;
+          value = workset.getCoordinate();
+        }
+        if (relations.same(value, coordinate)) {
+          ownerAxis = axis;
+          break;
+        }
+      }
+      if (!ownerAxis || !ownerAxes.insert(*ownerAxis).second) return false;
+    }
+    writes = true;
+  }
+  return writes;
+}
+
 LogicalResult vectorizeIterations(func::FuncOp kernel,
                                  uint64_t &source, int64_t &dimension,
                                  bool singleInstance) {
@@ -266,9 +311,10 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
   // when an enclosing independent loop is subsequently widened.
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops) {
-    // Declared independent iterations remain independent within each instance.
-    // Inferred mutable-buffer updates retain the single-instance restriction.
-    if (!singleInstance && !loop->hasAttr(independentIterationAttr))
+    // Read-free external stores can retain the current program's disjoint
+    // coordinate slice. Mutable-buffer inference still requires one instance.
+    if (!singleInstance && !loop->hasAttr(independentIterationAttr) &&
+        !hasProgramOwnedExternalWrites(loop))
       continue;
     auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
     llvm::DenseMap<Value, bool> varying;
