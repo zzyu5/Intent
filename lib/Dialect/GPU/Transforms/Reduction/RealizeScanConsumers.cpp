@@ -1,9 +1,13 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IterationDependencies.h"
+#include "Intent/Dialect/GPU/Analysis/MemoryEffects.h"
+#include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ExecutionSchema.h"
 #include "Intent/Dialect/GPU/Transforms/Control/Traversal.h"
@@ -32,6 +36,10 @@ struct ScanConsumerMatch {
   Value identity;
   SmallVector<MakeRangeOp> ranges;
   SmallVector<GatherOp> terminals;
+  SmallVector<CastOp> projections;
+  SmallVector<LoadOp> sourceLoads;
+  SmallVector<GatherOp> members;
+  IndependentIterationAccesses independence;
 };
 
 bool isScanProjection(CastOp cast) {
@@ -62,7 +70,8 @@ bool isLastScanRead(GatherOp gather, Value stop) {
 }
 
 std::optional<ScanConsumerMatch>
-matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
+matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis,
+                  bool closeProducers = true) {
   if (scan.getSources().size() != 1 || scan.getIdentities().size() != 1 ||
       scan.getCaptures().size() || scan.getAxis() != 0 ||
       scan.getReverse())
@@ -70,7 +79,9 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   auto type = dyn_cast<FragmentType>(scan.getResult(0).getType());
   if (!type || type.getShape().size() != 1)
     return std::nullopt;
-  ScanConsumerMatch match{scan, {}, scan.getIdentities().front(), {}, {}};
+  ScanConsumerMatch match;
+  match.scan = scan;
+  match.identity = scan.getIdentities().front();
   while (true) {
     if (auto splat = match.identity.getDefiningOp<SplatOp>())
       match.identity = splat.getValue();
@@ -95,6 +106,7 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
       if (auto cast = dyn_cast<CastOp>(user);
           isScanProjection(cast) && cast->getBlock() == scan->getBlock()) {
         projections.push_back(cast.getResult());
+        match.projections.push_back(cast);
         continue;
       }
     auto gather = dyn_cast<GatherOp>(user);
@@ -105,8 +117,8 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
     }
     auto loop = user->getParentOfType<scf::ForOp>();
     if (!gather || gather.getSource() != projections[position] ||
-        !loop || !loop->hasAttr(independentIterationAttr) ||
-        loop.getNumRegionIterArgs() || gather->getBlock() != loop.getBody() ||
+        !loop ||
+        loop.getNumRegionIterArgs() ||
         loop->getBlock() != scan->getBlock() || !scan->isBeforeInBlock(loop) ||
         (match.loop && match.loop != loop) || gather.getCoordinates().size() != 1 ||
         gather.getCoordinates().front() != loop.getInductionVar() ||
@@ -143,16 +155,20 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
                                      match.loop.getUpperBound()))
       return std::nullopt;
 
-  // Every replayed source read has a mandatory matching read in its independent
-  // consumer iteration. Cross-iteration writes cannot alter those locations in
-  // a legal parallel program; the current iteration still reads before writing.
+  if (!match.loop->hasAttr(independentIterationAttr)) {
+    auto independent = queryIndependentIterationAccesses(match.loop, scan);
+    if (failed(independent)) return std::nullopt;
+    match.independence = std::move(*independent);
+  }
+
+  // Replay eligibility is a coordinate/value fact. The memory epoch is checked
+  // separately, through the whole consumer loop and in the actual guard arm.
   llvm::DenseSet<Operation *> sourceLoads;
   for (Operation *access : ranges.accesses) {
     auto load = dyn_cast<LoadOp>(access);
     auto view =
         load ? dyn_cast<ViewType>(load.getResource().getType()) : ViewType();
     if (!load || !view ||
-        !canReplayReadAt(load, match.loop) ||
         !analysis.boundaryValidity(load, /*allowRangeGuards=*/true).isExact())
       return std::nullopt;
     std::optional<unsigned> memberCoordinate;
@@ -178,43 +194,8 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
     }
     if (!memberCoordinate)
       return std::nullopt;
-    bool matched = false;
-    for (Operation &operation : match.loop.getBody()->without_terminator()) {
-      if (isa<StoreOp>(operation))
-        break;
-      auto reader = dyn_cast<LoadOp>(operation);
-      if (reader && reader.getResource() == load.getResource() &&
-          reader.getSourceAxes() == load.getSourceAxes() &&
-          reader.getCoordinates().size() == load.getCoordinates().size() &&
-          analysis.boundaryValidity(reader).isExact() &&
-          llvm::all_of(llvm::enumerate(load.getCoordinates()), [&](auto item) {
-            if (item.index() == *memberCoordinate)
-              return llvm::is_contained(ranges.roots,
-                         item.value().template getDefiningOp<MakeRangeOp>()) &&
-                     reader.getCoordinates()[item.index()] == match.loop.getInductionVar();
-            return samePhysicalScalarExpression(item.value(), reader.getCoordinates()[item.index()]);
-          })) {
-        matched = true;
-        break;
-      }
-    }
-    bool privateWrites = llvm::all_of(
-        match.loop.getBody()->without_terminator(), [](Operation &operation) {
-          auto store = dyn_cast<StoreOp>(operation);
-          if (!store)
-            return true;
-          auto buffer = dyn_cast<BufferType>(store.getResource().getType());
-          if (!buffer)
-            return false;
-          auto scope = buffer.getScope().getValue();
-          return scope == BufferScope::InvocationWorkspace ||
-                 ((scope == BufferScope::ProgramPrivate ||
-                   scope == BufferScope::IterationPrivate) &&
-                  store.getResource().getDefiningOp<BufferOp>());
-        });
-    if (!matched && !privateWrites)
-      return std::nullopt;
     sourceLoads.insert(load);
+    match.sourceLoads.push_back(load);
   }
   llvm::DenseSet<Value> visited;
   std::function<bool(Value)> safeSource = [&](Value value) {
@@ -233,7 +214,139 @@ matchScanConsumer(ScanOp scan, PhysicalProgramAnalysis &analysis) {
   };
   if (!safeSource(scan.getSources().front()))
     return std::nullopt;
+  // Close the full-domain producers' live uses before duplicating their DAG in
+  // a bounded traversal. A second full consumer would retain the original
+  // value and defeat the storage/lifetime benefit of streaming it.
+  llvm::DenseSet<Value> prefixValues(projections.begin(), projections.end());
+  match.loop.walk([&](GatherOp gather) {
+    if ((visited.contains(gather.getSource()) ||
+         prefixValues.contains(gather.getSource())) &&
+        gather.getSourceAxes() == ArrayRef<int64_t>{0} &&
+        gather.getCoordinates().size() == 1 &&
+        gather.getCoordinates().front() == match.loop.getInductionVar() &&
+        gather.getType().isIntOrIndexOrFloat())
+      match.members.push_back(gather);
+  });
+  for (Value value : visited) {
+    if (!closeProducers) break;
+    if (!isa<FragmentType>(value.getType()) ||
+        value.getDefiningOp<MakeRangeOp>()) continue;
+    for (Operation *user : value.getUsers()) {
+      if (user == scan || llvm::any_of(user->getResults(),
+              [&](Value result) { return visited.contains(result); })) continue;
+      auto gather = dyn_cast<GatherOp>(user);
+      if (!gather || !llvm::is_contained(match.members, gather))
+        return std::nullopt;
+    }
+  }
   return match;
+}
+
+bool matchesMandatoryMemberRead(ScanConsumerMatch &match, LoadOp source,
+                               PhysicalProgramAnalysis &analysis) {
+  if (!match.loop->hasAttr(independentIterationAttr)) return false;
+  for (Operation &operation : match.loop.getBody()->without_terminator()) {
+    if (isa<StoreOp>(operation)) break;
+    auto reader = dyn_cast<LoadOp>(operation);
+    if (!reader || reader.getResource() != source.getResource() ||
+        reader.getSourceAxes() != source.getSourceAxes() ||
+        reader.getCoordinates().size() != source.getCoordinates().size() ||
+        !analysis.boundaryValidity(reader).isExact()) continue;
+    if (llvm::all_of(llvm::zip(source.getCoordinates(), reader.getCoordinates()),
+        [&](auto pair) {
+          auto [full, member] = pair;
+          if (isa<FragmentType>(full.getType()))
+            return member == match.loop.getInductionVar();
+          return samePhysicalScalarExpression(full, member);
+        })) return true;
+  }
+  return false;
+}
+
+// Include every write between the original SSA read and the end of the
+// consumer, not just writes before its loop. A scan source is a snapshot; a
+// later chunk may only reload it when the entire traversal preserves its epoch.
+bool preservesScanSourceEpoch(ScanConsumerMatch &match,
+                              PhysicalProgramAnalysis &analysis,
+                              bool collectGuards) {
+  ResourceAliasAnalysis aliases;
+  auto kernel = match.scan->getParentOfType<func::FuncOp>();
+  for (LoadOp load : match.sourceLoads) {
+    if (!collectGuards) {
+      bool memberRead = matchesMandatoryMemberRead(match, load, analysis);
+      auto effects = getEffectsRecursively(match.loop);
+      if (!effects || llvm::any_of(*effects, [](const auto &effect) {
+            return isa<MemoryEffects::Free>(effect.getEffect());
+          })) return false;
+      if (!canReplayReadAt(load, match.loop) ||
+          !preservesMemoryReads(load, match.loop, aliases,
+              [&](Value lhs, Value rhs) {
+                return aliases.disjointAt(lhs, rhs, match.loop) ||
+                       (lhs == rhs && memberRead);
+              })) return false;
+      continue;
+    }
+    if (load->getBlock() != match.loop->getBlock() ||
+        !load->isBeforeInBlock(match.loop)) return false;
+    bool memberRead = matchesMandatoryMemberRead(match, load, analysis);
+    for (Operation *operation = load->getNextNode(); operation;
+         operation = operation->getNextNode()) {
+      auto effects = getEffectsRecursively(operation);
+      if (!effects || llvm::any_of(*effects, [](const auto &effect) {
+            return isa<MemoryEffects::Free>(effect.getEffect());
+          })) return false;
+      auto disjoint = [&](Value lhs, Value rhs) {
+        if (aliases.disjointAt(lhs, rhs, match.loop)) return true;
+        if (operation == match.loop && lhs == rhs && memberRead) return true;
+        auto left = dyn_cast<BlockArgument>(lhs), right = dyn_cast<BlockArgument>(rhs);
+        if (lhs == rhs || !left || !right ||
+            left.getOwner() != &kernel.front() || right.getOwner() != &kernel.front() ||
+            !getPublicView(lhs) || !getPublicView(rhs)) return false;
+        auto pair = std::pair<Value, Value>{lhs, rhs};
+        auto reverse = std::pair<Value, Value>{rhs, lhs};
+        if (!llvm::is_contained(match.independence.disjointViews, pair) &&
+            !llvm::is_contained(match.independence.disjointViews, reverse))
+          match.independence.disjointViews.push_back(pair);
+        return true;
+      };
+      if (!preservesMemoryReads(load, operation, aliases, disjoint)) return false;
+      if (operation == match.loop) break;
+    }
+    // In the selected arm, re-query the same public replay authority used by
+    // all other consumers. Prospective byte-span guards grant no permission.
+  }
+  return true;
+}
+
+FailureOr<Value> materializeScanGuard(func::FuncOp kernel,
+                                     ScanConsumerMatch &match) {
+  Value condition;
+  OpBuilder builder(match.loop);
+  Location location = match.scan.getLoc();
+  auto append = [&](Value predicate) {
+    condition = condition ? builder.create<BinaryOp>(
+        location, builder.getI1Type(), condition, predicate,
+        BinaryOperator::LogicalAnd).getResult() : predicate;
+  };
+  for (Value view : match.independence.guardedViews) {
+    auto injective = materializeNonOverlappingView(kernel, view);
+    if (failed(injective)) return failure();
+    append(*injective);
+  }
+  for (auto [lhs, rhs] : match.independence.disjointViews) {
+    OpBuilder entry(&kernel.front(), kernel.front().begin());
+    Value overlap = entry.create<ViewOverlapOp>(location, entry.getI1Type(), lhs, rhs);
+    Value zero = builder.create<arith::ConstantOp>(location, builder.getBoolAttr(false));
+    append(builder.create<CompareOp>(location, builder.getI1Type(), overlap,
+                                     zero, ComparePredicate::Eq));
+  }
+  for (auto [count, maximum] : match.independence.countUpperBounds) {
+    Value limit = builder.create<arith::ConstantOp>(
+        location, builder.getIntegerAttr(count.getType(), maximum));
+    append(builder.create<CompareOp>(location, builder.getI1Type(), count,
+                                     limit, ComparePredicate::Le));
+  }
+  return condition;
 }
 
 LogicalResult restoreReplayedReadBounds(OpBuilder &builder) {
@@ -280,7 +393,12 @@ LogicalResult restoreReplayedReadBounds(OpBuilder &builder) {
   return success();
 }
 
-FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
+struct ScanTraversal {
+  ParameterOp chunk;
+  Value carry;
+};
+
+FailureOr<ScanTraversal> realizeScanConsumerMatch(func::FuncOp kernel,
                                                ScanConsumerMatch &match) {
   ScanOp scan = match.scan;
   auto original = cast<FragmentType>(scan.getResult(0).getType());
@@ -425,18 +543,10 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
         }
         IRMapping consumers;
         consumers.map(match.loop.getInductionVar(), range);
-        consumers.map(scan.getResult(0), consumerPrefix);
-        auto mapped = [&](Value value) { return consumers.lookupOrDefault(value); };
-        auto validity = [&](Value valid) -> Value {
-          if (!valid)
-            return tail;
-          return nested.create<BinaryOp>(
-              location, fragment(nested.getI1Type()), tail, lift(mapped(valid)),
-              BinaryOperator::LogicalAnd);
-        };
-        for (Operation &operation : match.loop.getBody()->without_terminator()) {
-          auto gather = dyn_cast<GatherOp>(operation);
-          Value root = gather ? gather.getSource() : Value();
+        IRMapping prefixValues;
+        prefixValues.map(scan.getResult(0), consumerPrefix);
+        for (GatherOp gather : match.members) {
+          Value root = gather.getSource();
           SmallVector<CastOp> projections;
           while (root) {
             auto cast = root.getDefiningOp<CastOp>();
@@ -445,28 +555,30 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
             projections.push_back(cast);
             root = cast.getValue();
           }
-          if (gather && root == scan.getResult(0)) {
+          Value selected;
+          if (root == scan.getResult(0)) {
             for (CastOp cast : llvm::reverse(projections))
-              if (!consumers.lookupOrNull(cast.getResult())) {
+              if (!prefixValues.lookupOrNull(cast.getResult())) {
                 auto result = llvm::cast<FragmentType>(cast.getResult().getType());
                 Value projected = nested.create<CastOp>(
-                    cast.getLoc(), fragment(result.getElementType()), mapped(cast.getValue()));
-                consumers.map(cast.getResult(), projected);
+                    cast.getLoc(), fragment(result.getElementType()),
+                    prefixValues.lookup(cast.getValue()));
+                prefixValues.map(cast.getResult(), projected);
               }
-            Value selectedPrefix = mapped(gather.getSource());
-            Value fill =
-                gather.getFill() ? lift(mapped(gather.getFill())) : Value();
-            if (!fill) {
-              Value zero = nested.create<arith::ConstantOp>(
-                  gather.getLoc(), nested.getZeroAttr(gather.getType()));
-              fill = lift(zero);
+            selected = prefixValues.lookup(gather.getSource());
+          } else {
+            selected = replay.lookupOrNull(gather.getSource());
+            if (!selected) {
+              auto member = materializeReplayedValue(
+                  nested, location, gather.getSource(), source, extent, replay,
+                  match.loop, options);
+              if (failed(member)) { failedBody = true; return; }
+              selected = *member;
             }
-            Value result = nested.create<SelectOp>(
-                gather.getLoc(), selectedPrefix.getType(), validity(gather.getValid()),
-                selectedPrefix, fill);
-            consumers.map(gather.getResult(), result);
-            continue;
           }
+          consumers.map(gather.getResult(), selected);
+        }
+        for (Operation &operation : match.loop.getBody()->without_terminator()) {
           if (failed(clonePredicatedScalarOperation(
                   nested, &operation, consumers, tail,
                   fragment(nested.getIndexType())))) {
@@ -490,9 +602,16 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
       });
   if (failedBody)
     return failure();
+  Value carry = traversal.getResult(0);
+  match.loop.erase();
+  return ScanTraversal{chunk, carry};
+}
+
+LogicalResult replaceScanTerminals(ScanConsumerMatch &match, Value carry) {
+  ScanOp scan = match.scan;
   for (GatherOp terminal : match.terminals) {
     OpBuilder at(terminal);
-    Value result = traversal.getResult(0);
+    Value result = carry;
     SmallVector<CastOp> projections;
     for (Value source = terminal.getSource(); source != scan.getResult(0);) {
       auto cast = source.getDefiningOp<CastOp>();
@@ -518,9 +637,81 @@ FailureOr<ParameterOp> realizeScanConsumerMatch(func::FuncOp kernel,
     terminal.getResult().replaceAllUsesWith(result);
     terminal.erase();
   }
-  match.loop.erase();
-  eraseDeadPhysicalValues(kernel);
-  return chunk;
+  return success();
+}
+
+FailureOr<bool> realizeGuardedScanConsumer(func::FuncOp kernel,
+                                         ScanConsumerMatch &match,
+                                         PhysicalProgramAnalysis &analysis) {
+  if (!preservesScanSourceEpoch(match, analysis, /*collectGuards=*/true))
+    return false;
+  auto condition = materializeScanGuard(kernel, match);
+  if (failed(condition)) return failure();
+  if (!*condition) {
+    if (!preservesScanSourceEpoch(match, analysis, /*collectGuards=*/false))
+      return false;
+    auto result = realizeScanConsumerMatch(kernel, match);
+    if (failed(result) || failed(replaceScanTerminals(match, result->carry)))
+      return failure();
+    return true;
+  }
+  // Only the pure scan/projections and zero-result consumer move into the
+  // branches. Intervening values and effects remain in their original block.
+  // Only a real selected control arm may consume contextual alias knowledge.
+  OpBuilder builder(match.loop);
+  bool terminal = !match.terminals.empty();
+  Type element = cast<FragmentType>(match.scan.getResult(0).getType()).getElementType();
+  auto branch = builder.create<scf::IfOp>(match.scan.getLoc(),
+      terminal ? TypeRange{element} : TypeRange{}, *condition, true);
+  for (Region &region : branch->getRegions())
+    if (!region.front().empty()) region.front().back().erase();
+  IRMapping selected;
+  builder.setInsertionPointToStart(branch.thenBlock());
+  builder.clone(*match.scan, selected);
+  for (CastOp projection : match.projections)
+    if (projection->isBeforeInBlock(match.loop)) builder.clone(*projection, selected);
+  builder.clone(*match.loop, selected);
+  ScanConsumerMatch fast = match;
+  fast.scan = cast<ScanOp>(selected.lookup(match.scan.getResult(0)).getDefiningOp());
+  fast.loop = cast<scf::ForOp>(cast<BlockArgument>(
+      selected.lookup(match.loop.getInductionVar())).getOwner()->getParentOp());
+  for (GatherOp &member : fast.members)
+    member = cast<GatherOp>(selected.lookup(member.getResult()).getDefiningOp());
+  fast.terminals.clear();
+  // Producer reads retain their original epoch. The false path still uses the
+  // immutable full-domain SSA values, without replay through consumer writes.
+  SmallVector<CastOp> movedProjections;
+  for (CastOp projection : match.projections)
+    if (projection->isBeforeInBlock(match.loop)) movedProjections.push_back(projection);
+  match.scan->moveBefore(branch.elseBlock(), branch.elseBlock()->end());
+  for (CastOp projection : movedProjections)
+    projection->moveBefore(branch.elseBlock(), branch.elseBlock()->end());
+  match.loop->moveBefore(branch.elseBlock(), branch.elseBlock()->end());
+  PhysicalProgramAnalysis selectedAnalysis(kernel);
+  if (!preservesScanSourceEpoch(fast, selectedAnalysis, /*collectGuards=*/false))
+    return fast.scan.emitOpError("selected scan traversal does not preserve its source epoch");
+  auto traversal = realizeScanConsumerMatch(kernel, fast);
+  if (failed(traversal)) return failure();
+  builder.setInsertionPointToEnd(branch.thenBlock());
+  builder.create<scf::YieldOp>(branch.getLoc(),
+      terminal ? ValueRange{traversal->carry} : ValueRange{});
+  builder.setInsertionPointToEnd(branch.elseBlock());
+  Value raw;
+  if (terminal) {
+    Value one = builder.create<arith::ConstantIndexOp>(branch.getLoc(), 1);
+    Value zero = builder.create<arith::ConstantIndexOp>(branch.getLoc(), 0);
+    Value last = builder.create<BinaryOp>(branch.getLoc(), builder.getIndexType(),
+        match.loop.getUpperBound(), one, BinaryOperator::Subtract);
+    Value valid = builder.create<CompareOp>(branch.getLoc(), builder.getI1Type(),
+        match.loop.getUpperBound(), zero, ComparePredicate::Gt);
+    raw = builder.create<GatherOp>(branch.getLoc(), element, match.scan.getResult(0),
+        ValueRange{last}, valid, match.identity, builder.getDenseI64ArrayAttr({0}));
+  }
+  builder.create<scf::YieldOp>(branch.getLoc(),
+      terminal ? ValueRange{raw} : ValueRange{});
+  if (terminal && failed(replaceScanTerminals(match, branch.getResult(0))))
+    return failure();
+  return true;
 }
 
 FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
@@ -663,18 +854,21 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
   // The copy is an independent consumer of an immutable scan. Reuse the same
   // bounded prefix traversal; the original ordered consumers stay after it.
   PhysicalProgramAnalysis currentAnalysis(kernel);
-  auto match = matchScanConsumer(scan, currentAnalysis);
+  auto match = matchScanConsumer(scan, currentAnalysis, /*closeProducers=*/false);
   if (!match)
     return scan.emitOpError("scan snapshot has no legal bounded prefix traversal");
-  auto chunk = realizeScanConsumerMatch(kernel, *match);
-  if (failed(chunk))
+  if (!preservesScanSourceEpoch(*match, currentAnalysis, /*collectGuards=*/false))
+    return scan.emitOpError("scan snapshot traversal changes its source epoch");
+  auto traversal = realizeScanConsumerMatch(kernel, *match);
+  if (failed(traversal) || failed(replaceScanTerminals(*match, traversal->carry)))
     return failure();
+  ParameterOp chunk = traversal->chunk;
   for (StoreOp store : stores) {
     builder.setInsertionPoint(store);
     Location location = store.getLoc();
     auto outputRange = store.getCoordinates().front().getDefiningOp<MakeRangeOp>();
     auto coordinateType = outputRange.getResult().getType();
-    PhysicalExprAttr extent = queryLaunchExpression(*chunk);
+    PhysicalExprAttr extent = queryLaunchExpression(chunk);
     auto fragment = [&](Type element) {
       return FragmentType::get(
           kernel.getContext(), element, builder.getArrayAttr({extent}),
@@ -684,11 +878,11 @@ FailureOr<bool> materializeScanSnapshot(ScanOp scan, func::FuncOp kernel,
     Value begin = builder.create<arith::ConstantIndexOp>(location, 0);
     Value step = builder.create<arith::ConstantIndexOp>(location, 1);
     auto loop = builder.create<scf::ForOp>(
-        location, begin, outputRange.getLogicalStop(), *chunk);
+        location, begin, outputRange.getLogicalStop(), chunk);
     builder.setInsertionPointToStart(loop.getBody());
     Value coordinate = builder.create<MakeRangeOp>(
         location, fragment(builder.getIndexType()), loop.getInductionVar(),
-        *chunk, step, begin, outputRange.getLogicalStop(),
+        chunk, step, begin, outputRange.getLogicalStop(),
         outputRange.getSourceId(), outputRange.getSourceAxis(), outputRange.getDerived());
     Value end = builder.create<BroadcastOp>(
         location, fragment(builder.getIndexType()), outputRange.getLogicalStop());
@@ -722,17 +916,21 @@ static LogicalResult realizeScanConsumerTraversalsImpl(ModuleOp module) {
   FailureOr<func::FuncOp> kernel = getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
+  llvm::DenseSet<Operation *> considered;
   while (true) {
     PhysicalProgramAnalysis analysis(*kernel);
     std::optional<ScanConsumerMatch> match;
     kernel->walk([&](ScanOp scan) {
+      if (considered.contains(scan)) return WalkResult::advance();
       match = matchScanConsumer(scan, analysis);
       return match ? WalkResult::interrupt() : WalkResult::advance();
     });
     if (match) {
-      if (failed(realizeScanConsumerMatch(*kernel, *match)))
+      considered.insert(match->scan);
+      auto result = realizeGuardedScanConsumer(*kernel, *match, analysis);
+      if (failed(result))
         return failure();
-      continue;
+      if (*result) continue;
     }
     SmallVector<ScanOp> scans;
     kernel->walk([&](ScanOp scan) { scans.push_back(scan); });
@@ -742,6 +940,14 @@ static LogicalResult realizeScanConsumerTraversalsImpl(ModuleOp module) {
       if (failed(result))
         return failure();
       if (*result) {
+        // Snapshot cleanup can erase an earlier considered scan. Drop those
+        // identities before the next rewrite allocates any new operations.
+        llvm::DenseSet<Operation *> live;
+        kernel->walk([&](ScanOp current) { live.insert(current); });
+        SmallVector<Operation *> erased;
+        for (Operation *previous : considered)
+          if (!live.contains(previous)) erased.push_back(previous);
+        for (Operation *previous : erased) considered.erase(previous);
         materialized = true;
         break;
       }
@@ -749,6 +955,7 @@ static LogicalResult realizeScanConsumerTraversalsImpl(ModuleOp module) {
     if (!materialized)
       break;
   }
+  eraseDeadPhysicalValues(*kernel);
   return success();
 }
 LogicalResult realizeScanConsumerTraversals(ModuleOp module) {

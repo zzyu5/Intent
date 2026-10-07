@@ -219,21 +219,34 @@ LogicalResult materializeGatherSources(func::FuncOp kernel) {
     // Large-source selection is a profitability choice, not a proof about the
     // native layout. Bind unknown coverage sizes with the actual constexpr
     // extent so inexpensive small-domain gathers retain their native path.
-    Value enabled;
+    Value sizeEnabled;
     if (!oversized && capacity->minimumElements <= capabilities.getMaxThreadsPerBlock())
-      enabled = largeSourceGuard(source, capabilities.getMaxThreadsPerBlock());
+      sizeEnabled = largeSourceGuard(source, capabilities.getMaxThreadsPerBlock());
+    Value domainEnabled = gpu::materializeFragmentSnapshotReadDomain(source, gathers);
+    Value enabled = sizeEnabled ? sizeEnabled : domainEnabled;
+    if (sizeEnabled && domainEnabled) {
+      Operation *after = sizeEnabled.getDefiningOp();
+      if (Operation *domain = domainEnabled.getDefiningOp();
+          domain && domain->getBlock() == after->getBlock() &&
+          after->isBeforeInBlock(domain))
+        after = domain;
+      OpBuilder builder(after);
+      builder.setInsertionPointAfter(after);
+      enabled = builder.create<gpu::BinaryOp>(source.getLoc(), builder.getI1Type(),
+          sizeEnabled, domainEnabled, BinaryOperator::LogicalAnd);
+    }
     auto storage = gpu::materializeFragmentSnapshot(source, enabled);
     if (failed(storage)) return failure();
     for (gpu::GatherOp gather : gathers) {
       Value replacement;
-      if (!enabled) {
+      if (!sizeEnabled) {
         auto value = gpu::loadFragmentSnapshot(gather, *storage);
         if (failed(value)) return failure();
         replacement = *value;
       } else {
         OpBuilder builder(gather);
         auto branch = builder.create<scf::IfOp>(gather.getLoc(),
-            TypeRange{gather.getResult().getType()}, enabled, true);
+            TypeRange{gather.getResult().getType()}, sizeEnabled, true);
         builder.setInsertionPointToStart(branch.elseBlock());
         auto native = cast<gpu::GatherOp>(builder.clone(*gather));
         builder.create<scf::YieldOp>(gather.getLoc(), native.getResult());

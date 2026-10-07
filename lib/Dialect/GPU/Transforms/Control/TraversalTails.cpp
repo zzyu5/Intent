@@ -2,6 +2,7 @@
 
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
+#include "Intent/Dialect/GPU/Analysis/TraversalPartitions.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -68,6 +69,7 @@ bool peel(scf::ForOp loop, func::FuncOp kernel) {
   if (!effects || llvm::any_of(*effects, [](const auto &effect) {
         return isa<MemoryEffects::Allocate>(effect.getEffect());
       })) return false;
+  if (!canPeelTraversalEffects(loop, analysis)) return false;
 
   // For U >= 0 and W > 0, floor(U/W)*W is representable, aligned, and in [0,U].
   // The prefix and suffix partition precisely the original induction values.

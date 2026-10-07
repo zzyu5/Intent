@@ -85,6 +85,23 @@ Value singleControlTarget(OpOperand &operand, ControlFlowEdgeKind kind,
   return selected;
 }
 
+bool preservesMemoryReadsAt(Operation *reads, Operation *intervening,
+                            ResourceAliasAnalysis &aliases, Operation *context) {
+  auto effects = getEffectsRecursively(intervening);
+  if (!effects) return false;
+  auto disjoint = [&](Value lhs, Value rhs) {
+    // Nonoverlapping views can still share an allocation. A byte-span guard
+    // therefore cannot authorize crossing a release of that allocation.
+    if (llvm::any_of(*effects, [&](const auto &effect) {
+          return isa<MemoryEffects::Free>(effect.getEffect()) &&
+                 effect.getValue() == rhs;
+        }))
+      return false;
+    return aliases.disjointAt(lhs, rhs, context);
+  };
+  return preservesMemoryReads(reads, intervening, aliases, disjoint);
+}
+
 } // namespace
 
 bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
@@ -92,7 +109,7 @@ bool canReplayReadAt(LoadOp load, Operation *insertionAnchor) {
     return false;
   ResourceAliasAnalysis aliases;
   auto preservesRead = [&](Operation *operation) {
-    return preservesMemoryReads(load, operation, aliases);
+    return preservesMemoryReadsAt(load, operation, aliases, insertionAnchor);
   };
   // This motion stays in the same invocation of the enclosing block, including
   // the same iteration when the block belongs to an ordered loop.
@@ -307,7 +324,8 @@ void PhysicalProgramAnalysis::analyzeReplay(
       ResourceAliasAnalysis aliases;
       Operation *anchor = insertionAnchor;
       while (anchor && anchor->getBlock() != replayRoot->getBlock()) {
-        preservesReads &= preservesMemoryReads(replayRoot, anchor, aliases);
+        preservesReads &= preservesMemoryReadsAt(replayRoot, anchor, aliases,
+                                                insertionAnchor);
         anchor = anchor->getParentOp();
       }
       preservesReads &= anchor &&
@@ -315,7 +333,8 @@ void PhysicalProgramAnalysis::analyzeReplay(
       if (preservesReads && anchor != replayRoot)
         for (Operation *next = replayRoot->getNextNode(); next != anchor;
              next = next->getNextNode())
-          preservesReads &= preservesMemoryReads(replayRoot, next, aliases);
+          preservesReads &= preservesMemoryReadsAt(replayRoot, next, aliases,
+                                                  insertionAnchor);
     }
     if (!preservesReads || dependentControl) {
       appendUnique(result.blockers, operation);

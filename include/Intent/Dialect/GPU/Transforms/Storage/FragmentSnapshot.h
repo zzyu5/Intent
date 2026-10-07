@@ -6,6 +6,13 @@
 
 namespace intent::gpu {
 
+// Return the predicate of a common enclosing If arm for every selected reader.
+// The If must share the source definition's block and follow that definition;
+// only an else-arm predicate needs new scalar IR immediately before the If.
+// No predicate is returned when this control relation is unknown.
+mlir::Value materializeFragmentSnapshotReadDomain(
+    mlir::Value source, llvm::ArrayRef<GatherOp> readers);
+
 // Save the completed physical SSA lanes at their definition (or at the current
 // block argument's entry). The fresh program-private buffer has position axes;
 // this neither replays the producer nor chooses whether storage is profitable.

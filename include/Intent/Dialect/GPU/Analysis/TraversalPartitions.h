@@ -1,7 +1,10 @@
 #ifndef INTENT_DIALECT_GPU_ANALYSIS_TRAVERSALPARTITIONS_H
 #define INTENT_DIALECT_GPU_ANALYSIS_TRAVERSALPARTITIONS_H
 
-namespace mlir { class Operation; }
+namespace mlir {
+class Operation;
+namespace scf { class ForOp; }
+}
 
 namespace intent::gpu {
 class PhysicalProgramAnalysis;
@@ -12,6 +15,11 @@ class PhysicalProgramAnalysis;
 bool areDisjointTraversalPartitions(mlir::Operation *first,
                                    mlir::Operation *second,
                                    PhysicalProgramAnalysis &analysis);
+
+// Check before cloning that every observable write has the current range and
+// control structure consumed by the traversal-partition proof above.
+bool canPeelTraversalEffects(mlir::scf::ForOp loop,
+                             PhysicalProgramAnalysis &analysis);
 
 } // namespace intent::gpu
 #endif

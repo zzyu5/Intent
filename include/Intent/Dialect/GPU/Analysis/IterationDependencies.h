@@ -8,6 +8,8 @@
 
 namespace intent::gpu {
 
+class ScanOp;
+
 // Conditional independence of a current unit-step, carry-free iteration.
 // The caller must preserve each iteration's internal order and materialize
 // injective-layout guards for guardedViews and non-overlap guards for every
@@ -16,10 +18,19 @@ namespace intent::gpu {
 struct IndependentIterationAccesses {
   llvm::SmallVector<mlir::Value> guardedViews;
   llvm::SmallVector<std::pair<mlir::Value, mlir::Value>> disjointViews;
+  // Additional conditions for active count-prefix coordinates: the complete
+  // logical member count must not exceed the given inclusive integer limit.
+  // The caller must materialize these conditions before reordering iterations.
+  llvm::SmallVector<std::pair<mlir::Value, int64_t>> countUpperBounds;
 };
 
 mlir::FailureOr<IndependentIterationAccesses>
 queryIndependentIterationAccesses(mlir::scf::ForOp loop);
+
+// Also consider an explicitly supplied forward inclusive integer count scan.
+// Unknown count/predicate relations retain only the original affine proof domain.
+mlir::FailureOr<IndependentIterationAccesses>
+queryIndependentIterationAccesses(mlir::scf::ForOp loop, ScanOp countPrefix);
 
 } // namespace intent::gpu
 

@@ -16,7 +16,8 @@ LogicalResult materializeFragmentStorage(func::FuncOp kernel) {
   IRMapping replacements;
   for (auto &[original, gathers] : readers) {
     Value source = replacements.lookupOrDefault(original);
-    auto snapshot = gpu::materializeFragmentSnapshot(source);
+    Value enabled = gpu::materializeFragmentSnapshotReadDomain(source, gathers);
+    auto snapshot = gpu::materializeFragmentSnapshot(source, enabled);
     if (failed(snapshot)) return failure();
     for (gpu::GatherOp gather : gathers) {
       auto loaded = gpu::loadFragmentSnapshot(gather, *snapshot);

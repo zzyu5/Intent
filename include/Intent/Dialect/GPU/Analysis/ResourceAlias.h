@@ -15,6 +15,12 @@ class ResourceAliasAnalysis {
 public:
   mlir::AliasResult alias(mlir::Value lhs, mlir::Value rhs);
 
+  // In addition to global allocation facts, consume a launch-time view-overlap
+  // predicate proved false by an actual enclosing If arm. This is a byte-span
+  // fact for the exact external views, not a new global allocation identity;
+  // no branch fact survives its join or is cached as an AliasResult.
+  bool disjointAt(mlir::Value lhs, mlir::Value rhs, mlir::Operation *context);
+
 private:
   struct Roots {
     llvm::SmallVector<mlir::Value> allocations;

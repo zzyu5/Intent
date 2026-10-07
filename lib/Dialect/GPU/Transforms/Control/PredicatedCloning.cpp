@@ -163,6 +163,22 @@ LogicalResult clonePredicatedScalarOperation(
     return lift(zero);
   };
 
+  // A traversal can bind a member read to an already selected lane value.
+  // Apply this read's own fill and current control predicate here, including
+  // reads nested in scalar branches; the binding does not authorize a load.
+  if (auto gather = dyn_cast<GatherOp>(operation))
+    if (Value member = mapping.lookupOrNull(gather.getResult())) {
+      auto type = resultType(gather.getType());
+      auto valid = maskedValidity(gather.getValid(), gather.getType());
+      auto inactive = fill(gather.getFill(), gather.getType());
+      if (failed(type) || failed(valid) || failed(inactive)) return failure();
+      auto selected = project(member, *type);
+      if (failed(selected)) return failure();
+      mapping.map(gather.getResult(), builder.create<SelectOp>(
+          location, *type, *valid, *selected, *inactive).getResult());
+      return success();
+    }
+
   Operation *clone;
   if (auto loop = dyn_cast<scf::ForOp>(operation)) {
     auto initial = liftGroup(loop.getInitArgs());

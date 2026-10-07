@@ -3,9 +3,12 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/UniformValues.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OperationSupport.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -56,7 +59,8 @@ bool tailCondition(Value condition, Value end, Value upper,
 
 class CoordinateMatch {
 public:
-  CoordinateMatch(scf::ForOp prefix, IndexRelations &relations) : relations(relations) {
+  CoordinateMatch(scf::ForOp prefix, IndexRelations &relations)
+      : prefix(prefix), relations(relations) {
     bindings[prefix.getInductionVar()] = prefix.getUpperBound();
     for (auto [argument, result] : llvm::zip(prefix.getRegionIterArgs(), prefix.getResults()))
       bindings[argument] = result;
@@ -71,11 +75,7 @@ public:
     auto left = dyn_cast<OpResult>(lhs), right = dyn_cast<OpResult>(rhs);
     if (!left || !right || left.getResultNumber() != right.getResultNumber()) return false;
     Operation *a = left.getOwner(), *b = right.getOwner();
-    auto coordinate = [](Operation *operation) {
-      return isa<MakeRangeOp>(operation) ||
-          isPhysicalReplayNode(operation, PhysicalReplayScope::Coordinate, false);
-    };
-    if (a->getNumRegions() || b->getNumRegions() || !coordinate(a) || !coordinate(b)) return false;
+    if (!coordinateNode(a) || !coordinateNode(b)) return false;
     if (!OperationEquivalence::isEquivalentTo(a, b,
           [&](Value x, Value y) { return success(same(x, y)); }, nullptr,
           OperationEquivalence::IgnoreLocations)) return false;
@@ -85,30 +85,52 @@ public:
 
   void bind(Value lhs, Value rhs) { bindings[lhs] = rhs; }
 
+  bool canMatchClone(Value value) {
+    if (prefix.isDefinedOutsideOfLoop(value) || bindings.contains(value) ||
+        relations.constant(value)) return true;
+    if (auto found = cloneable.find(value); found != cloneable.end()) return found->second;
+    Operation *producer = value.getDefiningOp();
+    bool result = producer && coordinateNode(producer) &&
+        llvm::all_of(producer->getOperands(), [&](Value operand) {
+          return canMatchClone(operand);
+        });
+    cloneable[value] = result;
+    return result;
+  }
+
 private:
+  static bool coordinateNode(Operation *operation) {
+    return !operation->getNumRegions() && (isa<MakeRangeOp>(operation) ||
+        isPhysicalReplayNode(operation, PhysicalReplayScope::Coordinate, false));
+  }
+
+  scf::ForOp prefix;
   IndexRelations &relations;
   llvm::DenseMap<Value, Value> bindings;
+  llvm::DenseMap<Value, bool> cloneable;
 };
+
+bool collectControlPath(Operation *effect, Region *boundary,
+                        SmallVectorImpl<Region *> &path) {
+  for (Region *region = effect->getParentRegion(); region != boundary;) {
+    Operation *owner = region ? region->getParentOp() : nullptr;
+    // A nested traversal must correspond on both sides. Stateful loops and
+    // unknown control cannot be inferred from their trip count alone.
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
+      if (loop.getNumRegionIterArgs()) return false;
+    } else if (!isa_and_nonnull<scf::IfOp>(owner)) return false;
+    path.push_back(region);
+    region = owner->getParentRegion();
+  }
+  return true;
+}
 
 bool matchingControl(Operation *first, Operation *second, scf::ForOp prefix,
                      scf::IfOp suffix, CoordinateMatch &match) {
   SmallVector<Region *> left, right;
-  auto collect = [](Operation *effect, Region *boundary,
-                    SmallVectorImpl<Region *> &path) {
-    for (Region *region = effect->getParentRegion(); region != boundary;) {
-      Operation *owner = region ? region->getParentOp() : nullptr;
-      // A nested traversal must correspond on both sides. Stateful loops and
-      // unknown control cannot be inferred from their trip count alone.
-      if (auto loop = dyn_cast_or_null<scf::ForOp>(owner)) {
-        if (loop.getNumRegionIterArgs()) return false;
-      } else if (!isa_and_nonnull<scf::IfOp>(owner)) return false;
-      path.push_back(region);
-      region = owner->getParentRegion();
-    }
-    return true;
-  };
-  if (!collect(first, &prefix.getRegion(), left) ||
-      !collect(second, &suffix.getThenRegion(), right) || left.size() != right.size()) return false;
+  if (!collectControlPath(first, &prefix.getRegion(), left) ||
+      !collectControlPath(second, &suffix.getThenRegion(), right) ||
+      left.size() != right.size()) return false;
   for (auto [a, b] : llvm::zip(llvm::reverse(left), llvm::reverse(right))) {
     if (auto loop = dyn_cast<scf::ForOp>(a->getParentOp())) {
       auto other = dyn_cast<scf::ForOp>(b->getParentOp());
@@ -155,6 +177,17 @@ bool confinesTail(Value validity, MakeRangeOp range, PhysicalProgramAnalysis &an
       analysis.isTailPredicate(validity, {{range, range.getLogicalStop()}});
 }
 
+bool partitionRange(MakeRangeOp range, Value start, Value step, Value upper,
+                    const IndexRelations &relations) {
+  auto type = range.getResult().getType();
+  return type.getShape().size() == 1 && isUnitStepRange(range) &&
+      sameIndex(range.getStart(), start, relations) &&
+      sameIndex(range.getExtent(), step, relations) &&
+      relations.constant(range.getLogicalStart()) == 0 &&
+      sameIndex(range.getLogicalStop(), upper, relations) &&
+      queryLaunchExpression(step) == type.getShape()[0];
+}
+
 bool matchingStores(Operation *first, Operation *second, scf::ForOp prefix,
                     scf::IfOp suffix, Value upper, PhysicalProgramAnalysis &analysis,
                     IndexRelations &relations) {
@@ -175,18 +208,10 @@ bool matchingStores(Operation *first, Operation *second, scf::ForOp prefix,
   for (auto [left, right] : llvm::zip(a.coordinates, b.coordinates)) {
     auto x = left.getDefiningOp<MakeRangeOp>(), y = right.getDefiningOp<MakeRangeOp>();
     if (x && y && sameIndex(x.getStart(), prefix.getInductionVar(), relations)) {
-      auto type = x.getResult().getType();
-      if (type != y.getResult().getType() || type.getShape().size() != 1 ||
+      if (x.getResult().getType() != y.getResult().getType() ||
           !(sourceAxisIdentity(x) == sourceAxisIdentity(y)) ||
-          !isUnitStepRange(x) || !isUnitStepRange(y) ||
-          !sameIndex(y.getStart(), prefix.getUpperBound(), relations) ||
-          !sameIndex(x.getExtent(), prefix.getStep(), relations) ||
-          !sameIndex(y.getExtent(), prefix.getStep(), relations) ||
-          relations.constant(x.getLogicalStart()) != 0 ||
-          relations.constant(y.getLogicalStart()) != 0 ||
-          !sameIndex(x.getLogicalStop(), upper, relations) ||
-          !sameIndex(y.getLogicalStop(), upper, relations) ||
-          queryLaunchExpression(prefix.getStep()) != type.getShape()[0] ||
+          !partitionRange(x, prefix.getInductionVar(), prefix.getStep(), upper, relations) ||
+          !partitionRange(y, prefix.getUpperBound(), prefix.getStep(), upper, relations) ||
           !confinesTail(b.validity, y, analysis, relations)) return false;
       anchored = true;
       continue;
@@ -243,6 +268,55 @@ bool prefixAndSuffix(Operation *first, Operation *second,
 bool areDisjointTraversalPartitions(Operation *first, Operation *second,
                                    PhysicalProgramAnalysis &analysis) {
   return prefixAndSuffix(first, second, analysis) || prefixAndSuffix(second, first, analysis);
+}
+
+bool canPeelTraversalEffects(scf::ForOp loop, PhysicalProgramAnalysis &analysis) {
+  IndexRelations relations;
+  llvm::SmallDenseSet<int64_t> origins;
+  WalkResult result = loop.walk([&](Operation *operation) {
+    auto access = dyn_cast<AccessOpInterface>(operation);
+    if (!access || !access.writesMemory()) return WalkResult::advance();
+    Value resource = access.getAccessResource();
+    if (!operation->hasAttr(originAttr) &&
+        (isa<BufferType>(resource.getType()) || isInvocationWorkspace(resource)))
+      return WalkResult::advance();
+    if (!isa<StoreOp>(operation)) return WalkResult::interrupt();
+    // Existing exclusive definitions would also need cross-arm partition
+    // proofs after cloning. The current matcher proves corresponding paths.
+    auto origin = operation->getAttrOfType<IntegerAttr>(originAttr);
+    if (!origin || !origins.insert(origin.getInt()).second) return WalkResult::interrupt();
+    auto footprint = analysis.footprint(operation);
+    if (footprint.state != PhysicalFactState::Exact ||
+        footprint.rangeState != PhysicalFactState::Exact ||
+        !loop.isDefinedOutsideOfLoop(footprint.resource) ||
+        !analysis.accessBounds(operation).isExact()) return WalkResult::interrupt();
+    CoordinateMatch match(loop, relations);
+    SmallVector<Region *> control;
+    if (!collectControlPath(operation, &loop.getRegion(), control)) return WalkResult::interrupt();
+    for (Region *region : llvm::reverse(control)) {
+      if (auto nested = dyn_cast<scf::ForOp>(region->getParentOp())) {
+        if (!match.canMatchClone(nested.getLowerBound()) ||
+            !match.canMatchClone(nested.getUpperBound()) ||
+            !match.canMatchClone(nested.getStep())) return WalkResult::interrupt();
+        match.bind(nested.getInductionVar(), nested.getInductionVar());
+      } else if (!match.canMatchClone(cast<scf::IfOp>(region->getParentOp()).getCondition())) {
+        return WalkResult::interrupt();
+      }
+    }
+    bool anchored = false;
+    for (Value coordinate : footprint.coordinates) {
+      auto range = coordinate.getDefiningOp<MakeRangeOp>();
+      if (range && sameIndex(range.getStart(), loop.getInductionVar(), relations)) {
+        if (!partitionRange(range, loop.getInductionVar(), loop.getStep(),
+                            loop.getUpperBound(), relations) ||
+            !confinesTail(footprint.validity, range, analysis, relations))
+          return WalkResult::interrupt();
+        anchored = true;
+      } else if (!match.canMatchClone(coordinate)) return WalkResult::interrupt();
+    }
+    return anchored ? WalkResult::advance() : WalkResult::interrupt();
+  });
+  return !result.wasInterrupted();
 }
 
 } // namespace intent::gpu

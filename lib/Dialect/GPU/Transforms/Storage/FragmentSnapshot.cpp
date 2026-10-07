@@ -3,6 +3,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Storage/Workspace.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
 #include <limits>
 #include <numeric>
@@ -43,6 +44,46 @@ Type withStorageElement(Type type, Type storage) {
 }
 
 } // namespace
+
+Value materializeFragmentSnapshotReadDomain(Value source,
+                                            ArrayRef<GatherOp> readers) {
+  if (readers.empty() || !isa<FragmentType>(source.getType()) ||
+      !llvm::all_of(readers, [&](GatherOp reader) {
+        return reader.getSource() == source;
+      }))
+    return {};
+  auto kernel = source.getParentRegion()->getParentOfType<func::FuncOp>();
+  if (!kernel) return {};
+  Operation *definition = source.getDefiningOp();
+  Block *block = definition ? definition->getBlock()
+                            : cast<BlockArgument>(source).getOwner();
+  DominanceInfo dominance(kernel);
+  for (Operation *parent = readers.front()->getParentOp();
+       parent && parent != kernel; parent = parent->getParentOp()) {
+    auto branch = dyn_cast<scf::IfOp>(parent);
+    if (!branch || branch->getBlock() != block ||
+        !dominance.dominates(source, parent))
+      continue;
+    auto readArm = [&](GatherOp reader) -> Region * {
+      Operation *nested = reader;
+      while (nested && nested->getParentOp() != parent)
+        nested = nested->getParentOp();
+      return nested ? nested->getParentRegion() : nullptr;
+    };
+    Region *arm = readArm(readers.front());
+    if (!llvm::all_of(readers, [&](GatherOp reader) {
+          return readArm(reader) == arm;
+        }))
+      continue;
+    if (arm == &branch.getThenRegion()) return branch.getCondition();
+    if (arm != &branch.getElseRegion()) continue;
+    OpBuilder builder(branch);
+    Value disabled = builder.create<arith::ConstantIntOp>(branch.getLoc(), 0, 1);
+    return builder.create<CompareOp>(branch.getLoc(), builder.getI1Type(),
+        branch.getCondition(), disabled, ComparePredicate::Eq);
+  }
+  return {};
+}
 
 FailureOr<Value> materializeFragmentSnapshot(Value source, Value enabled) {
   auto type = dyn_cast<FragmentType>(source.getType());
