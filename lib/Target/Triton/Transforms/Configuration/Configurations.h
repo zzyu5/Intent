@@ -15,11 +15,10 @@ struct TritonLocalOptions {
 
 
 mlir::FailureOr<llvm::SmallVector<TritonLocalOptions>> declareProviderOptions(
-    mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles,
+    mlir::func::FuncOp kernel,
     bool requiresCtaSynchronization, llvm::ArrayRef<mlir::scf::ForOp> loadPipelineLoops);
 mlir::LogicalResult materializeLegalConfigs(
-    mlir::func::FuncOp kernel, TensorDescriptorChoiceOp descriptorChoice,
-    llvm::ArrayRef<TritonLocalOptions> localOptions);
+    mlir::func::FuncOp kernel, TensorDescriptorChoiceOp descriptorChoice);
 mlir::LogicalResult finalizeConfigurationRequirements(mlir::func::FuncOp kernel);
 } // namespace intent::triton
 #endif

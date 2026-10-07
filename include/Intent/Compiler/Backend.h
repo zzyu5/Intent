@@ -65,7 +65,8 @@ struct Backend {
 
 llvm::ArrayRef<Backend> backends();
 const Backend &backend(Provider provider);
-llvm::SmallVector<gpu::TuningProfileSource> gpuProfileSources(llvm::StringRef directory);
+llvm::SmallVector<gpu::TuningProfileSource> gpuProfileSources(
+    llvm::StringRef directory, llvm::StringRef provider);
 mlir::FailureOr<mlir::DictionaryAttr> parseDSAParameterBindings(
     mlir::ModuleOp module, llvm::StringRef text, bool shapes);
 

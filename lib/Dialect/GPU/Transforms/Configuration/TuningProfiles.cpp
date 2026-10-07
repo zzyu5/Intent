@@ -1,5 +1,6 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -67,12 +68,33 @@ LogicalResult checkColumns(const TuningProfileSchema &schema, ArrayAttr columns,
   return success();
 }
 
+LogicalResult checkValues(const TuningProfileSchema &schema,
+                          TuningProfileTableAttr table, Location location) {
+  if (failed(checkColumns(schema, table.getColumns(), location))) return failure();
+  if (schema.columns.size() != 7 + schema.options.size())
+    return emitError(location)
+        << "complete configurations require shared granularity and provider option columns";
+  for (NamedAttribute family : table.getFamilies())
+    for (Attribute attribute : cast<ArrayAttr>(family.getValue()))
+      for (auto [index, value] : llvm::enumerate(cast<DenseI64ArrayAttr>(attribute).asArrayRef())) {
+        bool boolean = index >= 7 && schema.options[index - 7].isBoolean;
+        if (boolean ? value < 0 || value > 1 : value <= 0)
+          return emitError(location) << "configuration family '" << family.getName()
+                                     << "' has an invalid value for " << schema.columns[index];
+      }
+  return success();
+}
+
 } // namespace
 
 FailureOr<TuningProfiles> TuningProfiles::read(
     Location location, ArrayRef<TuningProfileSource> defaults,
     StringRef overrideFilename) {
   Builder builder(location.getContext());
+  if (defaults.size() != 1) {
+    emitError(location) << "GPU tuning requires one selected provider configuration table";
+    return failure();
+  }
   NamedAttrList spaces;
   for (const TuningProfileSource &source : defaults) {
     auto parsed = readJSON(location, source.filename);
@@ -153,6 +175,9 @@ FailureOr<TuningProfiles> TuningProfiles::read(
   auto resolved = TuningProfilesAttr::getChecked(location,
       builder.getContext(), spaces.getDictionary(builder.getContext()));
   if (!resolved) return failure();
+  const auto &schema = defaults.front().schema;
+  auto table = resolved.getSpaces().getAs<TuningProfileTableAttr>(schema.space);
+  if (failed(checkValues(schema, table, location))) return failure();
   return TuningProfiles(resolved);
 }
 
@@ -167,11 +192,64 @@ void TuningProfiles::attach(ModuleOp module) const {
   module->setAttr(tuningProfilesAttr, profiles);
 }
 
+FailureOr<TuningProfileTableAttr> TuningProfiles::table() const {
+  auto spaces = profiles.getSpaces();
+  if (spaces.size() != 1) {
+    emitError(UnknownLoc::get(profiles.getContext()))
+        << "resolved GPU profiles must contain one complete provider table";
+    return failure();
+  }
+  auto table = cast<TuningProfileTableAttr>(spaces.begin()->getValue());
+  static const StringRef sharedColumns[] = {
+      "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
+      "traversal_workers", "traversal_group"};
+  auto columns = table.getColumns();
+  auto location = UnknownLoc::get(profiles.getContext());
+  if (columns.size() < 7 ||
+      !llvm::equal(columns.getValue().take_front(7), sharedColumns,
+          [](Attribute column, StringRef expected) {
+            return cast<StringAttr>(column).getValue() == expected;
+          }))
+    return emitError(location) << "complete configuration table requires the seven shared granularity columns",
+           failure();
+  for (NamedAttribute family : table.getFamilies())
+    for (Attribute attribute : cast<ArrayAttr>(family.getValue()))
+      if (llvm::any_of(cast<DenseI64ArrayAttr>(attribute).asArrayRef().take_front(7),
+                      [](int64_t value) { return value <= 0; }))
+        return emitError(location) << "shared configuration granularities must be positive", failure();
+  return table;
+}
+
+LogicalResult TuningProfiles::declareProviderParameters(
+    func::FuncOp kernel, const TuningProfileSchema &schema) const {
+  auto selected = table();
+  if (failed(selected) || failed(checkValues(schema, *selected, kernel.getLoc())))
+    return failure();
+  Builder builder(kernel.getContext());
+  for (auto [index, option] : llvm::enumerate(schema.options)) {
+    if (schema.columns[7 + index] != option.name)
+      return kernel.emitError("provider option declaration disagrees with its configuration column");
+    SmallVector<int64_t> values;
+    for (NamedAttribute family : selected->getFamilies())
+      for (Attribute attribute : cast<ArrayAttr>(family.getValue())) {
+        int64_t value = cast<DenseI64ArrayAttr>(attribute).asArrayRef()[7 + index];
+        if (!llvm::is_contained(values, value)) values.push_back(value);
+      }
+    auto binding = ParameterBindingAttr::get(kernel.getContext(), {}, {}, {}, {}, false, false);
+    Type type = option.isBoolean ? Type(builder.getI1Type()) : Type(builder.getIndexType());
+    auto declaration = ParameterAttr::get(kernel.getContext(), builder.getStringAttr(option.name),
+        type, option.role, ParameterCategory::Provider, 0,
+        builder.getDenseI64ArrayAttr(values), ConfigurationBindingPhase::Provider, binding);
+    if (failed(declareParameter(kernel, declaration))) return failure();
+  }
+  return success();
+}
+
 FailureOr<TuningProfiles::Table>
 TuningProfiles::get(const TuningProfileSchema &schema, StringRef family,
                     Location location) const {
   auto space = profiles.getSpaces().getAs<TuningProfileTableAttr>(schema.space);
-  if (space && failed(checkColumns(schema, space.getColumns(), location)))
+  if (space && failed(checkValues(schema, space, location)))
     return failure();
   auto rows = space ? space.getFamilies().getAs<ArrayAttr>(family) : ArrayAttr();
   if (rows) {

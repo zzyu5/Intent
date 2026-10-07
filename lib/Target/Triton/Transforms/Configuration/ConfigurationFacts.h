@@ -13,10 +13,8 @@ struct ProgramConfigurationFacts {
   explicit ProgramConfigurationFacts(mlir::func::FuncOp kernel);
 
   llvm::SmallVector<gpu::ParameterCategory> categories;
-  bool twoAxisPointwise = false;
   bool hasContraction = false;
   bool allContractionsF32 = true;
-  bool recurrentContraction = false;
   bool straightLinePointwise = false;
   bool pipelineStagesAffectProgram = false;
 };

@@ -32,9 +32,7 @@ LogicalResult prepareProgram(ModuleOp module) {
   if (failed(gpu::contraction::normalizeMatrixContractShapes(*kernel)) ||
       failed(gpu::verifyGPUProgram(module)))
     return failure();
-  auto profiles = gpu::TuningProfiles::from(module);
-  if (failed(profiles) ||
-      failed(prepareLaunchConfigurations(*kernel, *profiles)) ||
+  if (failed(prepareLaunchConfigurations(*kernel)) ||
       failed(materializeFragmentStorage(*kernel)) ||
       failed(gpu::lowerWorkspaceAllocations(module)))
     return failure();

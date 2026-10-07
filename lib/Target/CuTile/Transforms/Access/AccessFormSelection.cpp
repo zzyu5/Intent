@@ -12,7 +12,7 @@ FailureOr<Value> AccessFormSelection::accessFormValue() {
   if (accessForm)
     return accessForm;
   auto parameter = declareProviderParameter(
-      kernel, profiles, "access_form", accessFormParameter,
+      kernel, accessFormParameter,
       gpu::ParameterRole::ProviderAccessForm, isLegalAccessForm);
   if (failed(parameter))
     return failure();
@@ -56,7 +56,7 @@ FailureOr<Value> AccessFormSelection::tmaCondition() {
 FailureOr<Value> AccessFormSelection::loadPolicyValue() {
   if (!loadPolicy) {
     auto parameter = declareProviderParameter(
-        kernel, profiles, "load_policy_loop", loadPolicyParameter,
+        kernel, loadPolicyParameter,
         gpu::ParameterRole::ProviderLoadPolicy, isLegalLoadPolicy);
     if (failed(parameter))
       return failure();

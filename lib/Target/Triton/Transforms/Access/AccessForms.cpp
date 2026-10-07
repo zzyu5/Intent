@@ -3,6 +3,7 @@
 #include "Intent/Target/Triton/IR/TritonOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
@@ -486,6 +487,14 @@ DescriptorAccessCandidates readDescriptorAccesses(func::FuncOp kernel) {
 FailureOr<TensorDescriptorChoiceOp>
 materializeTensorDescriptorForms(
     func::FuncOp kernel, ArrayRef<TritonLocalOptions> localOptions) {
+  auto declaration = gpu::lookupParameter(
+      kernel, StringAttr::get(kernel.getContext(), tensorDescriptorChoice));
+  if (!declaration || !declaration.getValueType().isInteger(1) ||
+      declaration.getRole() != gpu::ParameterRole::ProviderAccessForm ||
+      declaration.getPhase() != gpu::ConfigurationBindingPhase::Provider)
+    return kernel.emitError("Triton access forms require their declared boolean provider option"), failure();
+  if (!llvm::is_contained(declaration.getCandidates().asArrayRef(), int64_t(1)))
+    return TensorDescriptorChoiceOp();
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (!capabilities || capabilities.getComputeCapabilityMajor() < 9)
@@ -631,18 +640,10 @@ materializeTensorDescriptorForms(
   SmallVector<Value> descriptorValues;
   for (DescriptorPlan &plan : descriptors)
     descriptorValues.push_back(plan.descriptor.getResult());
-  auto declaration = gpu::ParameterAttr::get(
-      kernel.getContext(), entry.getStringAttr(tensorDescriptorChoice),
-      entry.getI1Type(), gpu::ParameterRole::ProviderAccessForm,
-      gpu::ParameterCategory::Provider, 0,
-      entry.getDenseI64ArrayAttr({0, 1}), gpu::ConfigurationBindingPhase::Provider,
-      gpu::ParameterBindingAttr::get(kernel.getContext(), {}, {}, {}, {}, false, false));
-  auto reference = gpu::declareParameter(kernel, declaration);
-  if (failed(reference)) return failure();
   auto choice = entry.create<TensorDescriptorChoiceOp>(
       kernel.getLoc(), entry.getI1Type(), descriptorValues,
       entry.getStringAttr("host"), entry.getStringAttr("all_eligible"),
-      *reference,
+      declaration.getReference(),
       entry.getStringAttr(tensorDescriptorEligibility));
   auto prepareBranch = [](Region &region) {
     Block &block = region.front();

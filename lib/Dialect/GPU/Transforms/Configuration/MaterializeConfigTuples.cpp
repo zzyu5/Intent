@@ -74,19 +74,15 @@ LogicalResult materializeSharedConfigTuples(func::FuncOp kernel) {
   bool invalidFootprint = false;
   auto project = configuration::projectConfigurationProfiles(
       kernel, facts, *tables,
-      [&](NamedAttrList &bindings, configuration::ProfileLookup profileFor,
-          bool splitInnerAxis) {
+      [&](NamedAttrList &bindings, const configuration::TuningProfile &profile) {
         configuration::bindContractionFreeExtents(
-            facts.freeExtents, bindings, profileFor, builder, splitInnerAxis);
+            facts.freeExtents, bindings, profile, builder);
         if (failed(configuration::bindTraversalFragmentFootprints(
                 kernel, parameters, resources, bindings, builder))) {
           invalidFootprint = true;
           return;
         }
         append(bindings.getDictionary(kernel.getContext()));
-        configuration::appendFullResultContractionTuples(
-            kernel, facts.fullResultContractions, bindings, parameters,
-            resources, profileFor, builder, append);
       });
   if (failed(project))
     return failure();

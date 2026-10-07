@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/GPU/IR/GPUAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
@@ -11,17 +12,22 @@
 
 namespace intent::gpu {
 
+struct ProviderOption {
+  llvm::StringRef name;
+  ParameterRole role;
+  bool isBoolean = false;
+};
+
 struct TuningProfileSchema {
   llvm::StringRef space;
   llvm::ArrayRef<llvm::StringRef> columns;
+  llvm::ArrayRef<ProviderOption> options;
 };
 
 struct TuningProfileSource {
   TuningProfileSchema schema;
   std::string filename;
 };
-
-const TuningProfileSchema &sharedTuningProfileSchema();
 
 class TuningProfiles {
 public:
@@ -34,6 +40,9 @@ public:
 
   static mlir::FailureOr<TuningProfiles> from(mlir::ModuleOp module);
   void attach(mlir::ModuleOp module) const;
+  mlir::FailureOr<TuningProfileTableAttr> table() const;
+  mlir::LogicalResult declareProviderParameters(
+      mlir::func::FuncOp kernel, const TuningProfileSchema &schema) const;
 
   mlir::FailureOr<Table>
   get(const TuningProfileSchema &schema, llvm::StringRef family,

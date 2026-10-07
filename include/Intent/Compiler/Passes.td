@@ -82,6 +82,7 @@ def ResolveGPUProfiles : Pass<"intent-resolve-gpu-profiles", "mlir::ModuleOp"> {
     Shared-IR resume does not rerun this pass or accept replacement overrides.
   }];
   let options = [
+    Option<"provider", "provider", "std::string", [{""}], "Provider owning the complete configuration table">,
     Option<"directory", "directory", "std::string", [{""}], "Directory of compiler profile resources">,
     Option<"overrides", "overrides", "std::string", [{""}], "Explicit profile overrides">
   ];

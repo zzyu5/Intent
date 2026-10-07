@@ -8,83 +8,79 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/Resources.h"
 #include "Intent/Target/Triton/IR/Configuration.h"
 #include "Intent/Target/Triton/Transforms/Configuration/TuningProfiles.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 namespace intent::triton {
 const gpu::TuningProfileSchema &tuningProfileSchema() {
-  static const StringRef columns[] = {"warps", "stages", "ctas"};
-  static const gpu::TuningProfileSchema schema{"triton", columns};
+  static const StringRef columns[] = {
+      "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
+      "traversal_workers", "traversal_group", "NUM_WARPS", "NUM_STAGES",
+      "NUM_CTAS", "USE_TENSOR_DESCRIPTOR"};
+  static const gpu::ProviderOption options[] = {
+      {"NUM_WARPS", gpu::ParameterRole::ProviderWarps},
+      {"NUM_STAGES", gpu::ParameterRole::ProviderStages},
+      {"NUM_CTAS", gpu::ParameterRole::ProviderCTAs},
+      {"USE_TENSOR_DESCRIPTOR", gpu::ParameterRole::ProviderAccessForm, true}};
+  static const gpu::TuningProfileSchema schema{"triton", columns, options};
   return schema;
 }
 
 namespace {
-StringRef localOptionsFamily(ArrayRef<gpu::ParameterCategory> categories,
-                             bool twoAxisPointwise,
-                             StringRef recurrentContractionFamily,
-                             bool fp32Contractions) {
-  if (llvm::is_contained(categories,
-                         gpu::ParameterCategory::RegionReduction))
-    return "region_reduction";
-  if (llvm::is_contained(categories,
-                         gpu::ParameterCategory::RegionContraction))
-    return "region_contraction";
-  if (llvm::is_contained(categories,
-                         gpu::ParameterCategory::PersistentContraction)) {
-    return recurrentContractionFamily.empty() ? "persistent_contraction"
-                                               : recurrentContractionFamily;
+LogicalResult bindProviderDomains(func::FuncOp kernel,
+                                  ArrayRef<DictionaryAttr> rows) {
+  Builder builder(kernel.getContext());
+  for (const gpu::ProviderOption &option : tuningProfileSchema().options) {
+    auto declaration = gpu::lookupParameter(kernel, builder.getStringAttr(option.name));
+    if (!declaration)
+      return kernel.emitError("Triton configuration has no declared provider option: ")
+             << option.name;
+    SmallVector<int64_t> domain;
+    for (DictionaryAttr row : rows) {
+      auto value = row.getAs<IntegerAttr>(option.name);
+      if (!value)
+        return kernel.emitError("Triton configuration row has no provider option: ")
+               << option.name;
+      if (!llvm::is_contained(domain, value.getInt())) domain.push_back(value.getInt());
+    }
+    auto selected = gpu::ParameterAttr::get(kernel.getContext(), declaration.getName(),
+        declaration.getValueType(), declaration.getRole(), declaration.getCategory(),
+        declaration.getElementBitWidth(), builder.getDenseI64ArrayAttr(domain),
+        declaration.getPhase(), declaration.getBinding());
+    if (failed(gpu::updateParameter(kernel, selected))) return failure();
   }
-  if (llvm::is_contained(categories, gpu::ParameterCategory::Contraction)) {
-    if (fp32Contractions)
-      return "contraction_f32";
-    return recurrentContractionFamily.empty() ? "contraction"
-                                               : recurrentContractionFamily;
-  }
-  if (llvm::is_contained(categories, gpu::ParameterCategory::Histogram))
-    return "histogram";
-  if (llvm::is_contained(categories, gpu::ParameterCategory::Reduction) ||
-      llvm::is_contained(categories, gpu::ParameterCategory::Scan))
-    return "reduction_scan";
-  if (twoAxisPointwise)
-    return "pointwise_two_axis";
-  return "pointwise";
+  return success();
 }
 
 } // namespace
 
 LogicalResult materializeLegalConfigs(func::FuncOp kernel,
-                                      TensorDescriptorChoiceOp descriptorChoice,
-                                      ArrayRef<TritonLocalOptions> localOptions) {
+                                      TensorDescriptorChoiceOp descriptorChoice) {
   auto space = gpu::ParameterSpace::read(kernel);
   if (failed(space))
     return failure();
-  auto schema = ConfigurationSchema::read(kernel);
-  if (failed(schema)) return failure();
   auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared))
     return failure();
-  auto warps = space->find(gpu::ParameterRole::ProviderWarps);
-  auto stages = space->find(gpu::ParameterRole::ProviderStages);
-  auto ctas = space->find(gpu::ParameterRole::ProviderCTAs);
-  if (!warps || !stages || !ctas)
-    return kernel.emitError("Triton provider parameter domains are incomplete");
+  auto form = space->find(gpu::ParameterRole::ProviderAccessForm);
+  if (!form)
+    return kernel.emitError("Triton configuration has no declared access form");
   SmallVector<DictionaryAttr> configs;
   Builder builder(kernel.getContext());
   for (DictionaryAttr tuple : *shared) {
-    for (const TritonLocalOptions &options : localOptions) {
-      int64_t formCount = descriptorChoice ? 2 : 1;
-      for (int64_t form = 0; form < formCount; ++form) {
-        NamedAttrList bindings(tuple);
-        if (descriptorChoice)
-          bindings.set(descriptorChoice.getConfigParameter().getName(), builder.getI64IntegerAttr(form));
-        bindings.set(schema->warps, builder.getI64IntegerAttr(options.warps));
-        bindings.set(schema->stages, builder.getI64IntegerAttr(options.stages));
-        bindings.set(schema->ctas, builder.getI64IntegerAttr(options.ctas));
-        DictionaryAttr config = bindings.getDictionary(kernel.getContext());
-        if (!llvm::is_contained(configs, config)) configs.push_back(config);
-      }
-    }
+    NamedAttrList bindings(tuple);
+    if (!descriptorChoice) bindings.erase(form.getName());
+    DictionaryAttr config = bindings.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(configs, config)) configs.push_back(config);
   }
+  if (!descriptorChoice) {
+    SmallVector<Attribute> declarations;
+    for (Attribute attribute : gpu::getParameterDeclarations(kernel))
+      if (attribute != form) declarations.push_back(attribute);
+    kernel->setAttr(gpu::parametersAttr, builder.getArrayAttr(declarations));
+  }
+  if (failed(ConfigurationSchema::read(kernel))) return failure();
 
   auto requirements = collectConfigurationRequirements(kernel);
   if (failed(requirements)) return failure();
@@ -94,27 +90,19 @@ LogicalResult materializeLegalConfigs(func::FuncOp kernel,
 }
 
 FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
-    func::FuncOp kernel, const gpu::TuningProfiles &profiles,
+    func::FuncOp kernel,
     bool requiresCtaSynchronization, ArrayRef<scf::ForOp> loadPipelineLoops) {
   const ProgramConfigurationFacts facts(kernel);
   auto capabilities = kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
-  bool blackwell = capabilities.getComputeCapabilityMajor() == 10 ||
-                   capabilities.getComputeCapabilityMajor() == 12;
-  StringRef recurrentContractionFamily;
-  if (facts.recurrentContraction) {
-    if (blackwell)
-      recurrentContractionFamily = "blackwell_recurrent_contraction";
-    else if (capabilities.getComputeCapabilityMajor() == 9)
-      recurrentContractionFamily = "hopper_recurrent_contraction";
-  }
-  auto rows = profiles.get(tuningProfileSchema(), localOptionsFamily(
-      facts.categories, facts.twoAxisPointwise, recurrentContractionFamily,
-      facts.hasContraction && facts.allContractionsF32), kernel.getLoc());
-  if (failed(rows))
-    return failure();
+  auto space = gpu::ParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  auto rows = space->configurations(gpu::ConfigurationStage::Shared);
+  if (failed(rows)) return failure();
   bool pipelineStagesAffectProgram = facts.pipelineStagesAffectProgram || !loadPipelineLoops.empty();
   SmallVector<TritonLocalOptions> localOptions;
-  SmallVector<int64_t> warpDomain, stageDomain, ctaDomain;
+  SmallVector<DictionaryAttr> selectedRows;
+  DenseMap<DictionaryAttr, int64_t> equivalentStages;
+  Builder builder(kernel.getContext());
   auto isDeviceOption = [&](int64_t warps, int64_t stages, int64_t ctas) {
     return isLegalDeviceOption(gpu::ParameterRole::ProviderWarps, warps,
                                capabilities, requiresCtaSynchronization) &&
@@ -123,41 +111,34 @@ FailureOr<SmallVector<TritonLocalOptions>> declareProviderOptions(
            isLegalDeviceOption(gpu::ParameterRole::ProviderCTAs, ctas,
                                capabilities, requiresCtaSynchronization);
   };
-  for (const auto &row : *rows) {
-    int64_t warps = row[0], stages = row[1], ctas = row[2];
+  for (DictionaryAttr row : *rows) {
+    int64_t warps = row.getAs<IntegerAttr>("NUM_WARPS").getInt();
+    int64_t stages = row.getAs<IntegerAttr>("NUM_STAGES").getInt();
+    int64_t ctas = row.getAs<IntegerAttr>("NUM_CTAS").getInt();
     if (facts.straightLinePointwise)
       stages = 1;
     if (!isDeviceOption(warps, stages, ctas))
       continue;
+    NamedAttrList bindings(row);
+    if (!pipelineStagesAffectProgram) {
+      bindings.erase("NUM_STAGES");
+      auto inserted = equivalentStages.try_emplace(bindings.getDictionary(kernel.getContext()), stages);
+      stages = inserted.first->second;
+    }
+    bindings.set("NUM_STAGES", builder.getI64IntegerAttr(stages));
+    DictionaryAttr selected = bindings.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(selectedRows, selected)) selectedRows.push_back(selected);
     if (llvm::any_of(localOptions, [&](const TritonLocalOptions &option) {
-          // Kernel-level stages pipeline dot producers. Ordinary loads need
-          // an explicit tl.range stage binding; keep one supplied setting
-          // when the current program has no such pipeline producer.
-          return option.warps == warps &&
-                 (!pipelineStagesAffectProgram || option.stages == stages) &&
-                 option.ctas == ctas;
+          return option.warps == warps && option.stages == stages && option.ctas == ctas;
         }))
       continue;
     localOptions.push_back({warps, stages, ctas});
-    if (!llvm::is_contained(warpDomain, warps)) warpDomain.push_back(warps);
-    if (!llvm::is_contained(stageDomain, stages)) stageDomain.push_back(stages);
-    if (!llvm::is_contained(ctaDomain, ctas)) ctaDomain.push_back(ctas);
   }
   if (localOptions.empty())
     return kernel.emitError("Triton tuning profile has no legal provider options");
-  Builder builder(kernel.getContext());
-  auto declareProviderParameter = [&](StringRef name, gpu::ParameterRole role,
-                                      ArrayRef<int64_t> candidates) -> LogicalResult {
-    return success(succeeded(gpu::getOrCreatePhysicalParameter(
-        kernel, name, role, gpu::ParameterCategory::Provider, 0, candidates)));
-  };
-  if (failed(declareProviderParameter("NUM_WARPS", gpu::ParameterRole::ProviderWarps,
-                                      warpDomain)) ||
-      failed(declareProviderParameter("NUM_STAGES", gpu::ParameterRole::ProviderStages,
-                                      stageDomain)) ||
-      failed(declareProviderParameter("NUM_CTAS", gpu::ParameterRole::ProviderCTAs,
-                                      ctaDomain)))
-    return kernel.emitError("Triton provider parameter name is already owned");
+  if (failed(bindProviderDomains(kernel, selectedRows)) ||
+      failed(gpu::writeConfigurations(kernel, selectedRows, gpu::ConfigurationStage::Shared)))
+    return failure();
   if (!loadPipelineLoops.empty()) {
     auto stages =
         gpu::queryParameterBySymbol(kernel, builder.getStringAttr("NUM_STAGES"));

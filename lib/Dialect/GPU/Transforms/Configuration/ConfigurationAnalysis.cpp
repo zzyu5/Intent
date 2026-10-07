@@ -561,23 +561,6 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters) 
   kernel.walk([&](ContractOp contract) {
     SmallVector<ContractionFreeExtent> contractGroups;
     bool factorizedFreeAxes = false;
-    SmallVector<ParameterAttr> contractProfiles;
-    for (ParameterAttr parameter : parameters) {
-      auto category =
-          parameter.getCategory();
-      if (category != ParameterCategory::Contraction &&
-          category != ParameterCategory::PersistentContraction &&
-          category != ParameterCategory::RegionContraction)
-        continue;
-      StringAttr name = parameter.getName();
-      if (reducedAxesReferenceParameter(
-              cast<FragmentType>(contract.getLhs().getType()),
-              contract.getLhsReductionAxes(), name) &&
-          reducedAxesReferenceParameter(
-              cast<FragmentType>(contract.getRhs().getType()),
-              contract.getRhsReductionAxes(), name))
-        contractProfiles.push_back(parameter);
-    }
     auto collectSide = [&](Value value, ArrayRef<int64_t> reduction,
                            ArrayRef<int64_t> batch, ParameterRole role) {
       ContractionFreeExtent group;
@@ -620,8 +603,6 @@ contractionFreeExtents(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters) 
         if (!collect(extent)) return;
         group.extents.push_back(extent);
       }
-      group.profileParameters = contractProfiles.empty() ? group.parameters
-                                                        : contractProfiles;
       if (!group.parameters.empty()) {
         factorizedFreeAxes |= factors > 1;
         contractGroups.push_back(std::move(group));
@@ -665,47 +646,6 @@ bool hasSmallRegionRows(func::FuncOp kernel, ArrayRef<ParameterAttr> parameters)
   return found;
 }
 
-SmallVector<FullResultContraction> fullResultContractions(func::FuncOp kernel) {
-  SmallVector<FullResultContraction> contractions;
-  kernel.walk([&](scf::ForOp loop) {
-    auto parameter = queryParameter(loop.getStep());
-    if (!parameter || loop.getNumResults() != 1)
-      return;
-    auto schema = parameter;
-    auto role = schema.getRole();
-    if (schema.getCategory() !=
-            ParameterCategory::Contraction ||
-        (role != ParameterRole::OwnershipM && role != ParameterRole::OwnershipN))
-      return;
-    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    auto gather = yield.getOperand(0).getDefiningOp<GatherOp>();
-    if (!gather || gather.getFill() != loop.getRegionIterArgs().front() ||
-        gather.getSourceAxes().size() != 1)
-      return;
-    auto source = dyn_cast<FragmentType>(gather.getSource().getType());
-    auto result = dyn_cast<FragmentType>(gather.getType());
-    if (!source || !result || source.getShape().size() != 2 ||
-        result.getShape().size() != 2)
-      return;
-    unsigned axis = gather.getSourceAxes().front();
-    if (axis >= 2 ||
-        source.getShape()[1 - axis] != result.getShape()[1 - axis])
-      return;
-    auto sliced = cast<PhysicalExprAttr>(source.getShape()[axis]);
-    auto full = cast<PhysicalExprAttr>(result.getShape()[axis]);
-    if (sliced.getKind() != PhysicalExprKind::Parameter ||
-        sliced.getParameterReference().getName() != schema.getName() ||
-        full.getKind() != PhysicalExprKind::Parameter)
-      return;
-    auto coverage = queryParameterBySymbol(kernel, full.getParameterReference().getName());
-    if (failed(coverage) || !coverage->isDeferred())
-      return;
-    auto other = cast<PhysicalExprAttr>(source.getShape()[1 - axis]);
-    contractions.push_back({parameter, other});
-  });
-  return contractions;
-}
-
 } // namespace
 
 ConfigurationFacts analyzeConfigurationPolicy(
@@ -723,16 +663,8 @@ ConfigurationFacts analyzeConfigurationPolicy(
     if ((kind == TuningClass::Contraction ||
          kind == TuningClass::PersistentContraction) && contractionWidth)
       width = contractionWidth;
-    bool pointwiseTraversal = false;
-    if (parameter.getBinding().getPointwiseChunk())
-      kernel.walk([&](scf::ForOp loop) {
-        auto step = queryLaunchExpression(loop.getStep());
-        if (step && expressionReferencesParameter(step, schema.getName()))
-          pointwiseTraversal = true;
-      });
     facts.classifications.try_emplace(
-        parameter, ParameterClassification{kind, width, reductionRow,
-                                           pointwiseTraversal});
+        parameter, ParameterClassification{kind, width, reductionRow});
   }
   facts.hasTwoAxisPointwiseOwnership = llvm::any_of(
       parameters, [](ParameterAttr parameter) {
@@ -752,8 +684,6 @@ ConfigurationFacts analyzeConfigurationPolicy(
       });
   facts.pointwiseOnlyProgram = true;
   kernel.walk([&](Operation *operation) {
-    facts.hasContraction |=
-        isa<ContractOp, ScaledContractOp, SparseContractOp>(operation);
     facts.pointwiseOnlyProgram &=
         !isa<ContractOp, ReduceOp, ScanOp, RegionFoldOp, RegionScanOp,
              ScaledContractOp, SparseContractOp, HistogramOp, ScatterReduceOp>(
@@ -833,60 +763,14 @@ ConfigurationFacts analyzeConfigurationPolicy(
 
   for (auto [index, parameter] : llvm::enumerate(facts.pointwiseRowAxes))
     facts.rowGroups[leader(index)].push_back(parameter);
-  // Bind the existing M/N profile along each outer axis of a fixed fragment.
-  // Separate worksets keep separate row bindings; correlate their choices as
-  // profile rows instead of constructing a Cartesian product of all axes.
+  // These dataflow relations bind producer and consumer axes from one row.
   facts.correlatedProfiles =
       correlatedReductionContractionParameters(kernel, parameters, facts);
-
-  auto capabilities =
-      kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
-  if (capabilities && capabilities.getMatrixUnits())
-    for (ParameterAttr parameter : parameters) {
-      ParameterAttr schema = parameter;
-      Attribute group = parameter.getBinding().getGroup();
-      if (schema.getCategory() !=
-              ParameterCategory::Contraction ||
-          schema.getRole() !=
-              ParameterRole::TraversalWorkers ||
-          !isa_and_nonnull<ArrayAttr>(group) ||
-          llvm::is_contained(facts.indirectRowGroups, group))
-        continue;
-      facts.indirectRowGroups.push_back(group);
-    }
 
   facts.smallRegionRows = hasSmallRegionRows(kernel, parameters);
   facts.multipleRegionMatrixAccumulators =
       hasMultipleRegionMatrixAccumulators(kernel);
   facts.freeExtents = contractionFreeExtents(kernel, parameters);
-  facts.fullResultContractions = fullResultContractions(kernel);
-  if (!facts.hasContraction)
-    kernel.walk([&](ReduceOp reduce) {
-      if (reduce.getSources().size() != 1 || reduce.getAxes().size() != 1)
-        return;
-      auto source = dyn_cast<FragmentType>(reduce.getSources().front().getType());
-      if (!source)
-        return;
-      ParameterAttr chunk;
-      SmallVector<ParameterAttr> rows;
-      for (ParameterAttr parameter : parameters) {
-        auto schema = parameter;
-        auto role = schema.getRole();
-        if (role == ParameterRole::Reduction &&
-            reducedAxesReferenceParameter(source, reduce.getAxes(), schema.getName())) {
-          if (chunk || facts.classifications.find(parameter)->second.kind != TuningClass::Reduction)
-            return;
-          chunk = parameter;
-        } else if ((role == ParameterRole::OwnershipM ||
-                    role == ParameterRole::OwnershipN) &&
-                   freeAxesReferenceParameter(source, reduce.getAxes(), schema.getName())) {
-          rows.push_back(parameter);
-        }
-      }
-      if (!chunk || rows.empty())
-        return;
-      facts.reductionProfiles.push_back({chunk, std::move(rows)});
-    });
   return facts;
 }
 

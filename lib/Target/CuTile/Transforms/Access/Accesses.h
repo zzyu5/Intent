@@ -2,7 +2,6 @@
 #define INTENT_TARGET_CUTILE_TRANSFORMS_ACCESS_ACCESSES_H
 
 #include "../NativeRewrite.h"
-#include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace intent::cutile {
@@ -17,8 +16,7 @@ struct NativeAccessInputs {
 };
 
 mlir::LogicalResult formNativeAccesses(
-    mlir::func::FuncOp kernel, const gpu::TuningProfiles &profiles,
-    const NativeAccessInputs &inputs, bool matrixCompute,
+    mlir::func::FuncOp kernel, const NativeAccessInputs &inputs, bool matrixCompute,
     NativeFormRewriter &rewriter);
 mlir::LogicalResult formNativeLoads(
     mlir::func::FuncOp kernel, llvm::ArrayRef<gpu::LoadOp> loads,

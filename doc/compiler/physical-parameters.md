@@ -17,23 +17,28 @@ Physical parameter不进入KIR，也不成为作者DSL参数。
 
 ## 编译期候选数据输入
 
-`intent.compile(..., tuning_config=path)`与`compile_shared_gpu(..., tuning_config=path)`接受有限JSON profile覆盖；CLI对应`--tuning-config <path>`。不传时读取随compiler分发的默认表。表与其shared/provider职责相邻，编译器在配置物化前读取一次；调表不需要重编译C++，但必须重新编译kernel artifact。launch与autotune不再读取该文件。
+`intent.compile(..., tuning_config=path)`与`compile_shared_gpu(..., tuning_config=path)`接受有限JSON配置覆盖；CLI对应`--tuning-config <path>`。不传时读取所选provider随compiler分发的完整配置表。表与provider配置职责相邻，编译器在配置物化前读取一次；调表不需要重编译C++，但必须重新编译kernel artifact。launch与autotune不再读取该文件。
 
-覆盖文件的顶层命名空间为`shared`、`triton`、`cutile`，每个命名空间包含已有family到候选行数组的映射。例如：
+一行配置同时指定shared粒度偏好和provider选项，组织方式对应Triton的完整`Config`列表。覆盖文件使用当前所选provider的命名空间`triton`或`cutile`，包含已有结构family到完整配置行数组的映射。例如Triton配置：
 
 ```json
 {
-  "shared": {"contraction_narrow": [[128, 128, 32, 1, 128, 1, 8]]},
-  "triton": {"contraction": [[4, 2, 1], [8, 3, 1]]},
-  "cutile": {"occupancy_loop": [[1], [2]]}
+  "triton": {
+    "contraction_narrow": [
+      [128, 256, 64, 1, 128, 1, 8, 8, 3, 1, 0],
+      [64, 128, 32, 1, 128, 1, 8, 4, 4, 1, 0]
+    ]
+  }
 }
 ```
 
-显式提供的family整组替换默认行；未提供的family继续使用默认数据。不存在按kernel名称、source或registry选择profile的规则，也不能在JSON中写条件或算法。文件不可读、未知字段/命名空间/family、错误列数/类型、非正整数、重复行或空候选表直接诊断。
+显式提供的family整组替换默认行；未提供的family继续使用默认数据。Compiler依据当前typed program的计算与遍历结构选择一个family，所有参数消费同一行，不能从各参数的独立family拼行。不存在按kernel名称、source或registry选择配置的规则，也不能在JSON中写条件或算法。文件不可读、未知字段/命名空间/family、错误列数/类型、超出列类型的值、重复行或空候选表直接诊断。
 
-Shared行的列依次为`ownership_m, ownership_n, reduction, reduction_outer, scan, traversal_workers, traversal_group`。它们是按role消费的相关粒度偏好，不是对任意shape强制生效的parameter binding：既有投影选择typed domain内不超过请求值的最大值，无此值时选择domain最小值；程序已固定的维度保持固定。相同规则用于默认表和覆盖表。IR graph classification、profile correlation、候选预算与role绑定仍由shared transformations决定，最终tuple明确保存实际值，不能把profile原值冒充最终binding。
+每行前七列依次为`ownership_m, ownership_n, reduction, reduction_outer, scan, traversal_workers, traversal_group`。它们是按role消费的相关粒度偏好，不是对任意shape强制生效的parameter binding：投影选择typed domain内不超过请求值的最大值，无此值时选择domain最小值；程序已固定的维度保持固定。轴关系与资源约束可以确定性地调整同一行的绑定或拒绝该行，不能追加新的候选。相同规则用于默认表和覆盖表。最终tuple明确保存实际值，不能把profile原值冒充最终binding。
 
-Triton行依次为`warps, stages, ctas`；cuTile的各family使用单列实际provider值。Provider值不投影到另一个值：先过滤可证明非法的值/组合，再物化typed domain与完整config。cuTile occupancy的可接受范围独立于选用的搜索集合。若当前程序没有合法候选则编译失败，不换算法、不退回默认表。外部provider compiler继续负责其独有的机器资源约束。
+Pointwise ownership若由当前reduce的轴关系证明为保留行轴，消费同行的`ownership_m`行预算；pointwise遍历与其它列轴继续消费对应的原role偏好。因此同一完整行能表达少量保留行与较大的遍历/reduction chunk，不依赖另加候选。该映射不重解释contraction自身的M/N，也不改logical axis或source顺序。
+
+Triton行随后四列为`NUM_WARPS, NUM_STAGES, NUM_CTAS, USE_TENSOR_DESCRIPTOR`；cuTile随后五列为`CUTILE_CTAS, CUTILE_WORKER_WARPS, CUTILE_OCCUPANCY, CUTILE_ACCESS_FORM, CUTILE_LOAD_POLICY`。Boolean列使用0/1，其余列为正整数。Provider选项以正式`ParameterAttr`声明，同一行的shared/provider绑定沿既有`ConfigurationSetAttr`保持关联；shared阶段可以保存尚未被provider结构消费的选项。Provider逐完整行过滤可证明非法的组合，删除没有实际消费者的选项并去重；不把tile与launch、访存、pipeline选项再次相乘，也不按轴补端点或反推未提供的搭配。没有影响程序的stage差异可以归并，实际流水线的stage选择保持原行。cuTile resident数由同一行的CTA/occupancy绑定导出，不与其它行交换。若当前程序没有合法候选则编译失败，不换算法、不退回默认表。外部provider compiler继续负责其独有的机器资源约束。
 
 ## 2. Parameter expressions
 
@@ -56,7 +61,7 @@ Shared passes先确定一份physical program structure，例如program mapping�
 
 不建立任意physical-program Cartesian product或图级structural autotuner。若一种选择会改变program structure且下层无法由参数自行形成，它由typed compiler pass作出并写入IR；若下层已把该选择作为compile-time config并能实测winner，Intent只提供合法parameter domain。
 
-`num_warps`、`num_stages`、`num_ctas`虽然会驱动Triton TTGIR结构变化，仍属于Triton provider parameters：Intent不写设备无关阶梯表选winner，只声明与当前program兼容的候选值和可证明constraints。
+`num_warps`、`num_stages`、`num_ctas`虽然会驱动Triton TTGIR结构变化，仍属于Triton provider parameters：Intent提供与当前program兼容的经验配置和可证明constraints，由provider调优器选winner。Parameter domain是所提供配置列的取值范围，不授权生成这些列的笛卡尔积；每条完整经验配置最多物化一条候选，过滤与去重可以减少数量。
 
 ## 4. Candidate 与 instantiation
 

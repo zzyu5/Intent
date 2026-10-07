@@ -1,102 +1,103 @@
 #include "ConfigurationPolicy.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "llvm/ADT/DenseSet.h"
 #include <algorithm>
 #include <limits>
 
 using namespace mlir;
 
-namespace intent::gpu {
-
-const TuningProfileSchema &sharedTuningProfileSchema() {
-  static const StringRef columns[] = {"ownership_m", "ownership_n", "reduction",
-      "reduction_outer", "scan", "traversal_workers", "traversal_group"};
-  static const TuningProfileSchema schema{"shared", columns};
-  return schema;
-}
-
-namespace configuration {
+namespace intent::gpu::configuration {
 namespace {
 
-FailureOr<SmallVector<TuningProfile, 5>>
-readProfiles(func::FuncOp kernel, StringRef family, const TuningProfiles &tables) {
-  auto rows = tables.get(sharedTuningProfileSchema(), family, kernel.getLoc());
-  if (failed(rows))
-    return failure();
-  SmallVector<TuningProfile, 5> profiles;
-  for (const TuningProfiles::Row &row : *rows)
-    profiles.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6]});
-  return profiles;
+unsigned priority(TuningClass kind) {
+  switch (kind) {
+  case TuningClass::PersistentContraction: return 13;
+  case TuningClass::RegionContraction: return 12;
+  case TuningClass::RegionReduction: return 11;
+  case TuningClass::Contraction: return 10;
+  case TuningClass::Histogram: return 9;
+  case TuningClass::MultiAxisReduction: return 8;
+  case TuningClass::StatefulReduction: return 7;
+  case TuningClass::Scan: return 6;
+  case TuningClass::Reduction: return 5;
+  case TuningClass::OnlineMoment: return 4;
+  case TuningClass::PointwiseReduction: return 3;
+  case TuningClass::Pointwise: return 2;
+  case TuningClass::Execution: return 1;
+  }
+  llvm_unreachable("unknown tuning class");
 }
 
-FailureOr<SmallVector<TuningProfile, 5>>
-profilesFor(func::FuncOp kernel, TuningClass kind, unsigned width,
-            bool twoAxisPointwise, bool fixedPointwiseLocal,
-            bool pointwiseOnlyProgram, bool smallRegionRows,
-            bool multipleRegionMatrixAccumulators, const TuningProfiles &tables) {
-  auto capabilities =
-      kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+StringRef familyFor(func::FuncOp kernel, const ConfigurationFacts &facts) {
+  TuningClass kind = TuningClass::Execution;
+  unsigned width = 0;
+  for (ParameterAttr parameter : facts.parameters) {
+    const auto &classification = facts.classifications.find(parameter)->second;
+    if (priority(classification.kind) > priority(kind)) {
+      kind = classification.kind;
+      width = classification.width;
+    } else if (classification.kind == kind) {
+      width = std::max(width, classification.width);
+    }
+  }
+  if (facts.parameters.empty())
+    kind = TuningClass::Pointwise;
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   bool matrix = capabilities && capabilities.getMatrixUnits();
   bool narrow = width <= 16;
-  StringRef family;
+  if (facts.multipleRegionMatrixAccumulators &&
+      (kind == TuningClass::Contraction || kind == TuningClass::RegionContraction))
+    return "region_contraction_multi_accumulator";
   switch (kind) {
   case TuningClass::PersistentContraction:
-    family = matrix && narrow ? "persistent_contraction_narrow" : "persistent_contraction";
-    break;
+    return matrix && narrow ? "persistent_contraction_narrow" : "persistent_contraction";
   case TuningClass::Contraction:
-    family = matrix && narrow ? "contraction_narrow" : "contraction";
-    break;
+    return matrix && narrow ? "contraction_narrow" : "contraction";
   case TuningClass::RegionContraction:
-    family = smallRegionRows ? "region_contraction_small_rows"
-                             : "region_contraction";
-    break;
-  case TuningClass::RegionReduction: family = "region_reduction"; break;
-  case TuningClass::Scan: family = "scan"; break;
-  case TuningClass::MultiAxisReduction: family = "multi_axis_reduction"; break;
-  case TuningClass::Histogram: family = "histogram"; break;
-  case TuningClass::Reduction: family = "reduction"; break;
-  case TuningClass::StatefulReduction: family = "stateful_reduction"; break;
-  case TuningClass::Execution: family = "execution"; break;
-  case TuningClass::OnlineMoment: family = "online_moment"; break;
+    {
+      bool found = false, allF32 = true;
+      kernel.walk([&](ContractOp contract) {
+        found = true;
+        allF32 &= cast<FragmentType>(contract.getLhs().getType()).getElementType().isF32() &&
+                  cast<FragmentType>(contract.getRhs().getType()).getElementType().isF32();
+      });
+      if (found && allF32) return "region_contraction_f32";
+    }
+    return facts.smallRegionRows ? "region_contraction_small_rows" : "region_contraction";
+  case TuningClass::RegionReduction: return "region_reduction";
+  case TuningClass::Scan: return "scan";
+  case TuningClass::MultiAxisReduction: return "multi_axis_reduction";
+  case TuningClass::Histogram: return "histogram";
+  case TuningClass::Reduction: return "reduction";
+  case TuningClass::StatefulReduction: return "stateful_reduction";
+  case TuningClass::Execution: return "execution";
+  case TuningClass::OnlineMoment: return "online_moment";
   case TuningClass::PointwiseReduction:
-    family = twoAxisPointwise ? "pointwise_reduction_two_axis" : "pointwise_reduction";
-    break;
+    return facts.hasTwoAxisPointwiseOwnership ? "pointwise_reduction_two_axis" : "pointwise_reduction";
   case TuningClass::Pointwise:
-    if (twoAxisPointwise && fixedPointwiseLocal)
-      family = pointwiseOnlyProgram ? "pointwise_only_fixed_local" : "pointwise_fixed_local";
-    else if (twoAxisPointwise)
-      family = narrow ? "pointwise_two_axis_narrow" : "pointwise_two_axis";
-    else
-      family = narrow ? "pointwise_narrow" : "pointwise";
-    break;
+    if (facts.hasTwoAxisPointwiseOwnership && facts.hasFixedPointwiseLocal)
+      return facts.pointwiseOnlyProgram ? "pointwise_only_fixed_local" : "pointwise_fixed_local";
+    if (facts.hasTwoAxisPointwiseOwnership)
+      return narrow ? "pointwise_two_axis_narrow" : "pointwise_two_axis";
+    return narrow ? "pointwise_narrow" : "pointwise";
   }
-  if (multipleRegionMatrixAccumulators &&
-      (kind == TuningClass::Contraction || kind == TuningClass::RegionContraction))
-    family = "region_contraction_multi_accumulator";
-  return readProfiles(kernel, family, tables);
+  llvm_unreachable("unknown tuning class");
 }
 
 } // namespace
 
 int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
   switch (role) {
-  case ParameterRole::OwnershipM:
-    return profile.ownershipM;
-  case ParameterRole::OwnershipN:
-    return profile.ownershipN;
+  case ParameterRole::OwnershipM: return profile.ownershipM;
+  case ParameterRole::OwnershipN: return profile.ownershipN;
   case ParameterRole::Reduction:
-    return profile.reduction;
-  case ParameterRole::ReductionInner:
-    return profile.reduction;
-  case ParameterRole::ReductionOuter:
-    return profile.reductionOuter;
-  case ParameterRole::ScanChunk:
-    return profile.scan;
-  case ParameterRole::TraversalWorkers:
-    return profile.traversalWorkers;
-  case ParameterRole::TraversalGroup:
-    return profile.traversalGroup;
-  case ParameterRole::ResidentWorkers:
-    return std::numeric_limits<int64_t>::max();
+  case ParameterRole::ReductionInner: return profile.reduction;
+  case ParameterRole::ReductionOuter: return profile.reductionOuter;
+  case ParameterRole::ScanChunk: return profile.scan;
+  case ParameterRole::TraversalWorkers: return profile.traversalWorkers;
+  case ParameterRole::TraversalGroup: return profile.traversalGroup;
+  case ParameterRole::ResidentWorkers: return std::numeric_limits<int64_t>::max();
   case ParameterRole::FullCoverage:
   case ParameterRole::ProviderWarps:
   case ParameterRole::ProviderStages:
@@ -112,10 +113,8 @@ int64_t requestedValue(const TuningProfile &profile, ParameterRole role) {
 int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
   int64_t selected = *std::min_element(candidates.begin(), candidates.end());
   for (int64_t candidate : candidates) {
-    if (candidate == requested)
-      return candidate;
-    if (candidate <= requested && candidate > selected)
-      selected = candidate;
+    if (candidate == requested) return candidate;
+    if (candidate <= requested && candidate > selected) selected = candidate;
   }
   return selected;
 }
@@ -123,140 +122,52 @@ int64_t selectCandidate(ArrayRef<int64_t> candidates, int64_t requested) {
 LogicalResult projectConfigurationProfiles(
     func::FuncOp kernel, const ConfigurationFacts &facts,
     const TuningProfiles &tables, ProfileBindingConsumer consume) {
-  ArrayRef<ParameterAttr> parameters = facts.parameters;
+  auto table = tables.table();
+  if (failed(table)) return failure();
+  StringRef family = familyFor(kernel, facts);
+  auto rows = table->getFamilies().getAs<ArrayAttr>(family);
+  if (!rows)
+    return kernel.emitError("missing declared complete tuning family '") << family << "'";
   Builder builder(kernel.getContext());
-  unsigned profileCount = 0;
-  llvm::DenseMap<ParameterAttr, SmallVector<TuningProfile, 5>> parameterProfiles;
-  for (ParameterAttr parameter : parameters) {
-    const auto &classification = facts.classifications.find(parameter)->second;
-    auto profiles = profilesFor(
-        kernel, classification.kind, classification.width,
-        facts.hasTwoAxisPointwiseOwnership, facts.hasFixedPointwiseLocal,
-        facts.pointwiseOnlyProgram, facts.smallRegionRows,
-        facts.multipleRegionMatrixAccumulators, tables);
-    if (failed(profiles))
-      return failure();
-    profileCount = std::max<unsigned>(profileCount, profiles->size());
-    parameterProfiles.try_emplace(parameter, std::move(*profiles));
-  }
-  if (profileCount == 0)
-    profileCount = 1;
-  int64_t largestReduction = 0;
-  bool hasReductionRows = false;
-  for (ParameterAttr parameter : parameters) {
-    hasReductionRows |= facts.classifications.find(parameter)->second.reductionRow;
-    auto role = parameter.getRole();
-    if (role == ParameterRole::Reduction || role == ParameterRole::ReductionInner ||
-        role == ParameterRole::ReductionOuter)
-      for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
-        largestReduction = std::max(largestReduction, requestedValue(profile, role));
-  }
-  unsigned rowChoiceCount = 1;
+  llvm::SmallDenseSet<ParameterAttr> selectedRows;
   for (const auto &group : facts.rowGroups)
-    rowChoiceCount = std::max<unsigned>(rowChoiceCount, group.second.size());
-  unsigned freeAxisChoices = llvm::any_of(facts.freeExtents, [](const auto &group) {
-    return group.parameters.size() > 1;
-  }) ? 2 : 1;
-  auto appendTuple = [&](ProfileLookup profileFor, bool compactRows = false) {
-    for (unsigned choice = 0; choice < rowChoiceCount * freeAxisChoices; ++choice) {
-      llvm::SmallDenseSet<ParameterAttr> selectedRows;
-      for (const auto &group : facts.rowGroups)
-        selectedRows.insert(group.second[(choice / freeAxisChoices) % group.second.size()]);
-      NamedAttrList bindings;
-      for (ParameterAttr parameter : parameters) {
-        auto schema = parameter;
-        auto role = schema.getRole();
-        int64_t requested = requestedValue(profileFor(parameter), role);
-        // A one-axis pointwise profile budgets the entire fragment. Static
-        // local axes consume that budget even without their own parameters.
-        if (auto local = facts.pointwiseLocalMultiplicity.find(parameter);
-            local != facts.pointwiseLocalMultiplicity.end())
-          requested = std::max<int64_t>(1, requested / local->second);
-        if (!selectedRows.contains(parameter) &&
-            llvm::is_contained(facts.pointwiseRowAxes, parameter))
-          requested = 1;
-        if (compactRows && facts.classifications.find(parameter)->second.reductionRow) {
-          for (const TuningProfile &profile : parameterProfiles.find(parameter)->second)
-            requested = std::min(requested, requestedValue(profile, role));
-        } else if (compactRows &&
-                   (facts.classifications.find(parameter)->second.pointwiseTraversal ||
-                    role == ParameterRole::Reduction ||
-                    role == ParameterRole::ReductionInner ||
-                    role == ParameterRole::ReductionOuter)) {
-          requested = largestReduction;
-        }
-        int64_t selected = selectCandidate(schema.getCandidates().asArrayRef(), requested);
-        bindings.set(schema.getName(), builder.getI64IntegerAttr(selected));
+    selectedRows.insert(group.second.front());
+  for (Attribute attribute : rows) {
+    auto row = cast<DenseI64ArrayAttr>(attribute).asArrayRef();
+    TuningProfile profile{row[0], row[1], row[2], row[3], row[4], row[5], row[6]};
+    NamedAttrList bindings;
+    for (ParameterAttr parameter : facts.parameters) {
+      int64_t requested = requestedValue(profile, parameter.getRole());
+      const auto &classification = facts.classifications.find(parameter)->second;
+      // Independent rows retained by a reduction use the row budget. Keep
+      // contraction M/N roles and a separate pointwise traversal unchanged.
+      if (parameter.getCategory() == ParameterCategory::Pointwise &&
+          classification.reductionRow)
+        requested = profile.ownershipM;
+      for (const CorrelatedProfileParameters &relation : facts.correlatedProfiles) {
+        if (parameter == relation.pointwise) requested = profile.ownershipM;
+        if (parameter == relation.reduction) requested = profile.ownershipN;
       }
-      consume(bindings, profileFor, choice % freeAxisChoices != 0);
+      if (auto local = facts.pointwiseLocalMultiplicity.find(parameter);
+          local != facts.pointwiseLocalMultiplicity.end())
+        requested = std::max<int64_t>(1, requested / local->second);
+      if (!selectedRows.contains(parameter) &&
+          llvm::is_contained(facts.pointwiseRowAxes, parameter))
+        requested = 1;
+      bindings.set(parameter.getName(), builder.getI64IntegerAttr(
+          selectCandidate(parameter.getCandidates().asArrayRef(), requested)));
     }
-  };
-  for (unsigned profileIndex = 0; profileIndex < profileCount;
-       ++profileIndex) {
-    appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
-      const auto &profiles = parameterProfiles.find(parameter)->second;
-      unsigned selectedProfile = std::min<unsigned>(profileIndex,
-                                                     profiles.size() - 1);
-      return profiles[selectedProfile];
-    });
-  }
-  // Independent rows and reduction/traversal chunks consume different axes of the
-  // resource budget. Keep one correlated small-row/large-chunk tuple instead
-  // of pairing both granularities solely by their profile row number.
-  if (!facts.hasContraction && hasReductionRows && largestReduction > 0)
-    appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
-      return parameterProfiles.find(parameter)->second.front();
-    }, true);
-  for (const ReductionProfileParameters &correlated : facts.reductionProfiles) {
-    for (auto [index, profile] :
-         llvm::enumerate(parameterProfiles.find(correlated.chunk)->second))
-      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
-        if (parameter == correlated.chunk || llvm::is_contained(correlated.rows, parameter))
-          return profile;
-        const auto &profiles = parameterProfiles.find(parameter)->second;
-        return profiles[std::min<size_t>(index, profiles.size() - 1)];
-      });
-  }
-  for (const CorrelatedProfileParameters &correlated : facts.correlatedProfiles) {
-    const auto &matrixProfiles =
-        parameterProfiles.find(correlated.contraction)->second;
-    for (auto [index, matrix] : llvm::enumerate(matrixProfiles)) {
-      // The consumer reduces the matrix's N axis. Bind its chunk and retained
-      // M rows from that same matrix profile, regardless of their tuning class.
-      // Zipping independent profile row numbers can omit these legal tiles.
-      TuningProfile rows = matrix;
-      rows.ownershipN = matrix.ownershipM;
-      TuningProfile columns = matrix;
-      columns.reduction = matrix.ownershipN;
-      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
-        if (parameter == correlated.pointwise)
-          return rows;
-        if (parameter == correlated.reduction)
-          return columns;
-        const auto &profiles = parameterProfiles.find(parameter)->second;
-        return profiles[std::min<size_t>(index, profiles.size() - 1)];
-      });
+    for (unsigned column = 7; column < table->getColumns().size(); ++column) {
+      auto name = cast<StringAttr>(table->getColumns()[column]);
+      auto parameter = queryParameterBySymbol(kernel, name);
+      if (failed(parameter) || parameter->getPhase() != ConfigurationBindingPhase::Provider ||
+          !llvm::is_contained(parameter->getCandidates().asArrayRef(), row[column]))
+        return kernel.emitError("complete tuning row has no declared provider binding for ") << name;
+      bindings.set(name, builder.getI64IntegerAttr(row[column]));
     }
-  }
-  if (!facts.indirectRowGroups.empty()) {
-    auto indirectProfiles = readProfiles(kernel, "indirect_row", tables);
-    if (failed(indirectProfiles))
-      return failure();
-    for (const TuningProfile &indirectRowProfile : *indirectProfiles) {
-      appendTuple([&](ParameterAttr parameter) -> const TuningProfile & {
-        ParameterAttr schema = parameter;
-        const auto &profiles = parameterProfiles.find(parameter)->second;
-        bool indirectContraction =
-            schema.getCategory() ==
-                ParameterCategory::Contraction &&
-            llvm::is_contained(facts.indirectRowGroups,
-                               parameter.getBinding().getGroup());
-        return indirectContraction ? indirectRowProfile : profiles.front();
-      });
-    }
+    consume(bindings, profile);
   }
   return success();
 }
 
-} // namespace configuration
-} // namespace intent::gpu
+} // namespace intent::gpu::configuration

@@ -5,6 +5,8 @@
 #include "Intent/Conversion/KIRToGPU/KIRToGPU.h"
 #include "Intent/Dialect/CPU/IR/CPUDialect.h"
 #include "Intent/Dialect/GPU/IR/GPUDialect.h"
+#include "Intent/Dialect/GPU/IR/Program.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/TuningProfiles.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -75,10 +77,17 @@ public:
       module.emitError("GPU profile resolution requires a resource directory");
       return signalPassFailure();
     }
-    auto sources = gpuProfileSources(directory.getValue());
+    auto sources = gpuProfileSources(directory.getValue(), provider.getValue());
+    if (sources.size() != 1) {
+      module.emitError("GPU profiles require an available selected provider");
+      return signalPassFailure();
+    }
     auto profiles = gpu::TuningProfiles::read(module.getLoc(), sources, overrides);
     if (failed(profiles)) return signalPassFailure();
     profiles->attach(module);
+    auto kernel = gpu::getPhysicalKernel(module);
+    if (failed(kernel) || failed(profiles->declareProviderParameters(*kernel, sources.front().schema)))
+      signalPassFailure();
   }
 };
 

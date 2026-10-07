@@ -25,28 +25,16 @@ struct ParameterClassification {
   TuningClass kind;
   unsigned width;
   bool reductionRow;
-  bool pointwiseTraversal;
 };
 
 struct CorrelatedProfileParameters {
   ParameterAttr pointwise, reduction, contraction;
 };
 
-struct ReductionProfileParameters {
-  ParameterAttr chunk;
-  llvm::SmallVector<ParameterAttr> rows;
-};
-
 struct ContractionFreeExtent {
   llvm::SmallVector<PhysicalExprAttr> extents;
   llvm::SmallVector<ParameterAttr> parameters;
-  llvm::SmallVector<ParameterAttr> profileParameters;
   ParameterRole role;
-};
-
-struct FullResultContraction {
-  ParameterAttr parameter;
-  PhysicalExprAttr otherExtent;
 };
 
 // Recomputed for one unchanged current program. These facts select profile
@@ -57,27 +45,21 @@ struct ConfigurationFacts {
   bool hasTwoAxisPointwiseOwnership = false;
   bool hasFixedPointwiseLocal = false;
   bool pointwiseOnlyProgram = true;
-  bool hasContraction = false;
   bool smallRegionRows = false;
   bool multipleRegionMatrixAccumulators = false;
   llvm::DenseMap<ParameterAttr, int64_t> pointwiseLocalMultiplicity;
   llvm::SmallVector<ParameterAttr> pointwiseRowAxes;
   llvm::MapVector<unsigned, llvm::SmallVector<ParameterAttr>> rowGroups;
   llvm::SmallVector<CorrelatedProfileParameters> correlatedProfiles;
-  llvm::SmallVector<ReductionProfileParameters> reductionProfiles;
-  llvm::SmallVector<mlir::Attribute> indirectRowGroups;
   llvm::SmallVector<ContractionFreeExtent> freeExtents;
-  llvm::SmallVector<FullResultContraction> fullResultContractions;
 };
 
 ConfigurationFacts analyzeConfigurationPolicy(
     mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources);
 
-using ProfileLookup =
-    llvm::function_ref<const TuningProfile &(ParameterAttr)>;
 using ProfileBindingConsumer =
-    llvm::function_ref<void(mlir::NamedAttrList &, ProfileLookup, bool)>;
+    llvm::function_ref<void(mlir::NamedAttrList &, const TuningProfile &)>;
 mlir::LogicalResult projectConfigurationProfiles(
     mlir::func::FuncOp kernel, const ConfigurationFacts &facts,
     const TuningProfiles &tables, ProfileBindingConsumer consume);
@@ -86,18 +68,11 @@ int64_t selectCandidate(llvm::ArrayRef<int64_t> candidates, int64_t requested);
 
 void bindContractionFreeExtents(
     llvm::ArrayRef<ContractionFreeExtent> groups, mlir::NamedAttrList &bindings,
-    ProfileLookup profileFor, mlir::Builder &builder, bool splitInnerAxis);
+    const TuningProfile &profile, mlir::Builder &builder);
 mlir::LogicalResult bindTraversalFragmentFootprints(
     mlir::func::FuncOp kernel, llvm::ArrayRef<ParameterAttr> parameters,
     const FragmentResourceAnalysis &resources,
     mlir::NamedAttrList &bindings, mlir::Builder &builder);
-void appendFullResultContractionTuples(
-    mlir::func::FuncOp kernel,
-    llvm::ArrayRef<FullResultContraction> contractions,
-    const mlir::NamedAttrList &bindings, llvm::ArrayRef<ParameterAttr> parameters,
-    const FragmentResourceAnalysis &resources, ProfileLookup profileFor,
-    mlir::Builder &builder,
-    llvm::function_ref<void(mlir::DictionaryAttr)> append);
 
 } // namespace intent::gpu::configuration
 

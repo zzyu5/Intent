@@ -517,10 +517,10 @@ LogicalResult TuningProfileTableAttr::verify(
     for (Attribute attribute : rows) {
       auto row = mlir::dyn_cast<DenseI64ArrayAttr>(attribute);
       if (!row || row.size() != columns.size() ||
-          llvm::any_of(row.asArrayRef(), [](int64_t value) { return value <= 0; }))
+          llvm::any_of(row.asArrayRef(), [](int64_t value) { return value < 0; }))
         return emitError() << "tuning family '" << family.getName()
                            << "' requires " << columns.size()
-                           << " positive integers per row";
+                           << " nonnegative integers per row";
       if (!unique.insert(row).second)
         return emitError() << "tuning family contains duplicate rows";
     }

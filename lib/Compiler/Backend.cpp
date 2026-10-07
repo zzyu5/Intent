@@ -39,8 +39,7 @@ SmallVector<std::string> Backend::profilePaths(StringRef directory) const {
   if (!available)
     return result;
   if (std::holds_alternative<GPUBackend>(model)) {
-    // The shared preparation pass resolves the complete GPU profile namespace.
-    for (const auto &source : gpuProfileSources(directory))
+    for (const auto &source : gpuProfileSources(directory, name))
       result.push_back(source.filename);
   } else if (const auto *cpu = std::get_if<CPUBackend>(&model)) {
     llvm::SmallString<256> path(directory);
@@ -64,16 +63,16 @@ LogicalResult Backend::verifySharedInput(ModuleOp module, const Request &request
   }, model);
 }
 
-SmallVector<gpu::TuningProfileSource> gpuProfileSources(StringRef directory) {
+SmallVector<gpu::TuningProfileSource> gpuProfileSources(StringRef directory,
+                                                     StringRef provider) {
   SmallVector<gpu::TuningProfileSource> sources;
   auto append = [&](gpu::TuningProfileSchema schema, StringRef resource) {
     llvm::SmallString<256> filename(directory);
     llvm::sys::path::append(filename, resource);
     sources.push_back({schema, std::string(filename)});
   };
-  append(gpu::sharedTuningProfileSchema(), "shared.json");
   for (const Backend &adapter : backends())
-    if (adapter.available)
+    if (adapter.available && adapter.name == provider)
       if (const auto *model = std::get_if<GPUBackend>(&adapter.model))
         append(model->profiles, model->profileFilename);
   return sources;

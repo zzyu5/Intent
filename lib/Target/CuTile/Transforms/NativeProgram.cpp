@@ -12,8 +12,6 @@
 using namespace mlir;
 namespace intent::cutile {
 LogicalResult formNativeProgram(ModuleOp module) {
-  auto profiles = gpu::TuningProfiles::from(module);
-  if (failed(profiles)) return failure();
   auto physicalKernel = gpu::getPhysicalKernel(module);
   if (failed(physicalKernel)) return failure();
   func::FuncOp kernel = *physicalKernel;
@@ -35,7 +33,7 @@ LogicalResult formNativeProgram(ModuleOp module) {
     else if (auto op = dyn_cast<gpu::AssumeInBoundsOp>(operation)) assumptions.push_back(op);
   });
   NativeFormRewriter rewriter;
-  if (failed(formNativeAccesses(kernel, *profiles, accesses, features.matrixCompute,
+  if (failed(formNativeAccesses(kernel, accesses, features.matrixCompute,
                                 rewriter)) ||
       failed(formComputePrimitives(kernel, computations, rewriter)))
     return failure();

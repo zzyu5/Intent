@@ -7,130 +7,125 @@
 #include "Intent/Target/CuTile/Analysis/Program.h"
 #include "Intent/Target/CuTile/IR/CuTileOps.h"
 #include "Intent/Target/CuTile/Transforms/Configuration/TuningProfiles.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "llvm/ADT/MapVector.h"
+#include "mlir/IR/AttrTypeSubElements.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 namespace intent::cutile {
 const gpu::TuningProfileSchema &tuningProfileSchema() {
-  static const StringRef columns[] = {"value"};
-  static const gpu::TuningProfileSchema schema{"cutile", columns};
+  static const StringRef columns[] = {
+      "ownership_m", "ownership_n", "reduction", "reduction_outer", "scan",
+      "traversal_workers", "traversal_group", ctasParameter,
+      workerWarpsParameter, occupancyParameter, accessFormParameter,
+      loadPolicyParameter};
+  static const gpu::ProviderOption options[] = {
+      {ctasParameter, gpu::ParameterRole::ProviderCTAs},
+      {workerWarpsParameter, gpu::ParameterRole::ProviderWarps},
+      {occupancyParameter, gpu::ParameterRole::ProviderOccupancy},
+      {accessFormParameter, gpu::ParameterRole::ProviderAccessForm},
+      {loadPolicyParameter, gpu::ParameterRole::ProviderLoadPolicy}};
+  static const gpu::TuningProfileSchema schema{"cutile", columns, options};
   return schema;
 }
 
 FailureOr<gpu::ParameterRefAttr> declareProviderParameter(
-    func::FuncOp kernel, const gpu::TuningProfiles &profiles, StringRef family,
-    StringRef name, gpu::ParameterRole role, bool (*isLegal)(int64_t)) {
-  auto rows = profiles.get(tuningProfileSchema(), family, kernel.getLoc());
-  if (failed(rows))
-    return failure();
-  SmallVector<int64_t> candidates;
-  for (const auto &row : *rows)
-    if (isLegal(row.front()))
-      candidates.push_back(row.front());
-  if (candidates.empty())
-    return kernel.emitError("cuTile tuning profile has no legal hints for ") << name;
-  return gpu::getOrCreatePhysicalParameter(
-      kernel, name, role, gpu::ParameterCategory::Provider, 0, candidates);
+    func::FuncOp kernel, StringRef name, gpu::ParameterRole role,
+    bool (*isLegal)(int64_t)) {
+  auto declaration = gpu::lookupParameter(kernel, StringAttr::get(kernel.getContext(), name));
+  if (!declaration || !declaration.isExtent() || declaration.getRole() != role ||
+      declaration.getPhase() != gpu::ConfigurationBindingPhase::Provider ||
+      declaration.getCategory() != gpu::ParameterCategory::Provider ||
+      declaration.getCandidates().asArrayRef().empty() ||
+      !llvm::all_of(declaration.getCandidates().asArrayRef(), isLegal))
+    return kernel.emitError("cuTile complete profiles require a legal provider declaration for ") << name;
+  return declaration.getReference();
 }
 
 namespace {
 
-bool containsFragment(Type type) {
-  if (isa<gpu::FragmentType>(type))
-    return true;
-  auto record = dyn_cast<gpu::RecordType>(type);
-  return record && llvm::any_of(record.getFieldTypes(), [](Attribute field) {
-           return containsFragment(cast<TypeAttr>(field).getValue());
-         });
-}
-
-bool hasLoopCarriedFragment(func::FuncOp kernel) {
-  bool found = false;
-  kernel.walk([&](scf::ForOp loop) {
-    found |= llvm::any_of(loop.getInitArgs(), [](Value value) {
-      return containsFragment(value.getType());
-    });
-  });
-  kernel.walk([&](scf::WhileOp loop) {
-    found |= llvm::any_of(loop.getInits(), [](Value value) {
-      return containsFragment(value.getType());
-    });
-  });
-  return found;
-}
-
-StringRef occupancyProfileFamily(func::FuncOp kernel,
-                                  gpu::CapabilitiesAttr capabilities) {
-  for (Attribute attribute : gpu::getParameterDeclarations(kernel))
-    if (cast<gpu::ParameterAttr>(attribute).getRole() ==
-        gpu::ParameterRole::ResidentWorkers)
-      return "occupancy_persistent";
-  if (hasLoopCarriedFragment(kernel))
-    return "occupancy_loop";
-  return capabilities.getComputeCapabilityMajor() < 9
-             ? "occupancy_legacy" : "occupancy_modern";
-}
-
-SmallVector<SmallVector<NamedAttribute>>
-launchConfigurations(const gpu::ParameterSpace &space, Builder &builder) {
-  SmallVector<NamedAttribute> launchBaseline;
-  SmallVector<NamedAttribute> launchEndpoint;
-  SmallVector<gpu::ParameterAttr> launchOptions;
-  for (gpu::ParameterAttr definition : space.declarations()) {
-    if (definition.getPhase() != gpu::ConfigurationBindingPhase::Provider)
-      continue;
-    if (definition.getRole() == gpu::ParameterRole::ProviderAccessForm ||
-        definition.getRole() == gpu::ParameterRole::ProviderLoadPolicy)
-      continue;
-    auto candidates = definition.getCandidates().asArrayRef();
-    launchOptions.push_back(definition);
-    launchBaseline.push_back(builder.getNamedAttr(
-        definition.getName(), builder.getI64IntegerAttr(candidates.front())));
-    launchEndpoint.push_back(builder.getNamedAttr(
-        definition.getName(), builder.getI64IntegerAttr(candidates.back())));
+bool legalProviderValue(gpu::ParameterRole role, int64_t value) {
+  switch (role) {
+  case gpu::ParameterRole::ProviderCTAs: return isLegalCTAs(value);
+  case gpu::ParameterRole::ProviderWarps: return isLegalWorkerWarps(value);
+  case gpu::ParameterRole::ProviderOccupancy: return isLegalOccupancy(value);
+  case gpu::ParameterRole::ProviderAccessForm: return isLegalAccessForm(value);
+  case gpu::ParameterRole::ProviderLoadPolicy: return isLegalLoadPolicy(value);
+  default: return false;
   }
+}
 
-  // Launch hints are correlated candidates, not another Cartesian search over
-  // every shared tile. Retain each declared value and the joint endpoint,
-  // including the lower compiler's inferred worker count.
-  SmallVector<SmallVector<NamedAttribute>> configurations{launchBaseline};
-  for (gpu::ParameterAttr definition : launchOptions) {
-    for (int64_t candidate : definition.getCandidates().asArrayRef().drop_front()) {
-      auto bindings = launchBaseline;
-      for (NamedAttribute &binding : bindings)
-        if (binding.getName() == definition.getName())
-          binding = builder.getNamedAttr(
-              definition.getName(), builder.getI64IntegerAttr(candidate));
-      configurations.push_back(std::move(bindings));
+LogicalResult filterProviderConfigurations(func::FuncOp kernel) {
+  auto space = gpu::ParameterSpace::read(kernel);
+  if (failed(space)) return failure();
+  auto rows = space->configurations(gpu::ConfigurationStage::Shared);
+  if (failed(rows)) return failure();
+  SmallVector<DictionaryAttr> accepted;
+  for (DictionaryAttr row : *rows) {
+    bool legal = true;
+    for (gpu::ParameterAttr declaration : space->declarations()) {
+      if (declaration.getPhase() != gpu::ConfigurationBindingPhase::Provider) continue;
+      auto value = row.getAs<IntegerAttr>(declaration.getName());
+      legal &= value && legalProviderValue(declaration.getRole(), value.getInt());
     }
+    if (legal) accepted.push_back(row);
   }
-  if (!llvm::is_contained(configurations, launchEndpoint))
-    configurations.push_back(std::move(launchEndpoint));
-  return configurations;
+  if (accepted.empty())
+    return kernel.emitError("cuTile complete profiles contain no legal provider configuration");
+  for (gpu::ParameterAttr declaration : space->declarations()) {
+    if (declaration.getPhase() != gpu::ConfigurationBindingPhase::Provider) continue;
+    SmallVector<int64_t> candidates;
+    for (DictionaryAttr row : accepted) {
+      int64_t value = row.getAs<IntegerAttr>(declaration.getName()).getInt();
+      if (!llvm::is_contained(candidates, value)) candidates.push_back(value);
+    }
+    if (failed(gpu::updateParameter(kernel, declaration.withCandidates(
+            DenseI64ArrayAttr::get(kernel.getContext(), candidates)))))
+      return failure();
+  }
+  return gpu::writeConfigurations(kernel, accepted, gpu::ConfigurationStage::Shared);
+}
+
+llvm::DenseSet<gpu::ParameterRefAttr> programParameterReferences(func::FuncOp kernel) {
+  llvm::DenseSet<gpu::ParameterRefAttr> references;
+  AttrTypeWalker walker;
+  walker.addWalk([&](gpu::ParameterRefAttr reference) { references.insert(reference); });
+  kernel.walk([&](Operation *operation) {
+    if (auto parameter = dyn_cast<gpu::ParameterOp>(operation);
+        parameter && parameter.getResult().use_empty()) return;
+    for (NamedAttribute attribute : operation->getAttrs()) {
+      if (operation == kernel.getOperation() &&
+          (attribute.getName() == gpu::parametersAttr ||
+           attribute.getName() == gpu::configurationsAttr)) continue;
+      walker.walk(attribute.getValue());
+    }
+    for (Type type : operation->getResultTypes()) walker.walk(type);
+    for (Region &region : operation->getRegions())
+      for (Block &block : region)
+        for (BlockArgument argument : block.getArguments()) walker.walk(argument.getType());
+  });
+  return references;
 }
 
 } // namespace
 
-LogicalResult prepareLaunchConfigurations(
-    func::FuncOp kernel, const gpu::TuningProfiles &profiles) {
+LogicalResult prepareLaunchConfigurations(func::FuncOp kernel) {
+  if (failed(filterProviderConfigurations(kernel))) return failure();
   NativeProgramFeatures features = queryNativeProgramFeatures(kernel);
   auto capabilities =
       kernel->getAttrOfType<gpu::CapabilitiesAttr>(gpu::capabilitiesAttr);
   if (features.occupancySensitive &&
       failed(declareProviderParameter(
-          kernel, profiles, occupancyProfileFamily(kernel, capabilities),
-          occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
+          kernel, occupancyParameter, gpu::ParameterRole::ProviderOccupancy,
           isLegalOccupancy)))
     return failure();
   if (features.matrixCompute &&
       failed(declareProviderParameter(
-          kernel, profiles, "ctas", ctasParameter,
+          kernel, ctasParameter,
           gpu::ParameterRole::ProviderCTAs, isLegalCTAs)))
     return failure();
   if (features.occupancySensitive &&
       failed(declareProviderParameter(
-          kernel, profiles, "worker_warps", workerWarpsParameter,
+          kernel, workerWarpsParameter,
           gpu::ParameterRole::ProviderWarps, isLegalWorkerWarps)))
     return failure();
 
@@ -141,14 +136,17 @@ LogicalResult prepareLaunchConfigurations(
   auto resident = space->find(gpu::ParameterRole::ResidentWorkers);
   auto ctas = space->find(gpu::ParameterRole::ProviderCTAs);
   auto occupancy = space->find(gpu::ParameterRole::ProviderOccupancy);
-  if (!resident || !ctas || !occupancy) return success();
+  if (!resident) return success();
+  if (!ctas || !occupancy)
+    return kernel.emitError("cuTile resident binding requires CTA and occupancy columns");
   if (!capabilities || capabilities.getComputeUnits() <= 0)
     return kernel.emitError("cuTile resident binding requires a positive compute-unit count");
 
   Builder builder(kernel.getContext());
   SmallVector<int64_t> counts;
-  for (const auto &configuration : launchConfigurations(*space, builder)) {
-    NamedAttrList bindings(configuration);
+  SmallVector<DictionaryAttr> projected;
+  for (DictionaryAttr row : *shared) {
+    NamedAttrList bindings(row);
     int64_t cluster = cast<IntegerAttr>(bindings.get(ctas.getName())).getInt();
     int64_t capacity = cast<IntegerAttr>(bindings.get(occupancy.getName())).getInt();
     if (!isLegalCTAs(cluster) || !isLegalOccupancy(capacity))
@@ -157,19 +155,13 @@ LogicalResult prepareLaunchConfigurations(
     if (llvm::MulOverflow(capabilities.getComputeUnits() / cluster, capacity, count) || count <= 0)
       return kernel.emitError("cuTile resident capacity is not a positive representable count");
     if (!llvm::is_contained(counts, count)) counts.push_back(count);
+    bindings.set(resident.getName(), builder.getI64IntegerAttr(count));
+    auto bound = bindings.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(projected, bound)) projected.push_back(bound);
   }
   llvm::sort(counts);
-  SmallVector<DictionaryAttr> projected;
-  for (DictionaryAttr tuple : *shared)
-    for (int64_t count : counts) {
-      NamedAttrList bindings(tuple);
-      bindings.set(resident.getName(), builder.getI64IntegerAttr(count));
-      auto row = bindings.getDictionary(kernel.getContext());
-      if (!llvm::is_contained(projected, row)) projected.push_back(row);
-    }
-  // Publish the actual shared binding domain before any allocation envelope is
-  // formed. The complete rows later restore launch correlation through the
-  // resident/CTA/occupancy requirement; they never rebind this value.
+  // Allocation envelopes consume the same correlated resident binding as the
+  // eventual launch, before native access formation can create workspaces.
   if (failed(gpu::updateParameter(kernel, resident.withCandidates(
           DenseI64ArrayAttr::get(kernel.getContext(), counts)))))
     return failure();
@@ -189,66 +181,39 @@ LogicalResult materializeClosedConfigs(func::FuncOp kernel) {
   auto shared = space->configurations(gpu::ConfigurationStage::Shared);
   if (failed(shared))
     return failure();
-  Builder builder(kernel.getContext());
-  auto resident = space->find(gpu::ParameterRole::ResidentWorkers);
-  if (!space->find(gpu::ParameterRole::ProviderCTAs) ||
-      !space->find(gpu::ParameterRole::ProviderOccupancy))
-    resident = {};
-  llvm::MapVector<DictionaryAttr, SmallVector<DictionaryAttr>> sharedGroups;
-  for (DictionaryAttr tuple : *shared) {
-    NamedAttrList identity(tuple);
-    if (resident) identity.erase(resident.getName());
-    sharedGroups[identity.getDictionary(kernel.getContext())].push_back(tuple);
-  }
-  auto launches = launchConfigurations(*space, builder);
-  auto accessForm = space->find(gpu::ParameterRole::ProviderAccessForm);
-  auto loadPolicy = space->find(gpu::ParameterRole::ProviderLoadPolicy);
-
-  SmallVector<SmallVector<NamedAttribute>> memoryConfigurations(1);
-  for (gpu::ParameterAttr definition : {loadPolicy, accessForm}) {
-    if (!definition)
-      continue;
-    auto forms = definition.getCandidates().asArrayRef();
-    SmallVector<SmallVector<NamedAttribute>> expanded;
-    for (const auto &base : memoryConfigurations)
-      for (int64_t form : forms) {
-        auto configuration = base;
-        configuration.push_back(builder.getNamedAttr(
-            definition.getName(), builder.getI64IntegerAttr(form)));
-        expanded.push_back(std::move(configuration));
-      }
-    memoryConfigurations = std::move(expanded);
-  }
-
-  SmallVector<SmallVector<NamedAttribute>> providerConfigurations;
-  for (const auto &memory : memoryConfigurations) {
-    ArrayRef<SmallVector<NamedAttribute>> selectedLaunches(launches);
-    // Every access form retains the correlated launch portfolio. An additional
-    // legal form must not remove launch choices from an existing primitive.
-    // Nonbaseline load policies still vary only at the launch baseline.
-    if (loadPolicy &&
-        cast<IntegerAttr>(NamedAttrList(memory).get(loadPolicy.getName())).getInt() !=
-            loadPolicy.getCandidates().asArrayRef().front())
-      selectedLaunches = selectedLaunches.take_front();
-    for (const auto &launch : selectedLaunches) {
-      auto configuration = launch;
-      configuration.append(memory);
-      providerConfigurations.push_back(std::move(configuration));
+  auto features = queryNativeProgramFeatures(kernel);
+  auto references = programParameterReferences(kernel);
+  SmallVector<Attribute> declarations;
+  SmallVector<StringAttr> removed;
+  for (gpu::ParameterAttr declaration : space->declarations()) {
+    bool used = true;
+    switch (declaration.getRole()) {
+    case gpu::ParameterRole::ProviderCTAs: used = features.matrixCompute; break;
+    case gpu::ParameterRole::ProviderWarps:
+    case gpu::ParameterRole::ProviderOccupancy: used = features.occupancySensitive; break;
+    case gpu::ParameterRole::ProviderAccessForm:
+    case gpu::ParameterRole::ProviderLoadPolicy:
+      used = references.contains(declaration.getReference()); break;
+    default: break;
     }
+    if (used || references.contains(declaration.getReference())) declarations.push_back(declaration);
+    else removed.push_back(declaration.getName());
   }
-  // Group only the resident alternatives introduced by preparation. Keep the
-  // original shared-tuple/launch order after the equality requirement selects
-  // the matching resident alternative below.
+  SmallVector<gpu::ParameterOp> deadReads;
+  kernel.walk([&](gpu::ParameterOp parameter) {
+    if (parameter.getResult().use_empty() &&
+        llvm::is_contained(removed, parameter.getDeclaration().getName()))
+      deadReads.push_back(parameter);
+  });
+  for (auto read : deadReads) read.erase();
+  kernel->setAttr(gpu::parametersAttr, ArrayAttr::get(kernel.getContext(), declarations));
   SmallVector<DictionaryAttr> encoded;
-  for (const auto &group : sharedGroups)
-    for (const auto &provider : providerConfigurations) {
-      for (DictionaryAttr base : group.second) {
-        NamedAttrList bindings(base);
-        bindings.append(provider);
-        DictionaryAttr candidate = bindings.getDictionary(kernel.getContext());
-        if (!llvm::is_contained(encoded, candidate)) encoded.push_back(candidate);
-      }
-    }
+  for (DictionaryAttr row : *shared) {
+    NamedAttrList bindings(row);
+    for (StringAttr name : removed) bindings.erase(name);
+    auto candidate = bindings.getDictionary(kernel.getContext());
+    if (!llvm::is_contained(encoded, candidate)) encoded.push_back(candidate);
+  }
   if (encoded.empty())
     return kernel.emitError("cuTile legalization produced no provider config");
   auto requirements = collectConfigurationRequirements(kernel);

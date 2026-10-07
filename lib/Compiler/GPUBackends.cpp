@@ -53,15 +53,16 @@ void GPUBackend::buildConstruction(OpPassManager &manager, const Request &reques
   manager.addPass(createConstructGPU(options));
 }
 
-void GPUBackend::buildShared(OpPassManager &manager, const Request &request, StringRef) const {
+void GPUBackend::buildShared(OpPassManager &manager, const Request &request, StringRef provider) const {
   ResolveGPUProfilesOptions options;
   options.directory = request.profileDirectory;
   options.overrides = request.tuningConfig;
+  options.provider = provider.str();
   manager.addPass(createResolveGPUProfiles(options));
   gpu::buildSharedGPUPipeline(manager);
 }
 
-LogicalResult GPUBackend::verifySharedInput(ModuleOp module, const Request &request, StringRef) const {
+LogicalResult GPUBackend::verifySharedInput(ModuleOp module, const Request &request, StringRef provider) const {
   if (failed(gpu::verifyGPUProgram(module))) return failure();
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel) || failed(gpu::verifySharedConfigTuples(*kernel))) return failure();
@@ -80,7 +81,9 @@ LogicalResult GPUBackend::verifySharedInput(ModuleOp module, const Request &requ
   auto resolved = gpu::TuningProfiles::from(module);
   if (failed(resolved)) return failure();
   auto tables = module->getAttrOfType<gpu::TuningProfilesAttr>(gpu::tuningProfilesAttr);
-  for (const auto &schema : {gpu::sharedTuningProfileSchema(), profiles}) {
+  if (tables.getSpaces().size() != 1 || !tables.getSpaces().get(provider))
+    return module.emitError("shared GPU configurations belong to a different provider");
+  for (const auto &schema : {profiles}) {
     auto table = tables.getSpaces().getAs<gpu::TuningProfileTableAttr>(schema.space);
     if (!table)
       return module.emitError("shared GPU program is missing the resolved profile namespace '")

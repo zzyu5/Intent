@@ -39,15 +39,13 @@ LogicalResult prepareTritonMemory(ModuleOp module) {
 }
 
 LogicalResult formTritonProgram(ModuleOp module) {
-  auto profiles = gpu::TuningProfiles::from(module);
-  if (failed(profiles)) return failure();
   auto kernel = gpu::getPhysicalKernel(module);
   if (failed(kernel))
     return failure();
   bool requiresCtaSynchronization = detail::hasOrderedViewDependencies(*kernel);
   kernel->walk([&](gpu::BufferOp) { requiresCtaSynchronization = true; });
   auto localOptions = declareProviderOptions(
-      *kernel, *profiles, requiresCtaSynchronization,
+      *kernel, requiresCtaSynchronization,
       detail::findLoadPipelineLoops(*kernel));
   if (failed(localOptions) || failed(gpu::verifyGPUProgram(module)) ||
       failed(gpu::lowerWorkspaceAllocations(module)))
@@ -62,7 +60,7 @@ LogicalResult formTritonProgram(ModuleOp module) {
     return failure();
   if (failed(detail::orientPointerLoads(*kernel)))
     return failure();
-  if (failed(materializeLegalConfigs(*kernel, *descriptors, *localOptions)))
+  if (failed(materializeLegalConfigs(*kernel, *descriptors)))
     return failure();
   detail::selectContractForms(*kernel);
   // Native extensions now belong to the current program; the shared surface

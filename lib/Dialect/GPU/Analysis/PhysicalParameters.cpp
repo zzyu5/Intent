@@ -62,8 +62,7 @@ LogicalResult ParameterSpace::verifyBindings(DictionaryAttr bindings,
   unsigned expected = 0;
   for (ParameterAttr parameter : parameters) {
     auto phase = parameter.getPhase();
-    if (phase == ConfigurationBindingPhase::Deferred ||
-        (stage == ConfigurationStage::Shared && phase == ConfigurationBindingPhase::Provider))
+    if (phase == ConfigurationBindingPhase::Deferred)
       continue;
     ++expected;
     auto value = bindings.getAs<IntegerAttr>(parameter.getName());

@@ -4,9 +4,7 @@ add_llvm_executable(intent-compile
 
 llvm_update_compile_flags(intent-compile)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/profiles")
-configure_file("${PROJECT_SOURCE_DIR}/lib/Dialect/GPU/Transforms/Configuration/TuningProfiles.json"
-               "${CMAKE_CURRENT_BINARY_DIR}/profiles/shared.json" COPYONLY)
-set(intent_profile_files "${CMAKE_CURRENT_BINARY_DIR}/profiles/shared.json")
+set(intent_profile_files)
 foreach(provider Triton CuTile Mojo Weft)
   string(TOLOWER "${provider}" provider_name)
   set(profile_directory "${PROJECT_SOURCE_DIR}/lib/Target/${provider}/Transforms")
