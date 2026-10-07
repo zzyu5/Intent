@@ -3,6 +3,7 @@
 
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include <optional>
@@ -28,6 +29,39 @@ mlir::LogicalResult verifyConfigurationRequirements(
 
 PhysicalExprAttr fragmentElementCount(FragmentType fragment);
 PhysicalExprAttr fragmentRegisterFootprint(FragmentType fragment);
+
+// Nominal 32-bit payload words, preserving physical shape expressions. Each
+// type is a distinct payload; records include all their fields. Unknown types
+// or an empty type list return an empty attribute. Views/buffers themselves do
+// not own SSA payloads.
+PhysicalExprAttr nominalPayloadWords(mlir::TypeRange types);
+
+// Compact an equivalent maximum of nominal stages. Additive payload terms keep
+// their multiplicities; only proven nonnegative terms permit subset dominance.
+// Unknown terms retain their original stage (apart from structural duplicates).
+PhysicalExprAttr maximumNominalWorkingSet(
+    mlir::func::FuncOp kernel, llvm::ArrayRef<PhysicalExprAttr> stages);
+
+// Current SSA payloads live at this operation, including values retained by
+// parent regions. Shape views share their underlying payload. Additional values
+// are retained at this point and must already be available here. This is a cost
+// estimate, not a native allocation or semantic legality guarantee.
+PhysicalExprAttr nominalLivePayloadWords(mlir::Operation *point,
+                                        mlir::ValueRange additional = {});
+
+// Maximum over the current loop's execution stages. Nonempty replacementCarries
+// must have one type per iter_arg; those replacement payloads span the loop.
+// Ignored operations' result payloads are omitted, but their operands' old live
+// ranges can conservatively remain. Additional payload types are simultaneously
+// retained throughout the loop (e.g. newly lifted helper results). Unknown facts
+// return an empty attribute. retainedUntilYield extends existing values' live
+// ranges from their actual definitions to the loop yield, without counting them
+// twice where they were already live. Discard after IR/type changes.
+PhysicalExprAttr nominalLoopWorkingSet(
+    mlir::scf::ForOp loop, mlir::TypeRange replacementCarries = {},
+    llvm::ArrayRef<mlir::Operation *> ignored = {},
+    mlir::TypeRange additionalPayloads = {},
+    mlir::ValueRange retainedUntilYield = {});
 
 enum class FragmentFootprintScope { PhysicalShape, FullScalarSeedCapacity };
 

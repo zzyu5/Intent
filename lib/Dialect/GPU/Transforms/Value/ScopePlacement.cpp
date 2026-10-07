@@ -2,9 +2,11 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/ConfigurationExpressions.h"
 #include "Intent/Dialect/GPU/Analysis/MemoryEffects.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/ResourceAlias.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/IR/AccessOpInterface.h"
 #include "Intent/Dialect/GPU/IR/GPUOps.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
@@ -41,54 +43,6 @@ bool shapeOnly(Operation *operation) {
              MakeRecordOp, ExtractOp, arith::ConstantOp>(operation);
 }
 
-std::optional<int64_t> retainedWords(Type type, func::FuncOp kernel) {
-  if (auto record = dyn_cast<RecordType>(type)) {
-    int64_t total = 0;
-    for (Attribute field : record.getFieldTypes()) {
-      auto words = retainedWords(cast<TypeAttr>(field).getValue(), kernel);
-      if (!words || *words > INT64_MAX - total) return std::nullopt;
-      total += *words;
-    }
-    return total;
-  }
-  if (isa<ViewType, BufferType>(type)) return 0;
-  auto fragment = dyn_cast<FragmentType>(type);
-  Type element = fragment ? fragment.getElementType() : type;
-  if (!element.isIntOrIndexOrFloat()) return std::nullopt;
-  int64_t words = std::max(1u, ((element.isIndex() ? 64u :
-      element.getIntOrFloatBitWidth()) + 31) / 32);
-  if (!fragment) return words;
-  for (Attribute dimension : fragment.getShape()) {
-    auto bounds = queryPositiveExtentBounds(cast<PhysicalExprAttr>(dimension), kernel);
-    if (!bounds || words > INT64_MAX / bounds->second) return std::nullopt;
-    words *= bounds->second;
-  }
-  return words;
-}
-
-// Shape views share their inputs; count each materialized capture and actual
-// carry once. This is a conservative nominal working set, not native allocation.
-std::optional<int64_t> loopLiveWords(scf::ForOp loop, func::FuncOp kernel) {
-  llvm::SetVector<Value> captures;
-  getUsedValuesDefinedAbove(loop.getRegion(), captures);
-  SmallVector<Value> pending(captures.begin(), captures.end());
-  llvm::append_range(pending, loop.getRegionIterArgs());
-  llvm::DenseSet<Value> visited;
-  int64_t total = 0;
-  while (!pending.empty()) {
-    Value value = pending.pop_back_val();
-    if (!visited.insert(value).second) continue;
-    if (Operation *producer = value.getDefiningOp(); producer && shapeOnly(producer)) {
-      llvm::append_range(pending, producer->getOperands());
-      continue;
-    }
-    auto words = retainedWords(value.getType(), kernel);
-    if (!words || *words > INT64_MAX - total) return std::nullopt;
-    total += *words;
-  }
-  return total;
-}
-
 Value disjointCondition(OpBuilder &builder, Location location,
                         func::FuncOp kernel, Value first, Value second) {
   Value overlap;
@@ -115,17 +69,23 @@ LogicalResult hoistLoopInvariantValues(func::FuncOp kernel) {
   auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
   for (LoopLikeOpInterface loopLike : loops) {
     auto loop = dyn_cast<scf::ForOp>(loopLike.getOperation());
-    auto live = loop ? loopLiveWords(loop, kernel) : std::nullopt;
+    auto live = loop ? nominalLoopWorkingSet(loop) : PhysicalExprAttr();
     int64_t budget = capabilities ? capabilities.getRegistersPerUnit() : 0;
+    Builder builder(kernel.getContext());
+    auto limit = PhysicalExprAttr::get(kernel.getContext(), PhysicalExprKind::Constant,
+        budget - 1, builder.getStringAttr(""), builder.getArrayAttr({}));
+    auto fits = [&](PhysicalExprAttr words) {
+      return words && budget > 0 && configurationExpressionAtMost(kernel, words, limit);
+    };
     auto reserve = [&](TypeRange types) {
-      if (!live || budget <= 0 || *live >= budget) return false;
-      int64_t extra = 0;
-      for (Type type : types) {
-        auto words = retainedWords(type, kernel);
-        if (!words || *words >= budget - *live - extra) return false;
-        extra += *words;
-      }
-      *live += extra;
+      if (!fits(live)) return false;
+      if (types.empty()) return true;
+      auto extra = nominalPayloadWords(types);
+      if (!extra) return false;
+      auto total = PhysicalExprAttr::get(kernel.getContext(), PhysicalExprKind::Add,
+          0, builder.getStringAttr(""), builder.getArrayAttr({live, extra}));
+      if (!fits(total)) return false;
+      live = total;
       return true;
     };
     moveLoopInvariantCode(loopLike.getLoopRegions(),
@@ -141,7 +101,7 @@ LogicalResult hoistLoopInvariantValues(func::FuncOp kernel) {
            isPhysicalReplayNode(operation, PhysicalReplayScope::Coordinate, false) ||
            operation->hasTrait<OpTrait::Elementwise>()) && reserve(operation->getResultTypes());
     }, [&](Operation *operation, Region *) { loopLike.moveOutOfLoop(operation); });
-    if (!loop || !live || budget <= 0 || *live >= budget) continue;
+    if (!loop || !fits(live)) continue;
 
     SmallVector<LoadOp> loads;
     for (LoadOp load : loop.getBody()->getOps<LoadOp>()) loads.push_back(load);

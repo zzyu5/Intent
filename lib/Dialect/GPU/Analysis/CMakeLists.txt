@@ -17,6 +17,7 @@ add_mlir_library(MLIRIntentGPUAnalysis
   IndexPredicates.cpp
   IndexRelations.cpp
   IterationDependencies.cpp
+  ReductionConsumers.cpp
   TraversalPartitions.cpp
   PhysicalParameters.cpp
   ResourceAlias.cpp
