@@ -7,7 +7,7 @@
 
 namespace intent::triton::detail {
 
-mlir::LogicalResult materializeOversizedGathers(mlir::func::FuncOp kernel);
+mlir::LogicalResult materializeGatherSources(mlir::func::FuncOp kernel);
 mlir::LogicalResult legalizeLargeScalarGathers(mlir::func::FuncOp kernel);
 mlir::LogicalResult legalizeGatherCoordinates(mlir::func::FuncOp kernel);
 mlir::LogicalResult legalizeExpandingGathers(mlir::func::FuncOp kernel);

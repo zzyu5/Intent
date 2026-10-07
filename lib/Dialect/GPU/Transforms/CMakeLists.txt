@@ -77,6 +77,7 @@ add_mlir_library(MLIRIntentGPUTransforms
   Value/Relations/Worklist.cpp
 
   Storage/LowerWorkspace.cpp
+  Storage/FragmentSnapshot.cpp
   Storage/Workspace.cpp
   Storage/MaterializeRetainedValues.cpp
   Storage/PromoteBufferValues.cpp

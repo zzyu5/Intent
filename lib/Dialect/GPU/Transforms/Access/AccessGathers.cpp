@@ -217,8 +217,12 @@ FailureOr<bool> composeReshapedGather(GatherOp gather) {
 
 FailureOr<bool> composeRangeGather(GatherOp gather) {
   auto range = gather.getSource().getDefiningOp<MakeRangeOp>();
-  auto result = dyn_cast<FragmentType>(gather.getResult().getType());
-  if (!range || !result || gather.getSourceAxes() != ArrayRef<int64_t>{0} ||
+  Type result = gather.getResult().getType();
+  auto fragment = dyn_cast<FragmentType>(result);
+  if (!range || (!fragment && !result.isIndex()) ||
+      !uniformElementType(result).isIndex() ||
+      gather.getSourceAxes() != ArrayRef<int64_t>{0} ||
+      gather.getCoordinates().size() != 1 ||
       !uniformElementType(gather.getCoordinates().front().getType()).isIndex())
     return false;
   OpBuilder builder(gather);
@@ -227,8 +231,12 @@ FailureOr<bool> composeRangeGather(GatherOp gather) {
       builder, location, gather.getCoordinates().front(), result);
   if (failed(coordinate))
     return gather.emitOpError("range gather lost its result coordinate projection");
-  Value start = builder.create<SplatOp>(location, result, range.getStart());
-  Value step = builder.create<SplatOp>(location, result, range.getStep());
+  auto projectScalar = [&](Value value) -> Value {
+    return fragment ? builder.create<SplatOp>(location, fragment, value).getResult()
+                    : value;
+  };
+  Value start = projectScalar(range.getStart());
+  Value step = projectScalar(range.getStep());
   Value offset = builder.create<BinaryOp>(location, result, *coordinate, step,
                                          BinaryOperator::Multiply);
   Value value = builder.create<BinaryOp>(location, result, start, offset,

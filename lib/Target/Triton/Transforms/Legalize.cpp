@@ -28,7 +28,7 @@ LogicalResult prepareTritonMemory(ModuleOp module) {
   if (failed(kernel))
     return failure();
   detail::foldIntegerScanTails(*kernel);
-  if (failed(detail::materializeOversizedGathers(*kernel)) ||
+  if (failed(detail::materializeGatherSources(*kernel)) ||
       failed(detail::legalizeLargeScalarGathers(*kernel)) ||
       failed(detail::legalizeGatherCoordinates(*kernel)) ||
       failed(detail::legalizeExpandingGathers(*kernel)) ||
