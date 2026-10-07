@@ -75,13 +75,19 @@ def _measure(context, count, device):
         import torch
     samples = []
     with torch.cuda.device(device) if gpu else nullcontext():
+        if gpu:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            # CUDA events allocate their native handles on first record. Keep
+            # that setup outside the measured call and reuse completed events.
+            start.record()
+            end.record()
+            end.synchronize()
         for _ in range(count):
             for invocation in context.invocations:
                 invocation.reset_inputs()
             if gpu:
                 torch.cuda.synchronize(device)
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
                 start.record()
             else:
                 started = time.perf_counter()
