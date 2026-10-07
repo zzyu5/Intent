@@ -18,7 +18,8 @@ def _read_facts(source, metadata, abi):
 def _bind(program, target):
     from intent.runtime.cutile import materialize_cutile_artifact
     return materialize_cutile_artifact(
-        program.source, program.ir, program.entry_name, target.device, program._contract)
+        program.source, program.ir, program.entry_name, target.device, program._contract,
+        source_path=program.cache_directory / "kernel.source")
 
 
 def _compiler():

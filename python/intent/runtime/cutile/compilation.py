@@ -17,6 +17,8 @@ def _initialize_compiler(module_name, filename, source):
     global _compile_namespace
     linecache.cache[filename] = (len(source), None, source.splitlines(keepends=True), filename)
     _compile_namespace = {"__name__": module_name}
+    if Path(filename).is_absolute():
+        _compile_namespace["__file__"] = filename
     exec(compile(source, filename, "exec", dont_inherit=True), _compile_namespace)
 
 

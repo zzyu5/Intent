@@ -1,6 +1,7 @@
 from contextvars import copy_context
 from dataclasses import replace
 from math import isfinite
+from pathlib import Path
 
 from ..artifact import CompiledArtifact
 from ..gpu.expressions import evaluate_shape
@@ -420,6 +421,8 @@ def materialize_triton_artifact(
     entry_name: str,
     device: int,
     contract,
+    *,
+    source_path: Path | None = None,
 ) -> CompiledArtifact:
     return materialize_gpu_program(
         provider_name="triton", provider_type=TritonProgram, contract=contract,
@@ -428,4 +431,5 @@ def materialize_triton_artifact(
         entry_name=entry_name,
         device=device,
         backend_ir_collector=_collect_triton_ir,
+        source_path=source_path,
     )

@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from ..artifact import CompiledArtifact
@@ -84,7 +85,8 @@ class CuTileProgram:
         self.tile_bounds = facts.index_tile_bounds
         self.search = _search
         self.observe_tuning = None
-        self.tuning_options: dict = {}
+        # Use the SDK worker to bound each candidate's first warmup probe.
+        self.tuning_options: dict = {"single_run_timeout_sec": 30.0}
         self._winners: dict = {}
 
     def _array_values(self, values: dict) -> None:
@@ -258,10 +260,13 @@ def materialize_cutile_artifact(
     entry_name: str,
     device: int,
     contract,
+    *,
+    source_path: Path | None = None,
 ) -> CompiledArtifact:
     return materialize_gpu_program(
         provider_name="cutile", provider_type=lambda *args: CuTileProgram(*args, source=source), contract=contract,
         source=source,
+        source_path=source_path,
         module_text=module_text,
         entry_name=entry_name,
         device=device,

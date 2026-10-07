@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from ..artifact import CompiledArtifact
@@ -132,11 +133,13 @@ class GPUProgram:
 
 def materialize_gpu_program(*, provider_name: str, provider_type, source: str,
                             module_text: str, contract, entry_name: str,
-                            device: int, backend_ir_collector=None) -> CompiledArtifact:
+                            device: int, backend_ir_collector=None,
+                            source_path: Path | None = None) -> CompiledArtifact:
     if contract.provider != provider_name:
         raise ValueError(f"{provider_name} runtime cannot load {contract.provider} metadata")
     interface = contract.abi
-    namespace = load_python_source(target_name=provider_name, source=source, entry_name=entry_name)
+    namespace = load_python_source(target_name=provider_name, source=source, entry_name=entry_name,
+                                   source_path=source_path)
     provider = provider_type(interface, namespace, contract.facts, contract.metadata["target"])
     program = GPUProgram(interface, provider, device)
     artifact = CompiledArtifact(source=source, mlir=module_text, device=device,
