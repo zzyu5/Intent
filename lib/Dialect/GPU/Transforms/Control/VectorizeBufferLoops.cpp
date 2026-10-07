@@ -2,9 +2,8 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IterationDependencies.h"
 #include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
-#include "Intent/Dialect/GPU/Analysis/UniformValues.h"
-#include "Intent/Analysis/IntegerRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
@@ -15,9 +14,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
-
-#include <functional>
 
 using namespace mlir;
 
@@ -86,245 +82,34 @@ bool canVectorizeIterations(Block &block, scf::ForOp loop,
   return true;
 }
 
-bool isOutsideIterationRange(Value coordinate, scf::ForOp loop) {
-  if (!coordinate.getType().isIndex() ||
-      !loop.isDefinedOutsideOfLoop(coordinate))
-    return false;
-  if (samePhysicalScalarExpression(coordinate, loop.getUpperBound()))
-    return true;
-  if (auto index = coordinate.getDefiningOp<arith::ConstantIndexOp>()) {
-    auto lower = loop.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
-    auto upper = loop.getUpperBound().getDefiningOp<arith::ConstantIndexOp>();
-    if ((lower && index.value() < lower.value()) ||
-        (upper && index.value() >= upper.value()))
-      return true;
-  }
-  auto successor = loop.getLowerBound().getDefiningOp<BinaryOp>();
-  if (!successor || successor.getOperatorKind() != BinaryOperator::Add)
-    return false;
-  auto induction = dyn_cast<BlockArgument>(coordinate);
-  auto owner = induction
-                   ? dyn_cast<scf::ForOp>(induction.getOwner()->getParentOp())
-                   : scf::ForOp();
-  auto step = owner ? owner.getStep().getDefiningOp<arith::ConstantIndexOp>()
-                   : arith::ConstantIndexOp();
-  if (!owner || coordinate != owner.getInductionVar() || !step ||
-      step.value() != 1 || !owner->isProperAncestor(loop))
-    return false;
-  // An active unit-step induction value is strictly below its signed upper
-  // bound, so adding one is representable even at the last iteration.
-  for (auto [base, offset] :
-       {std::pair{successor.getLhs(), successor.getRhs()},
-        std::pair{successor.getRhs(), successor.getLhs()}})
-    if (base == coordinate)
-      if (auto one = offset.getDefiningOp<arith::ConstantIndexOp>())
-        if (one.value() == 1)
-          return true;
-  return false;
-}
-
-bool isUnitIterationCoordinate(Value coordinate, scf::ForOp loop) {
-  // The shared difference query describes modular arithmetic. Address slices
-  // additionally require each arithmetic step to preserve signed coordinates.
-  llvm::DenseMap<Value, IntegerDifference> differences;
-  llvm::DenseSet<Value> active;
-  std::function<IntegerDifference(Value)> difference = [&](Value value) -> IntegerDifference {
-    if (value == loop.getInductionVar())
-      return 1;
-    if (loop.isDefinedOutsideOfLoop(value))
-      return 0;
-    auto known = differences.find(value);
-    if (known != differences.end())
-      return known->second;
-    if (!value.getType().isIndex() || !active.insert(value).second)
-      return std::nullopt;
-    Operation *producer = value.getDefiningOp();
-    IntegerDifference result;
-    if (producer && !producer->getNumRegions() && isMemoryEffectFree(producer)) {
-      UniformExpression expression = describeUniformValue(value);
-      bool preservesInteger = true;
-      if (expression.kind == UniformKind::Add ||
-          expression.kind == UniformKind::Subtract ||
-          expression.kind == UniformKind::Multiply)
-        preservesInteger = integerOperationDoesNotWrap(value);
-      if (expression.kind == UniformKind::Cast)
-        preservesInteger = expression.operands.size() == 1 &&
-            isValuePreservingIntegerCast(expression.operands.front(), value.getType());
-      if (preservesInteger)
-        result = foldIntegerDifference(
-            expression, difference,
-            [](Value operand) { return IndexRelations().constant(operand); }, 64);
-    }
-    active.erase(value);
-    differences[value] = result;
-    return result;
-  };
-  return coordinate.getType().isIndex() &&
-         difference(coordinate) == IntegerDifference(1);
-}
-
-bool hasIndependentUpdates(scf::ForOp loop, func::FuncOp kernel,
-                           SmallVectorImpl<Value> &guardedViews,
-                           SmallVectorImpl<std::pair<Value, Value>> &disjointViews,
-                           llvm::DenseMap<Value, bool> &varying) {
-  struct WrittenSlice {
-    unsigned axis;
-    Value coordinate;
-  };
-  llvm::DenseMap<Value, WrittenSlice> writtenAxes;
-  bool independent = true;
-  loop.walk([&](StoreOp store) {
-    auto buffer = store.getResource().getDefiningOp<BufferOp>();
-    auto type = dyn_cast<BufferType>(store.getResource().getType());
-    auto view = dyn_cast<ViewType>(store.getResource().getType());
-    auto group = buffer ? dyn_cast<ExecutionGroupOp>(buffer->getParentOp())
-                        : ExecutionGroupOp{};
-    bool privateBuffer = group && group->getBlock() == &kernel.front() &&
-        buffer->getBlock() == &group.getBody().front() && type &&
-        type.getScope().getValue() == BufferScope::ProgramPrivate;
-    if (!privateBuffer && !view) {
-      independent = false;
-      return;
-    }
-    if (view && !llvm::is_contained(guardedViews, store.getResource()))
-      guardedViews.push_back(store.getResource());
-    std::optional<unsigned> selected;
-    Value selectedCoordinate;
-    for (auto [axis, coordinate] :
-         llvm::zip(store.getSourceAxes(), store.getCoordinates())) {
-      if (!selected && isUnitIterationCoordinate(coordinate, loop)) {
-        selected = axis;
-        selectedCoordinate = coordinate;
-      } else if (variesWithIteration(coordinate, loop, varying))
-        independent = false;
-    }
-    if (!selected) {
-      independent = false;
-      return;
-    }
-    auto [previous, inserted] = writtenAxes.try_emplace(
-        store.getResource(), WrittenSlice{*selected, selectedCoordinate});
-    // Two translated writers of the same resource must still own the same
-    // per-iteration slice; i and i+1 would introduce a loop-carried dependence.
-    independent &= inserted ||
-        (previous->second.axis == *selected &&
-         samePhysicalScalarExpression(previous->second.coordinate, selectedCoordinate));
-  });
-  if (!independent || writtenAxes.empty())
-    return false;
-
-  // Distinct external resources may alias even when each layout is injective.
-  // Guard every write/read and write/write pair using the actual launch views.
-  SmallVector<Value> accessedViews(guardedViews.begin(), guardedViews.end());
-  loop.walk([&](LoadOp load) {
-    if (isa<ViewType>(load.getResource().getType()) &&
-        !llvm::is_contained(accessedViews, load.getResource()))
-      accessedViews.push_back(load.getResource());
-  });
-  for (Value view : accessedViews) {
-    auto argument = dyn_cast<BlockArgument>(view);
-    if (!argument || argument.getOwner() != &kernel.front())
-      return false;
-  }
-  for (Value written : guardedViews)
-    for (Value other : accessedViews) {
-      if (written == other)
-        continue;
-      auto pair = std::pair{written, other};
-      if (cast<BlockArgument>(written).getArgNumber() >
-          cast<BlockArgument>(other).getArgNumber())
-        std::swap(pair.first, pair.second);
-      if (!llvm::is_contained(disjointViews, pair))
-        disjointViews.push_back(pair);
-    }
-
-  // Fresh buffers are disjoint, and external views need the layout guard below.
-  // Each iteration owns one slice. Reads must stay in that slice or outside
-  // the written range, without changing ordered arithmetic.
-  loop.walk([&](LoadOp load) {
-    auto written = writtenAxes.find(load.getResource());
-    if (written == writtenAxes.end())
-      return;
-    bool independentRead = false;
-    for (auto [axis, coordinate] :
-         llvm::zip(load.getSourceAxes(), load.getCoordinates()))
-      if (axis == written->second.axis)
-        independentRead =
-            samePhysicalScalarExpression(coordinate, written->second.coordinate) ||
-            (written->second.coordinate == loop.getInductionVar() &&
-             isOutsideIterationRange(coordinate, loop));
-    independent &= independentRead;
-  });
-  return independent;
-}
-
-bool hasProgramOwnedExternalWrites(scf::ForOp loop) {
-  auto group = loop->getParentOfType<ExecutionGroupOp>();
-  IndexRelations relations;
-  if (!group || !relations.nonnegative(loop.getLowerBound()) ||
-      !relations.nonnegative(loop.getUpperBound()))
-    return false;
-  bool writes = false;
-  for (Operation &operation : loop.getBody()->without_terminator()) {
-    if (operation.getNumRegions()) return false;
-    auto store = dyn_cast<StoreOp>(operation);
-    if (!store) {
-      if (!isMemoryEffectFree(&operation)) return false;
-      continue;
-    }
-    if (!isa<ViewType>(store.getResource().getType()) ||
-        !store.getValue().getType().isIntOrIndexOrFloat() ||
-        !llvm::all_of(store.getCoordinates(), [](Value coordinate) {
-          return coordinate.getType().isIndex();
-        }))
-      return false;
-    // Keep every non-singleton program coordinate on a distinct, invariant
-    // resource axis. The existing whole-view layout guard then separates both
-    // program instances and the unit-stride iteration slices proved below.
-    llvm::SmallDenseSet<unsigned> ownerAxes;
-    for (auto [ordinal, coordinate] : llvm::enumerate(group.getCoordinates())) {
-      if (relations.constant(group.getExtents()[ordinal]) == 1) continue;
-      std::optional<unsigned> ownerAxis;
-      for (auto [axis, value] : llvm::zip(store.getSourceAxes(), store.getCoordinates())) {
-        if (!loop.isDefinedOutsideOfLoop(value)) continue;
-        if (auto workset = value.getDefiningOp<WorksetCoordinateOp>()) {
-          if (relations.constant(workset.getStep()) != 1) continue;
-          value = workset.getCoordinate();
-        }
-        if (relations.same(value, coordinate)) {
-          ownerAxis = axis;
-          break;
-        }
-      }
-      if (!ownerAxis || !ownerAxes.insert(*ownerAxis).second) return false;
-    }
-    writes = true;
-  }
-  return writes;
-}
-
 LogicalResult vectorizeIterations(func::FuncOp kernel,
-                                 uint64_t &source, int64_t &dimension,
-                                 bool singleInstance) {
+                                 uint64_t &source, int64_t &dimension) {
   SmallVector<scf::ForOp> loops;
   // Lift the inner independent axis first. Its fragment becomes the suffix
   // when an enclosing independent loop is subsequently widened.
   kernel.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
   for (scf::ForOp loop : loops) {
-    // Read-free external stores can retain the current program's disjoint
-    // coordinate slice. Mutable-buffer inference still requires one instance.
-    if (!singleInstance && !loop->hasAttr(independentIterationAttr) &&
-        !hasProgramOwnedExternalWrites(loop))
-      continue;
-    auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+    IndexRelations relations;
+    Type inductionType = loop.getInductionVar().getType();
+    auto integer = dyn_cast<IntegerType>(inductionType);
+    bool signedI32 = integer && !integer.isUnsigned() && integer.getWidth() == 32;
     llvm::DenseMap<Value, bool> varying;
-    SmallVector<Value> guardedViews;
-    SmallVector<std::pair<Value, Value>> disjointViews;
-    if (loop.getNumResults() || !step || step.value() != 1 ||
-        !canVectorizeIterations(*loop.getBody(), loop, varying) ||
-        (!loop->hasAttr(independentIterationAttr) &&
-         !hasIndependentUpdates(loop, kernel, guardedViews, disjointViews, varying)))
+    if (loop.getNumResults() || relations.constant(loop.getStep()) != 1 ||
+        (!inductionType.isIndex() && !signedI32) ||
+        // i32 endpoints and their difference fit the new i64 traversal. For
+        // index endpoints, retain a domain where span and span-1 cannot wrap.
+        (!signedI32 && (!relations.nonnegative(loop.getLowerBound()) ||
+                       !relations.nonnegative(loop.getUpperBound()))) ||
+        !canVectorizeIterations(*loop.getBody(), loop, varying))
       continue;
+    IndependentIterationAccesses accesses;
+    if (!loop->hasAttr(independentIterationAttr)) {
+      auto independent = queryIndependentIterationAccesses(loop);
+      if (failed(independent)) continue;
+      accesses = std::move(*independent);
+    }
+    auto &guardedViews = accesses.guardedViews;
+    auto &disjointViews = accesses.disjointViews;
     uint32_t elementBitWidth = 0;
     loop.walk([&](StoreOp store) {
       Type type = store.getValue().getType();
@@ -378,10 +163,10 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     }
     auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
     int64_t maximumWidth = capabilities.getMaxThreadsPerBlock();
-    auto lower = loop.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
-    auto upper = loop.getUpperBound().getDefiningOp<arith::ConstantIndexOp>();
+    auto lower = relations.constant(loop.getLowerBound());
+    auto upper = relations.constant(loop.getUpperBound());
     if (lower && upper) {
-      __int128 length = static_cast<__int128>(upper.value()) - lower.value();
+      __int128 length = static_cast<__int128>(*upper) - *lower;
       int64_t covered = 1;
       while (covered < length && covered <= maximumWidth / 2)
         covered *= 2;
@@ -391,9 +176,9 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     for (int64_t width = 1; width <= maximumWidth;
          width *= 2)
       candidates.push_back(width);
-    bool completeChunks = lower && upper && upper.value() > lower.value() &&
+    bool completeChunks = lower && upper && *upper > *lower &&
         llvm::all_of(candidates, [&](int64_t width) {
-          return (static_cast<__int128>(upper.value()) - lower.value()) % width == 0;
+          return (static_cast<__int128>(*upper) - *lower) % width == 0;
         });
     auto name = ("ITERATION_" + Twine(source)).str();
     auto reference = getOrCreatePhysicalParameter(
@@ -422,13 +207,18 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
         shape.getAxisMaps(), shape.getValidity(), shape.getOwner());
     Location location = loop.getLoc();
     Type index = builder.getIndexType();
+    Value begin = loop.getLowerBound(), end = loop.getUpperBound();
+    if (signedI32) {
+      begin = builder.create<CastOp>(location, index, begin);
+      end = builder.create<CastOp>(location, index, end);
+    }
     Value zero = builder.create<arith::ConstantIndexOp>(location, 0);
     Value one = builder.create<arith::ConstantIndexOp>(location, 1);
     Value nonempty = builder.create<CompareOp>(
-        location, builder.getI1Type(), loop.getLowerBound(), loop.getUpperBound(),
+        location, builder.getI1Type(), begin, end,
         ComparePredicate::Lt);
     Value span = builder.create<BinaryOp>(
-        location, index, loop.getUpperBound(), loop.getLowerBound(),
+        location, index, end, begin,
         BinaryOperator::Subtract);
     Value last = builder.create<BinaryOp>(location, index, span, one,
                                          BinaryOperator::Subtract);
@@ -444,11 +234,10 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
     Value offset = builder.create<BinaryOp>(
         location, index, blocked.getInductionVar(), width.getResult(),
         BinaryOperator::Multiply);
-    Value start = builder.create<BinaryOp>(location, index, loop.getLowerBound(),
+    Value start = builder.create<BinaryOp>(location, index, begin,
                                           offset, BinaryOperator::Add);
     Value members = builder.create<MakeRangeOp>(
-        loop.getLoc(), shape, start, width.getResult(), loop.getStep(),
-        loop.getLowerBound(), loop.getUpperBound(),
+        loop.getLoc(), shape, start, width.getResult(), one, begin, end,
         ordinal.getSourceId(), 0, false);
     // Count chunks and guard lane ordinals so a padded final lane cannot wrap
     // past a large logical upper bound and accidentally become active again.
@@ -466,7 +255,13 @@ LogicalResult vectorizeIterations(func::FuncOp kernel,
                                         ComparePredicate::Lt);
     }
     IRMapping values;
-    values.map(loop.getInductionVar(), members);
+    Value induction = members;
+    if (signedI32) {
+      auto bodyShape = FragmentType::get(kernel.getContext(), inductionType,
+          shape.getShape(), shape.getAxisMaps(), shape.getValidity(), shape.getOwner());
+      induction = builder.create<CastOp>(location, bodyShape, members);
+    }
+    values.map(loop.getInductionVar(), induction);
     for (Operation &operation : loop.getBody()->without_terminator())
       if (failed(clonePredicatedScalarOperation(
               builder, &operation, values, active, shape,
@@ -538,14 +333,8 @@ static LogicalResult vectorizeBufferLoopsImpl(ModuleOp module) {
   if (failed(physical))
     return failure();
   func::FuncOp kernel = *physical;
-  auto space = kernel->getAttrOfType<ArrayAttr>(programSpaceAttr);
-  bool singleInstance = llvm::all_of(space, [](Attribute attribute) {
-        auto extent = cast<PhysicalExprAttr>(attribute);
-        return extent.getKind() == PhysicalExprKind::Constant &&
-               extent.getValue() == 1;
-      });
   auto [source, dimension] = nextPhysicalAxisIdentities(kernel);
-  if (failed(vectorizeIterations(kernel, source, dimension, singleInstance)))
+  if (failed(vectorizeIterations(kernel, source, dimension)))
     return failure();
   if (failed(assignIterationRoles(kernel))) return failure();
   eraseDeadPhysicalValues(kernel);
