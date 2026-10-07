@@ -121,28 +121,35 @@ Value physicalTailMembershipPredicate(RegionFoldOp fold, ValueRange identities,
   UniformBindings tailValues;
   for (auto [argument, plan] : llvm::zip(fold.getSummarize().front().getArguments().take_front(fold.getSources().size()), plans))
     if (plan.tailConstant) tailValues[argument] = plan.tailConstant;
-  for (Operation &operation : fold.getSummarize().front().without_terminator()) {
-    for (Value result : operation.getResults()) {
-      auto fragment = dyn_cast<FragmentType>(result.getType());
-      bool carriesSegment = fragment && llvm::any_of(
-          fragment.getShape(), [&](Attribute extent) {
-            auto expression = dyn_cast<PhysicalExprAttr>(extent);
-            return expression &&
-                   expression.getKind() == PhysicalExprKind::Parameter &&
-                   expression.getParameterReference() == segment;
-          });
-      if (!fragment || !fragment.getElementType().isInteger(1) ||
-          !carriesSegment)
-        continue;
-      bool identityOnly = true;
-      UniformBindings assumptions = tailValues;
-      assumptions[result] = uniformZero(uniformElementType(result.getType()));
-      for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
-        identityOnly &= equalUniformConstants(facts.evaluate(summary, assumptions), facts.evaluate(identity));
-      if (identityOnly)
-        candidate = result;
-    }
-  }
+  auto consider = [&](Value value) {
+    auto fragment = dyn_cast<FragmentType>(value.getType());
+    bool carriesSegment = fragment && llvm::any_of(
+        fragment.getShape(), [&](Attribute extent) {
+          auto expression = dyn_cast<PhysicalExprAttr>(extent);
+          return expression &&
+                 expression.getKind() == PhysicalExprKind::Parameter &&
+                 expression.getParameterReference() == segment;
+        });
+    if (!fragment || !fragment.getElementType().isInteger(1) ||
+        !carriesSegment)
+      return;
+    bool identityOnly = true;
+    UniformBindings assumptions = tailValues;
+    assumptions[value] = uniformZero(uniformElementType(value.getType()));
+    for (auto [summary, identity] : llvm::zip(yield.getValues(), identities))
+      identityOnly &= equalUniformConstants(facts.evaluate(summary, assumptions),
+                                           facts.evaluate(identity));
+    if (identityOnly)
+      candidate = value;
+  };
+  // A source predicate can feed several independent projections in the helper.
+  // Prove the complete summary from their shared input, not one projection.
+  for (BlockArgument argument : fold.getSummarize().front().getArguments()
+                                    .take_front(fold.getSources().size()))
+    consider(argument);
+  for (Operation &operation : fold.getSummarize().front().without_terminator())
+    for (Value result : operation.getResults())
+      consider(result);
   return candidate;
 }
 

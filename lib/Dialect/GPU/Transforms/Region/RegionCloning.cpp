@@ -442,6 +442,11 @@ FailureOr<SmallVector<Value>> inlinePureRegion(OpBuilder &builder, Region &regio
   for (BlockArgument argument : region.front().getArguments()) {
     auto projected = projectBound(argument, mapping.lookup(argument));
     if (failed(projected)) return failure();
+    if (argument == conjunctSource &&
+        !(argument == substituteSource && substituteTarget)) {
+      projected = conjoin(*projected);
+      if (failed(projected)) return failure();
+    }
     mapping.map(argument, *projected);
   }
   for (Operation &operation : region.front().without_terminator()) {
