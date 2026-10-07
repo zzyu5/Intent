@@ -21,9 +21,12 @@ mlir::FailureOr<bool> realizeFullCoverageReduce(
 mlir::LogicalResult decomposeMultiAxisReduce(
     ReduceOp reduce, mlir::func::FuncOp kernel);
 
+enum class ReductionCarryForm { Automatic, CompactSummary };
+
 mlir::LogicalResult realizeRuntimeReduce(
     ReduceOp reduce, llvm::ArrayRef<SourcePlan> sourcePlans,
-    mlir::func::FuncOp kernel, bool tileProducerFreeAxis);
+    mlir::func::FuncOp kernel, bool tileProducerFreeAxis,
+    ReductionCarryForm carryForm = ReductionCarryForm::Automatic);
 
 bool hoistNestedReduction(mlir::scf::ForOp outer, mlir::func::FuncOp kernel);
 

@@ -19,6 +19,10 @@ class IntentGPUTransformPass<string passArgument, string summaryText,
 def HoistLoopInvariants : Option<"hoistLoopInvariants", "hoist-loop-invariants",
     "bool", "true", "Run bounded invariant value and stable-read placement at this group's cleanup points">;
 
+def ReductionResidencyPreference : Option<"preferredResidentPrograms",
+    "preferred-resident-programs", "unsigned", "1",
+    "Preferred native program residency for the nominal full-tile adoption budget">;
+
 def NormalizeStructuredSourcesPass : IntentGPUTransformPass<
     "intent-gpu-normalize-structured-sources",
     "Normalize structured GPU sources", [{
@@ -53,6 +57,25 @@ def PointwiseOwnershipPass : IntentGPUTransformPass<
     consumes this ownership; this stage must not be replaced by serializer
     inference or skipped while required ownership remains unformed.
   }]>;
+
+def ReductionConsumersPass : IntentGPUTransformPass<
+    "intent-gpu-realize-reduction-consumers",
+    "Realize shared GPU summary and output traversals", [{
+    Consumes formed ownership before independent pointwise blocking. Normalizes
+    ordinary reduction chains and native tuples, then queries closed input,
+    compact summary and pointwise output groups. Uses current nominal liveness
+    to retain fitting complete tiles or form bounded input/output traversals.
+    A native adapter supplies its residency preference as a pass option. Only
+    groups whose minimum whole working set exceeds that nominal budget adopt
+    streaming; fitting native primitives and their original configuration
+    family remain intact. This is profitability policy, not native allocation.
+    Preserves source read epochs and captures. Additional output reads require
+    real control with disjoint, nonoverlapping views; the other arm retains the
+    complete original program. Collectives retain their typed callbacks and
+    identities for provider-native lowering. Owns value-relation closure.
+  }]> {
+  let options = [ReductionResidencyPreference];
+}
 
 def PointwiseBlockingPass : IntentGPUTransformPass<
     "intent-gpu-form-pointwise-blocking",
@@ -278,7 +301,9 @@ def RealizeSharedProgramPass : IntentGPUTransformPass<
     traversal fusion follow separately. For custom composition use the same
     registered groups with their stated preconditions and optional switches,
     rather than treating arbitrary pass permutations as supported.
-  }]>;
+  }]> {
+  let options = [ReductionResidencyPreference];
+}
 
 def MaterializeConfigurationsPass : IntentGPUTransformPass<
     "intent-gpu-materialize-configurations",

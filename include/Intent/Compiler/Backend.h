@@ -18,6 +18,8 @@ struct GPUBackend {
   bool nativeTupleReductions;
   bool nativeTupleReductionRequiresConstantIdentity;
   bool nativeFragmentGather;
+  // Native-adapter profitability preference, not a register-allocation promise.
+  unsigned preferredReductionResidentPrograms;
   gpu::TuningProfileSchema profiles;
   llvm::StringRef profileFilename;
   void buildConstruction(mlir::OpPassManager &, const Request &) const;

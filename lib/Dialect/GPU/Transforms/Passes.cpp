@@ -22,6 +22,7 @@ namespace intent::gpu {
 #define GEN_PASS_DEF_NORMALIZESTRUCTUREDSOURCESPASS
 #define GEN_PASS_DEF_PREDICATESCALARCONTROLPASS
 #define GEN_PASS_DEF_POINTWISEOWNERSHIPPASS
+#define GEN_PASS_DEF_REDUCTIONCONSUMERSPASS
 #define GEN_PASS_DEF_POINTWISEBLOCKINGPASS
 #define GEN_PASS_DEF_SCANCONSUMERSPASS
 #define GEN_PASS_DEF_RETAINEDVALUESPASS
@@ -272,10 +273,27 @@ public:
   }
 };
 
-void populateTransformations(OpPassManager &manager) {
+class ReductionConsumersPass
+    : public impl::ReductionConsumersPassBase<ReductionConsumersPass> {
+public:
+  using ReductionConsumersPassBase::ReductionConsumersPassBase;
+  void runOnOperation() final {
+    auto module = getOperation();
+    if (failed(finishTransformation(module, getArgument(),
+                                   realizeReductionConsumerTraversals(
+                                       module, preferredResidentPrograms))))
+      signalPassFailure();
+  }
+};
+
+void populateTransformations(OpPassManager &manager,
+                              unsigned preferredResidentPrograms) {
   manager.addPass(createNormalizeStructuredSourcesPass());
   manager.addPass(createPredicateScalarControlPass());
   manager.addPass(createPointwiseOwnershipPass());
+  ReductionConsumersPassOptions consumers;
+  consumers.preferredResidentPrograms = preferredResidentPrograms;
+  manager.addPass(createReductionConsumersPass(consumers));
   manager.addPass(createPointwiseBlockingPass());
   manager.addPass(createScanConsumersPass());
   manager.addPass(createRetainedValuesPass());
@@ -296,6 +314,7 @@ void populateTransformations(OpPassManager &manager) {
 class RealizeSharedProgramPass
     : public impl::RealizeSharedProgramPassBase<RealizeSharedProgramPass> {
 public:
+  using RealizeSharedProgramPassBase::RealizeSharedProgramPassBase;
   void runOnOperation() final {
     ModuleOp module = getOperation();
     auto transform = [&]() -> LogicalResult {
@@ -303,7 +322,7 @@ public:
       auto kernel = getPhysicalKernel(module);
       if (failed(kernel)) return failure();
       OpPassManager pipeline(ModuleOp::getOperationName());
-      populateTransformations(pipeline);
+      populateTransformations(pipeline, preferredResidentPrograms);
       if (scf::IfOp conditional = independentUniformBranches(*kernel)) {
         auto realized = realizeUniformBranches(module, *kernel, conditional,
             [&](ModuleOp branch) { return runPipeline(pipeline, branch); });
@@ -401,7 +420,7 @@ void registerGPUPasses() {
   registerIntentGPUTransformPasses();
   PassPipelineRegistration<>("intent-gpu-shared",
       "Realize and close the shared executable GPU program",
-      buildSharedGPUPipeline);
+      [](OpPassManager &manager) { buildSharedGPUPipeline(manager); });
 }
 
 LogicalResult completeGPUProgramConstruction(ModuleOp module) {
@@ -412,8 +431,11 @@ LogicalResult completeGPUProgramConstruction(ModuleOp module) {
   return verifyGPUProgram(module);
 }
 
-void buildSharedGPUPipeline(OpPassManager &manager) {
-  manager.addPass(createRealizeSharedProgramPass());
+void buildSharedGPUPipeline(OpPassManager &manager,
+                            unsigned preferredResidentPrograms) {
+  RealizeSharedProgramPassOptions options;
+  options.preferredResidentPrograms = preferredResidentPrograms;
+  manager.addPass(createRealizeSharedProgramPass(options));
   manager.addPass(createMaterializeConfigurationsPass());
   manager.addPass(createFuseIndependentTraversalsPass());
   manager.addPass(createNormalizeCompletedReductionsPass());

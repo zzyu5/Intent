@@ -12,13 +12,16 @@ namespace intent::gpu {
 #include "Intent/Dialect/GPU/Transforms/Passes.h.inc"
 
 void registerGPUPasses();
-void buildSharedGPUPipeline(mlir::OpPassManager &manager);
+void buildSharedGPUPipeline(mlir::OpPassManager &manager,
+                            unsigned preferredResidentPrograms = 1);
 
 mlir::LogicalResult verifyGPUProgram(mlir::ModuleOp module);
 mlir::LogicalResult realizeAccessComposition(mlir::ModuleOp module);
 mlir::LogicalResult simplifyMaskedAccessCoordinates(mlir::ModuleOp module);
 mlir::LogicalResult predicateScalarControl(mlir::ModuleOp module);
 mlir::LogicalResult realizeScanConsumerTraversals(mlir::ModuleOp module);
+mlir::LogicalResult realizeReductionConsumerTraversals(
+    mlir::ModuleOp module, unsigned preferredResidentPrograms);
 mlir::LogicalResult materializeRetainedValues(mlir::ModuleOp module);
 mlir::LogicalResult vectorizeBufferLoops(mlir::ModuleOp module);
 mlir::LogicalResult promoteBufferValues(mlir::ModuleOp module);

@@ -20,13 +20,13 @@ namespace intent::compiler {
 ArrayRef<Backend> gpuBackends() {
   static const Backend adapters[] = {
       {Provider::Triton, "triton", true,
-       GPUBackend{true, false, true, triton::tuningProfileSchema(), "triton.json"},
+       GPUBackend{true, false, true, 1, triton::tuningProfileSchema(), "triton.json"},
        [](DialectRegistry &registry) { registry.insert<triton::IntentTritonDialect>(); },
        triton::registerTritonPasses,
        [](OpPassManager &manager, const Request &) { triton::buildTritonPipeline(manager); },
        triton::serializeProgram},
       {Provider::CuTile, "cutile", true,
-       GPUBackend{true, true, false, cutile::tuningProfileSchema(), "cutile.json"},
+       GPUBackend{true, true, false, 2, cutile::tuningProfileSchema(), "cutile.json"},
        [](DialectRegistry &registry) { registry.insert<cutile::IntentCuTileDialect>(); },
        cutile::registerCuTilePasses,
        [](OpPassManager &manager, const Request &) { cutile::buildCuTilePipeline(manager); },
@@ -59,7 +59,7 @@ void GPUBackend::buildShared(OpPassManager &manager, const Request &request, Str
   options.overrides = request.tuningConfig;
   options.provider = provider.str();
   manager.addPass(createResolveGPUProfiles(options));
-  gpu::buildSharedGPUPipeline(manager);
+  gpu::buildSharedGPUPipeline(manager, preferredReductionResidentPrograms);
 }
 
 LogicalResult GPUBackend::verifySharedInput(ModuleOp module, const Request &request, StringRef provider) const {

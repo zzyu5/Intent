@@ -4,6 +4,10 @@
 #include "ReductionParameters.h"
 #include "ReductionValues.h"
 #include "Intent/Dialect/GPU/Analysis/Helpers.h"
+#include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
+#include "Intent/Dialect/GPU/Analysis/IntegerRanges.h"
+#include "Intent/Dialect/GPU/Analysis/PhysicalExpressionBounds.h"
+#include "Intent/Dialect/GPU/Analysis/Resources.h"
 #include "Intent/Dialect/GPU/Transforms/Value/Helpers.h"
 #include "Intent/Dialect/GPU/Analysis/ValueSchema.h"
 #include "Intent/Dialect/GPU/IR/PhysicalExpressions.h"
@@ -16,6 +20,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <functional>
@@ -27,7 +32,8 @@ namespace intent::gpu::reduction {
 LogicalResult realizeRuntimeReduce(ReduceOp reduce,
                                    ArrayRef<SourcePlan> sourcePlans,
                                    func::FuncOp kernel,
-                                   bool tileProducerFreeAxis) {
+                                   bool tileProducerFreeAxis,
+                                   ReductionCarryForm carryForm) {
   if (sourcePlans.empty())
     return reduce.emitOpError("runtime reduction has no physical sources");
   SmallVector<SmallVector<RootAccess>> accesses;
@@ -138,6 +144,7 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
 
   Region vectorCombine;
   bool vectorAccumulation =
+      carryForm == ReductionCarryForm::Automatic &&
       prepareVectorAccumulation(reduce, blockedSourceTypes, vectorCombine);
 
   SmallVector<Value> loopInitials(identities);
@@ -475,9 +482,10 @@ LogicalResult realizeRuntimeReduce(ReduceOp reduce,
           Value identity = identities[component];
           if (auto fragment = dyn_cast<FragmentType>(identity.getType());
               fragment && fragment != blockedSource) {
-            FragmentType expanded = replaceExtent(
-                blockedSource, plan.reductionAxis,
-                expression(reduce.getContext(), PhysicalExprKind::Constant, 1));
+            FragmentType expanded = blockedSource;
+            auto unit = expression(reduce.getContext(), PhysicalExprKind::Constant, 1);
+            for (int64_t axis : reduce.getAxes())
+              expanded = replaceExtent(expanded, axis, unit);
             FailureOr<ArrayAttr> relation =
                 inferReshapeReassociation(fragment, expanded);
             if (failed(relation)) {
@@ -586,6 +594,30 @@ bool isolatedReductionUpdate(scf::ForOp loop, ReduceOp reference,
   return true;
 }
 
+PhysicalExprAttr savedCollectivePayloadWork(scf::ForOp loop,
+    TypeRange accumulatorTypes, func::FuncOp kernel) {
+  auto lower = queryLaunchExpression(loop.getLowerBound());
+  auto upper = queryLaunchExpression(loop.getUpperBound());
+  auto step = queryLaunchExpression(loop.getStep());
+  auto payload = nominalPayloadWords(accumulatorTypes);
+  if (!lower || !upper || !step || !payload) return {};
+  auto context = loop.getContext();
+  auto distance = expression(context, PhysicalExprKind::Subtract, 0, {}, {upper, lower});
+  auto distanceBounds = queryPhysicalExpressionRange(distance, kernel);
+  auto stepBounds = queryPhysicalExpressionRange(step, kernel);
+  if (!distanceBounds || distanceBounds->smin().isNegative() ||
+      !stepBounds || !stepBounds->smin().isStrictlyPositive()) return {};
+  auto trips = expression(context, PhysicalExprKind::CeilDiv, 0, {}, {distance, step});
+  auto one = expression(context, PhysicalExprKind::Constant, 1);
+  auto zero = expression(context, PhysicalExprKind::Constant, 0);
+  auto repeated = expression(context, PhysicalExprKind::Subtract, 0, {}, {trips, one});
+  // Empty and one-trip loops save no repeated collective work.
+  repeated = expression(context, PhysicalExprKind::Maximum, 0, {}, {repeated, zero});
+  auto saved = expression(context, PhysicalExprKind::Multiply, 0, {}, {repeated, payload});
+  auto bounds = queryPhysicalExpressionRange(saved, kernel);
+  return bounds && !bounds->smin().isNegative() ? saved : PhysicalExprAttr();
+}
+
 } // namespace
 
 bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
@@ -660,11 +692,95 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
                                       accumulatorTypes, reason)))
     return false;
 
+  SmallVector<Operation *> ignored(updates.begin(), updates.end());
+  for (ReduceOp reduce : reductions) ignored.push_back(reduce);
+  SmallVector<Type> additionalPayloads;
+  for (Operation &operation : vectorCombine.front().without_terminator()) {
+    if (isa<BroadcastOp, SplatOp, ReshapeOp, MakeRecordOp, ExtractOp>(&operation))
+      continue;
+    for (Type type : operation.getResultTypes())
+      if (isa<FragmentType, RecordType>(type)) additionalPayloads.push_back(type);
+  }
+  auto workingSet = nominalLoopWorkingSet(outer, accumulatorTypes, ignored,
+                                          additionalPayloads, sources);
+  auto bounds = workingSet ? queryPhysicalExpressionRange(workingSet, kernel)
+                           : std::nullopt;
+  auto capabilities = kernel->getAttrOfType<CapabilitiesAttr>(capabilitiesAttr);
+  if (!bounds || bounds->smin().isNegative() || !capabilities ||
+      capabilities.getRegistersPerUnit() <= 0)
+    return false;
+  int64_t budget = capabilities.getRegistersPerUnit();
+  auto savedWork = savedCollectivePayloadWork(outer, accumulatorTypes, kernel);
+  auto savedBounds = savedWork ? queryPhysicalExpressionRange(savedWork, kernel)
+                              : std::nullopt;
+  bool alwaysWorthHoisting = savedBounds &&
+      savedBounds->smin().getSExtValue() >= bounds->smax().getSExtValue();
+  bool canSaveEnough = savedBounds &&
+      savedBounds->smax().getSExtValue() >= bounds->smin().getSExtValue();
+  if (bounds->smin().getSExtValue() > budget && !canSaveEnough) return false;
+  bool guarded = bounds->smax().getSExtValue() > budget && !alwaysWorthHoisting;
+  if (guarded) {
+    // Both versions keep their original loop allocation scope. Nevertheless,
+    // cloning allocations would duplicate the physical resource identities.
+    auto effects = getEffectsRecursively(outer);
+    if (!effects || llvm::any_of(*effects, [](const auto &effect) {
+          return isa<MemoryEffects::Allocate>(effect.getEffect());
+        })) return false;
+    for (Operation *current = outer; Operation *parent = current->getParentOp();
+         current = parent) {
+      auto branch = dyn_cast<scf::IfOp>(parent);
+      if (!branch || current->getParentRegion() != &branch.getElseRegion()) continue;
+      bool includesBudget = false, includesSavings = false;
+      SmallVector<Value> pending{branch.getCondition()};
+      while (!pending.empty()) {
+        Value value = pending.pop_back_val();
+        if (auto disjunction = value.getDefiningOp<BinaryOp>();
+            disjunction && disjunction.getOperatorKind() == BinaryOperator::LogicalOr) {
+          pending.push_back(disjunction.getLhs());
+          pending.push_back(disjunction.getRhs());
+          continue;
+        }
+        auto condition = value.getDefiningOp<CompareOp>();
+        if (!condition) continue;
+        auto lhs = queryLaunchExpression(condition.getLhs());
+        auto rhs = queryLaunchExpression(condition.getRhs());
+        includesBudget |= condition.getPredicate() == ComparePredicate::Le &&
+            lhs == workingSet && IndexRelations().constant(condition.getRhs()) == budget;
+        includesSavings |= savedWork &&
+            ((condition.getPredicate() == ComparePredicate::Ge &&
+              lhs == savedWork && rhs == workingSet) ||
+             (condition.getPredicate() == ComparePredicate::Le &&
+              lhs == workingSet && rhs == savedWork));
+      }
+      if (includesBudget && (!canSaveEnough || includesSavings)) return false;
+    }
+  }
+
   // These are compiler-created ordinary-reduction traversals. Keep their
   // existing tile, loads, masks and effects, but carry the tile through the
-  // loop so the native collective runs only after traversal is complete.
+  // loop when its nominal working set fits or the eliminated repeated
+  // collective payload work covers that footprint. This is a scheduling cost
+  // choice; the provider owns native allocation and the collective's tree.
   // The use checks exclude observable partial summaries and ordered carries.
   OpBuilder builder(outer);
+  scf::IfOp choice;
+  if (guarded) {
+    Value words = builder.create<PhysicalExprOp>(outer.getLoc(),
+        builder.getIndexType(), workingSet);
+    Value limit = builder.create<arith::ConstantIndexOp>(outer.getLoc(), budget);
+    Value fits = builder.create<CompareOp>(outer.getLoc(), builder.getI1Type(),
+                                          words, limit, ComparePredicate::Le);
+    if (canSaveEnough) {
+      Value saved = builder.create<PhysicalExprOp>(outer.getLoc(),
+          builder.getIndexType(), savedWork);
+      Value worthHoisting = builder.create<CompareOp>(outer.getLoc(), builder.getI1Type(),
+          saved, words, ComparePredicate::Ge);
+      fits = builder.create<BinaryOp>(outer.getLoc(), builder.getI1Type(),
+                                      fits, worthHoisting, BinaryOperator::LogicalOr);
+    }
+    choice = builder.create<scf::IfOp>(outer.getLoc(), outer.getResultTypes(), fits, true);
+    builder.setInsertionPointToStart(choice.thenBlock());
+  }
   SmallVector<Value> initial;
   for (auto [source, identity] : llvm::zip(sources, identities))
     initial.push_back(builder.create<SplatOp>(
@@ -708,8 +824,16 @@ bool hoistNestedReduction(scf::ForOp outer, func::FuncOp kernel) {
     Operation *cloned = builder.clone(*reduce, reduceMapping);
     results.assign(cloned->getResults().begin(), cloned->getResults().end());
   }
-  outer.replaceAllUsesWith(results);
-  outer.erase();
+  if (choice) {
+    builder.create<scf::YieldOp>(outer.getLoc(), results);
+    outer.replaceAllUsesWith(choice.getResults());
+    outer->moveBefore(choice.elseBlock(), choice.elseBlock()->end());
+    builder.setInsertionPointAfter(outer);
+    builder.create<scf::YieldOp>(outer.getLoc(), outer.getResults());
+  } else {
+    outer.replaceAllUsesWith(results);
+    outer.erase();
+  }
   return true;
 }
 
