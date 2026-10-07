@@ -13,6 +13,7 @@ add_mlir_library(MLIRIntentBangC
   Transforms/Supply.cpp
   Transforms/CoarsenLocal.cpp
   Transforms/InvariantSupply.cpp
+  Transforms/CompletedSupply.cpp
   Transforms/PipelineSupply.cpp
   Transforms/Storage.cpp
   Transforms/Verifier.cpp

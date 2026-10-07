@@ -620,7 +620,7 @@ LogicalResult reuseStorageScopes(ModuleOp module,
   auto function = *module.getOps<func::FuncOp>().begin();
   auto config = function->getAttrOfType<dsa::ConfigurationAttr>("intent_dsa.configuration");
   if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
-  while (placeInvariantSupply(function, config)) {
+  while (placeInvariantSupply(function, config) || reuseCompletedSupply(function, config)) {
     if (failed(cleanup()) || failed(composeLocalStorage(function, cleanup))) return failure();
   }
   while (initializeMatrixStorage(function)) {

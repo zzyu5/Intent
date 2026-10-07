@@ -98,7 +98,9 @@ def BangCStorageReuse : IntentBangCPass<"intent-bangc-storage-reuse",
     would leave stale physical storage. No hidden stage attribute is required.
 
     Owns entry canonicalization and copy/dead-write closure, invariant supply
-    placement, positive-zero matrix first-write specialization, and the storage
+    placement, reuse of completed prepared representations and bounded windows
+    of existing immutable converted snapshots, positive-zero matrix first-write
+    specialization, and the storage
     closure exposed by each rewrite. Finishes with supported in-place reuse and
     independent load coalescing. Every query consumes current SSA, storage
     versions and completion facts; analyses are rebuilt after mutation. Empty
