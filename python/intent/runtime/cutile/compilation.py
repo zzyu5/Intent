@@ -144,6 +144,21 @@ class CuTileCompilation:
     def _lookup(self, key):
         return next((entry for entry in self._compiled if entry.key == key), None)
 
+    def _request(self, kernel, arguments, context):
+        from cuda.tile.compilation import CallingConvention, KernelSignature
+
+        static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
+                            for annotation in kernel._annotated_function.parameter_annotations)
+        convention = (CallingConvention.cutile_python_v2() if static_arrays
+                      else CallingConvention.cutile_python_v1())
+        signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
+        return self._key(kernel, signature, context), signature
+
+    def request_key(self, kernel, arguments):
+        from cuda.tile._cext import default_tile_context
+
+        return self._request(kernel, arguments, default_tile_context)[0]
+
     def compile(self, requests):
         """Compile (kernel, bound arguments) requests in their declared order.
 
@@ -151,17 +166,11 @@ class CuTileCompilation:
         remains a failed candidate when the unchanged SDK tuner encounters it.
         """
         from cuda.tile._cext import default_tile_context
-        from cuda.tile.compilation import CallingConvention, KernelSignature
 
         context = default_tile_context
         keys, pending = [], []
         for kernel, arguments in requests:
-            static_arrays = any(annotation.array is not None and annotation.array.static_shape_dims
-                                for annotation in kernel._annotated_function.parameter_annotations)
-            convention = (CallingConvention.cutile_python_v2() if static_arrays
-                          else CallingConvention.cutile_python_v1())
-            signature = KernelSignature.from_kernel_args(kernel, arguments, convention)
-            key = self._key(kernel, signature, context)
+            key, signature = self._request(kernel, arguments, context)
             keys.append(key)
             with self._lock:
                 if self._lookup(key) is not None or any(key == item[0] for item in pending):

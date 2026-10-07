@@ -143,6 +143,8 @@ class GPUInterface:
             overlaps.append(OverlapBinding(name, lhs, rhs))
         self.overlaps = tuple(overlaps)
         require_references(self.grid, self)
+        require_references(tuple(binding.bound for binding in (
+            *self.configuration_space.coverage, *self.configuration_space.derived)), self)
         for requirement in self.configuration_space.requirements:
             require_references(requirement.expressions, self)
         self._binders = build_invocation_binders(
@@ -188,8 +190,9 @@ class GPUInterface:
                     strides.add(identity)
                 dependencies.append(frozenset((entry.source,)))
             elif isinstance(entry, CoverageBinding):
-                if any(isinstance(reference, str) for reference in entry.bound.references):
-                    raise ValueError("full-coverage bounds cannot depend on physical parameters")
+                if any(isinstance(reference, str) and reference not in self.configuration_space.coverage_names
+                       for reference in entry.bound.references):
+                    raise ValueError("invocation extents cannot depend on unselected candidate parameters")
                 dependencies.append(entry.bound.references)
             else:
                 dependencies.append(frozenset(reference for extent in entry.shape for reference in extent.references))
@@ -200,7 +203,7 @@ class GPUInterface:
                     continue
                 producer = positions.get(reference)
                 if producer is None:
-                    if reference in self.configuration_space.bound_names:
+                    if reference in self.configuration_space.bound_names | self.configuration_space.derived_names:
                         raise ValueError("GPU host allocation cannot depend on an unselected candidate parameter")
                     raise ValueError(f"GPU host binding references an unavailable argument or parameter: {reference!r}")
                 incoming[index] += 1

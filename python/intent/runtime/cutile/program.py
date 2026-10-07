@@ -116,7 +116,17 @@ class CuTileProgram:
                 tuple(values[entry.name] for entry in self.interface.overlaps))
 
     def _configurations(self, values):
-        return tuple(SimpleNamespace(**config) for config in self.configurations.candidates(values))
+        kernel = self._kernel(values)
+        selected, keys = [], []
+        for row in self.configurations.candidates(values):
+            config = SimpleNamespace(**self.configurations.bound_configuration(values, row))
+            variant = kernel.replace_hints(**self._hints(config))
+            key = (self.compilation.request_key(variant, self._arguments(values, config)),
+                   self._grid(values, config))
+            if key not in keys:
+                keys.append(key)
+                selected.append(config)
+        return tuple(selected)
 
     def _kernel(self, values):
         if self.tile_bounds is not None:

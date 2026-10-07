@@ -15,7 +15,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -177,6 +179,18 @@ private:
       values[metadata.value] = metadata.name;
     for (const ViewABI &view : views)
       values[view.value] = view.name;
+    AttrTypeWalker parameterUses;
+    parameterUses.addWalk([&](gpu::ParameterRefAttr reference) { nativeParameters.insert(reference); });
+    kernel.walk([&](Operation *operation) {
+      if (operation == kernel.getOperation()) return;
+      if (auto parameter = dyn_cast<gpu::ParameterOp>(operation);
+          parameter && parameter.getResult().use_empty()) return;
+      parameterUses.walk(operation->getAttrDictionary());
+      for (Type type : operation->getResultTypes()) parameterUses.walk(type);
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (BlockArgument argument : block.getArguments()) parameterUses.walk(argument.getType());
+    });
     for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
       auto parameter = cast<gpu::ParameterAttr>(attribute);
       if (StringRef hint = providerHint(parameter); !hint.empty()) {
@@ -292,7 +306,7 @@ private:
       argument(valueString(overlap.getResult()) + ": ct.Constant[bool]");
     for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
       auto parameter = cast<gpu::ParameterAttr>(attribute);
-      if (!providerHint(parameter).empty())
+      if (!providerHint(parameter).empty() || !nativeParameters.contains(parameter.getReference()))
         continue;
       std::string name = parameter.getName().getValue().str();
       argument(name + ": ConstInt");
@@ -654,7 +668,7 @@ private:
       arguments.push_back(valueString(overlap.getResult()));
     for (Attribute attribute : gpu::getParameterDeclarations(kernel)) {
       auto parameter = cast<gpu::ParameterAttr>(attribute);
-      if (providerHint(parameter).empty())
+      if (providerHint(parameter).empty() && nativeParameters.contains(parameter.getReference()))
         arguments.push_back(parameter.getName().getValue());
     }
     details["kernel_arguments"] = std::move(arguments);
@@ -700,6 +714,7 @@ private:
   SmallVector<MetadataABI> metadataArguments;
   SmallVector<gpu::ViewOverlapOp> overlapFacts;
   std::map<std::string, std::string> providerHintParameters;
+  llvm::DenseSet<gpu::ParameterRefAttr> nativeParameters;
 };
 
 } // namespace

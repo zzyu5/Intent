@@ -4,6 +4,8 @@
 #include "Intent/Dialect/GPU/Analysis/PhysicalProgram.h"
 #include "Intent/Dialect/GPU/Analysis/IndexRelations.h"
 #include "Intent/Dialect/GPU/IR/Program.h"
+#include "mlir/IR/AttrTypeSubElements.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 namespace intent::cutile {
@@ -56,8 +58,9 @@ Value stripIndexIdentities(Value value) {
   return value;
 }
 
-gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
-                                         func::FuncOp kernel) {
+static gpu::PhysicalExprAttr arrayIndexTileBound(
+    gpu::PhysicalExprAttr expression, func::FuncOp kernel,
+    llvm::DenseSet<gpu::ParameterRefAttr> &active) {
   auto kind = expression.getKind();
   if (kind == gpu::PhysicalExprKind::Constant)
     return expression.getValue() > 0 ? expression : gpu::PhysicalExprAttr();
@@ -65,8 +68,36 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
     auto parameter = gpu::queryParameterBySymbol(kernel, expression.getParameterReference().getName());
     if (failed(parameter))
       return {};
-    if (parameter->isDeferred())
-      return expression;
+    if (parameter->isDeferred()) {
+      auto bound = parameter->getBinding().getCoverageBound();
+      if (!bound) return {};
+      bool referencesParameters = false;
+      AttrTypeWalker walker;
+      walker.addWalk([&](gpu::ParameterRefAttr) { referencesParameters = true; });
+      walker.walk(bound);
+      if (!referencesParameters) return expression;
+      // A minimum selects one operand's value. When all operand domains are
+      // included, deferred binding is exact rather than a covering round-up.
+      bool exact = bound.getKind() == gpu::PhysicalExprKind::Minimum;
+      for (Attribute attribute : bound.getOperands()) {
+        auto operand = cast<gpu::PhysicalExprAttr>(attribute);
+        auto source = operand.getKind() == gpu::PhysicalExprKind::Parameter
+            ? gpu::lookupParameter(kernel, operand.getParameterReference()) : gpu::ParameterAttr{};
+        exact &= source && llvm::all_of(source.getCandidates().asArrayRef(), [&](int64_t candidate) {
+          return llvm::is_contained(parameter->getCandidates().asArrayRef(), candidate);
+        });
+      }
+      if (exact) {
+        auto reference = parameter->getReference();
+        if (!active.insert(reference).second) return {};
+        auto result = arrayIndexTileBound(bound, kernel, active);
+        active.erase(reference);
+        return result;
+      }
+      return gpu::PhysicalExprAttr::get(kernel.getContext(), gpu::PhysicalExprKind::Constant,
+          *llvm::max_element(parameter->getCandidates().asArrayRef()), StringAttr::get(kernel.getContext()),
+          ArrayAttr::get(kernel.getContext(), {}));
+    }
     auto configurations = kernel->getAttrOfType<gpu::ConfigurationSetAttr>(gpu::configurationsAttr);
     if (!configurations || configurations.getStage() != gpu::ConfigurationStage::Complete)
       return {};
@@ -90,7 +121,7 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
     return {};
   SmallVector<Attribute> operands;
   for (Attribute operand : expression.getOperands()) {
-    auto bound = arrayIndexTileBound(cast<gpu::PhysicalExprAttr>(operand), kernel);
+    auto bound = arrayIndexTileBound(cast<gpu::PhysicalExprAttr>(operand), kernel, active);
     if (!bound && kind != gpu::PhysicalExprKind::Minimum)
       return {};
     if (bound)
@@ -105,6 +136,12 @@ gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
   return gpu::PhysicalExprAttr::get(
       kernel.getContext(), expression.getKind(), expression.getValue(),
       expression.getSymbol(), ArrayAttr::get(kernel.getContext(), operands));
+}
+
+gpu::PhysicalExprAttr arrayIndexTileBound(gpu::PhysicalExprAttr expression,
+                                         func::FuncOp kernel) {
+  llvm::DenseSet<gpu::ParameterRefAttr> active;
+  return arrayIndexTileBound(expression, kernel, active);
 }
 
 std::optional<ArrayIndexBounds> arrayIndexTileBounds(func::FuncOp kernel) {

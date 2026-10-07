@@ -28,6 +28,7 @@ mlir::LogicalResult renameParameters(
     mlir::func::FuncOp kernel,
     llvm::function_ref<mlir::StringAttr(mlir::StringAttr)> rename);
 void eraseUnusedParameters(mlir::func::FuncOp kernel);
+mlir::LogicalResult projectBoundedParameterUses(mlir::func::FuncOp kernel);
 mlir::LogicalResult materializeSharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult verifySharedConfigTuples(mlir::func::FuncOp kernel);
 mlir::LogicalResult writeConfigurations(

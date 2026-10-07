@@ -1,10 +1,12 @@
 #include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 #include "Intent/Dialect/GPU/Analysis/PhysicalParameters.h"
+#include "Intent/Dialect/GPU/IR/ProgramInterface.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include <algorithm>
+#include <string>
 
 using namespace mlir;
 
@@ -273,6 +275,112 @@ void eraseUnusedParameters(func::FuncOp kernel) {
   }
   if (retained.size() != declarations.size())
     kernel->setAttr(parametersAttr, ArrayAttr::get(kernel.getContext(), retained));
+}
+
+LogicalResult projectBoundedParameterUses(func::FuncOp kernel) {
+  SmallVector<ParameterAttr> parameters;
+  for (Attribute attribute : getParameterDeclarations(kernel))
+    parameters.push_back(cast<ParameterAttr>(attribute));
+  auto walkProgram = [&](AttrTypeWalker &walker) {
+    kernel.walk([&](Operation *operation) {
+      for (NamedAttribute attribute : operation->getAttrs())
+        if (operation != kernel.getOperation() || attribute.getName() != parametersAttr)
+          walker.walk<WalkOrder::PreOrder>(attribute.getValue());
+      for (Type type : operation->getResultTypes())
+        walker.walk<WalkOrder::PreOrder>(type);
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (BlockArgument argument : block.getArguments())
+            walker.walk<WalkOrder::PreOrder>(argument.getType());
+    });
+  };
+  for (ParameterAttr parameter : parameters) {
+    if (!parameter.isExtent() || parameter.getPhase() != ConfigurationBindingPhase::Shared)
+      continue;
+    auto reference = parameter.getReference();
+    ParameterAttr capacity;
+    PhysicalExprAttr bounded;
+    bool ambiguous = false;
+    auto match = [&](PhysicalExprAttr expression) -> ParameterAttr {
+      if (expression.getKind() != PhysicalExprKind::Minimum || expression.getOperands().size() != 2)
+        return {};
+      auto first = cast<PhysicalExprAttr>(expression.getOperands()[0]);
+      auto second = cast<PhysicalExprAttr>(expression.getOperands()[1]);
+      if (first.getKind() != PhysicalExprKind::Parameter ||
+          second.getKind() != PhysicalExprKind::Parameter)
+        return {};
+      if (second.getParameterReference() == reference) std::swap(first, second);
+      if (first.getParameterReference() != reference) return {};
+      auto other = lookupParameter(kernel, second.getParameterReference());
+      return other && other.isDeferred() && other.getBinding().getCoverageBound()
+                 ? other : ParameterAttr{};
+    };
+    AttrTypeWalker discovery;
+    discovery.addWalk([&](PhysicalExprAttr expression) {
+      auto found = match(expression);
+      if (!found) return;
+      if (capacity && capacity != found) ambiguous = true;
+      else { capacity = found; bounded = expression; }
+    });
+    walkProgram(discovery);
+    if (!bounded || ambiguous) continue;
+
+    bool early = false;
+    AttrTypeWalker earlyUses;
+    earlyUses.addWalk([&](ParameterRefAttr use) { early |= use == reference; });
+    for (Attribute attribute : getParameterDeclarations(kernel))
+      earlyUses.walk(cast<ParameterAttr>(attribute).getBinding());
+    for (BlockArgument argument : kernel.getArguments())
+      if (auto binding = getArgumentBinding(argument);
+          binding && binding.getKind() == ArgumentKind::Workspace)
+        earlyUses.walk(argument.getType());
+    if (early) continue;
+
+    bool raw = false;
+    AttrTypeWalker uses;
+    uses.addWalk([&](PhysicalExprAttr expression) {
+      return match(expression) == capacity ? WalkResult::skip() : WalkResult::advance();
+    });
+    uses.addWalk([&](ParameterRefAttr use) { raw |= use == reference; });
+    walkProgram(uses);
+    if (raw) continue;
+
+    Builder builder(kernel.getContext());
+    std::string stem = parameter.getName().getValue().str() + "_EFFECTIVE";
+    std::string name = stem;
+    for (unsigned suffix = 1; lookupParameter(kernel, builder.getStringAttr(name)); ++suffix)
+      name = stem + "_" + std::to_string(suffix);
+    auto projectedReference = ParameterRefAttr::get(kernel.getContext(), builder.getStringAttr(name));
+    auto projectedExpression = PhysicalExprAttr::get(kernel.getContext(), PhysicalExprKind::Parameter,
+        0, projectedReference, builder.getArrayAttr({}));
+    SmallVector<int64_t> candidates(parameter.getCandidates().asArrayRef());
+    llvm::append_range(candidates, capacity.getCandidates().asArrayRef());
+    llvm::sort(candidates);
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    auto projected = ParameterAttr::get(kernel.getContext(), builder.getStringAttr(name),
+        parameter.getValueType(), parameter.getRole(), parameter.getCategory(),
+        parameter.getElementBitWidth(), builder.getDenseI64ArrayAttr(candidates),
+        ConfigurationBindingPhase::Deferred, parameter.getBinding().withCoverageBound(bounded));
+    // Rewrite the current program before adding the new declaration, whose
+    // binding deliberately retains the original expression and candidate row.
+    AttrTypeReplacer replacer;
+    replacer.addReplacement([&](PhysicalExprAttr expression) -> std::optional<Attribute> {
+      return match(expression) == capacity ? std::optional<Attribute>(projectedExpression) : std::nullopt;
+    });
+    replacer.recursivelyReplaceElementsIn(kernel, true, false, true);
+    auto configurations = kernel->getAttrOfType<ConfigurationSetAttr>(configurationsAttr);
+    if (failed(declareParameter(kernel, projected))) return failure();
+    if (configurations) {
+      SmallVector<DictionaryAttr> rows;
+      SmallVector<ConfigurationRequirementAttr> requirements;
+      for (Attribute row : configurations.getRows()) rows.push_back(cast<DictionaryAttr>(row));
+      for (Attribute requirement : configurations.getRequirements())
+        requirements.push_back(cast<ConfigurationRequirementAttr>(requirement));
+      if (failed(writeConfigurations(kernel, rows, configurations.getStage(), requirements)))
+        return failure();
+    }
+  }
+  return success();
 }
 
 } // namespace intent::gpu

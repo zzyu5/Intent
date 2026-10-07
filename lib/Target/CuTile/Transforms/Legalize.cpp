@@ -16,6 +16,7 @@
 #include "Intent/Dialect/GPU/Transforms/Value/ValueMaterialization.h"
 #include "Intent/Dialect/GPU/Transforms/Value/ValueRelations.h"
 #include "Intent/Dialect/GPU/Transforms/Contraction/Contraction.h"
+#include "Intent/Dialect/GPU/Transforms/Configuration/PhysicalParameters.h"
 
 using namespace mlir;
 namespace intent::cutile {
@@ -56,6 +57,10 @@ LogicalResult finalizeProgram(ModuleOp module, bool hoistLoopInvariants) {
   if (failed(hoistLoopInvariants ? gpu::hoistLoopInvariantValues(module)
                                 : gpu::eliminateCommonValues(module)))
     return failure();
+  if (failed(finalizeConfigurationRequirements(*kernel)))
+    return failure();
+  if (failed(gpu::projectBoundedParameterUses(*kernel)))
+    return failure();
   if (auto bounds = arrayIndexTileBounds(*kernel)) {
     (*kernel)->setAttr(arrayIndexTileBoundsAttr, UnitAttr::get(module.getContext()));
     for (auto [resource, shape] : *bounds) {
@@ -65,8 +70,6 @@ LogicalResult finalizeProgram(ModuleOp module, bool hoistLoopInvariants) {
         resource.getDefiningOp()->setAttr(arrayIndexTileBoundsAttr, shape);
     }
   }
-  if (failed(finalizeConfigurationRequirements(*kernel)))
-    return failure();
   if (failed(verifyCuTileProgram(module, verifySourceOperation)))
     return failure();
   return success();

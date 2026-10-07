@@ -4,6 +4,7 @@
 #include "Intent/Dialect/GPU/IR/Program.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "llvm/ADT/DenseSet.h"
+#include <functional>
 
 using namespace mlir;
 
@@ -136,12 +137,40 @@ public:
       // Shared construction may still be preparing a deferred declaration. A
       // host consumer cannot use it until its coverage bound is present.
       if (parameter.isDeferred() && parameter.getBinding().getCoverageBound() &&
-          failed(visit(parameter.getReference()))) return failure();
+          failed(visitDeferred(parameter.getReference()))) return failure();
     }
     return success();
   }
 
 private:
+  LogicalResult visitDeferred(ParameterRefAttr reference) {
+    auto found = deferredState.find(reference);
+    if (found != deferredState.end()) {
+      if (found->second == Complete) return success();
+      return kernel.emitError("cycle in deferred parameter bindings: ") << reference;
+    }
+    auto parameter = lookupParameterDeclaration(kernel, reference);
+    if (!parameter || !parameter.isExtent())
+      return kernel.emitError("deferred extent references an unavailable extent parameter: ") << reference;
+    if (!parameter.isDeferred()) return success();
+    auto bound = parameter.getBinding().getCoverageBound();
+    if (!bound) return kernel.emitError("deferred extent has no bound expression: ") << reference;
+    deferredState[reference] = Visiting;
+    std::function<LogicalResult(PhysicalExprAttr)> check = [&](PhysicalExprAttr value) {
+      if (value.getKind() == PhysicalExprKind::Parameter)
+        return visitDeferred(value.getParameterReference());
+      if (value.getKind() == PhysicalExprKind::Dimension ||
+          value.getKind() == PhysicalExprKind::ScalarABI)
+        return visit(value.getArgumentReference());
+      for (Attribute operand : value.getOperands())
+        if (failed(check(cast<PhysicalExprAttr>(operand)))) return failure();
+      return success();
+    };
+    if (failed(check(bound))) return failure();
+    deferredState[reference] = Complete;
+    return success();
+  }
+
   LogicalResult expression(PhysicalExprAttr value, bool allowDeferred) {
     switch (value.getKind()) {
     case PhysicalExprKind::Constant: return success();
@@ -215,6 +244,7 @@ private:
   func::FuncOp kernel;
   const llvm::DenseMap<ArgumentRefAttr, BlockArgument> &arguments;
   llvm::DenseMap<Attribute, State> state;
+  llvm::DenseMap<ParameterRefAttr, State> deferredState;
   SmallVector<Attribute> stack;
 };
 

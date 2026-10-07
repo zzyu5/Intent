@@ -156,12 +156,12 @@ class ConfigurationSpace:
             tuple(entry["argument_axis"]) if entry.get("argument_axis") is not None else None,
         ) for entry in interface["parameters"])
         self.requirements = tuple(ConfigurationRequirement.read(entry) for entry in interface["requirements"])
-        self.coverage = tuple(CoverageBinding(entry["name"], Expression.read(entry["coverage"]),
-                                               tuple(entry["candidates"]))
-                              for entry in interface["parameters"] if entry.get("coverage") is not None)
-        self.coverage_names = tuple(binding.name for binding in self.coverage)
+        deferred = tuple(CoverageBinding(entry["name"], Expression.read(entry["coverage"]),
+                                         tuple(entry["candidates"]))
+                         for entry in interface["parameters"] if entry.get("coverage") is not None)
+        deferred_names = frozenset(binding.name for binding in deferred)
         self.bound_names = frozenset(parameter.name for parameter in self.parameters
-                                     if parameter.name not in self.coverage_names)
+                                     if parameter.name not in deferred_names)
         names = {parameter.name for parameter in self.parameters}
         if len(names) != len(self.parameters) or not self.rows:
             raise ValueError("configuration space requires unique parameters and nonempty candidate rows")
@@ -171,13 +171,16 @@ class ConfigurationSpace:
             value_type = value_types[parameter.name]
             if value_type not in {"bool", "index"}:
                 raise ValueError("configuration parameter must have a boolean or index value type")
-            if value_type == "bool" and (parameter.category != 6 or parameter.name in self.coverage_names):
+            if value_type == "bool" and (parameter.category != 6 or parameter.name in deferred_names):
                 raise ValueError("boolean configuration choices must be bound provider parameters")
             if not parameter.candidates or any(
                 type(value) is not int or (value not in (0, 1) if value_type == "bool" else value <= 0)
                 for value in parameter.candidates
             ):
                 raise ValueError("configuration parameter candidates disagree with its value type")
+        self.coverage, self.derived = self._order_deferred(deferred, names, value_types)
+        self.coverage_names = tuple(binding.name for binding in self.coverage)
+        self.derived_names = frozenset(binding.name for binding in self.derived)
         for row in self.rows:
             if set(row) != self.bound_names or any(type(value) is not int or value not in domains[name]
                                                    for name, value in row.items()):
@@ -191,6 +194,33 @@ class ConfigurationSpace:
                 if any(isinstance(reference, str) and value_types[reference] != "index"
                        for reference in expression.references):
                     raise ValueError("configuration quantity expressions require index parameters")
+
+    def _order_deferred(self, deferred, names, value_types):
+        """Separate invocation extents from extents depending on a selected row."""
+        pending = list(deferred)
+        resolved = set(self.bound_names)
+        candidate_dependent = set(self.bound_names)
+        coverage, derived = [], []
+        for binding in pending:
+            for reference in binding.bound.references:
+                if isinstance(reference, str) and (
+                    reference not in names or value_types[reference] != "index"
+                ):
+                    raise ValueError("deferred extent must reference declared index parameters")
+        while pending:
+            ready = next((binding for binding in pending if all(
+                not isinstance(reference, str) or reference in resolved
+                for reference in binding.bound.references)), None)
+            if ready is None:
+                raise ValueError("deferred configuration extents contain a dependency cycle")
+            pending.remove(ready)
+            if ready.bound.references & candidate_dependent:
+                derived.append(ready)
+                candidate_dependent.add(ready.name)
+            else:
+                coverage.append(ready)
+            resolved.add(ready.name)
+        return tuple(coverage), tuple(derived)
 
     def assess(self, values: Mapping[int | str, object]) -> tuple[RequirementEvaluation, ...]:
         """Evaluate declared candidate conditions, independently of native allocation."""
@@ -214,7 +244,10 @@ class ConfigurationSpace:
         return self.select(self.inspect(values, rows=rows))
 
     def bound_configuration(self, values: Mapping[int | str, object], row: Mapping[str, int]) -> dict:
-        return {**row, **{name: values[name] for name in self.coverage_names}}
+        result = {**row, **{name: values[name] for name in self.coverage_names}}
+        for binding in self.derived:
+            result[binding.name] = binding.select({**values, **result})
+        return result
 
     def inspect(self, values: Mapping[int | str, object], *,
                 rows: Iterable[Mapping[str, int]] | None = None) -> tuple[ConfigurationAssessment, ...]:
@@ -223,8 +256,11 @@ class ConfigurationSpace:
         if any(row not in self.rows for row in selected):
             from ...compiler.toolchain import CompilationStageError
             raise CompilationStageError("candidate_binding", "candidate is absent from the generated configuration space")
-        return tuple(ConfigurationAssessment(bindings(self.bound_configuration(values, row)),
-                                              self.assess({**values, **row})) for row in selected)
+        result = []
+        for row in selected:
+            bound = self.bound_configuration(values, row)
+            result.append(ConfigurationAssessment(bindings(bound), self.assess({**values, **bound})))
+        return tuple(result)
 
     def select(self, assessed: tuple[ConfigurationAssessment, ...]) -> tuple[dict, ...]:
         """Select evaluated rows without reinterpreting or re-evaluating conditions."""
@@ -249,7 +285,7 @@ class ConfigurationSpace:
     def enumerate(self, values: Mapping[int | str, object], rows: Iterable[Mapping[str, int]]) -> tuple[TuningConfiguration, ...]:
         result = []
         for row in rows:
-            bindings = {**values, **row}
+            bindings = {**values, **self.bound_configuration(values, row)}
             result.append(TuningConfiguration(self.parameters,
                                                tuple(bindings[parameter.name] for parameter in self.parameters)))
         return tuple(result)
