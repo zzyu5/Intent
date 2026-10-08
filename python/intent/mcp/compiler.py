@@ -1,10 +1,13 @@
 """Explicitly enabled compilation tools, separate from the read-only manual."""
+import argparse
 from pathlib import Path
-from .compilation import describe as describe_interface, read_artifact as read_artifact_file
-from .requests import request_async
+from ..tools.compilation import describe as describe_interface, read_artifact as read_artifact_file
+from ..tools.requests import request_async
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Intent compiler tools over stdio MCP")
+    parser.parse_args()
     try:
         from mcp.server.fastmcp import FastMCP
         from mcp.types import ToolAnnotations

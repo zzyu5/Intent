@@ -86,4 +86,4 @@ Intent 不是纯表达式图。一个 kernel body 可以同时包含：
 
 - [`kernel-and-host.md`](kernel-and-host.md) 定义 kernel、helper、specialization 与 host orchestration；
 - [`logical-program.md`](logical-program.md) 定义 domain、subregion、control、state、structured operations、relations 与 effects；
-- [`../dsl/`](../dsl/) 定义 Python DSL 表面。
+- [`../dsl/`](../dsl/README.md) 定义 Python DSL 表面。

@@ -1,6 +1,10 @@
 # Installation
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 The public setup uses Linux and Python 3.10–3.12. Install an Intent wheel, then use the installed `intent setup` command to add one backend's Python dependencies. The source checkout also provides a virtual-environment bootstrap. Python MLIR bindings are not needed. GPU execution requires an appropriate NVIDIA driver; CPU and MLU toolchains are selected explicitly below. Installation, successful compilation, and numerical correctness are separate checks.
+
+IntentDSL has a Python package and a wheel build route. It has not been published to PyPI, so `pip install intentdsl` is not an installation route yet. Build a wheel below or download one from the repository's Distribution workflow. A wheel installs the compiler independently of any provider runtime.
 
 ## Install an existing wheel
 
@@ -16,7 +20,7 @@ intent doctor --target triton
 
 This route does not inspect SDK paths, build C++, or install MLIR bindings. The wheel includes `intent-compile`, `intent-opt`, their shared profiles, the language manual, and the tools' non-system ELF dependencies. The binaries find their libraries through relative `$ORIGIN` paths. Third-party copyright/license files and a library-to-notice listing are installed under `intent/_bin/third-party/`.
 
-These are local Linux platform wheels. They require a compatible host architecture, glibc, libstdc++, libgcc, and selected backend environment; bundling does not make a binary built against a newer system work on an older one. No manylinux compatibility or public release is implied. For an environment whose backend dependencies are already installed, `python -m pip install "${INTENT_WHEEL}[manual]"` installs the package directly without a checkout.
+The distribution recipe produces `manylinux_2_35_x86_64` wheels for mainstream Linux x86-64 systems with glibc 2.35 or newer. It uses [auditwheel](https://github.com/pypa/auditwheel) to inspect the actual compiler executables, bundled libraries, external symbol versions and CPU ISA requirements, then repair the wheel for that policy. It does not make newer symbols work on an older system: an incompatible build fails rather than receiving a misleading tag. Backend/device requirements remain separate from the compiler wheel. For an environment whose backend dependencies are already installed, `python -m pip install "${INTENT_WHEEL}[manual]"` installs the package directly without a checkout.
 
 For compiler/KIR tools and the MCP servers alone, omit `intent setup`: the wheel installation needs no provider SDK or tensor framework. Run `intent doctor --json` to check the installed compiler and its KIR output stage. Add a selected backend's dependencies when you need its runtime; a base compiler check does not establish device or kernel support.
 
@@ -96,7 +100,7 @@ For a wheel, add `--wheel "$INTENT_WHEEL"`. Omit Weft source/build flags on that
 .venv-bangc/bin/intent doctor --target bangc --target-option 'neuware="/path/to/neuware"'
 ```
 
-Weft's vector width and worker count above are an example of explicit construction budgets; supply the values for your deployment. Its CMake integration requires matching LLVM/MLIR and generated Weft headers/libraries. [CPU](../experiments/cpu/README.md) and [MLU](../experiments/mlu/README.md) retain the production deployment instructions and measured coverage. The public installer does not infer those settings from a private profile.
+Weft's vector width and worker count above are examples of explicit construction budgets; supply the values for your deployment. Its CMake integration requires matching LLVM/MLIR and generated Weft headers/libraries. The public installer does not infer those settings from a private profile. Use the [product programs](../examples/README.md) with your selected backend for compilation and execution.
 
 ## Build the package directly
 
@@ -109,19 +113,19 @@ python3 environment/build.py \
   --jobs 8
 ```
 
-Use a new work directory and a separate output directory. The command builds the source distribution first, builds the wheel from that archive, and installs it into an isolated environment outside the checkout. It then runs the existing base doctor, API discovery, both MCP entry points, the original softmax definition's KIR compilation, and standard IR optimization. It needs no GPU or provider SDK. The output directory receives the source archive and wheel after these steps complete; the work directory retains the installed environment, command output and compiler artifacts, including on failure.
+Use a new work directory and a separate output directory. The command builds the source distribution first, builds the wheel from that archive, applies auditwheel's `manylinux_2_35_x86_64` inspection and repair, and checks distribution metadata with `twine check --strict`. It installs the repaired wheel into an isolated environment outside the checkout, then runs the existing base doctor, API discovery, both MCP entry points, the original softmax definition's KIR compilation, and standard IR optimization. It needs no GPU or provider SDK. The output directory receives the source archive and repaired wheel after these steps complete; the work directory retains the installed environment, command output and compiler artifacts, including on failure.
 
-This recipe fixes the native build route to GCC, Ninja and Release mode and uses the existing CMake runtime bundling rules. It accepts `--mlir-dir`, `--llvm-dir`, `--runtime-notices`, and the paired `--weft-source-dir` / `--weft-binary-dir` options. It does not publish the package or assign a manylinux tag. System ABI compatibility still follows the selected build SDK and platform; the recipe is not a claim of byte-identical builds. Other environments can use the manual source build below.
+This recipe fixes the native build route to GCC, Ninja and Release mode and uses the existing CMake runtime bundling rules. It accepts `--mlir-dir`, `--llvm-dir`, `--runtime-notices`, and the paired `--weft-source-dir` / `--weft-binary-dir` options. Its platform policy follows [PEP 600](https://peps.python.org/pep-0600/); a custom SDK must satisfy the same actual ABI and ISA checks. It does not publish the package or claim byte-identical builds. Other source environments can use the manual build below, which produces a local platform wheel unless separately repaired.
 
 ### Download a CI build
 
-The [Distribution workflow](../.github/workflows/distribution.yml) invokes this same recipe for pull requests affecting the product, build inputs or documentation, and can also be started with **Run workflow** in GitHub Actions. It uses a GitHub-hosted Ubuntu 22.04 x86-64 runner, Python 3.10 and the LLVM/MLIR 20 packages. The base job installs no Torch, GPU SDK, external CPU compiler or device runner; optional Weft support is not built into this artifact.
+The [Distribution workflow](../.github/workflows/distribution.yml) invokes this same recipe for main-branch pushes and pull requests affecting the product, build inputs or documentation, and can also be started with **Run workflow** in GitHub Actions. It uses a GitHub-hosted Ubuntu 22.04 x86-64 runner, Python 3.10 and the LLVM/MLIR 20 packages. The base job installs no Torch, GPU SDK, external CPU compiler or device runner; optional Weft support is not built into this artifact.
 
-Open the chosen workflow run and download `intentdsl-ubuntu-22.04-x86_64` from its **Artifacts** section. Extract the archive and install its wheel using the existing wheel instructions above, then select `intent setup --target triton` or `--target cutile` in the corresponding separate environment. The archive also contains the source distribution. These are artifacts of that reviewed run, retained for 14 days, rather than a PyPI or GitHub release. They carry the same local Linux ABI requirements and third-party notices as the direct build; the workflow does not choose a project license.
+Open the chosen workflow run and download `intentdsl-ubuntu-22.04-x86_64` from its **Artifacts** section. Extract the archive and install its repaired manylinux wheel using the existing wheel instructions above, then select `intent setup --target triton` or `--target cutile` in the corresponding separate environment. The archive also contains the source distribution. These are artifacts of that reviewed run, retained for 14 days, rather than a PyPI or GitHub release. They carry the same platform policy and third-party notices as the direct distribution build.
 
-The `intentdsl-distribution-diagnostics` artifact retains the build transcript, ordered `commands/*.command`, `.log` and `.status` files, and the installed tools' actual JSON/IR/log outputs, including on failure. The build helper uses the same command logs locally. Hosted CI establishes packaging, installed compiler startup and the original softmax KIR/optimization path; device execution and performance continue to use the existing production registries. The fixed Ubuntu user space is part of the binary ABI baseline, so changing the runner to `ubuntu-latest` is not an equivalent build.
+The `intentdsl-distribution-diagnostics` artifact retains the build transcript, ordered `commands/*.command`, `.log` and `.status` files, and the installed tools' actual JSON/IR/log outputs, including on failure. The build helper uses the same command logs locally. Hosted CI establishes packaging, installed compiler startup and the original softmax KIR/optimization path; device execution and performance use the thirty [product programs](../examples/README.md). The fixed Ubuntu user space is part of the binary ABI baseline, so changing the runner to `ubuntu-latest` is not an equivalent build.
 
-Once the SDK and selected backend dependencies are installed:
+To install the compiler directly from the checkout once the SDK is installed:
 
 ```bash
 python -m pip install '.[manual]' \

@@ -1,6 +1,25 @@
 name: Distribution
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/distribution.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'include/**'
+      - 'lib/**'
+      - 'tools/**'
+      - 'python/**'
+      - 'environment/**'
+      - 'examples/**'
+      - 'doc/**'
+      - 'mcp/**'
+      - 'images/**'
+      - 'pyproject.toml'
+      - 'README*.md'
+      - 'CONTRIBUTING*.md'
+      - 'LICENSE'
   pull_request:
     paths:
       - '.github/**'
@@ -13,9 +32,12 @@ on:
       - 'environment/**'
       - 'examples/**'
       - 'doc/**'
+      - 'mcp/**'
+      - 'images/**'
       - 'pyproject.toml'
-      - 'README.md'
-      - 'CONTRIBUTING.md'
+      - 'README*.md'
+      - 'CONTRIBUTING*.md'
+      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
@@ -27,7 +49,7 @@ concurrency:
 
 jobs:
   distribution:
-    name: Ubuntu 22.04 x86-64 / LLVM 20 / Python 3.10
+    name: manylinux_2_35 x86-64 / LLVM 20 / Python 3.10
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:

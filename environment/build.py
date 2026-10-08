@@ -1,8 +1,9 @@
-"""Build and install-check a local Ubuntu 22.04 x86-64 distribution.
+"""Build and install-check an Ubuntu 22.04 x86-64 distribution.
 
 This recipe builds a wheel from its sdist and uses the existing public tools on
 the installed package. It neither installs provider SDKs nor executes kernels.
-The result is a local Linux wheel, not a manylinux or bit-reproducibility claim.
+Auditwheel verifies and repairs the wheel for manylinux_2_35_x86_64 before
+installation. The recipe does not publish artifacts or claim reproducibility.
 """
 from __future__ import annotations
 
@@ -100,6 +101,8 @@ def read_source_distribution(archive: Path, destination: Path) -> tuple[str, lis
         version = metadata["Version"]
         if metadata["Name"] != "intentdsl" or not version:
             raise ValueError("The source distribution has no IntentDSL package identity")
+        if not contents("LICENSE"):
+            raise ValueError("The source distribution does not contain the project license")
         destination.write_bytes(contents(AUTHOR_SOURCE))
         manual = []
         for member in members:
@@ -123,8 +126,12 @@ def check_wheel_contents(wheel: Path, version: str, manual: list[str]) -> None:
         metadata = BytesParser().parsebytes(archive.read(metadata_files[0]))
         if metadata["Name"] != "intentdsl" or metadata["Version"] != version:
             raise ValueError("The wheel package identity differs from its source distribution")
+        if (metadata["License-Expression"] != "Apache-2.0"
+                or "LICENSE" not in metadata.get_all("License-File", [])):
+            raise ValueError("The wheel does not declare the project license and license file")
+        license_file = metadata_files[0].removesuffix("METADATA") + "licenses/LICENSE"
         for name in ("intent/_bin/intent-compile", "intent/_bin/intent-opt",
-                     "intent/_bin/third-party/libraries.json", *manual):
+                     "intent/_bin/third-party/libraries.json", license_file, *manual):
             if archive.getinfo(name).file_size == 0:
                 raise ValueError(f"The wheel has an empty runtime resource: {name}")
 
@@ -194,7 +201,9 @@ def main() -> None:
     build_environment = work / "build-environment"
     run(sys.executable, "-m", "venv", build_environment, cwd=work, env=env)
     build_python = build_environment / "bin/python"
-    run(build_python, "-m", "pip", "install", "--upgrade", "pip", "build>=1.2,<2", cwd=work, env=env)
+    env["PATH"] = str(build_environment / "bin") + os.pathsep + env["PATH"]
+    run(build_python, "-m", "pip", "install", "--upgrade", "pip", "build>=1.2,<2",
+        "twine>=6,<7", "auditwheel>=6.8,<7", "patchelf>=0.17", cwd=work, env=env)
     source_output, wheel_output = work / "sdist", work / "wheel"
     run(build_python, "-m", "build", "--sdist", "--outdir", source_output,
         REPOSITORY, cwd=work, env=env)
@@ -220,6 +229,15 @@ def main() -> None:
         source_archive, cwd=work, env=env)
     wheel = one_artifact(wheel_output, "*.whl")
     check_wheel_contents(wheel, version, manual)
+    run(build_python, "-m", "auditwheel", "show", wheel, cwd=work, env=env)
+    portable_output = work / "repaired-wheel"
+    run(build_python, "-m", "auditwheel", "repair", "--plat", "manylinux_2_35_x86_64",
+        "--only-plat", "--wheel-dir", portable_output, wheel, cwd=work, env=env)
+    wheel = one_artifact(portable_output, "*.whl")
+    check_wheel_contents(wheel, version, manual)
+    run(build_python, "-m", "auditwheel", "show", wheel, cwd=work, env=env)
+    run(build_python, "-m", "twine", "check", "--strict", source_archive, wheel,
+        cwd=work, env=env)
 
     # No source imports, explicit compiler, SDK loader path or prior cache may
     # make the installed wheel's own runtime checks appear to work.
@@ -260,6 +278,7 @@ def main() -> None:
         shutil.copy2(artifact, destination)
     print(json.dumps({"sdist": str(destinations[0]), "wheel": str(destinations[1]),
                       "work_directory": str(work), "installed_environment": str(installed),
+                      "platform": "manylinux_2_35_x86_64",
                       "scope": "Installed compiler, optimizer, public declarations, manual packaging and original softmax KIR; no provider execution"}, indent=2))
 
 

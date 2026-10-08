@@ -73,4 +73,4 @@ softmax、logsumexp、Welford、attention、normalization、MoE、量化 GEMM �
 
 - [`core.md`](core.md)：作者构造、canonical operations与surface shorthand；
 - [`types-numerics-and-effects.md`](types-numerics-and-effects.md)：类型、数值、views、buffers、memory effects与RNG；
-- [`examples/`](examples/)：理想化完整 DSL 示例。
+- [`examples/`](examples/README.md)：理想化完整 DSL 示例。

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="680 0 688 372" role="img" aria-labelledby="title description" font-family="'Liberation Serif', Georgia, 'Times New Roman', serif">
-  <title id="title">IntentDSL workflow</title>
+  <title id="title">IntentDSL: one algorithm, multiple execution models</title>
   <desc id="description">Developers and agents write an IntentDSL program describing tensor and region computation, accesses, state, and composition rules. The compiler maps and optimizes this program into inspectable Triton and cuTile source for GPUs, Mojo source for x86 CPUs, Weft source for RISC-V CPUs, and BANG C source for Cambricon MLUs.</desc>
   <rect x="680" y="0" width="688" height="372" fill="white"/>
   <g fill="#202020">
